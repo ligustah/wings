@@ -184,6 +184,30 @@ recording never becomes backpressure on the work. A full buffer drops entries
 rather than blocking a submit — and counts them, so a gap in the record is
 reported rather than silent.
 
+### Machines outlive the coordinator
+
+A cloud machine does not stop existing because the process that asked for it
+died, and it does not stop billing either. So before wings asks a cloud for
+anything it mints a **lease** — an identity of its own — and writes an *intent*
+record to a second stream on that same embedded engine. Only then does it call
+`Provision`. The machine is recorded as ready once a worker is running on it,
+and released when it is destroyed.
+
+Write-ahead is the whole point. Recording a machine once the API returned would
+leave a window in which a billed VM exists that nothing on earth knows about,
+and that window is exactly the one a crash finds. A failure to write the intent
+refuses the launch outright, for the same reason.
+
+On startup, before it provisions anything, a coordinator reads that record and
+offers every unreleased lease to the provisioner. What comes back is still out
+there: a machine whose worker is alive is picked up where it left off — tunnel
+reopened, queue and results intact, no upload and no restart, because the worker
+was launched detached precisely so it outlives the session that started it — and
+one that cannot be resumed is destroyed rather than left running. Leases nothing
+came back for are closed, so no later start hunts for a machine that is already
+gone. Recovered machines count towards the worker target, so a restart provisions
+only the difference.
+
 ### Remote deployment
 
 For `-target remote`, per machine: provision → wait for SSH → upload the
@@ -265,7 +289,7 @@ Either way the SSH deployment, tunnelling and worker protocol are shared:
 
 ```go
 type Provisioner interface {
-    Provision(ctx context.Context, n int) ([]Machine, error)
+    Provision(ctx context.Context, leases []string) ([]Machine, error)
 }
 
 type Machine interface {
@@ -276,6 +300,27 @@ type Machine interface {
     Close(ctx context.Context) error
 }
 ```
+
+The **leases** are identities wings minted, not names the cloud chose, and that
+direction is the point: the coordinator writes down what it is about to create
+*before* it creates it. Your implementation must make each machine findable by
+its lease afterwards — as its name, a tag, a label, whatever the cloud offers —
+and `ID()` must return it. A lease is ten lowercase alphanumeric characters
+starting with a letter, so it is safe to embed in any cloud's naming rules.
+
+Implement `Reattacher` too if the cloud can look a machine up, which is nearly
+all of them:
+
+```go
+type Reattacher interface {
+    Provisioner
+    Reattach(ctx context.Context, leases []string) ([]Machine, error)
+}
+```
+
+Return only the machines that still exist; say nothing about the rest and wings
+closes them out. Without it a restarted coordinator can only destroy what it
+finds, which is safe and wastes everything those machines had done.
 
 ## Requirements
 

@@ -78,4 +78,19 @@
 // went where, what came back, which workers came and went — on that same
 // embedded engine. Broker-less by construction: nothing else reads it, and its
 // value is that it outlives the process that wrote it.
+//
+// # Machines outlive the coordinator
+//
+// A cloud machine does not stop existing because the process that asked for it
+// died, and it does not stop billing either. So for [Remote] targets wings
+// writes down what it is about to create BEFORE it creates it: it mints a lease
+// of its own, records the intent, and only then calls [Provisioner.Provision].
+// Recording after the fact would leave a window in which a billed machine
+// exists that nothing knows about, and that is the window a crash finds.
+//
+// On startup, before provisioning anything, a coordinator offers every
+// unreleased lease back to the provisioner via [Reattacher]. A machine whose
+// worker is still alive is picked up where it left off, queue and results
+// intact; one that cannot be resumed is destroyed rather than left running.
+// Recovered machines count towards the worker target.
 package wings

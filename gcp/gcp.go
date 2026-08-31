@@ -113,7 +113,7 @@ type gcpProvisioner struct {
 // In parallel because these are minutes, not milliseconds: eight machines
 // created in sequence is eight boot times, and the whole point of asking for
 // eight is not to wait for them one after another.
-func (p *gcpProvisioner) Provision(ctx context.Context, n int) ([]wings.Machine, error) {
+func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wings.Machine, error) {
 	if p.cfg.Project == "" || p.cfg.Zone == "" {
 		return nil, fmt.Errorf("gcp: Config needs both Project and Zone")
 	}
@@ -128,17 +128,15 @@ func (p *gcpProvisioner) Provision(ctx context.Context, n int) ([]wings.Machine,
 		return nil, fmt.Errorf("wings: compute client: %w", err)
 	}
 
-	run := strings.ToLower(randomToken(6))
-	machines := make([]wings.Machine, n)
-	errs := make([]error, n)
+	machines := make([]wings.Machine, len(leases))
+	errs := make([]error, len(leases))
 
 	var wg sync.WaitGroup
-	for i := range n {
+	for i, lease := range leases {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			name := fmt.Sprintf("%s-%s-%d", p.cfg.NamePrefix, run, i)
-			m, err := p.createOne(ctx, client, name, signer, authorizedKey)
+			m, err := p.createOne(ctx, client, lease, signer, authorizedKey)
 			machines[i], errs[i] = m, err
 		}()
 	}
@@ -166,8 +164,155 @@ func (p *gcpProvisioner) Provision(ctx context.Context, n int) ([]wings.Machine,
 	return machines, nil
 }
 
-func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.InstancesClient, name string, signer ssh.Signer, authorizedKey string) (wings.Machine, error) {
-	log := p.cfg.Logger.With("instance", name)
+// instanceName is how a lease becomes a name GCE will accept.
+//
+// Deterministic, because it is also how a lease is found again: reattachment
+// looks up exactly this name, so the mapping has to be a function and not a
+// choice made once and remembered.
+func (p *gcpProvisioner) instanceName(lease string) string {
+	return p.cfg.NamePrefix + "-" + lease
+}
+
+// Reattach finds instances a previous coordinator created and lets this one
+// back in.
+//
+// The awkward part is the credential. wings mints an ephemeral SSH key per run
+// and never writes it down — deliberately, so nothing it creates outlives the
+// cluster — which means the key that opened these machines died with the
+// process that made them. So this installs a NEW public key on each instance
+// through the metadata API and connects with that.
+//
+// The alternative was to persist the private key to disk so a later run could
+// reuse it, and it is worth being clear about why not: that turns a
+// memory-only credential into a file, on the coordinator, for the lifetime of
+// the data directory. Pushing a fresh key costs a metadata write and the
+// seconds the guest agent takes to apply it, and keeps the promise.
+func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings.Machine, error) {
+	if p.cfg.Project == "" || p.cfg.Zone == "" {
+		return nil, fmt.Errorf("gcp: Config needs both Project and Zone")
+	}
+
+	signer, authorizedKey, err := ephemeralKey()
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := compute.NewInstancesRESTClient(ctx, p.cfg.ClientOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("wings: compute client: %w", err)
+	}
+
+	found := make([]wings.Machine, len(leases))
+	var wg sync.WaitGroup
+	for i, lease := range leases {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m, err := p.reattachOne(ctx, client, lease, signer, authorizedKey)
+			if err != nil {
+				// Not fatal, and not even unusual: a lease whose machine was
+				// preempted or never created is exactly what this is for.
+				p.cfg.Logger.Info("wings: machine not recovered", "lease", lease, "err", err)
+				return
+			}
+			found[i] = m
+		}()
+	}
+	wg.Wait()
+
+	var out []wings.Machine
+	for _, m := range found {
+		if m != nil {
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		_ = client.Close()
+	}
+	return out, nil
+}
+
+func (p *gcpProvisioner) reattachOne(
+	ctx context.Context,
+	client *compute.InstancesClient,
+	lease string,
+	signer ssh.Signer,
+	authorizedKey string,
+) (wings.Machine, error) {
+	name := p.instanceName(lease)
+	log := p.cfg.Logger.With("instance", name, "lease", lease)
+
+	got, err := client.Get(ctx, &computepb.GetInstanceRequest{
+		Project:  p.cfg.Project,
+		Zone:     p.cfg.Zone,
+		Instance: name,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("not found: %w", err)
+	}
+	if status := got.GetStatus(); status != "RUNNING" {
+		return nil, fmt.Errorf("instance is %s, not RUNNING", status)
+	}
+	ip := externalIP(got)
+	if ip == "" {
+		return nil, fmt.Errorf("instance has no external IP")
+	}
+
+	// created is false: we did not make this one, but we are taking
+	// responsibility for it, and Close must still delete it.
+	m := &gcpMachine{name: name, lease: lease, ip: ip, cfg: p.cfg, client: client, log: log, created: true}
+
+	// The fingerprint is GCE's optimistic-concurrency token: a write carrying a
+	// stale one is refused rather than clobbering somebody else's change.
+	meta := got.GetMetadata()
+	items := []*computepb.Items{{
+		Key:   proto.String("ssh-keys"),
+		Value: proto.String(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
+	}}
+	for _, it := range meta.GetItems() {
+		if it.GetKey() != "ssh-keys" {
+			items = append(items, it)
+		}
+	}
+
+	log.Info("wings: installing a fresh key on a recovered instance")
+	op, err := client.SetMetadata(ctx, &computepb.SetMetadataInstanceRequest{
+		Project:          p.cfg.Project,
+		Zone:             p.cfg.Zone,
+		Instance:         name,
+		MetadataResource: &computepb.Metadata{Fingerprint: meta.Fingerprint, Items: items},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("install key: %w", err)
+	}
+	if err := op.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("install key: %w", err)
+	}
+
+	// Dial retries, which it has to here: the guest agent applies the new key
+	// on its own schedule, so the first several attempts failing is the normal
+	// path rather than a problem.
+	dialCtx, cancel := context.WithTimeout(ctx, p.cfg.BootTimeout)
+	defer cancel()
+
+	conn, err := sshx.Dial(dialCtx, sshx.Config{
+		Addr:    ip,
+		User:    p.cfg.User,
+		Signer:  signer,
+		HostKey: p.cfg.HostKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("never accepted the new key: %w", err)
+	}
+	m.ssh = conn
+
+	log.Info("wings: recovered instance", "ip", ip)
+	return m, nil
+}
+
+func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.InstancesClient, lease string, signer ssh.Signer, authorizedKey string) (wings.Machine, error) {
+	name := p.instanceName(lease)
+	log := p.cfg.Logger.With("instance", name, "lease", lease)
 
 	inst := &computepb.Instance{
 		Name:        proto.String(name),
@@ -216,6 +361,7 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 	// it rather than leaking a billed VM.
 	m := &gcpMachine{
 		name:    name,
+		lease:   lease,
 		cfg:     p.cfg,
 		client:  client,
 		log:     log,
@@ -277,6 +423,7 @@ func externalIP(inst *computepb.Instance) string {
 // gcpMachine is one Compute Engine instance.
 type gcpMachine struct {
 	name    string
+	lease   string
 	ip      string
 	cfg     Config
 	client  *compute.InstancesClient
@@ -288,7 +435,10 @@ type gcpMachine struct {
 	err  error
 }
 
-func (m *gcpMachine) ID() string { return m.name }
+// ID is the lease, not the instance name: it is what the coordinator wrote down
+// before this machine existed, and matching a recovered machine back to that
+// record is what makes recovery possible. The instance name is in the logs.
+func (m *gcpMachine) ID() string { return m.lease }
 
 func (m *gcpMachine) Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error {
 	return m.ssh.Upload(ctx, src, size, remotePath)
@@ -349,18 +499,4 @@ func ephemeralKey() (ssh.Signer, string, error) {
 	}
 	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))) + " wings"
 	return signer, line, nil
-}
-
-func randomToken(n int) string {
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand does not fail in practice; a time-based fallback would be
-		// worse than saying so.
-		panic(fmt.Sprintf("wings: read randomness: %v", err))
-	}
-	for i := range b {
-		b[i] = alphabet[int(b[i])%len(alphabet)]
-	}
-	return string(b)
 }

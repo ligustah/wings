@@ -40,11 +40,44 @@ func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error
 		return nil, err
 	}
 
-	machines, err := c.cfg.Target.prov.Provision(ctx, n)
+	// Written down BEFORE anything is created. If the process dies between this
+	// and the machines existing, the record still names what was about to be
+	// made, and a later start can go and look for it. Recording after the fact
+	// would leave a window in which a billed machine exists that nothing knows
+	// about — and that is the window a crash finds.
+	//
+	// A failure to record refuses the launch outright, for the same reason: an
+	// unrecorded machine is one nothing will ever clean up.
+	leases := make([]string, n)
+	for i := range leases {
+		leases[i] = newLease()
+		if err := c.machines.write(ctx, machineRecord{Kind: machineIntent, Lease: leases[i]}); err != nil {
+			return nil, err
+		}
+	}
+
+	machines, err := c.cfg.Target.prov.Provision(ctx, leases)
 	if err != nil {
+		// The intents stay. Some of these machines may exist despite the error,
+		// and the record is the only thing that will find them.
+		for _, lease := range leases {
+			_ = c.machines.write(context.WithoutCancel(ctx), machineRecord{
+				Kind: machineFailed, Lease: lease, Err: err.Error(),
+			})
+		}
 		return nil, fmt.Errorf("wings: provision %d machines: %w", n, err)
 	}
 
+	conns, err := c.deployAll(ctx, machines, image)
+	if err != nil {
+		return nil, err
+	}
+	return conns, nil
+}
+
+// deployAll puts the worker onto every machine and connects to each, releasing
+// all of them if any fails.
+func (c *Cluster) deployAll(ctx context.Context, machines []Machine, image *workerImage) ([]*workerConn, error) {
 	conns := make([]*workerConn, len(machines))
 	errs := make([]error, len(machines))
 
@@ -53,7 +86,14 @@ func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conns[i], errs[i] = c.deploy(ctx, m, image, c.workerID("remote"))
+			id := c.workerID("remote")
+			conns[i], errs[i] = c.deploy(ctx, m, image, id)
+			if errs[i] == nil {
+				conns[i].lease = m.ID()
+				errs[i] = c.machines.write(ctx, machineRecord{
+					Kind: machineReady, Lease: m.ID(), Worker: id,
+				})
+			}
 		}()
 	}
 	wg.Wait()
@@ -66,13 +106,144 @@ func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error
 		for i, m := range machines {
 			if conns[i] != nil {
 				_ = conns[i].close(release)
-				continue
+			} else {
+				_ = m.Close(release)
 			}
-			_ = m.Close(release)
+			_ = c.machines.write(release, machineRecord{Kind: machineReleased, Lease: m.ID()})
 		}
 		return nil, err
 	}
 	return conns, nil
+}
+
+// reattach recovers the machines a previous coordinator left running.
+//
+// This is what the write-ahead record is for. Every lease that has not been
+// released is offered to the provisioner; what comes back is still out there
+// and still billing, and is either put back to work or destroyed. What does not
+// come back is gone, and the record is closed so no later start looks for it
+// again.
+//
+// A machine that comes back but whose worker has died is destroyed rather than
+// redeployed. Redeploying would be possible, but it would also mean a machine
+// in an unknown state — half a previous run's data, a worker that may be about
+// to come back — and a fresh one costs a boot.
+func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
+	if c.cfg.Target.kind != targetRemote || c.cfg.Target.prov == nil {
+		return nil, nil
+	}
+	leases, err := c.machines.outstanding(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(leases) == 0 {
+		return nil, nil
+	}
+
+	re, ok := c.cfg.Target.prov.(Reattacher)
+	if !ok {
+		// Nothing can be recovered, and leaving the record open would mean
+		// trying again on every start forever. Say so loudly: those machines
+		// may still exist and still be billing.
+		c.log.Error("wings: machines were left running by a previous run and this provider "+
+			"cannot reattach; they must be cleaned up by hand",
+			"leases", leases, "provider", fmt.Sprintf("%T", c.cfg.Target.prov))
+		for _, lease := range leases {
+			_ = c.machines.write(ctx, machineRecord{
+				Kind: machineReleased, Lease: lease, Err: "provider cannot reattach; not cleaned up",
+			})
+		}
+		return nil, nil
+	}
+
+	c.log.Info("wings: looking for machines left by a previous run", "leases", len(leases))
+	found, err := re.Reattach(ctx, leases)
+	if err != nil {
+		return nil, fmt.Errorf("wings: reattach: %w", err)
+	}
+
+	alive := map[string]Machine{}
+	for _, m := range found {
+		alive[m.ID()] = m
+	}
+	// A lease nothing came back for is gone. Closing the record is what stops
+	// every future start from hunting for a machine that no longer exists.
+	for _, lease := range leases {
+		if _, ok := alive[lease]; !ok {
+			_ = c.machines.write(ctx, machineRecord{
+				Kind: machineReleased, Lease: lease, Err: "not found on reattach",
+			})
+		}
+	}
+	if len(found) == 0 {
+		return nil, nil
+	}
+
+	var conns []*workerConn
+	release := context.WithoutCancel(ctx)
+	for _, m := range found {
+		w, err := c.reconnect(ctx, m)
+		if err != nil {
+			c.log.Warn("wings: could not resume a recovered machine, destroying it",
+				"lease", m.ID(), "err", err)
+			_ = m.Close(release)
+			_ = c.machines.write(release, machineRecord{
+				Kind: machineReleased, Lease: m.ID(), Err: err.Error(),
+			})
+			continue
+		}
+		conns = append(conns, w)
+	}
+	if len(conns) > 0 {
+		c.log.Info("wings: resumed machines from a previous run", "workers", len(conns))
+	}
+	return conns, nil
+}
+
+// reconnect opens a tunnel to a recovered machine and picks its worker back up.
+//
+// No upload and no start: the binary is already there and the process is still
+// running, because a worker is launched detached precisely so it outlives the
+// session that started it. All that is missing is the way back in.
+func (c *Cluster) reconnect(ctx context.Context, m Machine) (*workerConn, error) {
+	local, err := m.Forward(ctx, defaultRemotePort)
+	if err != nil {
+		return nil, fmt.Errorf("wings: tunnel to %s: %w", m.ID(), err)
+	}
+
+	backend, err := dialUntilReady(ctx, local, m.ID())
+	if err != nil {
+		return nil, fmt.Errorf("wings: worker on %s did not answer: %w", m.ID(), err)
+	}
+
+	// The worker kept the id it was started with, and its streams are named
+	// after it — so recovering the name is what recovers the queue.
+	id, err := c.workerIDFor(ctx, m.ID())
+	if err != nil {
+		_ = backend.Close()
+		return nil, err
+	}
+
+	w, err := c.connectBackend(id, backend)
+	if err != nil {
+		_ = backend.Close()
+		return nil, err
+	}
+	w.machine = m
+	w.lease = m.ID()
+	return w, nil
+}
+
+// workerIDFor recovers the worker id that was running on a machine.
+func (c *Cluster) workerIDFor(ctx context.Context, lease string) (string, error) {
+	id, err := c.machines.workerFor(ctx, lease)
+	if err != nil {
+		return "", err
+	}
+	if id == "" {
+		return "", fmt.Errorf("wings: machine %s has no recorded worker; it never finished starting one", lease)
+	}
+	return id, nil
 }
 
 // deploy puts the worker on one machine and connects to it.

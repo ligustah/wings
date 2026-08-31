@@ -50,6 +50,10 @@ type Cluster struct {
 	// worker, which is why it is here and not on a workerConn.
 	journal *journal
 
+	// machines is the write-ahead record of provisioned machines, so a
+	// coordinator that restarts knows what it left running.
+	machines *machineLog
+
 	// mu guards workers, pending, closed, and every workerConn field that
 	// changes after construction (inflight, draining, idleSince).
 	//
@@ -83,6 +87,10 @@ type workerConn struct {
 	node    *workerNode // in-process only; shares the cluster engine, owns nothing
 	proc    *os.Process // local-process only
 	machine Machine     // remote only
+
+	// lease is the machine's identity in the coordinator's own record. Empty
+	// for a worker that is not a machine.
+	lease string
 
 	// exited closes when a worker we can actually observe has stopped.
 	//
@@ -207,15 +215,45 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.cleanupDir()
 		return nil, err
 	}
-
-	n := cfg.Scaling.initialWorkers(cfg.workers())
-	workers, err := c.launch(ctx, n)
-	if err != nil {
+	if c.machines, err = c.openMachineLog(ctx); err != nil {
 		cancel()
 		c.journal.close()
 		_ = c.closeShared()
 		c.cleanupDir()
 		return nil, err
+	}
+
+	fail := func(err error) (*Cluster, error) {
+		cancel()
+		c.journal.close()
+		_ = c.closeShared()
+		c.cleanupDir()
+		return nil, err
+	}
+
+	// Before provisioning anything: whatever a previous coordinator left
+	// running is still billing, and is either put back to work or destroyed.
+	// Doing this first also means the machines it recovers count towards the
+	// number wanted, so a restart does not double the cluster.
+	//
+	// Only reachable with a persistent Dir. With a temporary one the record is
+	// created fresh and empty every time, which is correct: nothing was left.
+	workers, err := c.reattach(ctx)
+	if err != nil {
+		return fail(err)
+	}
+
+	n := cfg.Scaling.initialWorkers(cfg.workers()) - len(workers)
+	if n > 0 {
+		fresh, err := c.launch(ctx, n)
+		if err != nil {
+			release := context.WithoutCancel(ctx)
+			for _, w := range workers {
+				_ = w.close(release)
+			}
+			return fail(err)
+		}
+		workers = append(workers, fresh...)
 	}
 	for _, w := range workers {
 		c.adopt(w)
@@ -693,6 +731,14 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	var errs []error
 	for _, w := range workers {
 		errs = append(errs, w.close(ctx))
+		if w.lease != "" {
+			// Recorded only once the machine is actually gone, so a crash
+			// between the two leaves the lease open and the next start goes
+			// looking for it — which is the safe direction to be wrong in.
+			errs = append(errs, c.machines.write(ctx, machineRecord{
+				Kind: machineReleased, Lease: w.lease, Worker: w.id,
+			}))
+		}
 	}
 	// The journal writes through the shared instance, so it must be drained
 	// before that instance goes away — and it is drained last, so the entries

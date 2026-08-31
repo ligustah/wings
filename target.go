@@ -14,16 +14,52 @@ import (
 // business, so a new cloud is one small type and not a second copy of the
 // worker protocol.
 type Provisioner interface {
-	// Provision brings up n machines and returns them once they accept
-	// connections. Implementations should clean up anything they created if
-	// they return an error.
-	Provision(ctx context.Context, n int) ([]Machine, error)
+	// Provision brings up one machine per lease and returns them once they
+	// accept connections. Implementations should clean up anything they created
+	// if they return an error.
+	//
+	// The leases are identities WINGS minted, not names the cloud chose, and
+	// that direction is load-bearing: the coordinator writes down what it is
+	// about to create before it creates it, so a crash mid-creation still
+	// leaves a note naming the machine. An implementation must make each
+	// machine findable by its lease afterwards — as its name, a tag, a label,
+	// whatever the cloud offers — and [Machine.ID] must return it.
+	//
+	// A lease is short, lowercase and alphanumeric, so it is safe to embed in
+	// whatever a cloud's naming rules allow.
+	Provision(ctx context.Context, leases []string) ([]Machine, error)
+}
+
+// Reattacher is a Provisioner that can find machines it created earlier.
+//
+// Optional, and worth implementing: without it a coordinator that restarts
+// cannot recover the machines it left running, and can only destroy them —
+// which is safe, and wastes everything they had done.
+type Reattacher interface {
+	Provisioner
+
+	// Reattach returns the machines among leases that still exist and can be
+	// reached.
+	//
+	// A lease it cannot find is not an error: the machine may have been
+	// preempted, deleted, or never created at all, and reporting that as a
+	// failure would make an ordinary recovery look broken. Return what is
+	// there; the coordinator treats the rest as gone.
+	//
+	// The machines come back after the process that created them, so an
+	// implementation must re-establish whatever access it needs — a fresh
+	// credential is the coordinator's to install, not something it kept.
+	Reattach(ctx context.Context, leases []string) ([]Machine, error)
 }
 
 // Machine is one host a worker can be deployed onto.
 type Machine interface {
-	// ID names the machine in logs and errors. Human-readable; uniqueness
-	// within one run is enough.
+	// ID returns the lease this machine was created for.
+	//
+	// The lease, not the cloud's own name for it: the lease is what the
+	// coordinator wrote down before the machine existed, and matching a
+	// recovered machine back to its record is the whole reason it can recover
+	// at all.
 	ID() string
 
 	// Upload writes size bytes from src to remotePath, creating parent
