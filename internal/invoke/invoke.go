@@ -71,3 +71,42 @@ func From(ctx context.Context) Host {
 	h, _ := ctx.Value(ctxKey{}).(Host)
 	return h
 }
+
+// Origin says which larger piece of work a call belongs to.
+//
+// A bare Digest(ctx, w) has no origin and needs none. The same line inside a
+// workflow does: the coordinator's record of what it sent where is far more
+// useful if it can say WHICH RUN each job was a step of, and a workflow is the
+// only thing that knows that. So the workflow host stamps it on the context and
+// the cluster reads it back out when it writes the job down.
+//
+// Purely for the coordinator's own record. It is not put on the wire and no
+// worker ever sees it — a work function's behaviour must not depend on who
+// called it, or the same input stops meaning the same thing.
+type Origin struct {
+	// Flow is the workflow definition's name; Run is the instance it is a step
+	// of. Both empty for a call made outside a workflow.
+	Flow string
+	Run  string
+	// Thread and Step locate the call within that run, which is what makes a
+	// journal entry line up with a position in the workflow's history.
+	Thread  string
+	Step    uint64
+	Attempt uint64
+}
+
+// Zero reports whether o names nothing.
+func (o Origin) Zero() bool { return o.Flow == "" && o.Run == "" }
+
+type originKey struct{}
+
+// WithOrigin returns a context whose dispatched work is recorded as part of o.
+func WithOrigin(ctx context.Context, o Origin) context.Context {
+	return context.WithValue(ctx, originKey{}, o)
+}
+
+// OriginFrom returns the origin bound to ctx, zero when there is none.
+func OriginFrom(ctx context.Context) Origin {
+	o, _ := ctx.Value(originKey{}).(Origin)
+	return o
+}

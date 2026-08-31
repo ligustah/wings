@@ -75,9 +75,12 @@
 // stood up for itself.
 //
 // The coordinator also keeps a durable record of its own decisions — which job
-// went where, what came back, which workers came and went — on that same
-// embedded engine. Broker-less by construction: nothing else reads it, and its
-// value is that it outlives the process that wrote it.
+// went to which node, what came back, which workers came and went — on that
+// same embedded engine. Broker-less by construction: nothing else reads it, and
+// its value is that it outlives the process that wrote it. A job dispatched
+// from inside a workflow is recorded with the flow, run and thread it is a step
+// of, so the record answers "which activity of which run went where" and not
+// merely "which job".
 //
 // # Machines outlive the coordinator
 //

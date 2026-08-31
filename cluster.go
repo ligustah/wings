@@ -15,6 +15,8 @@ import (
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
+
+	"github.com/ligustah/wings/internal/invoke"
 )
 
 // Cluster is a set of running workers and the means to call work functions on
@@ -149,6 +151,10 @@ type pendingJob struct {
 	job    jobEnvelope
 	worker *workerConn
 	done   chan resultEnvelope
+	// origin is what larger piece of work this job is a step of, kept so a
+	// redispatch or a failure can be recorded against the same run as the
+	// submit — the caller's context is long gone by then.
+	origin invoke.Origin
 }
 
 // Start brings up the workers described by cfg.
@@ -518,11 +524,19 @@ func (c *Cluster) deliver(res resultEnvelope) {
 	c.journal.record(journalEntry{
 		Kind: journalCompleted, Job: res.ID, Func: p.job.Func,
 		Worker: p.worker.id, Attempt: p.job.Attempt, Err: res.Error,
-	})
+	}.from(p.origin))
 	select {
 	case p.done <- res:
 	default:
 	}
+}
+
+// workerID names the worker a job was on, or nothing when it never reached one.
+func workerID(w *workerConn) string {
+	if w == nil {
+		return ""
+	}
+	return w.id
 }
 
 // release credits a finished job back to its worker. Call with mu held.
@@ -584,7 +598,7 @@ func (c *Cluster) redispatchFrom(dead *workerConn) {
 		c.journal.record(journalEntry{
 			Kind: journalRedispatch, Job: job.ID, Func: job.Func,
 			Worker: w.id, Attempt: job.Attempt,
-		})
+		}.from(p.origin))
 
 		if _, err := w.jobs.Append(c.ctx, []jobEnvelope{job}); err != nil {
 			c.mu.Lock()
@@ -607,8 +621,8 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	}
 	c.journal.record(journalEntry{
 		Kind: journalFailed, Job: p.job.ID, Func: p.job.Func,
-		Attempt: p.job.Attempt, Err: err.Error(),
-	})
+		Worker: workerID(p.worker), Attempt: p.job.Attempt, Err: err.Error(),
+	}.from(p.origin))
 	select {
 	case p.done <- resultEnvelope{ID: p.job.ID, Error: err.Error()}:
 	default:
@@ -637,7 +651,14 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		Func:    fnName,
 		Payload: payload,
 	}
-	p := &pendingJob{job: job, done: make(chan resultEnvelope, 1)}
+	p := &pendingJob{
+		job:  job,
+		done: make(chan resultEnvelope, 1),
+		// Read off the context rather than passed in: only a workflow sets it,
+		// and threading a parameter nobody else supplies through every caller
+		// would make the ordinary case pay for the special one.
+		origin: invoke.OriginFrom(ctx),
+	}
 
 	c.mu.Lock()
 	if c.closed {
@@ -663,7 +684,7 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	}
 	c.journal.record(journalEntry{
 		Kind: journalSubmitted, Job: job.ID, Func: job.Func, Worker: w.id,
-	})
+	}.from(p.origin))
 	return p, nil
 }
 

@@ -74,6 +74,17 @@ func (t *threadState) peek() *protos.Event {
 	return nil
 }
 
+// at returns the thread's current position.
+//
+// Only this thread's own goroutine ever moves the cursor, so the value is
+// stable to its caller; the lock is here because other threads are appending to
+// the same run concurrently.
+func (t *threadState) at() uint64 {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	return t.serial
+}
+
 // expect consumes the event at the cursor and asserts its payload type.
 //
 // A nil result means nothing is recorded there yet, which is the signal to do

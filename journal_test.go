@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
+
+	"github.com/ligustah/wings/internal/invoke"
 )
 
 // readJournal reads the coordinator's record back off the stream it was written
@@ -164,6 +166,73 @@ func TestInProcessWorkersShareOneEngine(t *testing.T) {
 	for _, cl := range clients {
 		if cl != c.shared {
 			t.Fatal("an in-process worker is on a client of its own, not the cluster's shared instance")
+		}
+	}
+}
+
+// THE POINT: the record has to be answerable at the level someone asks at.
+// "Job 3f went to worker 2" is nearly useless on its own; "step 4 of run
+// order-77 went to worker 2 and never came back" is the question actually being
+// asked after a failure, and answering it means the job's assignment carries
+// which larger piece of work it was part of.
+func TestTheJournalSaysWhichRunAJobBelongedTo(t *testing.T) {
+	c := start(t, Config{Target: InProcess()})
+
+	// What a workflow stamps on the context; here set directly so this tests
+	// the coordinator's half without dragging the workflow engine in.
+	origin := invoke.Origin{Flow: "checkout", Run: "order-77", Thread: "main.2", Step: 4}
+	ctx := invoke.WithOrigin(c.Bind(t.Context()), origin)
+
+	if got, err := double(ctx, 21); err != nil {
+		t.Fatalf("double: %v", err)
+	} else if got != 42 {
+		t.Fatalf("got %d, want 42", got)
+	}
+
+	entries := awaitJournal(t, c, func(es []journalEntry) bool {
+		return countKind(es, journalSubmitted) >= 1 && countKind(es, journalCompleted) >= 1
+	})
+
+	// Both ends of the job, because a submission that names its run and a
+	// completion that does not still cannot be joined up by whoever is reading.
+	for _, kind := range []string{journalSubmitted, journalCompleted} {
+		var found bool
+		for _, e := range entries {
+			if e.Kind != kind {
+				continue
+			}
+			found = true
+			if e.Flow != origin.Flow || e.Run != origin.Run || e.Thread != origin.Thread || e.Step != origin.Step {
+				t.Errorf("the %s entry records flow %q run %q thread %q step %d, want %q/%q/%q/%d",
+					kind, e.Flow, e.Run, e.Thread, e.Step,
+					origin.Flow, origin.Run, origin.Thread, origin.Step)
+			}
+			if e.Worker == "" {
+				t.Errorf("the %s entry names no worker, which is the other half of the answer", kind)
+			}
+		}
+		if !found {
+			t.Errorf("no %s entry was written at all", kind)
+		}
+	}
+}
+
+// A call that belongs to nothing larger must not claim otherwise: a run id in
+// the record that names no run is worse than an empty column.
+func TestABareCallLeavesTheRunColumnsEmpty(t *testing.T) {
+	c := start(t, Config{Target: InProcess()})
+
+	if _, err := double(c.Bind(t.Context()), 1); err != nil {
+		t.Fatalf("double: %v", err)
+	}
+
+	entries := awaitJournal(t, c, func(es []journalEntry) bool {
+		return countKind(es, journalSubmitted) >= 1
+	})
+	for _, e := range entries {
+		if e.Flow != "" || e.Run != "" || e.Thread != "" {
+			t.Errorf("a %s entry for a bare call claims flow %q run %q thread %q",
+				e.Kind, e.Flow, e.Run, e.Thread)
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
+	"github.com/ligustah/wings/internal/invoke"
 )
 
 // journalStream is where the coordinator records what it did.
@@ -43,6 +44,23 @@ type journalEntry struct {
 	Worker  string    `json:"worker,omitempty"`
 	Attempt int       `json:"attempt,omitempty"`
 	Err     string    `json:"err,omitempty"`
+
+	// Flow, Run, Thread and Step are set when the job was a step of a workflow
+	// rather than a bare call, and they are what make the record answerable at
+	// the level someone actually asks at: not "job 3f went to remote-2" but
+	// "the second activity of that run went to remote-2, and never came back".
+	// Absent for a call made outside a workflow, which belongs to nothing
+	// larger and needs no such column.
+	Flow   string `json:"flow,omitempty"`
+	Run    string `json:"run,omitempty"`
+	Thread string `json:"thread,omitempty"`
+	Step   uint64 `json:"step,omitempty"`
+}
+
+// from copies a call's origin onto an entry.
+func (e journalEntry) from(o invoke.Origin) journalEntry {
+	e.Flow, e.Run, e.Thread, e.Step = o.Flow, o.Run, o.Thread, o.Step
+	return e
 }
 
 // journal appends entries off the hot path.

@@ -173,11 +173,19 @@ Streams, offsets, brokers and clients appear nowhere in the public API.
 ### The coordinator's own record
 
 On that same embedded engine — broker-less, no listener, no port — the
-coordinator keeps a stream of what it decided: every job accepted and where it
-was sent, every result that came back, every redispatch after a worker was lost,
-every worker that entered or left service. Nothing reads it during the run. Its
-value is that it outlives the process, so a coordinator that died has still left
-an account of what it had done.
+coordinator keeps a stream of what it decided: every job accepted and **which
+node it was sent to**, every result that came back, every redispatch after a
+worker was lost, every worker that entered or left service. Nothing reads it
+during the run. Its value is that it outlives the process, so a coordinator that
+died has still left an account of what it had done.
+
+When the job was a step of a workflow (the [`flow`](flow) package), the entry says so — the
+flow, the run, the thread and the position in that run's history. That is what
+makes the record answerable at the level anyone actually asks at: not "job 3f
+went to remote-2" but "the second activity of order-77 went to remote-2 and
+never came back". Only the workflow knows which run a call belongs to, so it
+stamps it on the dispatch and the coordinator writes it down. A bare call
+belongs to nothing larger and leaves those columns empty.
 
 Writes go through a buffered channel drained by one goroutine and batched, so
 recording never becomes backpressure on the work. A full buffer drops entries

@@ -78,7 +78,16 @@ func (h host) Invoke(ctx context.Context, name string, payload []byte) ([]byte, 
 		return nil, err
 	}
 
-	out, callErr := h.inner.Invoke(ctx, name, payload)
+	// Tell whatever runs this which step of which run it is. The cursor now
+	// sits just past the call event, so the call's own position is one back —
+	// and that is the number a reader of the journal can find in the history.
+	out, callErr := h.inner.Invoke(invoke.WithOrigin(ctx, invoke.Origin{
+		Flow:    t.run.name,
+		Run:     t.run.instance,
+		Thread:  t.id,
+		Step:    t.at() - 1,
+		Attempt: t.run.attempt,
+	}), name, payload)
 
 	// Recorded either way. A failed activity is a fact about the run, and one
 	// that a retry must not repeat blindly — the error is what the next attempt
