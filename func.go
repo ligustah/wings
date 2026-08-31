@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/ligustah/durable_streams/dswire"
 	"github.com/ligustah/wings/internal/invoke"
@@ -34,9 +35,56 @@ type Func[In, Out any] func(ctx context.Context, in In) (Out, error)
 type def[In, Out any] struct {
 	name string
 	fn   func(context.Context, In) (Out, error)
+	opts defOptions
 
 	inCodec  dswire.Codec[In]
 	outCodec dswire.Codec[Out]
+}
+
+// defOptions are the properties of a work function that are not its code.
+//
+// Per function rather than per cluster because a bound on how long something
+// may take is a fact about the work, not about the machines running it: one
+// function is a millisecond of arithmetic and another is an hour of transcoding,
+// and a single cluster-wide number is either useless to one or fatal to the
+// other. [Config.JobTimeout] remains as the default for functions that say
+// nothing.
+type defOptions struct {
+	timeout time.Duration
+	beat    time.Duration
+}
+
+// Option configures a work function at [Define] time.
+type Option func(*defOptions)
+
+// WithTimeout bounds one call of this function, from the moment a worker starts
+// it to the moment it returns.
+//
+// A call that exceeds it FAILS rather than being retried. Exceeding a bound on
+// total duration is a statement about the work — it is too slow, or it is stuck
+// on something no other machine would be luckier with — and retrying it would
+// spend the same time again to reach the same answer. Use [WithHeartbeatTimeout]
+// for the case where the machine is the suspect.
+//
+// Overrides [Config.JobTimeout] for this function. Zero means no bound.
+func WithTimeout(d time.Duration) Option {
+	return func(o *defOptions) { o.timeout = d }
+}
+
+// WithHeartbeatTimeout requires this function to report progress at least this
+// often, using [Heartbeat].
+//
+// A job that goes quiet for longer is presumed stuck rather than slow, and is
+// redispatched to another worker — carrying the last checkpoint it reported, so
+// the retry resumes rather than starting over. That is the difference from
+// [WithTimeout]: here the suspicion falls on the machine, and moving is the
+// remedy.
+//
+// The clock starts when the job is dispatched, so a function that declares this
+// must heartbeat; one that never calls [Heartbeat] will be moved on every
+// worker in turn. Zero means no such bound, and no obligation.
+func WithHeartbeatTimeout(d time.Duration) Option {
+	return func(o *defOptions) { o.beat = d }
 }
 
 // Define registers a work function under name and returns a callable handle.
@@ -52,7 +100,7 @@ type def[In, Out any] struct {
 //
 // Panics if name is empty or already defined. Both are programming errors, and
 // at package-init time a panic is the report that cannot be ignored.
-func Define[In, Out any](name string, fn func(context.Context, In) (Out, error)) Func[In, Out] {
+func Define[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...Option) Func[In, Out] {
 	if name == "" {
 		panic("wings: Define requires a non-empty name")
 	}
@@ -64,6 +112,9 @@ func Define[In, Out any](name string, fn func(context.Context, In) (Out, error))
 		fn:       fn,
 		inCodec:  dswire.ReflectCodec[In]{New: allocator[In]()},
 		outCodec: dswire.ReflectCodec[Out]{New: allocator[Out]()},
+	}
+	for _, opt := range opts {
+		opt(&d.opts)
 	}
 	register(d)
 
@@ -109,6 +160,9 @@ func (d *def[In, Out]) decode(payload []byte) (Out, error) {
 // Name returns the wire name this function is dispatched under.
 func (d *def[In, Out]) Name() string { return d.name }
 
+// options returns this function's bounds, through the erased handler interface.
+func (d *def[In, Out]) options() defOptions { return d.opts }
+
 // invoke decodes a job payload, runs the function, and encodes its result.
 //
 // This is the type-erased entry point the worker uses. Everything above it
@@ -134,6 +188,7 @@ func (d *def[In, Out]) invoke(ctx context.Context, payload []byte) ([]byte, erro
 // can satisfy it — the set of handlers is exactly the set of defined functions.
 type handler interface {
 	Name() string
+	options() defOptions
 	invoke(ctx context.Context, payload []byte) ([]byte, error)
 }
 
@@ -156,6 +211,17 @@ func lookup(name string) (handler, bool) {
 	defer registryMu.RUnlock()
 	h, ok := registry[name]
 	return h, ok
+}
+
+// optionsFor returns the bounds declared for a function, or none if it is not
+// defined in this binary. A coordinator dispatching to a worker built from the
+// same source sees the same answer the worker will.
+func optionsFor(name string) defOptions {
+	h, ok := lookup(name)
+	if !ok {
+		return defOptions{}
+	}
+	return h.options()
 }
 
 // definedNames reports every registered name, for diagnostics on a failed

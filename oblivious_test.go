@@ -173,8 +173,8 @@ func TestJobTimeoutAppliesOnEveryTarget(t *testing.T) {
 
 			if _, err := slow(c.Bind(t.Context()), 10*time.Second); err == nil {
 				t.Fatal("want a timeout, got nil")
-			} else if !strings.Contains(err.Error(), "deadline exceeded") {
-				t.Fatalf("want a deadline error, got: %v", err)
+			} else if !strings.Contains(err.Error(), "exceeded its 100ms timeout") {
+				t.Fatalf("want the timeout named, got: %v", err)
 			}
 		})
 	}

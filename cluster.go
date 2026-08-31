@@ -96,6 +96,12 @@ type workerConn struct {
 	jobs    *dsclient.Stream[jobEnvelope]
 	results *dsclient.Stream[resultEnvelope]
 
+	// beats is progress reported by jobs still running here. Read on its own
+	// goroutine rather than with results, because it says something about a
+	// job that has NOT finished and waiting for the result stream to produce
+	// would defeat the purpose.
+	beats *dsclient.Stream[beatEnvelope]
+
 	// ownsClient is false for an in-process worker, whose backend the worker
 	// node itself closes. Closing it twice takes the broker down under the half
 	// of the process still using it.
@@ -170,6 +176,42 @@ type pendingJob struct {
 	// redispatch or a failure can be recorded against the same run as the
 	// submit — the caller's context is long gone by then.
 	origin invoke.Origin
+
+	// opts are the bounds declared on the work function. Read once at submit
+	// so the watchdog does not go through the registry per job per tick.
+	opts defOptions
+	// since is when the current attempt was dispatched, and beat when it last
+	// reported progress. Zero beat means it has not yet, which is why the
+	// heartbeat clock runs from since: a function that declares a heartbeat
+	// timeout and never beats must be caught, not exempted.
+	//
+	// Guarded by Cluster.mu.
+	since time.Time
+	beat  time.Time
+	// checkpoint is the last progress reported, and is handed to the next
+	// attempt so it resumes rather than starting over.
+	checkpoint []byte
+}
+
+// overdue reports whether a job has run out of time, and why. Call with mu
+// held.
+//
+// The two bounds mean different things and get different remedies, so this
+// answers with which one was hit rather than with a bare yes.
+func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
+	if p.opts.timeout > 0 && !p.since.IsZero() && now.Sub(p.since) > p.opts.timeout {
+		tooSlow = true
+	}
+	if p.opts.beat > 0 {
+		last := p.beat
+		if last.IsZero() {
+			last = p.since
+		}
+		if !last.IsZero() && now.Sub(last) > p.opts.beat {
+			stuck = true
+		}
+	}
+	return stuck, tooSlow
 }
 
 // Start brings up the workers described by cfg.
@@ -283,6 +325,9 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.adopt(w)
 	}
 
+	c.wg.Add(1)
+	go c.watchdog()
+
 	if cfg.Scaling.enabled() {
 		c.wg.Add(1)
 		go c.autoscale()
@@ -332,6 +377,14 @@ func (c *Cluster) adopt(w *workerConn) {
 		defer w.wg.Done()
 		c.tail(w)
 	}()
+
+	c.wg.Add(1)
+	w.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer w.wg.Done()
+		c.tailBeats(w)
+	}()
 }
 
 // launch brings up n workers for the configured target.
@@ -368,6 +421,9 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	}
 	if w.results, err = client.OpenStream[resultEnvelope](resultStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", resultStreamFor(id), id, err)
+	}
+	if w.beats, err = client.OpenStream[beatEnvelope](beatStreamFor(id)); err != nil {
+		return nil, fmt.Errorf("wings: open %s on worker %s: %w", beatStreamFor(id), id, err)
 	}
 	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
 		return nil, err
@@ -616,36 +672,135 @@ func (c *Cluster) redispatchFrom(dead *workerConn) {
 	c.log.Warn("wings: redispatching jobs from lost worker", "worker", dead.id, "jobs", len(orphans))
 
 	for _, p := range orphans {
-		job := p.job
-		job.Attempt++
+		c.moveJob(p, fmt.Sprintf("worker %s was lost", dead.id))
+	}
+}
 
-		c.mu.Lock()
-		w := c.pick()
-		if w == nil {
-			c.mu.Unlock()
-			c.failPending(p, fmt.Errorf("wings: worker %s was lost and no live worker remains", dead.id))
-			continue
-		}
-		if cur, still := c.pending[job.ID]; !still || cur != p {
-			c.mu.Unlock()
-			continue
-		}
-		p.worker = w
-		p.job = job
-		c.charge(w)
+// moveJob sends one outstanding job to a different worker.
+//
+// The job keeps its id and gains an attempt, and it carries whatever
+// checkpoint the last attempt reported — so a long job that was most of the way
+// through does not start from nothing. That is what makes moving one affordable
+// enough to do on suspicion rather than only on certainty.
+//
+// The worker it came from is credited back. It has to be: a worker is reaped
+// only once nothing is outstanding on it, so a dead worker whose jobs were
+// moved away without this was never reaped, and its machine billed on until the
+// cluster stopped — which is precisely the case reaping exists for.
+func (c *Cluster) moveJob(p *pendingJob, why string) {
+	c.mu.Lock()
+	if cur, still := c.pending[p.job.ID]; !still || cur != p {
 		c.mu.Unlock()
-
-		c.journal.record(journalEntry{
-			Kind: journalRedispatch, Job: job.ID, Func: job.Func,
-			Worker: w.id, Attempt: job.Attempt,
-		}.from(p.origin))
-
-		if _, err := w.jobs.Append(c.ctx, []jobEnvelope{job}); err != nil {
-			c.mu.Lock()
-			c.release(w)
-			c.mu.Unlock()
-			c.failPending(p, fmt.Errorf("wings: redispatch to worker %s: %w", w.id, err))
+		return
+	}
+	from := p.worker
+	w := c.pick()
+	if w == nil {
+		if from != nil {
+			c.release(from)
+			p.worker = nil
 		}
+		c.mu.Unlock()
+		c.failPending(p, fmt.Errorf("wings: %s and no live worker remains", why))
+		return
+	}
+	if from != nil {
+		c.release(from)
+	}
+	job := p.job
+	job.Attempt++
+	job.Checkpoint = p.checkpoint
+	p.job = job
+	p.worker = w
+	p.since = time.Now()
+	p.beat = time.Time{}
+	c.charge(w)
+	c.mu.Unlock()
+
+	c.journal.record(journalEntry{
+		Kind: journalRedispatch, Job: job.ID, Func: job.Func,
+		Worker: w.id, Attempt: job.Attempt, Err: why,
+	}.from(p.origin))
+
+	if _, err := w.jobs.Append(c.ctx, []jobEnvelope{job}); err != nil {
+		c.mu.Lock()
+		c.release(w)
+		c.mu.Unlock()
+		c.failPending(p, fmt.Errorf("wings: redispatch to worker %s: %w", w.id, err))
+	}
+}
+
+// onBeat records that a job is still alive, and where it has got to.
+//
+// A beat for an id nobody is waiting for is ordinary rather than alarming: the
+// job may have just finished, or been moved elsewhere, and the worker's report
+// was already in flight.
+func (c *Cluster) onBeat(b beatEnvelope) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.pending[b.Job]
+	if !ok {
+		return
+	}
+	p.beat = time.Now()
+	if len(b.Checkpoint) > 0 {
+		p.checkpoint = b.Checkpoint
+	}
+}
+
+// watchdog moves jobs that have gone quiet and fails ones that have run too
+// long.
+//
+// One goroutine for the whole cluster rather than a timer per job: the
+// interesting quantity is a deadline that has already passed, and scanning a
+// map of outstanding jobs once a second costs nothing next to the work they
+// represent.
+func (c *Cluster) watchdog() {
+	defer c.wg.Done()
+
+	t := time.NewTicker(watchdogInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case now := <-t.C:
+			c.sweep(now)
+			c.reapDead()
+		}
+	}
+}
+
+func (c *Cluster) sweep(now time.Time) {
+	var (
+		stuck []*pendingJob
+		slow  []*pendingJob
+	)
+
+	c.mu.Lock()
+	for _, p := range c.pending {
+		isStuck, isSlow := p.overdue(now)
+		switch {
+		case isSlow:
+			// Checked first. A job that has blown its total bound is over
+			// whether or not it was also quiet, and moving it would only spend
+			// the same time again somewhere else.
+			slow = append(slow, p)
+		case isStuck:
+			stuck = append(stuck, p)
+		}
+	}
+	c.mu.Unlock()
+
+	for _, p := range slow {
+		c.log.Warn("wings: job exceeded its timeout", "job", p.job.ID, "fn", p.job.Func,
+			"timeout", p.opts.timeout)
+		c.failPending(p, fmt.Errorf("wings: %s exceeded its %s timeout", p.job.Func, p.opts.timeout))
+	}
+	for _, p := range stuck {
+		c.log.Warn("wings: job stopped reporting progress, moving it", "job", p.job.ID,
+			"fn", p.job.Func, "worker", workerID(p.worker), "heartbeat-timeout", p.opts.beat)
+		c.moveJob(p, fmt.Sprintf("no heartbeat for %s", p.opts.beat))
 	}
 }
 
@@ -694,6 +849,7 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	p := &pendingJob{
 		job:  job,
 		done: make(chan resultEnvelope, 1),
+		opts: optionsFor(fnName),
 		// Read off the context rather than passed in: only a workflow sets it,
 		// and threading a parameter nobody else supplies through every caller
 		// would make the ordinary case pay for the special one.
@@ -711,6 +867,7 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		return nil, errors.New("wings: no live workers")
 	}
 	p.worker = w
+	p.since = time.Now()
 	c.pending[job.ID] = p
 	c.charge(w)
 	c.mu.Unlock()
@@ -844,4 +1001,59 @@ func (w *workerConn) close(ctx context.Context) error {
 		errs = append(errs, w.machine.Close(ctx))
 	}
 	return errors.Join(errs...)
+}
+
+// tailBeats follows one worker's progress reports.
+//
+// A loop of its own rather than a second case in tail: results and beats are
+// different streams with different meanings, and a beat is only useful while the
+// job it describes is still running — waiting for the result stream to produce
+// something before noticing one would defeat the point entirely.
+//
+// Beats are read from the END of the stream, not from the beginning. Whatever a
+// previous coordinator's jobs reported is about jobs that are no longer
+// outstanding, and a checkpoint is a position rather than a record: only the
+// latest is ever wanted, and old ones name jobs nobody is waiting for.
+func (c *Cluster) tailBeats(w *workerConn) {
+	info, err := w.beats.Info(w.ctx)
+	if err != nil {
+		if w.ctx.Err() == nil {
+			c.log.Warn("wings: cannot follow heartbeats", "worker", w.id, "err", err)
+		}
+		return
+	}
+	// Newest is the log end, and the beat stream is not transactional — nothing
+	// appends to it inside a transaction — so the record after it is the next
+	// one anybody will write.
+	from := info.Newest + 1
+
+	for {
+		if w.ctx.Err() != nil || w.dead.Load() {
+			return
+		}
+		readCtx, cancel := context.WithTimeout(w.ctx, pollInterval)
+		recs, err := w.beats.ReadBlocking(readCtx, from, 256)
+		cancel()
+		if err != nil {
+			if w.ctx.Err() != nil {
+				return
+			}
+			// Nothing here declares a worker dead. That is the result tail's
+			// job, and it has the reconnect window and the exit signal to do it
+			// with; two goroutines racing to reach the same verdict would only
+			// make the verdict harder to reason about.
+			if !errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case <-w.ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			continue
+		}
+		for _, r := range recs {
+			c.onBeat(r.Record)
+			from = r.Offset + 1
+		}
+	}
 }

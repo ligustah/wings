@@ -262,6 +262,54 @@ failure; the error is re-raised on the coordinator as a plain error (the value
 does not survive the trip, only the message). A work function that panics costs
 one job, not the worker.
 
+## Long jobs
+
+Two different bounds, because "too slow" and "stuck" deserve different answers,
+and both are declared beside the work rather than on the cluster — one function
+is a millisecond of arithmetic and another an hour of transcoding, and a single
+cluster-wide number is either useless to one or fatal to the other.
+
+```go
+var Transcode = wings.Define("transcode", transcode,
+    wings.WithTimeout(2*time.Hour),            // total: exceeding it FAILS
+    wings.WithHeartbeatTimeout(30*time.Second) // quiet: exceeding it MOVES
+)
+```
+
+`WithTimeout` bounds one call end to end. A call that blows it fails and is not
+retried: exceeding a bound on total duration says the work is too slow or stuck
+on something no other machine would be luckier with, and retrying would spend
+the same time again to reach the same answer. The worker enforces it locally, so
+the error names the function and the bound.
+
+`WithHeartbeatTimeout` says the opposite: the machine is the suspect. A job that
+goes quiet for longer is moved to another worker. Moving it is affordable
+because the job reports where it has got to as it goes:
+
+```go
+func transcode(ctx context.Context, in Job) (Out, error) {
+    from, _, err := wings.Checkpoint[int](ctx)   // 0 on the first attempt
+    if err != nil {
+        return Out{}, err
+    }
+    for i := from; i < in.Frames; i++ {
+        // ... one frame ...
+        wings.Heartbeat(ctx, i+1)
+    }
+}
+```
+
+Only the latest heartbeat survives — this is a position, not a log — and it is
+handed to the next attempt, which resumes from it instead of starting over. Beats
+ride a stream of their own per worker rather than the result stream, which is
+transactional and would not make them visible until the job finished, which is
+exactly too late. Delivery is best-effort by design: a beat that goes missing
+costs a retry a little redone work, while a beat that blocked the work function
+to guarantee delivery would cost the work.
+
+The clock for a heartbeat timeout starts at dispatch, so a function that declares
+one must actually beat.
+
 ## Configuration
 
 Used directly rather than through `wings build`:

@@ -60,6 +60,20 @@
 // anything on the coordinator's machine: a worker may be on another continent
 // and shares no filesystem, no globals, and no open handles with the caller.
 //
+// # Long jobs
+//
+// Two bounds, both declared beside the work with [WithTimeout] and
+// [WithHeartbeatTimeout], because "too slow" and "stuck" deserve different
+// answers. Exceeding a total bound FAILS the call: retrying would spend the
+// same time again to reach the same answer. Going quiet for longer than the
+// heartbeat bound MOVES it to another worker, on the suspicion that the machine
+// rather than the work is at fault.
+//
+// Moving is affordable because a job reports where it has got to. [Heartbeat]
+// records a position; [Checkpoint] reads back whatever the previous attempt
+// last recorded, so a retry resumes instead of starting over. Only the latest
+// survives — it is a position, not a log.
+//
 // # Communication
 //
 // Workers and the coordinator talk over durable streams, and that is an

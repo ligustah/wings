@@ -12,6 +12,12 @@ package wings
 const (
 	jobStreamPrefix    = "wings.jobs."
 	resultStreamPrefix = "wings.results."
+	// beatStreamPrefix is where a worker reports progress on jobs still
+	// running. Separate from results because the result stream is
+	// transactional — exactly one record per job, committed with the offset
+	// that consumed it — and a heartbeat is neither one per job nor something
+	// worth a transaction.
+	beatStreamPrefix = "wings.beats."
 
 	// consumerGroup is the offset key a worker commits its progress under. It
 	// need not be more specific: a worker consumes only its own job stream.
@@ -20,6 +26,7 @@ const (
 
 func jobStreamFor(workerID string) string    { return jobStreamPrefix + workerID }
 func resultStreamFor(workerID string) string { return resultStreamPrefix + workerID }
+func beatStreamFor(workerID string) string   { return beatStreamPrefix + workerID }
 
 // jobEnvelope is one unit of work on the wire.
 //
@@ -33,6 +40,22 @@ type jobEnvelope struct {
 	// work function that cares can tell a retry from a first run, and so logs
 	// on the worker say which it was.
 	Attempt int `json:"attempt,omitempty"`
+	// Checkpoint is the last progress a previous attempt reported through
+	// [Heartbeat], and is what makes a retry cheap: the work resumes from it
+	// rather than starting over. Empty on a first attempt, and on a retry of
+	// something that never heartbeated.
+	Checkpoint []byte `json:"checkpoint,omitempty"`
+}
+
+// beatEnvelope is one report that a job is still running, and how far it has
+// got.
+//
+// Job rather than offset because a worker runs its whole batch at once, so
+// beats from several jobs interleave on one stream and each has to say which it
+// belongs to.
+type beatEnvelope struct {
+	Job        string `json:"job"`
+	Checkpoint []byte `json:"checkpoint,omitempty"`
 }
 
 // resultEnvelope is one outcome.

@@ -35,6 +35,7 @@ type workerNode struct {
 	client *dsclient.Client
 	jobs   *dsclient.Stream[jobEnvelope]
 	out    *dsclient.Stream[resultEnvelope]
+	beats  *dsclient.Stream[beatEnvelope]
 }
 
 // newWorkerNode declares a worker's streams on client and returns its loop.
@@ -62,7 +63,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 // already there. StreamExists is node-local, which is the right question for
 // both an embedded engine and a single-node broker.
 func (n *workerNode) declareStreams(ctx context.Context) error {
-	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id)} {
+	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
 		if err != nil {
 			return fmt.Errorf("wings: check stream %s: %w", name, err)
@@ -80,6 +81,27 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 	}
 	if n.out, err = n.client.OpenStream[resultEnvelope](resultStreamFor(n.id)); err != nil {
 		return fmt.Errorf("wings: open %s: %w", resultStreamFor(n.id), err)
+	}
+	if n.beats, err = n.client.OpenStream[beatEnvelope](beatStreamFor(n.id)); err != nil {
+		return fmt.Errorf("wings: open %s: %w", beatStreamFor(n.id), err)
+	}
+	return nil
+}
+
+// sendBeat publishes one progress report.
+//
+// Outside the processor's transaction on purpose: a heartbeat is only useful if
+// it arrives WHILE the job is running, and anything written inside that
+// transaction becomes visible when the job finishes, which is exactly too late.
+func (n *workerNode) sendBeat(ctx context.Context, jobID string, checkpoint []byte) error {
+	// Deliberately not ctx: a job whose deadline has just expired is precisely
+	// the one whose last checkpoint is worth having, and sending on the dying
+	// context would drop it.
+	_, err := n.beats.Append(context.WithoutCancel(ctx), []beatEnvelope{{
+		Job: jobID, Checkpoint: checkpoint,
+	}})
+	if err != nil {
+		return fmt.Errorf("wings: send heartbeat for job %s: %w", jobID, err)
 	}
 	return nil
 }
@@ -142,11 +164,25 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		return res
 	}
 
-	if n.timeout > 0 {
+	// The function's own bound wins over the cluster-wide default: one function
+	// is a millisecond of arithmetic and another an hour of transcoding, and
+	// the number that knows which is the one declared beside the code.
+	timeout := n.timeout
+	if d := h.options().timeout; d > 0 {
+		timeout = d
+	}
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, n.timeout)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+
+	// Progress reporting, and whatever the last attempt got to. Installed for
+	// every job rather than only for functions that declare a heartbeat
+	// timeout: calling Heartbeat is always allowed, and it is the checkpoint
+	// that makes a redispatch cheap whether or not anything is watching the
+	// clock.
+	ctx = withBeat(ctx, &beatState{job: job.ID, sink: n, in: job.Checkpoint})
 
 	// A panicking work function must cost one job, not the worker.
 	defer func() {
@@ -161,6 +197,14 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	payload, err := h.invoke(ctx, job.Payload)
 	if err != nil {
 		res.Error = err.Error()
+		// Say what actually happened. A work function that gives up on its
+		// context reports "context deadline exceeded", which names neither the
+		// function nor the bound it broke — and this is the one place that
+		// knows both. The parent's cancellation is excluded: a worker being
+		// shut down is not a slow job.
+		if timeout > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
+			res.Error = fmt.Sprintf("wings: %s exceeded its %s timeout", job.Func, timeout)
+		}
 		return res
 	}
 	res.Payload = payload

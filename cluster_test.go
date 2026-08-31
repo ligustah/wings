@@ -71,6 +71,21 @@ func start(t *testing.T, cfg Config) *Cluster {
 	return c
 }
 
+// firstWorker returns a worker under the cluster's lock.
+//
+// The lock is not ceremony: the watchdog reaps dead workers out of this slice
+// once a second, whatever the target and whether or not autoscaling is on, so
+// reading it bare is a race the detector will find.
+func firstWorker(t *testing.T, c *Cluster) *workerConn {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.workers) == 0 {
+		t.Fatal("the cluster has no workers")
+	}
+	return c.workers[0]
+}
+
 func TestInProcessCall(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
@@ -162,8 +177,10 @@ func TestJobTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("want a timeout error, got nil")
 	}
-	if !strings.Contains(err.Error(), "deadline exceeded") {
-		t.Fatalf("want a deadline error, got: %v", err)
+	// Named, not "context deadline exceeded": the worker knows which function
+	// and which bound, and it is the only place that does.
+	if !strings.Contains(err.Error(), "test.slow exceeded its 100ms timeout") {
+		t.Fatalf("want the timeout named, got: %v", err)
 	}
 }
 

@@ -43,7 +43,7 @@ func TestWorkSurvivesAWorkerBeingKilled(t *testing.T) {
 
 	// Kill one worker while it is busy.
 	time.Sleep(250 * time.Millisecond)
-	victim := c.workers[0]
+	victim := firstWorker(t, c)
 	if victim.proc == nil {
 		t.Fatal("expected a local worker with a process to kill")
 	}
@@ -83,7 +83,7 @@ func TestCallWithNoLiveWorkersFails(t *testing.T) {
 
 	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1})
 
-	w := c.workers[0]
+	w := firstWorker(t, c)
 	if err := w.proc.Kill(); err != nil {
 		t.Fatalf("kill worker: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestATransientOutageDoesNotKillAWorker(t *testing.T) {
 		t.Fatalf("warm-up call: %v", err)
 	}
 
-	w := c.workers[0]
+	w := firstWorker(t, c)
 
 	// Break the connection without touching the process: closing the client
 	// fails the read the way a dropped link would.
@@ -170,7 +170,7 @@ func TestAnOutageThatNeverEndsGivesUp(t *testing.T) {
 		t.Fatalf("warm-up call: %v", err)
 	}
 
-	w := c.workers[0]
+	w := firstWorker(t, c)
 	if err := w.client.Close(); err != nil {
 		t.Logf("closing the worker client: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestResultsAreMirroredToTheCoordinator(t *testing.T) {
 		t.Fatalf("Map: %v", err)
 	}
 
-	w := c.workers[0]
+	w := firstWorker(t, c)
 	stream, err := c.shared.OpenStream[mirroredResult](mirrorStreamFor(w.id))
 	if err != nil {
 		t.Fatalf("open mirror: %v", err)
@@ -250,7 +250,7 @@ func TestTheMirrorRemembersWhereItGotTo(t *testing.T) {
 		t.Fatalf("Map: %v", err)
 	}
 
-	w := c.workers[0]
+	w := firstWorker(t, c)
 	live := w.mirror.next
 	if live == 0 {
 		t.Fatal("the mirror still resumes from 0 after three results")
@@ -277,4 +277,69 @@ func TestTheMirrorRemembersWhereItGotTo(t *testing.T) {
 		t.Fatalf("after two more results the mirror resumes from %d, not past %d",
 			w.mirror.next, live)
 	}
+}
+
+// A dead worker is reaped only once nothing is outstanding on it — and a worker
+// that dies mid-job always has something outstanding. Moving its jobs away
+// without crediting them back left it permanently in flight, so it was never
+// reaped and, on a cloud target, its machine billed on until the cluster
+// stopped. Which is precisely the case reaping exists for.
+func TestAWorkerThatDiesMidJobIsReaped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	// No Scaling: reaping a dead worker is not a scaling decision, and a
+	// cluster with a fixed worker count used to have nothing that did it.
+	c := start(t, Config{Target: LocalProcess(), Workers: 3, Concurrency: 2})
+
+	in := make([]time.Duration, 12)
+	for i := range in {
+		in[i] = 300 * time.Millisecond
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := Map(c.Bind(t.Context()), slow, in)
+		done <- err
+	}()
+
+	time.Sleep(250 * time.Millisecond)
+	victim := firstWorker(t, c)
+	if victim.proc == nil {
+		t.Fatal("expected a local worker with a process to kill")
+	}
+	if err := victim.proc.Kill(); err != nil {
+		t.Fatalf("kill worker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Map: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("Map never returned")
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		inflight := victim.inflight
+		var listed bool
+		for _, w := range c.workers {
+			if w == victim {
+				listed = true
+			}
+		}
+		c.mu.Unlock()
+		if inflight == 0 && !listed {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	c.mu.Lock()
+	inflight := victim.inflight
+	c.mu.Unlock()
+	t.Fatalf("the killed worker still holds %d jobs and was never reaped; its machine would bill on until Stop", inflight)
 }

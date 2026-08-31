@@ -32,6 +32,15 @@ const (
 	// can hang forever is a worker that can be lost silently.
 	pollInterval = 30 * time.Second
 
+	// watchdogInterval is how often outstanding jobs are checked against their
+	// deadlines.
+	//
+	// A sweep rather than a timer per job: the question is only ever "has this
+	// deadline already passed", and walking the outstanding set once a second
+	// costs nothing beside the work it represents. It also bounds how late a
+	// verdict can be, which is why it is well under any timeout worth setting.
+	watchdogInterval = time.Second
+
 	// defaultRemotePort is the loopback port a remote worker's broker binds.
 	// Fixed rather than negotiated because a freshly provisioned machine has
 	// nothing else on it, and the coordinator reaches it through a tunnel it

@@ -139,8 +139,6 @@ func (c *Cluster) autoscale() {
 func (c *Cluster) scaleOnce() {
 	s := c.cfg.Scaling
 
-	c.reapDead()
-
 	now := time.Now()
 	c.mu.Lock()
 	if c.closed {
@@ -237,6 +235,11 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 // Their tail goroutine has already redispatched what they owed; this is what
 // releases the machine, so that a cloud instance whose worker crashed stops
 // being billed rather than lingering until Stop.
+//
+// Driven by the watchdog rather than by the scaling loop, which is where it
+// used to live: a cluster with a fixed worker count has no scaling loop, so a
+// machine whose worker crashed was never released at all. Nothing about a dead
+// machine costing money depends on whether autoscaling was asked for.
 func (c *Cluster) reapDead() {
 	var reaped []*workerConn
 
