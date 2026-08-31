@@ -82,6 +82,21 @@
 // the move happened is paid for twice, and that cost is irreducible: nobody can
 // say whether it finished.
 //
+// # Bulk output
+//
+// A result is one record on one stream and is held whole in memory at both
+// ends, which is the wrong shape for output measured in megabytes. [Record]
+// writes a typed event log and [Create] a byte stream; both leave the worker in
+// chunks as they are produced, land on the coordinator's own storage, and
+// return a small handle that travels in the result. Read them back with
+// [Replay] and [Open], and remove them with [Discard].
+//
+// This is deliberately outside durable execution. What a job writes here is its
+// own state in its own shape — wings stores it and gives it back, and never
+// reads it, records it or replays it into the job. [Step] and [Heartbeat] are
+// the other thing: they are about resuming a job, not about describing what it
+// did.
+//
 // # Communication
 //
 // Workers and the coordinator talk over durable streams, and that is an

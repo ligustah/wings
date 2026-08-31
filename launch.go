@@ -12,8 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/ligustah/durable_streams/broker/client/dsremote"
 )
 
 // readyTimeout bounds how long we wait for a worker to announce its address.
@@ -110,7 +108,7 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 		return nil, err
 	}
 
-	backend, err := dsremote.Dial([]string{addr})
+	backend, err := dialWorker(addr)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()

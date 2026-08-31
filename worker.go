@@ -36,6 +36,13 @@ type workerNode struct {
 	jobs   *dsclient.Stream[jobEnvelope]
 	out    *dsclient.Stream[resultEnvelope]
 	beats  *dsclient.Stream[beatEnvelope]
+	blobs  *dsclient.Stream[artifactChunk]
+
+	// open names the artifacts this worker has already opened, so a second
+	// Create under one job and name is refused rather than silently producing
+	// two logs under one handle.
+	openMu sync.Mutex
+	open   map[string]bool
 }
 
 // newWorkerNode declares a worker's streams on client and returns its loop.
@@ -63,7 +70,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 // already there. StreamExists is node-local, which is the right question for
 // both an embedded engine and a single-node broker.
 func (n *workerNode) declareStreams(ctx context.Context) error {
-	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id)} {
+	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id), artifactStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
 		if err != nil {
 			return fmt.Errorf("wings: check stream %s: %w", name, err)
@@ -84,6 +91,41 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 	}
 	if n.beats, err = n.client.OpenStream[beatEnvelope](beatStreamFor(n.id)); err != nil {
 		return fmt.Errorf("wings: open %s: %w", beatStreamFor(n.id), err)
+	}
+	if n.blobs, err = n.client.OpenStream[artifactChunk](artifactStreamFor(n.id)); err != nil {
+		return fmt.Errorf("wings: open %s: %w", artifactStreamFor(n.id), err)
+	}
+	return nil
+}
+
+// openArtifact mints an identity for one job's named output.
+//
+// The attempt is part of it because a job that is moved writes again from the
+// start, and the two logs must not be one: only the attempt that finished has a
+// handle anybody holds, and the other is deleted unread.
+func (n *workerNode) openArtifact(job, name string) (string, error) {
+	n.openMu.Lock()
+	defer n.openMu.Unlock()
+	if n.open == nil {
+		n.open = map[string]bool{}
+	}
+	key := job + "." + name
+	if n.open[key] {
+		return "", fmt.Errorf("wings: job %s already has an artifact called %q", job, name)
+	}
+	n.open[key] = true
+	return key, nil
+}
+
+// sendChunks ships artifact records to the coordinator.
+//
+// Outside the processor's transaction, like a heartbeat and for the same
+// reason: bulk output that only became visible when the job finished would have
+// to be held whole on the worker until then, which is the cost this exists to
+// avoid.
+func (n *workerNode) sendChunks(chunks []artifactChunk) error {
+	if _, err := n.blobs.Append(context.Background(), chunks); err != nil {
+		return fmt.Errorf("wings: send artifact data: %w", err)
 	}
 	return nil
 }
@@ -233,7 +275,10 @@ func startServedBroker(dir, listen string, log *slog.Logger) (*servedBroker, err
 		_ = b.Close()
 		return nil, fmt.Errorf("wings: listen on %s: %w", listen, err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxMessage),
+		grpc.MaxSendMsgSize(maxMessage),
+	)
 	protos.RegisterDurableStreamsServer(srv, b.Service())
 	s.srv, s.lis = srv, lis
 

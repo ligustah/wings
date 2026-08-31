@@ -12,9 +12,28 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"github.com/ligustah/durable_streams/broker/client/dsremote"
 	"github.com/ligustah/wings/internal/payload"
 )
+
+// dialWorker opens the coordinator's connection to one worker's broker.
+//
+// The one place that knows how, so the message limits are the same whichever
+// target put the worker there. gRPC's defaults are four megabytes in each
+// direction, which a result or a batch of artifact chunks passes without
+// trying — and a message the transport will not carry does not fail cleanly, it
+// looks exactly like a dropped connection.
+func dialWorker(addr string) (*dsremote.Client, error) {
+	return dsremote.Dial([]string{addr},
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMessage),
+			grpc.MaxCallSendMsgSize(maxMessage),
+		))
+}
 
 const (
 	// remoteWorkDir is where the worker binary and its data live on a machine.
@@ -312,7 +331,7 @@ func dialUntilReady(ctx context.Context, addr, machineID string) (*dsremote.Clie
 
 	var lastErr error
 	for {
-		backend, err := dsremote.Dial([]string{addr})
+		backend, err := dialWorker(addr)
 		if err == nil {
 			// Dial may succeed against a tunnel whose far end is not serving
 			// yet, so ask a question only a live broker can answer.

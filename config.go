@@ -32,6 +32,27 @@ const (
 	// can hang forever is a worker that can be lost silently.
 	pollInterval = 30 * time.Second
 
+	// maxMessage is the largest gRPC message the coordinator and a worker will
+	// exchange.
+	//
+	// gRPC defaults to four megabytes, which is nothing here: a work function's
+	// result travels as one record, and a result bigger than the limit did not
+	// merely fail — the read that could not carry it looked exactly like a
+	// dropped connection, so the worker was retried for the whole reconnect
+	// window, declared dead, and its job redispatched to another worker that
+	// produced the same oversized result. An unbounded loop, at two minutes a
+	// turn.
+	//
+	// Sixty-four megabytes is generous for a result and still an amount of
+	// memory a process can hold several of. Anything genuinely large belongs in
+	// an [Artifact], which is streamed in chunks and never held whole.
+	maxMessage = 64 << 20
+
+	// artifactBatch is how many artifact chunks the coordinator asks for at
+	// once. Chunks are a quarter of a megabyte each, so this is what bounds one
+	// message; the tail is not short of round trips.
+	artifactBatch = 8
+
 	// watchdogInterval is how often outstanding jobs are checked against their
 	// deadlines.
 	//
@@ -91,6 +112,18 @@ type Config struct {
 	// only paused.
 	ReconnectTimeout time.Duration
 
+	// MaxAttempts bounds how many workers one job may be tried on before the
+	// coordinator gives up on it. Defaults to 5; a value below 1 means one
+	// attempt and no retries.
+	//
+	// It exists because at-least-once has no natural end. A job that kills the
+	// worker it lands on — a result too large to read, a panic in a native
+	// library, a machine-agnostic wedge — is moved to the next worker, which
+	// meets the same fate, forever. The failure is then invisible: the caller
+	// waits, nothing errors, and the cluster looks merely busy. A bound turns
+	// that into an error naming the last reason.
+	MaxAttempts int
+
 	// Build controls cross-compilation of the worker binary. Used only by
 	// [Remote].
 	Build BuildConfig
@@ -130,6 +163,14 @@ func (c *Config) reconnect() time.Duration {
 		return c.ReconnectTimeout
 	}
 	return 2 * time.Minute
+}
+
+// attempts is the number of workers one job may be tried on.
+func (c Config) attempts() int {
+	if c.MaxAttempts != 0 {
+		return max(c.MaxAttempts, 1)
+	}
+	return 5
 }
 
 func (c *Config) workers() int {

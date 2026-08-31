@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,8 @@ import (
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ligustah/wings/internal/invoke"
 )
@@ -105,6 +108,11 @@ type workerConn struct {
 	// job that has NOT finished and waiting for the result stream to produce
 	// would defeat the purpose.
 	beats *dsclient.Stream[beatEnvelope]
+
+	// blobs is bulk output from jobs running here, on its way to the
+	// coordinator's own storage. Tailed on its own goroutine, like beats,
+	// because it too describes a job that has not finished.
+	blobs *dsclient.Stream[artifactChunk]
 
 	// ownsClient is false for an in-process worker, whose backend the worker
 	// node itself closes. Closing it twice takes the broker down under the half
@@ -210,6 +218,9 @@ type pendingJob struct {
 	// checkpoint is the last progress reported, and is handed to the next
 	// attempt so it resumes rather than starting over.
 	checkpoint []byte
+	// artifacts are the bulk outputs this attempt has begun writing, so an
+	// attempt that is abandoned takes them with it.
+	artifacts []string
 	// steps are the phases this job has completed, accumulated here rather
 	// than resent by the worker each time — a step then costs one message
 	// whatever came before it. A report that arrives out of order is dropped
@@ -412,6 +423,14 @@ func (c *Cluster) adopt(w *workerConn) {
 		defer w.wg.Done()
 		c.tailBeats(w)
 	}()
+
+	c.wg.Add(1)
+	w.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer w.wg.Done()
+		c.tailArtifacts(w)
+	}()
 }
 
 // launch brings up n workers for the configured target.
@@ -451,6 +470,9 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	}
 	if w.beats, err = client.OpenStream[beatEnvelope](beatStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", beatStreamFor(id), id, err)
+	}
+	if w.blobs, err = client.OpenStream[artifactChunk](artifactStreamFor(id)); err != nil {
+		return nil, fmt.Errorf("wings: open %s on worker %s: %w", artifactStreamFor(id), id, err)
 	}
 	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
 		return nil, err
@@ -560,6 +582,23 @@ func (c *Cluster) tail(w *workerConn) {
 			}
 			if w.dead.Load() {
 				return // already retired deliberately
+			}
+
+			// A message too large is not a link that might come back. Waiting
+			// out the reconnect window for it spends two minutes reaching a
+			// verdict already known, and says nothing about the actual cause —
+			// which is a result bigger than the transport will carry, and which
+			// belongs in an Artifact instead.
+			if status.Code(err) == codes.ResourceExhausted {
+				c.log.Error("wings: a result was too large for the connection to carry",
+					"worker", w.id, "err", err,
+					"hint", "return a wings.Artifact for output this size rather than a value")
+				c.journal.record(journalEntry{
+					Kind: journalWorkerGone, Worker: w.id, Err: "result too large: " + err.Error(),
+				})
+				w.dead.Store(true)
+				c.redispatchFrom(w)
+				return
 			}
 
 			// A worker we can see has exited is dead now, not in two minutes.
@@ -738,6 +777,20 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 		c.mu.Unlock()
 		return
 	}
+	// At-least-once has no natural end, and a job that kills whatever worker it
+	// lands on would be moved forever while the caller waited on a cluster that
+	// merely looked busy.
+	if p.job.Attempt+1 >= c.cfg.attempts() {
+		from := p.worker
+		if from != nil {
+			c.release(from)
+			p.worker = nil
+		}
+		c.mu.Unlock()
+		c.failPending(p, fmt.Errorf("wings: %s gave up after %d attempts; last: %s",
+			p.job.Func, c.cfg.attempts(), why))
+		return
+	}
 	from := p.worker
 	w := c.pick()
 	if w == nil {
@@ -752,6 +805,10 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	if from != nil {
 		c.release(from)
 	}
+	// Whatever the abandoned attempt was writing is unreachable: the handle
+	// only ever leaves in a result, and this attempt is not producing one.
+	c.dropArtifactsOf(p.job.ID)
+
 	job := p.job
 	job.Attempt++
 	job.Checkpoint = p.checkpoint
@@ -1139,4 +1196,127 @@ func (c *Cluster) tailBeats(w *workerConn) {
 			from = r.Offset + 1
 		}
 	}
+}
+
+// tailArtifacts copies bulk output from a worker onto the coordinator's own
+// storage as it is produced.
+//
+// The same store-and-forward shape as the result mirror, and for the same
+// reason: what a worker holds dies with the worker, and a cloud machine is
+// destroyed the moment its work is done. A hundred megabytes of simulation
+// events that only existed on the VM would be a hundred megabytes nobody could
+// ever read.
+//
+// Read from the beginning, unlike beats. A beat is a position and only the
+// latest matters; a chunk is a piece of something, and a piece skipped is a
+// hole in a file.
+func (c *Cluster) tailArtifacts(w *workerConn) {
+	client, err := c.sharedClient()
+	if err != nil {
+		c.log.Error("wings: cannot store artifacts", "worker", w.id, "err", err)
+		return
+	}
+
+	// Where each artifact's copy has got to, so a reconnected tail does not
+	// write a chunk twice.
+	copied := map[string]int{}
+	var from int64
+
+	for {
+		if w.ctx.Err() != nil || w.dead.Load() {
+			return
+		}
+		readCtx, cancel := context.WithTimeout(w.ctx, pollInterval)
+		recs, err := w.blobs.ReadBlocking(readCtx, from, artifactBatch)
+		cancel()
+		if err != nil {
+			if w.ctx.Err() != nil {
+				return
+			}
+			// Nothing here declares a worker dead: that is the result tail's
+			// job, and it has the window and the exit signal to do it with.
+			if !errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case <-w.ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			continue
+		}
+		for _, r := range recs {
+			from = r.Offset + 1
+			chunk := r.Record
+			if chunk.Seq < copied[chunk.ID] {
+				continue // already stored, on a previous pass
+			}
+			if err := c.storeChunk(client, chunk); err != nil {
+				c.log.Error("wings: storing artifact data", "worker", w.id,
+					"artifact", chunk.ID, "err", err)
+				continue
+			}
+			copied[chunk.ID] = chunk.Seq + 1
+			c.mu.Lock()
+			if p, ok := c.pending[chunk.Job]; ok {
+				p.artifacts = appendOnce(p.artifacts, chunk.ID)
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
+// storeChunk appends one chunk to the coordinator's copy of an artifact.
+func (c *Cluster) storeChunk(client *dsclient.Client, chunk artifactChunk) error {
+	name := artifactCopyOf(chunk.ID)
+	if chunk.Seq == 0 {
+		ok, err := client.StreamExists(c.ctx, name)
+		if err != nil {
+			return fmt.Errorf("wings: check %s: %w", name, err)
+		}
+		if !ok {
+			if err := client.CreateStream(c.ctx, name, nil); err != nil {
+				return fmt.Errorf("wings: create %s: %w", name, err)
+			}
+		}
+	}
+	stream, err := client.OpenStream[artifactChunk](name)
+	if err != nil {
+		return fmt.Errorf("wings: open %s: %w", name, err)
+	}
+	if _, err := stream.Append(c.ctx, []artifactChunk{chunk}); err != nil {
+		return fmt.Errorf("wings: append to %s: %w", name, err)
+	}
+	return nil
+}
+
+// dropArtifactsOf deletes what a job's abandoned attempt wrote. Call with mu
+// held.
+func (c *Cluster) dropArtifactsOf(jobID string) {
+	p, ok := c.pending[jobID]
+	if !ok || len(p.artifacts) == 0 {
+		return
+	}
+	ids := p.artifacts
+	p.artifacts = nil
+
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	// In the background: this is housekeeping, and a job waiting to be moved
+	// should not wait on a delete.
+	go func() {
+		for _, id := range ids {
+			if err := dropArtifact(context.WithoutCancel(c.ctx), client, id); err != nil {
+				c.log.Warn("wings: could not discard an abandoned artifact", "artifact", id, "err", err)
+			}
+		}
+	}()
+}
+
+func appendOnce(ids []string, id string) []string {
+	if slices.Contains(ids, id) {
+		return ids
+	}
+	return append(ids, id)
 }

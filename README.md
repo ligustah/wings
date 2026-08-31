@@ -352,6 +352,64 @@ copy would have thrown away is kept. The coordinator recognises it by the run,
 thread and position the call sits at, which replay puts in the same place every
 attempt.
 
+## Bulk output
+
+A result is one record on one stream, held whole in memory at both ends. That is
+the wrong shape for a job whose output is measured in megabytes — a simulation's
+event log, a render, a scan — and past a few of them the transport will not carry
+it at all.
+
+Write it as an **artifact** instead. It leaves the worker in chunks as it is
+produced, lands on the coordinator's own durable streams, and outlives the
+machine that made it; what comes back in the result is a small handle.
+
+Two ways to write one, same storage underneath.
+
+**Events**, when the job produces a sequence of typed things as it runs:
+
+```go
+rec, err := wings.Record[Event](ctx, "replay")
+for step := range simulation(ctx) {
+    if err := rec.Record(step.Event()); err != nil { return Result{}, err }
+}
+if err := rec.Close(); err != nil { return Result{}, err }
+return Result{Replay: rec.Artifact()}, nil
+```
+
+and on the coordinator:
+
+```go
+for ev, err := range wings.Replay[Event](ctx, played.Replay) {
+    if err != nil { return err }
+    ...
+}
+```
+
+Neither end holds the log. Events are packed into chunks on the way out and
+unpacked as the range advances, so a log of millions of events is a few hundred
+records rather than a few million.
+
+**Bytes**, when the producer wants an `io.Writer`:
+
+```go
+out, err := wings.Create(ctx, "render")
+_ = encode(ctx, out)          // an ordinary io.Writer
+_ = out.Close()
+return Result{Video: out.Artifact()}, nil
+```
+
+read back with `wings.Open(ctx, a)`, an `io.ReadCloser`. What a job writes is
+opaque either way: wings does not record it, replay it into the job, or have an
+opinion about it. This is deliberately **outside** durable execution — it is the
+job's own state, in the job's own shape, and `Step` and `Heartbeat` are for
+resuming a job rather than describing what it did.
+
+**Cleaning up.** An artifact lives on the coordinator's `Dir` until
+`wings.Discard(ctx, a)` — only the caller knows when it has been read, and a run
+that produces one per job and never discards them fills a disk. Artifacts from
+attempts that were abandoned, because a job was moved or given up on, are removed
+without being asked: nobody holds a handle to those.
+
 ### What cannot be moved
 
 The running goroutine. Its stack, its locals, its open sockets and half-filled
