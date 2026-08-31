@@ -29,7 +29,7 @@ func mustGenerate(t *testing.T, b []byte, err error) string {
 // jennifer separates top-level statements with a blank line, so the directive
 // and the var have to be one statement. This is the test that they still are.
 func TestEmbedDirectiveStaysAttachedToItsVar(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, true)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, true, nil)
 	src := mustGenerate(t, b, err)
 
 	lines := strings.Split(src, "\n")
@@ -57,7 +57,7 @@ func TestEmbedDirectiveStaysAttachedToItsVar(t *testing.T) {
 }
 
 func TestCoordinatorMainWiresTheOptions(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "arm64"}, true)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "arm64"}, true, nil)
 	src := mustGenerate(t, b, err)
 
 	for _, want := range []string{
@@ -80,7 +80,7 @@ func TestCoordinatorMainWiresTheOptions(t *testing.T) {
 // Without an exported Provisioner the field must be nil rather than absent or a
 // call to a function that does not exist.
 func TestCoordinatorMainWithoutProvisioner(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil)
 	src := mustGenerate(t, b, err)
 
 	if strings.Contains(src, "app.Provisioner") {
@@ -94,7 +94,7 @@ func TestCoordinatorMainWithoutProvisioner(t *testing.T) {
 // A split build still has to link the work package, or the coordinator has
 // nothing registered to dispatch against.
 func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
-	b, err := coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, false)
+	b, err := coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, false, nil)
 	src := mustGenerate(t, b, err)
 
 	if !strings.Contains(src, `_ "example.com/app/job"`) {
@@ -107,7 +107,7 @@ func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
 
 // The unsplit case must not import the same package twice.
 func TestUnsplitBuildImportsThePackageOnce(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil)
 	src := mustGenerate(t, b, err)
 
 	if n := strings.Count(src, `"example.com/app"`); n != 1 {

@@ -256,6 +256,7 @@ func isWorkerProcess() bool { return os.Getenv(envMode) == modeWorker }
 // stops it.
 func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	concurrency, _ := strconv.Atoi(os.Getenv(envConcurrency))
+	jobTimeout, _ := time.ParseDuration(os.Getenv(envJobTimeout))
 	dir := os.Getenv(envDir)
 	if dir == "" {
 		var err error
@@ -274,6 +275,7 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		dir:         dir,
 		listen:      listen,
 		concurrency: concurrency,
+		timeout:     jobTimeout,
 		log:         log,
 	})
 	if err != nil {

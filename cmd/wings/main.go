@@ -17,10 +17,12 @@
 //		…
 //	}
 //
-//	// Provisioner is optional; supply it to enable -target=remote.
-//	func Provisioner() wings.Provisioner {
-//		return gcp.New(gcp.Config{Project: "p", Zone: "europe-west1-b"})
-//	}
+// That is all. WHERE the work runs is not in it: -providers links clouds into
+// the coordinator, and -target and -provider choose between them at run time.
+//
+// For a cloud wings does not ship you may instead export
+// `func Provisioner() wings.Provisioner`, which takes precedence over -provider
+// — the one thing that puts a cloud back into your own source.
 //
 // # What this builds
 //
@@ -46,11 +48,14 @@
 //
 // # Keeping workers small
 //
-// Both mains import the package named by -pkg, so anything it pulls in — a
-// cloud SDK reached through Provisioner, say — lands in the worker too. Pass
-// -coordinator-pkg to split them: -pkg holds the work functions both halves
-// need, -coordinator-pkg holds Coordinate and Provisioner and is linked only
-// into the coordinator.
+// Providers are linked into the coordinator only, so a worker never carries the
+// cloud SDK that deployed it — dropping the example's worker from 28 MB to 15 MB
+// when its provisioner moved to a flag.
+//
+// Both mains do import the package named by -pkg, so anything IT pulls in lands
+// in the worker too. Pass -coordinator-pkg to split them: -pkg holds the work
+// functions both halves need, -coordinator-pkg holds Coordinate and is linked
+// only into the coordinator.
 package main
 
 import (
@@ -100,12 +105,14 @@ Usage:
 
 Flags:
   -pkg              package holding your work functions; linked into BOTH halves (default ".")
-  -coordinator-pkg  package holding Coordinate and Provisioner; defaults to -pkg.
-                    Split it out to keep provisioning code out of the worker.
+  -coordinator-pkg  package holding Coordinate; defaults to -pkg. Split it out to keep
+                    anything only the coordinator needs out of the worker.
   -coordinator      os/arch to run the coordinator on (default: this machine)
   -worker           os/arch to run workers on (default "linux/amd64")
   -o                output path for the coordinator binary (required)
   -worker-out       also write the bare worker binary here (for inspection)
+  -providers        clouds to link into the coordinator, comma-separated (default "gcp").
+                    A bare name means github.com/ligustah/wings/<name>; empty links none.
   -tags             build tags, passed to go build
   -ldflags          extra linker flags, appended after -s -w
   -keep-debug       keep debug info; binaries are much larger
@@ -113,7 +120,7 @@ Flags:
 
 Your package must export:
   func Coordinate(ctx context.Context, c *wings.Cluster) error   (required)
-  func Provisioner() wings.Provisioner                           (optional, enables -target=remote)
+  func Provisioner() wings.Provisioner                           (optional; overrides -provider)
 
 Example:
   wings build -pkg ./job -coordinator windows/amd64 -worker linux/amd64 -o myapp.exe
@@ -141,6 +148,9 @@ func build(args []string) error {
 	workerFlag := fs.String("worker", "linux/amd64", "os/arch to run workers on")
 	out := fs.String("o", "", "output path for the coordinator binary (required)")
 	workerOut := fs.String("worker-out", "", "also write the bare worker binary here")
+	providers := fs.String("providers", "gcp",
+		"comma-separated cloud providers to link into the coordinator; a bare name means "+
+			"github.com/ligustah/wings/<name>, a slash means an import path. Empty links none.")
 	tags := fs.String("tags", "", "build tags")
 	ldflags := fs.String("ldflags", "", "extra linker flags")
 	keepDebug := fs.Bool("keep-debug", false, "keep debug info")
@@ -254,7 +264,8 @@ func build(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "embedded     %-14s %s (gzipped)\n", worker, sizeOf(blobPath))
 
-	coordSrc, err := coordinatorMain(work.ImportPath, coordinate.ImportPath, worker, api.hasProvisioner)
+	coordSrc, err := coordinatorMain(work.ImportPath, coordinate.ImportPath, worker,
+		api.hasProvisioner, providerImports(*providers))
 	if err != nil {
 		return err
 	}
@@ -270,11 +281,34 @@ func build(args []string) error {
 	fmt.Fprintln(os.Stderr, sizeOf(absOut))
 
 	fmt.Fprintf(os.Stderr, "\n%s carries a %s worker.\n", absOut, worker)
-	if !api.hasProvisioner {
-		fmt.Fprintf(os.Stderr, "No Provisioner exported, so -target=remote is unavailable; "+
-			"inprocess and local work.\n")
+	switch links := providerImports(*providers); {
+	case api.hasProvisioner:
+		fmt.Fprintf(os.Stderr, "-target remote uses the Provisioner your package exports.\n")
+	case len(links) > 0:
+		fmt.Fprintf(os.Stderr, "-target remote is available via -provider (%s).\n", *providers)
+	default:
+		fmt.Fprintf(os.Stderr, "No provider linked in and no Provisioner exported, so -target remote "+
+			"is unavailable; inprocess and local work.\n")
 	}
 	return nil
+}
+
+// pkgInfo is the part of `go list -json` we need.
+// providerImports turns the -providers list into import paths. A bare name is
+// one of the providers wings ships; anything with a slash is somebody else's.
+func providerImports(list string) []string {
+	var out []string
+	for _, name := range strings.Split(list, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !strings.Contains(name, "/") {
+			name = wingsPkg + "/" + name
+		}
+		out = append(out, name)
+	}
+	return out
 }
 
 // pkgInfo is the part of `go list -json` we need.

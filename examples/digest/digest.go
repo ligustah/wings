@@ -8,7 +8,11 @@
 //
 //	./digest -target inprocess -jobs 32
 //	./digest -target local -workers 4
-//	./digest -target remote -workers 4 -project my-project -zone europe-west1-b
+//	./digest -target remote -workers 4 -gcp.project my-project -gcp.zone europe-west1-b
+//
+// Note what is NOT in this file: no cloud, no SDK, no Target, no provisioner.
+// Where the work runs is chosen entirely on the command line, and this package
+// cannot tell the difference.
 package digest
 
 import (
@@ -22,7 +26,6 @@ import (
 	"time"
 
 	"github.com/ligustah/wings"
-	"github.com/ligustah/wings/gcp"
 )
 
 // Flags registered here are parsed too: wings.CoordinatorMain calls
@@ -31,11 +34,6 @@ import (
 var (
 	jobs   = flag.Int("jobs", 32, "number of jobs to run")
 	rounds = flag.Int("rounds", 2_000_000, "hash rounds per job")
-
-	project     = flag.String("project", "", "GCP project (for -target remote)")
-	zone        = flag.String("zone", "europe-west1-b", "GCP zone")
-	machineType = flag.String("machine-type", "e2-standard-4", "GCP machine type")
-	spot        = flag.Bool("spot", true, "use preemptible Spot instances")
 )
 
 // Work is one unit of input.
@@ -98,15 +96,4 @@ func Coordinate(ctx context.Context, c *wings.Cluster) error {
 	fmt.Printf("\nfirst result: %s -> %s\n", results[0].Seed, results[0].Digest[:16])
 	fmt.Println(strings.Repeat("-", 40))
 	return nil
-}
-
-// Provisioner is optional. Exporting it is what makes -target=remote available;
-// without it wings says so and the other two targets still work.
-func Provisioner() wings.Provisioner {
-	return gcp.New(gcp.Config{
-		Project:     *project,
-		Zone:        *zone,
-		MachineType: *machineType,
-		Preemptible: *spot,
-	})
 }

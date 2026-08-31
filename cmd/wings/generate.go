@@ -66,7 +66,7 @@ func workerMain(workPkg string) ([]byte, error) {
 //	func main() {
 //		wings.CoordinatorMain(wings.CoordinatorOptions{…})
 //	}
-func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner bool) ([]byte, error) {
+func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner bool, providers []string) ([]byte, error) {
 	f := jen.NewFile("main")
 	f.HeaderComment(generatedBy)
 
@@ -79,6 +79,17 @@ func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner b
 		// coordinator encodes and dispatches against the functions it defines.
 		f.Comment("Linked in for its Define calls; the coordinator dispatches against them.")
 		f.Anon(workPkg)
+	}
+
+	if len(providers) > 0 {
+		// Imported for effect, the way a database driver is: each registers
+		// itself and its flags, so -provider can name it. Only the COORDINATOR
+		// links these — a worker provisions nothing and would carry a cloud SDK
+		// for no reason.
+		f.Comment("Each registers itself with wings, making it selectable with -provider.")
+		for _, p := range providers {
+			f.Anon(p)
+		}
 	}
 
 	// The comment and the var must be ONE statement. //go:embed applies to the

@@ -93,6 +93,9 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, binary, id string) (*wo
 	if c.cfg.Concurrency > 0 {
 		env[envConcurrency] = fmt.Sprint(c.cfg.Concurrency)
 	}
+	if c.cfg.JobTimeout > 0 {
+		env[envJobTimeout] = c.cfg.JobTimeout.String()
+	}
 
 	c.log.Info("wings: starting worker", "machine", m.ID())
 	if err := m.Start(ctx, remoteBin, env); err != nil {

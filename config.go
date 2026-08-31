@@ -13,6 +13,7 @@ const (
 	envListen      = "WINGS_LISTEN"
 	envDir         = "WINGS_DIR"
 	envConcurrency = "WINGS_CONCURRENCY"
+	envJobTimeout  = "WINGS_JOB_TIMEOUT"
 	envWorkerID    = "WINGS_WORKER_ID"
 
 	modeWorker = "worker"

@@ -20,8 +20,13 @@ change to the code.
 ```sh
 ./myapp -target inprocess          # goroutines in this process
 ./myapp -target local -workers 4   # child processes on this machine
-./myapp -target remote -workers 8  # cloud VMs, provisioned and torn down
+./myapp -target remote -workers 8 -provider gcp         -gcp.project my-proj -gcp.zone europe-west1-b
 ```
+
+Your program names no cloud, imports no SDK and holds no credentials. It cannot
+tell which of those three it is running under — `oblivious_test.go` parses the
+example and fails the build if it ever gains a `Target`, a provisioner or a
+cloud import.
 
 ## Build
 
@@ -38,9 +43,9 @@ go run github.com/ligustah/wings/cmd/wings build \
 ```
 
 ```
-worker       linux/amd64      28.2 MB
-embedded     linux/amd64       8.6 MB (gzipped)
-coordinator  windows/amd64    40.8 MB
+worker       linux/amd64      15.2 MB
+embedded     linux/amd64       5.9 MB (gzipped)
+coordinator  windows/amd64    38.1 MB
 ```
 
 The two halves are separate programs generated into a scratch directory (your
@@ -49,10 +54,15 @@ source tree is not written to):
 | | contains | built for |
 |---|---|---|
 | **worker** | your work functions, the worker loop | the machines it will run on |
-| **coordinator** | your work functions, `Coordinate`, provisioning, the embedded worker | the machine *you* run it on |
+| **coordinator** | your work functions, `Coordinate`, the providers, the embedded worker | the machine *you* run it on |
 
 Because they are separate, **the coordinator is never cross-compiled** — only
-the worker is — and the worker need not link the cloud SDK that deploys it.
+the worker is — and the worker does not link the cloud SDK that deploys it. That
+split is worth 13 MB on the example's worker.
+
+`-providers` picks which clouds the coordinator can reach (default `gcp`, empty
+links none); `-coordinator-pkg` splits your own package if it too should stay out
+of the worker.
 
 ## What you write
 
@@ -66,7 +76,6 @@ import (
     "context"
 
     "github.com/ligustah/wings"
-    "github.com/ligustah/wings/gcp"
 )
 
 // Work functions are package-scope vars, so a worker process — which never runs
@@ -83,12 +92,9 @@ func Coordinate(ctx context.Context, c *wings.Cluster) error {
     }
     return write(images)
 }
-
-// Provisioner is optional. Exporting it is what enables -target=remote.
-func Provisioner() wings.Provisioner {
-    return gcp.New(gcp.Config{Project: "my-project", Zone: "europe-west1-b"})
-}
 ```
+
+That is the whole file. No cloud appears in it.
 
 Flags you register in that package are parsed too — `CoordinatorMain` calls
 `flag.Parse()` on the default set, so your own flags sit beside `-target` and
@@ -164,8 +170,26 @@ one at dispatch time instead, which needs a Go toolchain and the module source.
 
 ## Other clouds
 
-Implement `Provisioner`; the SSH deployment, tunnelling and worker protocol are
-shared.
+Two ways, depending on whether the choice should be a flag.
+
+**A flag-selectable provider.** Implement `Provider` and register it from an
+init, the way a database driver does. `wings build -providers you/cloud` links it
+into the coordinator, and it becomes `-provider yourcloud` with its flags
+prefixed `-yourcloud.*`.
+
+```go
+type Provider interface {
+    Name() string
+    Flags(fs *flag.FlagSet)
+    New() (wings.Provisioner, error)
+}
+```
+
+**One baked in.** Export `func Provisioner() wings.Provisioner` from your
+package; it takes precedence over `-provider`. This is the escape hatch, and it
+is the one thing that puts a cloud back into your source.
+
+Either way the SSH deployment, tunnelling and worker protocol are shared:
 
 ```go
 type Provisioner interface {
@@ -189,8 +213,8 @@ type Machine interface {
 
 ## Example
 
-[`examples/digest`](examples/digest) is a complete program — work function,
-coordinator body, provisioner — that runs on all three targets.
+[`examples/digest`](examples/digest) is a complete program — one work function
+and a coordinator body, naming no cloud — that runs on all three targets.
 
 ```sh
 go run ./cmd/wings build -pkg ./examples/digest -o digest

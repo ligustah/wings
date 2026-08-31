@@ -74,12 +74,16 @@ func CoordinatorMain(opts CoordinatorOptions) {
 
 	var (
 		target      = flag.String("target", "inprocess", "where workers run: inprocess | local | remote")
+		provider    = flag.String("provider", "", providerUsage())
 		workers     = flag.Int("workers", 0, "number of workers; 0 uses the default for the target")
 		concurrency = flag.Int("concurrency", 0, "jobs in flight per worker; 0 lets each worker decide")
 		dir         = flag.String("dir", "", "data directory; empty uses a temporary one that is removed on exit")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
 	)
+	// Every linked-in provider's flags, before parsing — which provider is
+	// selected is itself a parsed flag, so they all have to be declared first.
+	registerProviderFlags(flag.CommandLine)
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -103,14 +107,19 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	case "local", "localprocess":
 		cfg.Target = LocalProcess()
 	case "remote", "cloud":
-		if opts.Provisioner == nil {
-			fmt.Fprintln(os.Stderr,
-				"wings: -target=remote needs a provisioner, and this binary has none.\n"+
-					"Export `func Provisioner() wings.Provisioner` from the package you built,\n"+
-					"returning e.g. gcp.New(gcp.Config{Project: ..., Zone: ...}).")
-			os.Exit(2)
+		// A provisioner supplied in code wins: it is the escape hatch for a
+		// cloud wings does not ship, and someone who wrote one meant it.
+		// Otherwise the choice comes off the command line, which is what keeps
+		// the program itself free of any mention of where it runs.
+		prov := opts.Provisioner
+		if prov == nil {
+			var err error
+			if prov, err = resolveProvider(*provider); err != nil {
+				fmt.Fprintf(os.Stderr, "wings: %v\n", err)
+				os.Exit(2)
+			}
 		}
-		cfg.Target = Remote(opts.Provisioner)
+		cfg.Target = Remote(prov)
 	default:
 		fmt.Fprintf(os.Stderr, "wings: unknown -target %q; want inprocess, local or remote\n", *target)
 		os.Exit(2)

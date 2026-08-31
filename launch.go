@@ -87,7 +87,7 @@ func (c *Cluster) launchLocalProcess(ctx context.Context, dir string, n int) ([]
 
 func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerConn, error) {
 	cmd := exec.Command(exe)
-	cmd.Env = append(os.Environ(), workerEnv(id, "127.0.0.1:0", dir, c.cfg.Concurrency)...)
+	cmd.Env = append(os.Environ(), workerEnv(id, "127.0.0.1:0", dir, c.cfg.Concurrency, c.cfg.JobTimeout)...)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -125,7 +125,7 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 }
 
 // workerEnv is the whole coordinator-to-worker contract.
-func workerEnv(id, listen, dir string, concurrency int) []string {
+func workerEnv(id, listen, dir string, concurrency int, jobTimeout time.Duration) []string {
 	env := []string{
 		envMode + "=" + modeWorker,
 		envWorkerID + "=" + id,
@@ -134,6 +134,13 @@ func workerEnv(id, listen, dir string, concurrency int) []string {
 	}
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))
+	}
+	// Carried explicitly, because a worker in another process shares nothing
+	// with the Config that set it. Leaving it out was a real bug: JobTimeout
+	// bound in-process jobs and silently did nothing anywhere else, so the
+	// guarantee changed with the target.
+	if jobTimeout > 0 {
+		env = append(env, envJobTimeout+"="+jobTimeout.String())
 	}
 	return env
 }
