@@ -31,6 +31,21 @@ type runState struct {
 	channels map[string]*chanState
 	sink     Sink
 	sinkErr  error // the first persistence failure, if any
+	over     bool  // this attempt has returned
+}
+
+// finish marks an attempt over, after which nothing more of it is written down.
+//
+// A forked thread outlives the attempt that made it — the workflow function can
+// return while one is still waiting on a work function — and when that thread
+// finally finishes it records what it found. Writing that into the history of a
+// run whose NEXT attempt is already under way is at best noise and at worst a
+// stale answer landing among fresh ones. The thread's own bookkeeping is left
+// alone; only the durable record is closed.
+func (r *runState) finish() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.over = true
 }
 
 // declareChannel registers a channel's runtime the first time it is created.
@@ -191,7 +206,7 @@ func record[E protos.Events](t *threadState, payload E) *protos.Event {
 	t.run.threads[t.id] = append(t.run.threads[t.id], ev)
 	t.serial++
 
-	if t.run.sink != nil && t.run.sinkErr == nil {
+	if t.run.sink != nil && t.run.sinkErr == nil && !t.run.over {
 		// Background, not the workflow's context: an event describing what has
 		// already happened must be written even while the run is being torn
 		// down, or the history stops exactly where it is most interesting.

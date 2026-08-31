@@ -66,7 +66,11 @@ type Cluster struct {
 	mu      sync.Mutex
 	workers []*workerConn
 	pending map[string]*pendingJob
-	closed  bool
+	// byOrigin indexes outstanding jobs by the workflow call they belong to,
+	// so a workflow attempt that replays a call finds the one its predecessor
+	// was making rather than starting a second.
+	byOrigin map[string]*pendingJob
+	closed   bool
 
 	// epoch identifies THIS run of the coordinator, and is part of every name
 	// it mints.
@@ -171,7 +175,22 @@ func (w *workerConn) hasExited() bool {
 type pendingJob struct {
 	job    jobEnvelope
 	worker *workerConn
-	done   chan resultEnvelope
+
+	// done closes once, when the job has an outcome, and res is that outcome.
+	//
+	// A closed channel rather than a value on one because a job can now have
+	// more than one waiter: a workflow that is retried rejoins the call its
+	// previous attempt was making instead of dispatching a second copy of it,
+	// and a value channel delivers to exactly one of them.
+	done chan struct{}
+	res  resultEnvelope
+	once sync.Once
+	// waiters counts who is still interested. A caller that gives up abandons
+	// the job only when it was the last one — the point of rejoining is that
+	// the work carries on.
+	//
+	// Guarded by Cluster.mu.
+	waiters int
 	// origin is what larger piece of work this job is a step of, kept so a
 	// redispatch or a failure can be recorded against the same run as the
 	// submit — the caller's context is long gone by then.
@@ -250,12 +269,13 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	c := &Cluster{
-		cfg:     cfg,
-		log:     log,
-		ctx:     runCtx,
-		cancel:  cancel,
-		pending: map[string]*pendingJob{},
-		epoch:   newEpoch(),
+		cfg:      cfg,
+		log:      log,
+		ctx:      runCtx,
+		cancel:   cancel,
+		pending:  map[string]*pendingJob{},
+		byOrigin: map[string]*pendingJob{},
+		epoch:    newEpoch(),
 	}
 
 	c.dir = cfg.Dir
@@ -617,7 +637,7 @@ func (c *Cluster) deliver(res resultEnvelope) {
 	c.mu.Lock()
 	p, ok := c.pending[res.ID]
 	if ok {
-		delete(c.pending, res.ID)
+		c.forget(p)
 		c.release(p.worker)
 	}
 	c.mu.Unlock()
@@ -628,10 +648,28 @@ func (c *Cluster) deliver(res resultEnvelope) {
 		Kind: journalCompleted, Job: res.ID, Func: p.job.Func,
 		Worker: p.worker.id, Attempt: p.job.Attempt, Err: res.Error,
 	}.from(p.origin))
-	select {
-	case p.done <- res:
-	default:
+	p.settle(res)
+}
+
+// forget takes a job out of the outstanding set. Call with mu held.
+func (c *Cluster) forget(p *pendingJob) {
+	if cur, ok := c.pending[p.job.ID]; !ok || cur != p {
+		return
 	}
+	delete(c.pending, p.job.ID)
+	if key := p.origin.Key(); key != "" {
+		if cur, ok := c.byOrigin[key]; ok && cur == p {
+			delete(c.byOrigin, key)
+		}
+	}
+}
+
+// settle publishes a job's outcome to everyone waiting on it, exactly once.
+func (p *pendingJob) settle(res resultEnvelope) {
+	p.once.Do(func() {
+		p.res = res
+		close(p.done)
+	})
 }
 
 // workerID names the worker a job was on, or nothing when it never reached one.
@@ -819,20 +857,17 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	c.mu.Lock()
 	cur, ok := c.pending[p.job.ID]
 	if ok && cur == p {
-		delete(c.pending, p.job.ID)
+		c.forget(p)
 	}
 	c.mu.Unlock()
-	if !ok {
+	if !ok || cur != p {
 		return
 	}
 	c.journal.record(journalEntry{
 		Kind: journalFailed, Job: p.job.ID, Func: p.job.Func,
 		Worker: workerID(p.worker), Attempt: p.job.Attempt, Err: err.Error(),
 	}.from(p.origin))
-	select {
-	case p.done <- resultEnvelope{ID: p.job.ID, Error: err.Error()}:
-	default:
-	}
+	p.settle(resultEnvelope{ID: p.job.ID, Error: err.Error()})
 }
 
 // pick chooses the available worker with the least work outstanding.
@@ -859,7 +894,7 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	}
 	p := &pendingJob{
 		job:  job,
-		done: make(chan resultEnvelope, 1),
+		done: make(chan struct{}),
 		opts: optionsFor(fnName),
 		// Read off the context rather than passed in: only a workflow sets it,
 		// and threading a parameter nobody else supplies through every caller
@@ -867,10 +902,28 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		origin: invoke.OriginFrom(ctx),
 	}
 
+	key := p.origin.Key()
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil, errors.New("wings: cluster is stopped")
+	}
+	// A workflow attempt that replays a call its predecessor had not finished
+	// rejoins that job instead of dispatching a second one. Two copies of an
+	// hour of work would be a waste on their own; worse, the copy starts from
+	// nothing while the original is most of the way through, holding the
+	// checkpoint and the steps that make it cheap to move.
+	if key != "" {
+		if live, ok := c.byOrigin[key]; ok {
+			live.waiters++
+			c.mu.Unlock()
+			c.journal.record(journalEntry{
+				Kind: journalAttached, Job: live.job.ID, Func: live.job.Func,
+				Worker: workerID(live.worker), Attempt: live.job.Attempt,
+			}.from(live.origin))
+			return live, nil
+		}
 	}
 	w := c.pick()
 	if w == nil {
@@ -879,13 +932,17 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	}
 	p.worker = w
 	p.since = time.Now()
+	p.waiters = 1
 	c.pending[job.ID] = p
+	if key != "" {
+		c.byOrigin[key] = p
+	}
 	c.charge(w)
 	c.mu.Unlock()
 
 	if _, err := w.jobs.Append(ctx, []jobEnvelope{job}); err != nil {
 		c.mu.Lock()
-		delete(c.pending, job.ID)
+		c.forget(p)
 		c.release(w)
 		c.mu.Unlock()
 		return nil, fmt.Errorf("wings: submit to worker %s: %w", w.id, err)
@@ -899,17 +956,32 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 // await blocks for one job's outcome.
 func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, error) {
 	select {
-	case res := <-p.done:
-		return res, nil
-	case <-ctx.Done():
+	case <-p.done:
 		c.mu.Lock()
-		if cur, ok := c.pending[p.job.ID]; ok && cur == p {
-			delete(c.pending, p.job.ID)
-			c.release(p.worker)
+		p.waiters--
+		c.mu.Unlock()
+		return p.res, nil
+
+	case <-ctx.Done():
+		// Abandoned only by the LAST caller still interested. A workflow that
+		// is retried has one attempt giving up while the next has already
+		// rejoined, and dropping the job there would throw away the work the
+		// retry is counting on.
+		c.mu.Lock()
+		p.waiters--
+		if p.waiters <= 0 {
+			if cur, ok := c.pending[p.job.ID]; ok && cur == p {
+				c.forget(p)
+				c.release(p.worker)
+			}
 		}
 		c.mu.Unlock()
 		return resultEnvelope{}, ctx.Err()
+
 	case <-c.ctx.Done():
+		c.mu.Lock()
+		p.waiters--
+		c.mu.Unlock()
 		return resultEnvelope{}, errors.New("wings: cluster stopped while waiting for a result")
 	}
 }

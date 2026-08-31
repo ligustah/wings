@@ -15,6 +15,7 @@ package invoke
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ligustah/durable_streams/dsclient"
 )
@@ -97,6 +98,21 @@ type Origin struct {
 
 // Zero reports whether o names nothing.
 func (o Origin) Zero() bool { return o.Flow == "" && o.Run == "" }
+
+// Key identifies one call of one workflow, stably across attempts of that
+// workflow.
+//
+// Attempt is deliberately not part of it. The whole use of this key is to
+// recognise, on a later attempt, the call the previous attempt was making —
+// and a key that changed with the attempt could never do that. Everything else
+// in it is deterministic: replay puts the same call at the same position of the
+// same thread every time.
+func (o Origin) Key() string {
+	if o.Zero() {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s/%s#%d", o.Flow, o.Run, o.Thread, o.Step)
+}
 
 type originKey struct{}
 

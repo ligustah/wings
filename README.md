@@ -341,6 +341,17 @@ is one message to the coordinator, which accumulates them, so a step costs the
 same however many came before it — but it is a message all the same. Use steps
 for coarse phases and `Heartbeat` for a position inside a loop.
 
+### Inside a workflow
+
+A work function called from a workflow checkpoints exactly the same way — `Step`
+and `Heartbeat` do not know or care whether a workflow is involved. What a
+workflow adds is a second way to be interrupted: the workflow itself can fail
+and be retried while the call is still running. The retry **rejoins** the call
+already in flight instead of dispatching a second copy, so the progress that
+copy would have thrown away is kept. The coordinator recognises it by the run,
+thread and position the call sits at, which replay puts in the same place every
+attempt.
+
 ### What cannot be moved
 
 The running goroutine. Its stack, its locals, its open sockets and half-filled

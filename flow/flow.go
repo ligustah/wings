@@ -67,6 +67,22 @@
 // A workflow that deadlocks on a channel deadlocks the same way a Go program
 // would; there is no scheduler here doing anything clever about it.
 //
+// # Long activities
+//
+// A work function called from a workflow checkpoints its own progress the same
+// way it would anywhere else: [github.com/ligustah/wings.Step] for coarse
+// phases, [github.com/ligustah/wings.Heartbeat] for a position inside one.
+// Nothing about being in a workflow changes that, and nothing in the workflow
+// function has to know about it.
+//
+// What a workflow adds is a second way for a long call to be interrupted: the
+// workflow itself can fail and be retried while the call is still running. When
+// the retry reaches that call again it REJOINS the one already in flight rather
+// than dispatching a second copy — two copies of an hour of work would be waste
+// on their own, and the copy would start from nothing while the original is
+// most of the way through, holding the very progress that makes it cheap to
+// move.
+//
 // # What it is not
 //
 // The workflow function runs on the coordinator, and only the calls it makes are
@@ -243,6 +259,9 @@ func (d *Definition[In, Out]) attempt(
 		sink:     sink,
 	}
 	main := &threadState{id: mainThread, run: run}
+	// Whatever a thread of this attempt does after it returns is this attempt's
+	// business and not the record's.
+	defer run.finish()
 
 	reason := protos.StartReason_START_REASON_INIT
 	if len(history) > 0 {
