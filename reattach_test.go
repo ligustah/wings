@@ -499,3 +499,51 @@ func TestLeasesAreUsableAsCloudNames(t *testing.T) {
 		seen[l] = true
 	}
 }
+
+// A machine destroyed on purpose must be struck from the record. It used to be
+// closed without the record being told, so its lease stayed open and every
+// future start went hunting for a machine that had been deliberately
+// destroyed — the exact cost the record exists to avoid, paid in the other
+// direction.
+func TestARetiredMachinesLeaseIsClosed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	cloud := newFakeCloud(t)
+	dir := t.TempDir()
+
+	c := startRemote(t, dir, cloud, 2)
+	if _, err := Map(c.Bind(t.Context()), double, []int{1, 2}); err != nil {
+		t.Fatalf("Map: %v", err)
+	}
+
+	// Retire one by hand: the scaler's path, without waiting for it to decide.
+	c.mu.Lock()
+	victim := c.workers[0]
+	c.workers = c.workers[1:]
+	victim.draining = true
+	c.mu.Unlock()
+	victim.dead.Store(true)
+	if err := c.releaseWorker(context.Background(), victim); err != nil {
+		t.Fatalf("releaseWorker: %v", err)
+	}
+
+	live, err := c.machines.outstanding(t.Context())
+	if err != nil {
+		t.Fatalf("outstanding: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("%d leases are still open after one machine was retired, want 1", len(live))
+	}
+	if live[0] == victim.lease {
+		t.Fatalf("the retired machine's lease %q is still open", victim.lease)
+	}
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if got := cloud.leases(); len(got) != 0 {
+		t.Fatalf("the cloud holds %d machines after a clean stop", len(got))
+	}
+}

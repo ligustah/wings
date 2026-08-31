@@ -226,7 +226,7 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 		w.dead.Store(true)
 		c.log.Info("wings: retiring idle worker", "worker", w.id)
 		c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "retired while idle"})
-		if err := w.close(context.WithoutCancel(c.ctx)); err != nil {
+		if err := c.releaseWorker(context.WithoutCancel(c.ctx), w); err != nil {
 			c.log.Error("wings: retiring worker", "worker", w.id, "err", err)
 		}
 	}
@@ -253,7 +253,7 @@ func (c *Cluster) reapDead() {
 	for _, w := range reaped {
 		c.log.Info("wings: releasing dead worker", "worker", w.id)
 		c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "died"})
-		if err := w.close(context.WithoutCancel(c.ctx)); err != nil {
+		if err := c.releaseWorker(context.WithoutCancel(c.ctx), w); err != nil {
 			c.log.Error("wings: releasing dead worker", "worker", w.id, "err", err)
 		}
 	}

@@ -294,6 +294,28 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	return c, nil
 }
 
+// releaseWorker closes a worker and closes its machine's lease.
+//
+// The two belong together, and they did not used to: a worker retired by the
+// scaler or reaped after dying was closed without the record being told, so its
+// lease stayed open and every future start went hunting for a machine that had
+// been destroyed on purpose. Anything that takes a worker out of service goes
+// through here.
+//
+// The lease is closed only once the machine is actually gone, so a crash
+// between the two leaves it open and the next start looks for it — which is the
+// safe direction to be wrong in. A machine that is looked for and not found
+// costs one API call; one that is never looked for bills forever.
+func (c *Cluster) releaseWorker(ctx context.Context, w *workerConn) error {
+	err := w.close(ctx)
+	if w.lease == "" {
+		return err
+	}
+	return errors.Join(err, c.machines.write(ctx, machineRecord{
+		Kind: machineReleased, Lease: w.lease, Worker: w.id,
+	}))
+}
+
 // adopt puts a freshly launched worker into service and starts tailing it.
 func (c *Cluster) adopt(w *workerConn) {
 	c.mu.Lock()
@@ -769,15 +791,7 @@ func (c *Cluster) Stop(ctx context.Context) error {
 
 	var errs []error
 	for _, w := range workers {
-		errs = append(errs, w.close(ctx))
-		if w.lease != "" {
-			// Recorded only once the machine is actually gone, so a crash
-			// between the two leaves the lease open and the next start goes
-			// looking for it — which is the safe direction to be wrong in.
-			errs = append(errs, c.machines.write(ctx, machineRecord{
-				Kind: machineReleased, Lease: w.lease, Worker: w.id,
-			}))
-		}
+		errs = append(errs, c.releaseWorker(ctx, w))
 	}
 	// The journal writes through the shared instance, so it must be drained
 	// before that instance goes away — and it is drained last, so the entries
