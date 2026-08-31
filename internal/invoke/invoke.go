@@ -13,7 +13,11 @@
 // together through here; nobody outside can.
 package invoke
 
-import "context"
+import (
+	"context"
+
+	"github.com/ligustah/durable_streams/dsclient"
+)
 
 // Host executes named work on behalf of a caller that holds only a name and
 // bytes.
@@ -43,6 +47,16 @@ type Host interface {
 	// body's error for index i is returned at errs[i]; a nil entry means that
 	// index succeeded.
 	Parallel(ctx context.Context, n int, body func(ctx context.Context, i int) error) (errs []error)
+
+	// Streams is the host's own embedded durable-streams instance: the
+	// broker-less one, with no listener and no port, that the coordinator keeps
+	// its records on.
+	//
+	// Exposed here so a workflow engine can put its event log on the instance
+	// that already exists rather than opening a second one — a log directory
+	// admits exactly one engine at a time, so "open your own" is not a free
+	// choice, it is a second directory and a second lock.
+	Streams() *dsclient.Client
 }
 
 type ctxKey struct{}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/wings/internal/invoke"
 )
 
@@ -42,6 +43,19 @@ func (h clusterHost) Invoke(ctx context.Context, name string, payload []byte) ([
 		return nil, errors.New(res.Error)
 	}
 	return res.Payload, nil
+}
+
+// Streams is the cluster's own embedded instance, created on first use.
+func (h clusterHost) Streams() *dsclient.Client {
+	client, err := h.c.sharedClient()
+	if err != nil {
+		// Cannot happen in practice: Start opens it before any worker exists and
+		// fails there if it cannot, so by the time anything holds a bound
+		// context this has already succeeded.
+		h.c.log.Error("wings: shared streams unavailable", "err", err)
+		return nil
+	}
+	return client
 }
 
 // Parallel runs every index at once. A cluster has no ordering to protect —
