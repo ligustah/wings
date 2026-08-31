@@ -68,6 +68,21 @@ type Cluster struct {
 	pending map[string]*pendingJob
 	closed  bool
 
+	// epoch identifies THIS run of the coordinator, and is part of every name
+	// it mints.
+	//
+	// Names outlive the process that chose them: a worker's mirror stream is
+	// named after the worker and sits on a persistent Dir, and a job id appears
+	// in results that are still on a worker's queue. A counter that restarts at
+	// zero therefore hands a new worker a name whose stream already has a read
+	// position — so its results are skipped as already seen, and every job sent
+	// to it hangs. Reattachment made that reachable within one process, since
+	// recovered workers keep the names they were started with.
+	//
+	// Deliberately NOT stored. Its whole purpose is to differ from last time,
+	// and a value read back from disk is the one thing that cannot.
+	epoch string
+
 	nextID  atomic.Uint64
 	nextSeq atomic.Uint64
 }
@@ -191,6 +206,7 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		ctx:     runCtx,
 		cancel:  cancel,
 		pending: map[string]*pendingJob{},
+		epoch:   newEpoch(),
 	}
 
 	c.dir = cfg.Dir
@@ -215,7 +231,7 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.cleanupDir()
 		return nil, err
 	}
-	if c.journal, err = openJournal(ctx, client, log); err != nil {
+	if c.journal, err = openJournal(ctx, client, log, c.epoch); err != nil {
 		cancel()
 		_ = c.closeShared()
 		c.cleanupDir()
@@ -228,6 +244,8 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.cleanupDir()
 		return nil, err
 	}
+
+	c.journal.record(journalEntry{Kind: journalClusterStart})
 
 	fail := func(err error) (*Cluster, error) {
 		cancel()
@@ -312,7 +330,7 @@ func (c *Cluster) launch(ctx context.Context, n int) ([]*workerConn, error) {
 // after a worker is torn down would make two workers share a transactional id
 // on the broker, which fences the live one.
 func (c *Cluster) workerID(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, c.nextSeq.Add(1)-1)
+	return fmt.Sprintf("%s-%s-%d", prefix, c.epoch, c.nextSeq.Add(1)-1)
 }
 
 // connect wires a worker's streams onto a backend the coordinator can reach.
@@ -647,7 +665,7 @@ func (c *Cluster) pick() *workerConn {
 // submit places one job and returns a handle to its outcome.
 func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*pendingJob, error) {
 	job := jobEnvelope{
-		ID:      strconv.FormatUint(c.nextID.Add(1), 36),
+		ID:      c.epoch + "-" + strconv.FormatUint(c.nextID.Add(1), 36),
 		Func:    fnName,
 		Payload: payload,
 	}

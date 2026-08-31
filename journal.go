@@ -22,13 +22,14 @@ const journalStream = "wings.coordinator"
 
 // Journal entry kinds.
 const (
-	journalSubmitted   = "submitted"   // a job was accepted and sent to a worker
-	journalRedispatch  = "redispatch"  // a lost worker's job was sent somewhere else
-	journalCompleted   = "completed"   // a result came back
-	journalFailed      = "failed"      // the coordinator gave up on the job
-	journalWorkerUp    = "worker-up"   // a worker entered service
-	journalWorkerGone  = "worker-gone" // a worker left, one way or another
-	journalClusterStop = "stop"        // Stop was called
+	journalClusterStart = "start"       // a coordinator came up
+	journalSubmitted    = "submitted"   // a job was accepted and sent to a worker
+	journalRedispatch   = "redispatch"  // a lost worker's job was sent somewhere else
+	journalCompleted    = "completed"   // a result came back
+	journalFailed       = "failed"      // the coordinator gave up on the job
+	journalWorkerUp     = "worker-up"   // a worker entered service
+	journalWorkerGone   = "worker-gone" // a worker left, one way or another
+	journalClusterStop  = "stop"        // Stop was called
 )
 
 // journalEntry is one line in that account.
@@ -37,13 +38,17 @@ const (
 // own to somebody reading the stream after a crash, without holding the rest of
 // the log in their head.
 type journalEntry struct {
-	At      time.Time `json:"at"`
-	Kind    string    `json:"kind"`
-	Job     string    `json:"job,omitempty"`
-	Func    string    `json:"fn,omitempty"`
-	Worker  string    `json:"worker,omitempty"`
-	Attempt int       `json:"attempt,omitempty"`
-	Err     string    `json:"err,omitempty"`
+	At   time.Time `json:"at"`
+	Kind string    `json:"kind"`
+	// Epoch names the run of the coordinator that wrote this line. The record
+	// is append-only and survives the process, so several runs share it; this
+	// is what lets a reader tell them apart without parsing names.
+	Epoch   string `json:"epoch,omitempty"`
+	Job     string `json:"job,omitempty"`
+	Func    string `json:"fn,omitempty"`
+	Worker  string `json:"worker,omitempty"`
+	Attempt int    `json:"attempt,omitempty"`
+	Err     string `json:"err,omitempty"`
 
 	// Flow, Run, Thread and Step are set when the job was a step of a workflow
 	// rather than a bare call, and they are what make the record answerable at
@@ -74,6 +79,7 @@ func (e journalEntry) from(o invoke.Origin) journalEntry {
 type journal struct {
 	stream *dsclient.Stream[journalEntry]
 	log    *slog.Logger
+	epoch  string
 
 	ch   chan journalEntry
 	done chan struct{}
@@ -83,7 +89,7 @@ type journal struct {
 }
 
 // openJournal declares the stream and starts the writer.
-func openJournal(ctx context.Context, client *dsclient.Client, log *slog.Logger) (*journal, error) {
+func openJournal(ctx context.Context, client *dsclient.Client, log *slog.Logger, epoch string) (*journal, error) {
 	ok, err := client.StreamExists(ctx, journalStream)
 	if err != nil {
 		return nil, fmt.Errorf("wings: check %s: %w", journalStream, err)
@@ -101,6 +107,7 @@ func openJournal(ctx context.Context, client *dsclient.Client, log *slog.Logger)
 	j := &journal{
 		stream: s,
 		log:    log,
+		epoch:  epoch,
 		// Deep enough that an ordinary burst of submits never touches the
 		// bottom, shallow enough that a wedged writer cannot pin much memory.
 		ch:   make(chan journalEntry, 4096),
@@ -116,6 +123,7 @@ func (j *journal) record(e journalEntry) {
 		return
 	}
 	e.At = time.Now()
+	e.Epoch = j.epoch
 	select {
 	case j.ch <- e:
 	default:

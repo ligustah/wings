@@ -151,18 +151,29 @@ func (l *machineLog) workerFor(ctx context.Context, lease string) (string, error
 }
 
 // newLease mints an identity for a machine that does not exist yet.
+func newLease() string { return newToken(10) }
+
+// newEpoch mints an identity for one run of the coordinator.
 //
-// Lowercase alphanumeric and short, because it has to survive being embedded in
+// Shorter than a lease because it is a prefix on names people read, and its job
+// is only to differ from the last run rather than to be globally unique.
+func newEpoch() string { return newToken(6) }
+
+// newToken returns n random lowercase alphanumeric characters, beginning with a
+// letter.
+//
+// Lowercase alphanumeric because a token has to survive being embedded in
 // whatever a cloud calls a machine name — GCE wants RFC1035, and the provider
 // is the one that knows that, so what it gets handed must be safe everywhere.
-func newLease() string {
+// A leading letter for the same reason: several clouds refuse a name that
+// starts with a digit.
+func newToken(n int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 10)
+	b := make([]byte, n)
 	rand.Read(b)
 	for i := range b {
 		b[i] = alphabet[int(b[i])%len(alphabet)]
 	}
-	// Leading letter: several clouds refuse a name that starts with a digit.
 	b[0] = alphabet[int(b[0])%26]
 	return string(b)
 }

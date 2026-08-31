@@ -192,6 +192,17 @@ recording never becomes backpressure on the work. A full buffer drops entries
 rather than blocking a submit — and counts them, so a gap in the record is
 reported rather than silent.
 
+Every entry names the **coordinator run** that wrote it. The record is
+append-only and survives the process, so several runs share it, and a reader who
+cannot tell them apart cannot tell a job that is still outstanding from one a
+previous run finished. For the same reason every name a coordinator mints —
+worker ids, job ids — carries that run's short identifier: names outlive the
+process that chose them (a worker's mirror stream is named after the worker and
+sits on a persistent `Dir`), so a counter restarting at zero would hand a new
+worker a name whose stream already has a read position, and every job sent to it
+would go unanswered. That identifier is deliberately *not* stored: its whole
+purpose is to differ from last time.
+
 ### Machines outlive the coordinator
 
 A cloud machine does not stop existing because the process that asked for it
