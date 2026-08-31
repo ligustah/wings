@@ -198,3 +198,45 @@ func TestCreatingAnArtifactOutsideAJobIsAnError(t *testing.T) {
 		t.Fatal("want an error from Record with no job")
 	}
 }
+
+// Replay hands events out one at a time, so a reader that has seen enough stops
+// reading. A resume that wants the first ten minutes of a two-hour log should
+// not pay for the other hundred and ten.
+func TestReplayStopsWhenTheReaderDoes(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1})
+	ctx := c.Bind(t.Context())
+
+	art, err := simulate(ctx, 20_000)
+	if err != nil {
+		t.Fatalf("simulate: %v", err)
+	}
+	if art.Chunks < 3 {
+		t.Fatalf("the log is %d chunks; this test needs several", art.Chunks)
+	}
+
+	seen := 0
+	for ev, err := range Replay[Tick](ctx, art) {
+		if err != nil {
+			t.Fatalf("replay: %v", err)
+		}
+		if ev.At != seen {
+			t.Fatalf("event %d says it is %d", seen, ev.At)
+		}
+		seen++
+		if seen == 5 {
+			break
+		}
+	}
+	if seen != 5 {
+		t.Fatalf("read %d events after breaking at 5", seen)
+	}
+
+	// And the log is still whole afterwards: stopping is not consuming.
+	again := 0
+	for range Replay[Tick](ctx, art) {
+		again++
+	}
+	if again != 20_000 {
+		t.Fatalf("a second pass read %d events, want 20000", again)
+	}
+}
