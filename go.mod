@@ -25,7 +25,6 @@ require (
 	github.com/ligustah/durable_streams/broker/protos v0.34.0
 	github.com/ligustah/durable_streams/dsclient v0.44.0
 	github.com/ligustah/durable_streams/dswire v0.25.1
-	github.com/pkg/sftp v1.13.11
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.83.2
@@ -56,7 +55,6 @@ require (
 	github.com/hashicorp/raft v1.7.3 // indirect
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
-	github.com/kr/fs v0.1.0 // indirect
 	github.com/ligustah/commitlog v0.104.0 // indirect
 	github.com/ligustah/durable_streams v0.141.0 // indirect
 	github.com/ligustah/durable_streams/dsembedded v0.77.0 // indirect

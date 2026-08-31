@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -289,8 +290,8 @@ type gcpMachine struct {
 
 func (m *gcpMachine) ID() string { return m.name }
 
-func (m *gcpMachine) Upload(ctx context.Context, localPath, remotePath string) error {
-	return m.ssh.Upload(ctx, localPath, remotePath)
+func (m *gcpMachine) Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error {
+	return m.ssh.Upload(ctx, src, size, remotePath)
 }
 
 func (m *gcpMachine) Start(ctx context.Context, cmd string, env map[string]string) error {

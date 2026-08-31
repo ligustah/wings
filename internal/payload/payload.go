@@ -17,8 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 )
 
@@ -61,6 +59,11 @@ func Info() (Meta, bool) {
 }
 
 // Get decompresses the embedded worker.
+//
+// Bytes, not a file. The worker is uploaded once per machine and the machines
+// are deployed to in parallel, so it is decompressed once here and each upload
+// reads from that one copy — there is never a reason to write 30-odd MB to the
+// coordinator's disk merely to have a path to hand to something.
 func Get() ([]byte, Meta, error) {
 	mu.RLock()
 	gz, m := compressed, meta
@@ -81,24 +84,4 @@ func Get() ([]byte, Meta, error) {
 	}
 	m.Size = int64(len(worker))
 	return worker, m, nil
-}
-
-// ExtractTo writes the embedded worker into dir and returns its path.
-//
-// Written to a file rather than streamed because it is uploaded once per
-// machine, in parallel, and decompressing it once beats decompressing it n
-// times.
-func ExtractTo(dir string) (string, Meta, error) {
-	worker, m, err := Get()
-	if err != nil {
-		return "", m, err
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", m, fmt.Errorf("wings: extract dir: %w", err)
-	}
-	out := filepath.Join(dir, "wings-worker")
-	if err := os.WriteFile(out, worker, 0o755); err != nil {
-		return "", m, fmt.Errorf("wings: write extracted worker: %w", err)
-	}
-	return out, m, nil
 }

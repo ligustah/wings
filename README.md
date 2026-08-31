@@ -195,6 +195,15 @@ Nothing wings starts is reachable from the internet, and no firewall rule is
 needed. An ephemeral ed25519 keypair is minted per run and installed via
 instance metadata; nothing wings creates outlives the cluster.
 
+The worker goes up **straight from memory** — it is decompressed once and each
+machine's upload reads from that one copy, so nothing is written to the
+coordinator's disk merely to have a path to hand to something. The transfer
+speaks the scp source protocol over an ordinary exec channel rather than using
+SFTP, because SFTP is a *subsystem* an SSH server need not offer, while running
+a command is a capability wings already depends on to start the worker at all.
+The protocol carries the size, so a connection that dies mid-copy is an error
+rather than a truncated executable that fails confusingly later.
+
 ## Delivery semantics
 
 **At-least-once.** A worker owns the queue of work assigned to it, so when one
@@ -261,7 +270,7 @@ type Provisioner interface {
 
 type Machine interface {
     ID() string
-    Upload(ctx context.Context, localPath, remotePath string) error
+    Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error
     Start(ctx context.Context, cmd string, env map[string]string) error
     Forward(ctx context.Context, remotePort int) (localAddr string, err error)
     Close(ctx context.Context) error

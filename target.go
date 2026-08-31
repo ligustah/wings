@@ -1,6 +1,9 @@
 package wings
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // Provisioner creates machines for wings to run workers on.
 //
@@ -23,9 +26,15 @@ type Machine interface {
 	// within one run is enough.
 	ID() string
 
-	// Upload copies a local file to remotePath, creating parent directories,
-	// and makes it executable.
-	Upload(ctx context.Context, localPath, remotePath string) error
+	// Upload writes size bytes from src to remotePath, creating parent
+	// directories, and makes it executable.
+	//
+	// A reader rather than a path because the thing being uploaded is usually
+	// the worker embedded in the coordinator, which is already in memory: a
+	// path would mean writing 30-odd MB to disk for no reason but to have
+	// something to name. Implementations must not assume src is seekable, and
+	// must read exactly size bytes from it.
+	Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error
 
 	// Start launches cmd in the background with env set, and returns as soon as
 	// it is running rather than waiting for it to exit.

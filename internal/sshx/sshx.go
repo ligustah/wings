@@ -7,18 +7,17 @@
 package sshx
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -103,42 +102,141 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 }
 
-// Upload copies localPath to remotePath, creating parent directories and
-// marking the result executable.
-func (c *Client) Upload(ctx context.Context, localPath, remotePath string) error {
-	src, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("ssh upload: open %s: %w", localPath, err)
-	}
-	defer src.Close()
-
-	sc, err := sftp.NewClient(c.conn)
-	if err != nil {
-		return fmt.Errorf("ssh upload: sftp: %w", err)
-	}
-	defer sc.Close()
-
+// Upload streams size bytes from src to remotePath, creating parent
+// directories and marking the result executable.
+//
+// It speaks the scp source protocol over an ordinary exec channel, which is
+// what scp itself has always done on the wire: run `scp -t <path>` on the far
+// side and hand it a header and the bytes. That is deliberate rather than
+// nostalgic — SFTP is a SUBSYSTEM, and an SSH server is under no obligation to
+// offer it. Plenty do not: a hardened image with `Subsystem sftp` commented
+// out, a container running dropbear, anything minimal. Every one of those still
+// runs commands, which is a capability wings depends on anyway to start the
+// worker at all. So this asks for nothing the rest of the deployment does not
+// already need.
+//
+// The size is required because the protocol sends it in the header, and that
+// is a feature: the far end knows exactly how many bytes to expect, so a
+// connection that dies mid-copy is an error here instead of a truncated
+// executable that fails confusingly later.
+func (c *Client) Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error {
+	// scp -t does not create directories. Cheap, and it needs only the shell.
 	if dir := path.Dir(remotePath); dir != "." && dir != "/" {
-		if err := sc.MkdirAll(dir); err != nil {
+		if _, err := c.Run(ctx, "mkdir -p "+shellQuote(dir)); err != nil {
 			return fmt.Errorf("ssh upload: mkdir %s: %w", dir, err)
 		}
 	}
 
-	dst, err := sc.Create(remotePath)
+	sess, err := c.conn.NewSession()
 	if err != nil {
-		return fmt.Errorf("ssh upload: create %s: %w", remotePath, err)
+		return fmt.Errorf("ssh upload: session: %w", err)
 	}
-	if _, err := io.Copy(dst, src); err != nil {
-		dst.Close()
-		return fmt.Errorf("ssh upload: write %s: %w", remotePath, err)
+	defer sess.Close()
+
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("ssh upload: stdin: %w", err)
 	}
-	if err := dst.Close(); err != nil {
-		return fmt.Errorf("ssh upload: close %s: %w", remotePath, err)
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("ssh upload: stdout: %w", err)
 	}
-	if err := sc.Chmod(remotePath, 0o755); err != nil {
-		return fmt.Errorf("ssh upload: chmod %s: %w", remotePath, err)
+	// The sink reports trouble on stdout as a protocol ack; stderr is where the
+	// remote scp puts anything it could not say that way, such as not existing.
+	var stderr strings.Builder
+	sess.Stderr = &stderr
+
+	if err := sess.Start("scp -t " + shellQuote(remotePath)); err != nil {
+		return fmt.Errorf("ssh upload: start remote scp: %w", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = sess.Signal(ssh.SIGKILL)
+			_ = sess.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	fail := func(err error) error {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("ssh upload %s: %w: %s", remotePath, err, msg)
+		}
+		return fmt.Errorf("ssh upload %s: %w", remotePath, err)
+	}
+
+	if err := scpSend(stdin, stdout, src, size, path.Base(remotePath)); err != nil {
+		return fail(err)
+	}
+
+	// Closing stdin ends the transfer; the remote scp then exits.
+	if err := stdin.Close(); err != nil {
+		return fail(fmt.Errorf("close: %w", err))
+	}
+	if err := sess.Wait(); err != nil {
+		return fail(fmt.Errorf("remote scp: %w", err))
 	}
 	return nil
+}
+
+// scpSend is the protocol itself, with the session plumbing left outside.
+//
+// Separated so it can be tested against a fake sink. A wire protocol that only
+// runs when a real VM is on the other end is a protocol that is never tested,
+// and this one has an ordering that is easy to get subtly wrong.
+func scpSend(w io.Writer, acks io.Reader, src io.Reader, size int64, name string) error {
+	ack := bufio.NewReader(acks)
+
+	// The sink acks first, to say it is ready for a header.
+	if err := readAck(ack); err != nil {
+		return err
+	}
+
+	// C<mode> <size> <name>. The name matters only when the remote path turns
+	// out to be a directory; otherwise the sink writes to the path it was given.
+	if _, err := fmt.Fprintf(w, "C0755 %d %s\n", size, name); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+	if err := readAck(ack); err != nil {
+		return err
+	}
+
+	// CopyN, not Copy: sending fewer bytes than the header promised would leave
+	// the sink waiting, and sending more would desynchronise the protocol.
+	if n, err := io.CopyN(w, src, size); err != nil {
+		return fmt.Errorf("write body after %d of %d bytes: %w", n, size, err)
+	}
+	// A zero byte terminates the file and asks for the final ack.
+	if _, err := w.Write([]byte{0}); err != nil {
+		return fmt.Errorf("terminate transfer: %w", err)
+	}
+	return readAck(ack)
+}
+
+// readAck reads one scp protocol acknowledgement.
+//
+// 0 is success. 1 is a warning and 2 is fatal, each followed by a message
+// terminated by a newline — and we treat both as failures, because the only
+// thing being uploaded is the binary the whole machine exists to run.
+func readAck(r *bufio.Reader) error {
+	code, err := r.ReadByte()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("remote scp closed the connection; is scp installed on the machine?")
+		}
+		return fmt.Errorf("read ack: %w", err)
+	}
+	if code == 0 {
+		return nil
+	}
+	msg, err := r.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("remote scp reported status %d, and its message could not be read: %w", code, err)
+	}
+	return fmt.Errorf("remote scp: %s", strings.TrimSpace(msg))
 }
 
 // Run executes cmd and returns its combined output, waiting for it to finish.
