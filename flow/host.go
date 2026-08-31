@@ -114,10 +114,14 @@ func (h host) Parallel(ctx context.Context, n int, body func(context.Context, in
 	children := make([]*threadState, n)
 	for i := range n {
 		children[i] = parent.fork()
-		record(parent, &protos.ForkEvent{
-			ParentThreadId: parent.id,
-			ThreadId:       children[i].id,
-		})
+		if err := recordFork(parent, children[i]); err != nil {
+			// A mismatch here is fatal for the whole fan-out: the children are
+			// named in order, so the rest of them are wrong too.
+			for j := range n {
+				errs[j] = err
+			}
+			return errs
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -138,7 +142,9 @@ func (h host) Parallel(ctx context.Context, n int, body func(context.Context, in
 	// Joins are recorded after the fact, in index order rather than completion
 	// order — for the same reason the forks were.
 	for i := range n {
-		record(parent, &protos.JoinEvent{ThreadId: children[i].id})
+		if err := recordJoin(parent, children[i]); err != nil && errs[i] == nil {
+			errs[i] = err
+		}
 	}
 	return errs
 }

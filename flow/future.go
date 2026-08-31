@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/ligustah/wings"
-	"github.com/ligustah/wings/flow/protos"
 	"github.com/ligustah/wings/internal/invoke"
 )
 
@@ -51,7 +50,11 @@ func Go[In, Out any](ctx context.Context, f wings.Func[In, Out], in In) *Future[
 
 	child := parent.fork()
 	fut.parent, fut.child = parent, child
-	record(parent, &protos.ForkEvent{ParentThreadId: parent.id, ThreadId: child.id})
+	if err := recordFork(parent, child); err != nil {
+		fut.err = err
+		close(fut.done)
+		return fut
+	}
 
 	go func() {
 		defer close(fut.done)
@@ -88,7 +91,9 @@ func (f *Future[Out]) Await(ctx context.Context) (Out, error) {
 		return zero, ctx.Err()
 	}
 
-	record(f.parent, &protos.JoinEvent{ThreadId: f.child.id})
+	if err := recordJoin(f.parent, f.child); err != nil {
+		return zero, err
+	}
 	if f.err != nil {
 		return zero, f.err
 	}

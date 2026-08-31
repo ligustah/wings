@@ -151,6 +151,45 @@ func (t *threadState) fork() *threadState {
 	return &threadState{id: id, run: t.run}
 }
 
+// recordFork consumes the fork already in history, or records a new one.
+//
+// Consuming matters. Forks and joins are events like any other, and a replay
+// that appends them again grows the history by a fork and a join per parallel
+// call per attempt — and then the log claims the workflow forked more threads
+// than it did, which is a lie told to whoever reads it after a failure.
+func recordFork(parent, child *threadState) error {
+	ev, err := expect[*protos.ForkEvent](parent)
+	if err != nil {
+		return err
+	}
+	if ev != nil {
+		if ev.GetThreadId() != child.id {
+			return continuityf("thread %q previously forked %q at this point, but is now forking %q",
+				parent.id, ev.GetThreadId(), child.id)
+		}
+		return parent.run.err()
+	}
+	record(parent, &protos.ForkEvent{ParentThreadId: parent.id, ThreadId: child.id})
+	return parent.run.err()
+}
+
+// recordJoin is recordFork for the other end.
+func recordJoin(parent, child *threadState) error {
+	ev, err := expect[*protos.JoinEvent](parent)
+	if err != nil {
+		return err
+	}
+	if ev != nil {
+		if ev.GetThreadId() != child.id {
+			return continuityf("thread %q previously joined %q at this point, but is now joining %q",
+				parent.id, ev.GetThreadId(), child.id)
+		}
+		return parent.run.err()
+	}
+	record(parent, &protos.JoinEvent{ThreadId: child.id})
+	return parent.run.err()
+}
+
 // err reports the first persistence failure of the run, if any.
 func (r *runState) err() error {
 	r.mu.Lock()

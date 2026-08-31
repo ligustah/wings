@@ -453,3 +453,49 @@ func TestRunRequiresAStore(t *testing.T) {
 		t.Fatal("want an error when no Store is given")
 	}
 }
+
+// A replayed fork must be RECOGNISED, not recorded again. Nothing about the
+// result goes wrong if it is — the cursor still advances one per operation
+// either way — but the history grows by a fork and a join per parallel call per
+// attempt, and it then claims the workflow forked more threads than it did.
+// A long-lived workflow that retries is exactly where that compounds.
+func TestReplayDoesNotDuplicateForkAndJoinEvents(t *testing.T) {
+	ctx := cluster(t)
+	store := flow.NewMemStore()
+	instance := flow.NewInstance()
+
+	var attempts atomic.Int64
+	wf := flow.Define("t.forkdup", func(ctx context.Context, in []int) ([]int, error) {
+		outs, err := wings.Map(ctx, double, in)
+		if err != nil {
+			return nil, err
+		}
+		if attempts.Add(1) < 3 {
+			return nil, errors.New("fail twice, after the fan-out")
+		}
+		return outs, nil
+	}, flow.Backoff(time.Millisecond, time.Millisecond))
+
+	if _, err := flow.Run(ctx, wf, instance, []int{1, 2, 3}, flow.WithStore(store)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	events, err := store.Events(context.Background(), "t.forkdup", instance)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+
+	var forks, joins int
+	for _, ev := range events {
+		if ev.GetFork() != nil {
+			forks++
+		}
+		if ev.GetJoin() != nil {
+			joins++
+		}
+	}
+	if forks != 3 || joins != 3 {
+		t.Fatalf("history records %d forks and %d joins after 3 attempts over 3 inputs; "+
+			"want 3 of each — a replayed fork must be recognised, not appended again", forks, joins)
+	}
+}
