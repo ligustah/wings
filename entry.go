@@ -155,7 +155,11 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		os.Exit(1)
 	}
 
-	runErr := opts.Coordinate(ctx, c)
+	// Bound, so a work function called inside Coordinate dispatches to this
+	// cluster without being told about it. That is the whole reason a work
+	// function is callable rather than something you pass to a method: the
+	// context already knows where work goes.
+	runErr := opts.Coordinate(c.Bind(ctx), c)
 	stopErr := c.Stop(context.Background())
 
 	if runErr != nil {

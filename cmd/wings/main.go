@@ -13,7 +13,7 @@
 //
 //	// Coordinate is called once, with a cluster that is already up.
 //	func Coordinate(ctx context.Context, c *wings.Cluster) error {
-//		imgs, err := c.Map(ctx, Render, frames)
+//		imgs, err := wings.Map(ctx, Render, frames)
 //		…
 //	}
 //

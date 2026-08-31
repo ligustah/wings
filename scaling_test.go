@@ -127,7 +127,7 @@ func TestAutoscaleAddsWorkersUnderLoad(t *testing.T) {
 
 	done := make(chan []string, 1)
 	go func() {
-		got, err := c.Map(t.Context(), slow, in)
+		got, err := Map(c.Bind(t.Context()), slow, in)
 		if err != nil {
 			t.Errorf("Map: %v", err)
 		}
@@ -177,7 +177,7 @@ func TestAutoscaleRetiresIdleWorkers(t *testing.T) {
 	for i := range in {
 		in[i] = 150 * time.Millisecond
 	}
-	if _, err := c.Map(t.Context(), slow, in); err != nil {
+	if _, err := Map(c.Bind(t.Context()), slow, in); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 
@@ -186,7 +186,7 @@ func TestAutoscaleRetiresIdleWorkers(t *testing.T) {
 	}
 
 	// And the cluster must still work afterwards.
-	got, err := c.Call(t.Context(), double, 21)
+	got, err := double(c.Bind(t.Context()), 21)
 	if err != nil {
 		t.Fatalf("Call after scale-down: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestScaleDownNeverDropsWork(t *testing.T) {
 			in[i] = round*100 + i
 			want[i] = in[i] * 2
 		}
-		got, err := c.Map(t.Context(), double, in)
+		got, err := Map(c.Bind(t.Context()), double, in)
 		if err != nil {
 			t.Fatalf("round %d: Map: %v", round, err)
 		}
@@ -255,7 +255,7 @@ func TestAutoscaleWorksOnTheLocalTarget(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if _, err := c.Map(t.Context(), slow, in); err != nil {
+		if _, err := Map(c.Bind(t.Context()), slow, in); err != nil {
 			t.Errorf("Map: %v", err)
 		}
 	}()

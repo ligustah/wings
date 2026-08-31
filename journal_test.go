@@ -70,7 +70,7 @@ func TestCoordinatorJournalsEveryJob(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Concurrency: 2})
 
 	in := []int{1, 2, 3, 4, 5, 6, 7, 8}
-	if _, err := c.Map(t.Context(), double, in); err != nil {
+	if _, err := Map(c.Bind(t.Context()), double, in); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 
@@ -119,7 +119,7 @@ func TestCoordinatorJournalsEveryJob(t *testing.T) {
 func TestJournalCarriesTheFailure(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	if _, err := c.Call(t.Context(), boom, "kaboom"); err == nil {
+	if _, err := boom(c.Bind(t.Context()), "kaboom"); err == nil {
 		t.Fatal("want an error from the failing work function")
 	}
 

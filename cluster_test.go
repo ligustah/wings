@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ligustah/durable_streams/dswire"
 )
 
 // TestMain lets the test binary be its own worker.
@@ -72,7 +74,7 @@ func start(t *testing.T, cfg Config) *Cluster {
 func TestInProcessCall(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	got, err := c.Call(t.Context(), double, 21)
+	got, err := double(c.Bind(t.Context()), 21)
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
@@ -86,7 +88,7 @@ func TestInProcessCall(t *testing.T) {
 func TestStructInput(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	got, err := c.Call(t.Context(), sum, point{X: 3, Y: 4})
+	got, err := sum(c.Bind(t.Context()), point{X: 3, Y: 4})
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
@@ -108,7 +110,7 @@ func TestMapPreservesOrder(t *testing.T) {
 		want[i] = i * 2
 	}
 
-	got, err := c.Map(t.Context(), double, in)
+	got, err := Map(c.Bind(t.Context()), double, in)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -123,7 +125,7 @@ func TestMapPreservesOrder(t *testing.T) {
 func TestWorkFunctionErrorPropagates(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	_, err := c.Call(t.Context(), boom, "input")
+	_, err := boom(c.Bind(t.Context()), "input")
 	if err == nil {
 		t.Fatal("want an error, got nil")
 	}
@@ -137,14 +139,14 @@ func TestWorkFunctionErrorPropagates(t *testing.T) {
 func TestPanicDoesNotKillTheWorker(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	if _, err := c.Call(t.Context(), panics, 1); err == nil {
+	if _, err := panics(c.Bind(t.Context()), 1); err == nil {
 		t.Fatal("want an error from the panicking function, got nil")
 	} else if !strings.Contains(err.Error(), "panicked") {
 		t.Fatalf("error should say it panicked: %v", err)
 	}
 
 	// The worker must still be serving.
-	got, err := c.Call(t.Context(), double, 5)
+	got, err := double(c.Bind(t.Context()), 5)
 	if err != nil {
 		t.Fatalf("worker died with the panic: %v", err)
 	}
@@ -156,7 +158,7 @@ func TestPanicDoesNotKillTheWorker(t *testing.T) {
 func TestJobTimeout(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), JobTimeout: 100 * time.Millisecond})
 
-	_, err := c.Call(t.Context(), slow, 10*time.Second)
+	_, err := slow(c.Bind(t.Context()), 10*time.Second)
 	if err == nil {
 		t.Fatal("want a timeout error, got nil")
 	}
@@ -181,7 +183,7 @@ func TestLocalProcessTargetMatchesInProcess(t *testing.T) {
 		want[i] = i * 2
 	}
 
-	got, err := c.Map(t.Context(), double, in)
+	got, err := Map(c.Bind(t.Context()), double, in)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -189,7 +191,7 @@ func TestLocalProcessTargetMatchesInProcess(t *testing.T) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 
-	if _, err := c.Call(t.Context(), boom, "remote"); err == nil ||
+	if _, err := boom(c.Bind(t.Context()), "remote"); err == nil ||
 		!strings.Contains(err.Error(), "deliberate failure: remote") {
 		t.Fatalf("error did not survive the process boundary: %v", err)
 	}
@@ -200,12 +202,14 @@ func TestLocalProcessTargetMatchesInProcess(t *testing.T) {
 func TestUnknownFunctionIsReported(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	ghost := &Func[int, int]{
+	// Built directly rather than through Define, because Define would register
+	// it — and then it would not be missing.
+	ghost := &def[int, int]{
 		name:     "test.not-registered",
-		inCodec:  double.inCodec,
-		outCodec: double.outCodec,
+		inCodec:  dswire.ReflectCodec[int]{},
+		outCodec: dswire.ReflectCodec[int]{},
 	}
-	_, err := c.Call(t.Context(), ghost, 1)
+	_, err := ghost.dispatch(c.Bind(t.Context()), 1)
 	if err == nil {
 		t.Fatal("want an error for an unregistered function")
 	}
@@ -221,7 +225,7 @@ func TestUnknownFunctionIsReported(t *testing.T) {
 func TestMapEmptyInput(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	got, err := c.Map(t.Context(), double, nil)
+	got, err := Map(c.Bind(t.Context()), double, nil)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -263,7 +267,7 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 
 	started := time.Now()
-	got, err := c.Map(t.Context(), slow, in)
+	got, err := Map(c.Bind(t.Context()), slow, in)
 	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
@@ -290,7 +294,7 @@ func ExampleDefine() {
 	}
 	defer c.Stop(context.Background())
 
-	out, err := c.Map(context.Background(), greet, []string{"ada", "alan"})
+	out, err := Map(c.Bind(context.Background()), greet, []string{"ada", "alan"})
 	if err != nil {
 		panic(err)
 	}

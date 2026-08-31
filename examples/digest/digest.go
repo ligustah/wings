@@ -78,7 +78,7 @@ func Coordinate(ctx context.Context, c *wings.Cluster) error {
 	}
 
 	start := time.Now()
-	results, err := c.Map(ctx, Digest, work)
+	results, err := wings.Map(ctx, Digest, work)
 	elapsed := time.Since(start)
 	if err != nil {
 		return err

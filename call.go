@@ -5,92 +5,51 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ligustah/durable_streams/dswire"
+	"github.com/ligustah/wings/internal/invoke"
 )
 
-// Call runs f on a worker and returns its result.
-//
-// The error is whatever the work function returned, reconstructed on this side
-// as a plain error: the value does not survive the trip, only its message, so
-// match on content rather than identity across a worker boundary.
-func (c *Cluster) Call[In, Out any](ctx context.Context, f *Func[In, Out], in In) (Out, error) {
-	var zero Out
-
-	payload, err := dswire.EncodeRecord(f.inCodec, in)
-	if err != nil {
-		return zero, fmt.Errorf("wings: encode input for %q: %w", f.name, err)
-	}
-
-	p, err := c.submit(ctx, f.name, payload)
-	if err != nil {
-		return zero, err
-	}
-	res, err := c.await(ctx, p)
-	if err != nil {
-		return zero, err
-	}
-	return decodeResult(f, res)
-}
-
-// Map runs f on every input, spread across the workers, and returns the results
-// in the order the inputs were given.
+// Map runs f on every input and returns the results in the order the inputs
+// were given.
 //
 // Every input is dispatched before any result is waited on, so the work is
 // actually in flight in parallel rather than merely submitted in a loop.
 //
-// If some inputs fail, the successful outputs are still returned in their
-// places and the error joins every failure, each naming its index. Check the
-// error before trusting a position you did not verify.
-func (c *Cluster) Map[In, Out any](ctx context.Context, f *Func[In, Out], ins []In) ([]Out, error) {
+// The parallelism comes from the context's host rather than from goroutines
+// started here, which is what makes this work unchanged inside a workflow: a
+// cluster runs the calls concurrently, while a workflow forks a thread per index
+// so the event log comes out in the same order every attempt. Written with `go`
+// instead, this function would be correct on a cluster and would quietly destroy
+// replay in a workflow.
+//
+// If some inputs fail, the successful outputs are still returned in their places
+// and the error joins every failure, each naming its index. Check the error
+// before trusting a position you did not verify.
+func Map[In, Out any](ctx context.Context, f Func[In, Out], ins []In) ([]Out, error) {
 	outs := make([]Out, len(ins))
 	if len(ins) == 0 {
 		return outs, nil
 	}
 
-	pending := make([]*pendingJob, len(ins))
-	var errs []error
-
-	for i, in := range ins {
-		payload, err := dswire.EncodeRecord(f.inCodec, in)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("wings: input %d: encode: %w", i, err))
-			continue
-		}
-		p, err := c.submit(ctx, f.name, payload)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("wings: input %d: %w", i, err))
-			continue
-		}
-		pending[i] = p
+	host := invoke.From(ctx)
+	if host == nil {
+		return outs, errors.New("wings: Map was called on a context that is not bound to a cluster " +
+			"or a workflow; use the context Coordinate was given, or Cluster.Bind")
 	}
 
-	for i, p := range pending {
-		if p == nil {
-			continue
-		}
-		res, err := c.await(ctx, p)
+	errs := host.Parallel(ctx, len(ins), func(ctx context.Context, i int) error {
+		out, err := f(ctx, ins[i])
 		if err != nil {
-			errs = append(errs, fmt.Errorf("wings: input %d: %w", i, err))
-			continue
-		}
-		out, err := decodeResult(f, res)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("wings: input %d: %w", i, err))
-			continue
+			return err
 		}
 		outs[i] = out
-	}
-	return outs, errors.Join(errs...)
-}
+		return nil
+	})
 
-func decodeResult[In, Out any](f *Func[In, Out], res resultEnvelope) (Out, error) {
-	var zero Out
-	if res.Error != "" {
-		return zero, errors.New(res.Error)
+	var joined []error
+	for i, err := range errs {
+		if err != nil {
+			joined = append(joined, fmt.Errorf("wings: input %d: %w", i, err))
+		}
 	}
-	out, err := dswire.DecodeRecord(f.outCodec, res.Payload)
-	if err != nil {
-		return zero, fmt.Errorf("wings: decode output for %q: %w", f.name, err)
-	}
-	return out, nil
+	return outs, errors.Join(joined...)
 }

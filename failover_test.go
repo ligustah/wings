@@ -37,7 +37,7 @@ func TestWorkSurvivesAWorkerBeingKilled(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		got, err := c.Map(t.Context(), slow, in)
+		got, err := Map(c.Bind(t.Context()), slow, in)
 		done <- outcome{got, err}
 	}()
 
@@ -99,7 +99,7 @@ func TestCallWithNoLiveWorkersFails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	if _, err := c.Call(ctx, double, 1); err == nil {
+	if _, err := double(c.Bind(ctx), 1); err == nil {
 		t.Fatal("want an error when no worker is live, got nil")
 	}
 }

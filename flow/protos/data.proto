@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package wings.flow.v1;
+
+option go_package = "github.com/ligustah/wings/flow/protos";
+
+enum Encoding {
+  JSON = 0;
+  PROTOBUF = 1;
+  TEXT = 2;
+  BINARY = 3;
+  CUSTOM = 4;
+}
+
+message Data {
+  bytes serialized = 1;
+  Encoding encoding = 2;
+}
+
+message Error {
+  string message = 1;
+  Data context = 2;
+}
+
+message Result {
+  oneof payload {
+    Data data = 1;
+    Error error = 2;
+  }
+}

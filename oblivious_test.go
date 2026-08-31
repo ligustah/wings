@@ -93,7 +93,7 @@ func TestTargetsProduceIdenticalResults(t *testing.T) {
 	run := func(target Target, workers int) []int {
 		t.Helper()
 		c := start(t, Config{Target: target, Workers: workers, Concurrency: 3})
-		got, err := c.Map(t.Context(), double, in)
+		got, err := Map(c.Bind(t.Context()), double, in)
 		if err != nil {
 			t.Fatalf("Map: %v", err)
 		}
@@ -135,7 +135,7 @@ func TestWorkFunctionSeesTheSameContextShapeEverywhere(t *testing.T) {
 			// A deadline set by the coordinator must reach the work function
 			// identically on both, since JobTimeout is the only deadline wings
 			// imposes and it is configured, not inferred from the target.
-			got, err := c.Call(t.Context(), reportsDeadline, 0)
+			got, err := reportsDeadline(c.Bind(t.Context()), 0)
 			if err != nil {
 				t.Fatalf("Call: %v", err)
 			}
@@ -171,7 +171,7 @@ func TestJobTimeoutAppliesOnEveryTarget(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := start(t, Config{Target: tc.target, Workers: 1, JobTimeout: 100 * time.Millisecond})
 
-			if _, err := c.Call(t.Context(), slow, 10*time.Second); err == nil {
+			if _, err := slow(c.Bind(t.Context()), 10*time.Second); err == nil {
 				t.Fatal("want a timeout, got nil")
 			} else if !strings.Contains(err.Error(), "deadline exceeded") {
 				t.Fatalf("want a deadline error, got: %v", err)

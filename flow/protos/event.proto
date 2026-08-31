@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package wings.flow.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+import "flow/protos/data.proto";
+
+option go_package = "github.com/ligustah/wings/flow/protos";
+
+/*
+  There are various kinds of events that are emitted during execution of a
+  workflow. Each has a timestamp and a serial, ensuring that deterministic
+  behavior can be verified.
+
+  Every event also names the thread it belongs to. In the project this schema
+  came from, threads were a map<string, Thread> inside the run and the whole run
+  was rewritten on each checkpoint; here the run IS the stream of its events, so
+  an event has to say where it belongs rather than being filed by its position
+  in a blob. That is what lets a checkpoint be an append of one record instead
+  of a rewrite of everything so far.
+ */
+message Event {
+  google.protobuf.Timestamp timestamp = 1;
+
+  // Position of this event within its thread, counting from zero. Replay
+  // consumes a thread's events in this order and compares each against what the
+  // workflow function is doing now.
+  uint64 serial = 2;
+
+  // The run that produced this event. Events from an abandoned attempt stay in
+  // the stream, so this is how a reader tells them apart.
+  uint64 attempt = 3;
+
+  // The thread this event belongs to. "main" is the thread the workflow
+  // function itself runs on; forked threads are named "<parent>.<n>".
+  string thread_id = 4;
+
+  oneof payload {
+    JoinEvent join = 20;
+    CallEvent call = 21;
+    ForkEvent fork = 22;
+    SleepEvent sleep = 23;
+    GetTimeEvent time = 24;
+    ReturnEvent return = 25;
+    RunStartEvent run_start = 26;
+    RunEndEvent run_end = 27;
+  }
+}
+
+message CallEvent {
+  string name = 1;
+  Data params = 2;
+}
+
+message ForkEvent {
+  // The parent thread that is executing the fork
+  string parent_thread_id = 1;
+
+  // The thread id of the new thread
+  string thread_id = 2;
+}
+
+message JoinEvent {
+  // The thread id that is being joined
+  string thread_id = 1;
+}
+
+message SleepEvent {
+  // The duration for which the workflow is sleeping
+  google.protobuf.Duration duration = 1;
+}
+
+message GetTimeEvent {
+  // The time at which the event was emitted
+  google.protobuf.Timestamp time = 1;
+}
+
+message ReturnEvent {
+  // The result of the call
+  Result result = 1;
+
+  // The serial of the call event for which this is the return
+  uint64 call_serial = 2;
+}
+
+enum StartReason {
+  START_REASON_UNKNOWN = 0;
+  START_REASON_INIT = 1;
+  START_REASON_RESUME = 2;
+  START_REASON_RETRY = 3;
+}
+
+// RunStartEvent opens an attempt. It carries everything needed to begin, so a
+// reader of the stream alone can tell what was run and with what.
+message RunStartEvent {
+  uint64 attempt = 1;
+  StartReason reason = 2;
+  string workflow_name = 3;
+  string instance_id = 4;
+  uint64 version = 5;
+  Data input = 6;
+}
+
+// RunEndEvent closes an attempt, and says what became of it.
+message RunEndEvent {
+  WorkflowStatus status = 1;
+  Result result = 2;
+
+  // When the next attempt should begin, for a run that is backing off or
+  // suspended. Unset otherwise.
+  google.protobuf.Timestamp scheduled_for = 3;
+}
+
+/**
+* The `WorkflowStatus` enum represents the status of a workflow run.
+*/
+enum WorkflowStatus {
+  // The status of the workflow is unknown. This is the default value.
+  WORKFLOW_STATUS_UNKNOWN = 0;
+
+  // The workflow is currently running.
+  WORKFLOW_STATUS_RUNNING = 1;
+
+  // The workflow has successfully finished.
+  WORKFLOW_STATUS_COMPLETED = 2;
+
+  // The workflow has permanently failed to complete.
+  WORKFLOW_STATUS_FAILED = 3;
+
+  // The workflow is temporarily on hold.
+  WORKFLOW_STATUS_SUSPENDED = 4;
+
+  // The workflow is in backoff state due to a failed attempt.
+  WORKFLOW_STATUS_BACKOFF = 5;
+
+  // The workflow has been added to a queue, and is waiting to get executed.
+  WORKFLOW_STATUS_QUEUED = 6;
+
+  // The workflow has been cancelled.
+  WORKFLOW_STATUS_CANCELLED = 7;
+}
