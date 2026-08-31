@@ -39,11 +39,50 @@ type Future[Out any] struct {
 // For a fan-out over a slice, prefer [wings.Map]: it forks the same way and
 // keeps the results in order.
 func Go[In, Out any](ctx context.Context, f wings.Func[In, Out], in In) *Future[Out] {
+	return spawn(ctx, "Go", func(ctx context.Context) (Out, error) {
+		return f(ctx, in)
+	})
+}
+
+// Spawn runs body on a workflow thread of its own and returns immediately.
+//
+// This is [Go] for a piece of workflow code rather than a single work function:
+// body may call work functions, sleep, use a [Channel], fork further threads —
+// anything the workflow function itself may do. It is what makes channels worth
+// having, since a channel between threads needs threads that do more than one
+// thing.
+//
+//	ch := flow.NewChannel[int](ctx)
+//	producer := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
+//	    for _, item := range work {
+//	        v, err := Digest(ctx, item)
+//	        if err != nil {
+//	            return 0, err
+//	        }
+//	        if err := ch.Send(ctx, v); err != nil {
+//	            return 0, err
+//	        }
+//	    }
+//	    return 0, ch.Close(ctx)
+//	})
+//
+// Use this rather than a bare goroutine, for the reason [Go] gives: the thread
+// it forks is named deterministically, and a goroutine's is not.
+//
+// body must be given the context IT receives, not the one Spawn was called
+// with. The child thread is bound to it, and code that uses the outer context
+// records on the parent thread instead — which replay will then find in the
+// wrong order.
+func Spawn[Out any](ctx context.Context, body func(ctx context.Context) (Out, error)) *Future[Out] {
+	return spawn(ctx, "Spawn", body)
+}
+
+func spawn[Out any](ctx context.Context, who string, body func(ctx context.Context) (Out, error)) *Future[Out] {
 	fut := &Future[Out]{done: make(chan struct{})}
 
 	parent := threadFrom(ctx)
 	if parent == nil {
-		fut.err = errors.New("flow: Go called outside a workflow")
+		fut.err = fmt.Errorf("flow: %s called outside a workflow", who)
 		close(fut.done)
 		return fut
 	}
@@ -63,7 +102,7 @@ func Go[In, Out any](ctx context.Context, f wings.Func[In, Out], in In) *Future[
 				fut.err = fmt.Errorf("flow: panic in forked work: %v", r)
 			}
 		}()
-		fut.out, fut.err = f(withThread(ctx, child), in)
+		fut.out, fut.err = body(withThread(ctx, child))
 	}()
 
 	return fut

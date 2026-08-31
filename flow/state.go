@@ -26,10 +26,34 @@ type runState struct {
 	instance string
 	attempt  uint64
 
-	mu      sync.Mutex
-	threads map[string][]*protos.Event
-	sink    Sink
-	sinkErr error // the first persistence failure, if any
+	mu       sync.Mutex
+	threads  map[string][]*protos.Event
+	channels map[string]*chanState
+	sink     Sink
+	sinkErr  error // the first persistence failure, if any
+}
+
+// declareChannel registers a channel's runtime the first time it is created.
+//
+// Idempotent, because a replay creates the same channels again and finding the
+// existing one is the whole point: values a re-run sender puts on it have to
+// reach a re-run receiver through the same queue.
+func (r *runState) declareChannel(name string, capacity int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.channels == nil {
+		r.channels = map[string]*chanState{}
+	}
+	if _, ok := r.channels[name]; !ok {
+		r.channels[name] = newChanState(capacity)
+	}
+}
+
+// channel returns a declared channel's runtime, or nil.
+func (r *runState) channel(name string) *chanState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.channels[name]
 }
 
 // threadState is one thread's cursor through the log.
@@ -46,7 +70,40 @@ type threadState struct {
 	// children are scheduled in.
 	counter uint64
 
+	// channels names the next channel this thread creates, on the same
+	// principle as counter; sends counts this thread's sends per channel, so a
+	// receive on another thread can name exactly one of them.
+	channels uint64
+	sends    map[string]uint64
+
 	run *runState
+}
+
+// newChannelName mints the next channel name for this thread.
+//
+// Derived from the thread rather than given by the caller, for the same reason
+// thread names are: a name the user chose can be got wrong — reused, or built
+// from something that varies between attempts — and this one cannot. A channel
+// created at a point every attempt reaches gets the same name every time.
+func (t *threadState) newChannelName() string {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	name := fmt.Sprintf("%s.ch%d", t.id, t.channels)
+	t.channels++
+	return name
+}
+
+// nextSend returns this thread's sequence number for its next send on a
+// channel.
+func (t *threadState) nextSend(channel string) uint64 {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	if t.sends == nil {
+		t.sends = map[string]uint64{}
+	}
+	seq := t.sends[channel]
+	t.sends[channel] = seq + 1
+	return seq
 }
 
 type ctxKey struct{}

@@ -182,6 +182,8 @@ type Event struct {
 	//	*Event_Return
 	//	*Event_RunStart
 	//	*Event_RunEnd
+	//	*Event_ChannelSend
+	//	*Event_ChannelRecv
 	Payload       isEvent_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -324,6 +326,24 @@ func (x *Event) GetRunEnd() *RunEndEvent {
 	return nil
 }
 
+func (x *Event) GetChannelSend() *ChannelSendEvent {
+	if x != nil {
+		if x, ok := x.Payload.(*Event_ChannelSend); ok {
+			return x.ChannelSend
+		}
+	}
+	return nil
+}
+
+func (x *Event) GetChannelRecv() *ChannelRecvEvent {
+	if x != nil {
+		if x, ok := x.Payload.(*Event_ChannelRecv); ok {
+			return x.ChannelRecv
+		}
+	}
+	return nil
+}
+
 type isEvent_Payload interface {
 	isEvent_Payload()
 }
@@ -360,6 +380,14 @@ type Event_RunEnd struct {
 	RunEnd *RunEndEvent `protobuf:"bytes,27,opt,name=run_end,json=runEnd,proto3,oneof"`
 }
 
+type Event_ChannelSend struct {
+	ChannelSend *ChannelSendEvent `protobuf:"bytes,28,opt,name=channel_send,json=channelSend,proto3,oneof"`
+}
+
+type Event_ChannelRecv struct {
+	ChannelRecv *ChannelRecvEvent `protobuf:"bytes,29,opt,name=channel_recv,json=channelRecv,proto3,oneof"`
+}
+
 func (*Event_Join) isEvent_Payload() {}
 
 func (*Event_Call) isEvent_Payload() {}
@@ -375,6 +403,10 @@ func (*Event_Return) isEvent_Payload() {}
 func (*Event_RunStart) isEvent_Payload() {}
 
 func (*Event_RunEnd) isEvent_Payload() {}
+
+func (*Event_ChannelSend) isEvent_Payload() {}
+
+func (*Event_ChannelRecv) isEvent_Payload() {}
 
 type CallEvent struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -671,6 +703,165 @@ func (x *ReturnEvent) GetCallSerial() uint64 {
 	return 0
 }
 
+// Channels let threads of one workflow pass typed values to each other. Two
+// events, because a send and a receive are separately observable and only one of
+// them is naturally deterministic.
+//
+// A thread's nth send on a channel always carries the same value, because the
+// thread's own execution is deterministic — so a send needs recording only for
+// WHEN it completed, which on an unbuffered channel depends on somebody
+// receiving. A receive is the opposite: which value arrives first is decided by
+// the operating system's scheduler, and nothing about the workflow determines
+// it. So the receive records WHICH item it took, and a replay waits for exactly
+// that one rather than taking whatever happens to be there.
+type ChannelSendEvent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The channel's name, derived from the thread that created it.
+	Channel string `protobuf:"bytes,1,opt,name=channel,proto3" json:"channel,omitempty"`
+	// This thread's nth send on this channel, counting from zero. Together with
+	// the thread id it identifies one item for a receive to name.
+	Seq uint64 `protobuf:"varint,2,opt,name=seq,proto3" json:"seq,omitempty"`
+	// What was sent. Not needed to replay — the sender recomputes it — but a
+	// history that shows what actually flowed is worth the bytes.
+	Value *Data `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	// Set when this closed the channel rather than sending. A close is a send in
+	// every respect that matters here: it is a thing one thread does that another
+	// observes, and it has to be ordered against the sends around it.
+	Closed        bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChannelSendEvent) Reset() {
+	*x = ChannelSendEvent{}
+	mi := &file_flow_protos_event_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChannelSendEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChannelSendEvent) ProtoMessage() {}
+
+func (x *ChannelSendEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_flow_protos_event_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChannelSendEvent.ProtoReflect.Descriptor instead.
+func (*ChannelSendEvent) Descriptor() ([]byte, []int) {
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ChannelSendEvent) GetChannel() string {
+	if x != nil {
+		return x.Channel
+	}
+	return ""
+}
+
+func (x *ChannelSendEvent) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *ChannelSendEvent) GetValue() *Data {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *ChannelSendEvent) GetClosed() bool {
+	if x != nil {
+		return x.Closed
+	}
+	return false
+}
+
+type ChannelRecvEvent struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Channel string                 `protobuf:"bytes,1,opt,name=channel,proto3" json:"channel,omitempty"`
+	// Which thread's send this took, and which of that thread's sends. Empty and
+	// zero when the receive observed a closed channel instead.
+	FromThreadId string `protobuf:"bytes,2,opt,name=from_thread_id,json=fromThreadId,proto3" json:"from_thread_id,omitempty"`
+	FromSeq      uint64 `protobuf:"varint,3,opt,name=from_seq,json=fromSeq,proto3" json:"from_seq,omitempty"`
+	// Set when the receive found the channel closed and drained, which is the
+	// one outcome that yields no value.
+	Closed        bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChannelRecvEvent) Reset() {
+	*x = ChannelRecvEvent{}
+	mi := &file_flow_protos_event_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChannelRecvEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChannelRecvEvent) ProtoMessage() {}
+
+func (x *ChannelRecvEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_flow_protos_event_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChannelRecvEvent.ProtoReflect.Descriptor instead.
+func (*ChannelRecvEvent) Descriptor() ([]byte, []int) {
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ChannelRecvEvent) GetChannel() string {
+	if x != nil {
+		return x.Channel
+	}
+	return ""
+}
+
+func (x *ChannelRecvEvent) GetFromThreadId() string {
+	if x != nil {
+		return x.FromThreadId
+	}
+	return ""
+}
+
+func (x *ChannelRecvEvent) GetFromSeq() uint64 {
+	if x != nil {
+		return x.FromSeq
+	}
+	return 0
+}
+
+func (x *ChannelRecvEvent) GetClosed() bool {
+	if x != nil {
+		return x.Closed
+	}
+	return false
+}
+
 // RunStartEvent opens an attempt. It carries everything needed to begin, so a
 // reader of the stream alone can tell what was run and with what.
 type RunStartEvent struct {
@@ -687,7 +878,7 @@ type RunStartEvent struct {
 
 func (x *RunStartEvent) Reset() {
 	*x = RunStartEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[7]
+	mi := &file_flow_protos_event_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -699,7 +890,7 @@ func (x *RunStartEvent) String() string {
 func (*RunStartEvent) ProtoMessage() {}
 
 func (x *RunStartEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[7]
+	mi := &file_flow_protos_event_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -712,7 +903,7 @@ func (x *RunStartEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunStartEvent.ProtoReflect.Descriptor instead.
 func (*RunStartEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{7}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RunStartEvent) GetAttempt() uint64 {
@@ -771,7 +962,7 @@ type RunEndEvent struct {
 
 func (x *RunEndEvent) Reset() {
 	*x = RunEndEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[8]
+	mi := &file_flow_protos_event_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -783,7 +974,7 @@ func (x *RunEndEvent) String() string {
 func (*RunEndEvent) ProtoMessage() {}
 
 func (x *RunEndEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[8]
+	mi := &file_flow_protos_event_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -796,7 +987,7 @@ func (x *RunEndEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunEndEvent.ProtoReflect.Descriptor instead.
 func (*RunEndEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{8}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RunEndEvent) GetStatus() WorkflowStatus {
@@ -824,7 +1015,7 @@ var File_flow_protos_event_proto protoreflect.FileDescriptor
 
 const file_flow_protos_event_proto_rawDesc = "" +
 	"\n" +
-	"\x17flow/protos/event.proto\x12\rwings.flow.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x16flow/protos/data.proto\"\xbb\x04\n" +
+	"\x17flow/protos/event.proto\x12\rwings.flow.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x16flow/protos/data.proto\"\xc7\x05\n" +
 	"\x05Event\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x16\n" +
 	"\x06serial\x18\x02 \x01(\x04R\x06serial\x12\x18\n" +
@@ -837,7 +1028,9 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\x04time\x18\x18 \x01(\v2\x1b.wings.flow.v1.GetTimeEventH\x00R\x04time\x124\n" +
 	"\x06return\x18\x19 \x01(\v2\x1a.wings.flow.v1.ReturnEventH\x00R\x06return\x12;\n" +
 	"\trun_start\x18\x1a \x01(\v2\x1c.wings.flow.v1.RunStartEventH\x00R\brunStart\x125\n" +
-	"\arun_end\x18\x1b \x01(\v2\x1a.wings.flow.v1.RunEndEventH\x00R\x06runEndB\t\n" +
+	"\arun_end\x18\x1b \x01(\v2\x1a.wings.flow.v1.RunEndEventH\x00R\x06runEnd\x12D\n" +
+	"\fchannel_send\x18\x1c \x01(\v2\x1f.wings.flow.v1.ChannelSendEventH\x00R\vchannelSend\x12D\n" +
+	"\fchannel_recv\x18\x1d \x01(\v2\x1f.wings.flow.v1.ChannelRecvEventH\x00R\vchannelRecvB\t\n" +
 	"\apayload\"L\n" +
 	"\tCallEvent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12+\n" +
@@ -855,7 +1048,17 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\vReturnEvent\x12-\n" +
 	"\x06result\x18\x01 \x01(\v2\x15.wings.flow.v1.ResultR\x06result\x12\x1f\n" +
 	"\vcall_serial\x18\x02 \x01(\x04R\n" +
-	"callSerial\"\xe8\x01\n" +
+	"callSerial\"\x81\x01\n" +
+	"\x10ChannelSendEvent\x12\x18\n" +
+	"\achannel\x18\x01 \x01(\tR\achannel\x12\x10\n" +
+	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12)\n" +
+	"\x05value\x18\x03 \x01(\v2\x13.wings.flow.v1.DataR\x05value\x12\x16\n" +
+	"\x06closed\x18\x04 \x01(\bR\x06closed\"\x85\x01\n" +
+	"\x10ChannelRecvEvent\x12\x18\n" +
+	"\achannel\x18\x01 \x01(\tR\achannel\x12$\n" +
+	"\x0efrom_thread_id\x18\x02 \x01(\tR\ffromThreadId\x12\x19\n" +
+	"\bfrom_seq\x18\x03 \x01(\x04R\afromSeq\x12\x16\n" +
+	"\x06closed\x18\x04 \x01(\bR\x06closed\"\xe8\x01\n" +
 	"\rRunStartEvent\x12\x18\n" +
 	"\aattempt\x18\x01 \x01(\x04R\aattempt\x122\n" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1a.wings.flow.v1.StartReasonR\x06reason\x12#\n" +
@@ -896,7 +1099,7 @@ func file_flow_protos_event_proto_rawDescGZIP() []byte {
 }
 
 var file_flow_protos_event_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_flow_protos_event_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_flow_protos_event_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_flow_protos_event_proto_goTypes = []any{
 	(StartReason)(0),              // 0: wings.flow.v1.StartReason
 	(WorkflowStatus)(0),           // 1: wings.flow.v1.WorkflowStatus
@@ -907,37 +1110,42 @@ var file_flow_protos_event_proto_goTypes = []any{
 	(*SleepEvent)(nil),            // 6: wings.flow.v1.SleepEvent
 	(*GetTimeEvent)(nil),          // 7: wings.flow.v1.GetTimeEvent
 	(*ReturnEvent)(nil),           // 8: wings.flow.v1.ReturnEvent
-	(*RunStartEvent)(nil),         // 9: wings.flow.v1.RunStartEvent
-	(*RunEndEvent)(nil),           // 10: wings.flow.v1.RunEndEvent
-	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
-	(*Data)(nil),                  // 12: wings.flow.v1.Data
-	(*durationpb.Duration)(nil),   // 13: google.protobuf.Duration
-	(*Result)(nil),                // 14: wings.flow.v1.Result
+	(*ChannelSendEvent)(nil),      // 9: wings.flow.v1.ChannelSendEvent
+	(*ChannelRecvEvent)(nil),      // 10: wings.flow.v1.ChannelRecvEvent
+	(*RunStartEvent)(nil),         // 11: wings.flow.v1.RunStartEvent
+	(*RunEndEvent)(nil),           // 12: wings.flow.v1.RunEndEvent
+	(*timestamppb.Timestamp)(nil), // 13: google.protobuf.Timestamp
+	(*Data)(nil),                  // 14: wings.flow.v1.Data
+	(*durationpb.Duration)(nil),   // 15: google.protobuf.Duration
+	(*Result)(nil),                // 16: wings.flow.v1.Result
 }
 var file_flow_protos_event_proto_depIdxs = []int32{
-	11, // 0: wings.flow.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
+	13, // 0: wings.flow.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
 	5,  // 1: wings.flow.v1.Event.join:type_name -> wings.flow.v1.JoinEvent
 	3,  // 2: wings.flow.v1.Event.call:type_name -> wings.flow.v1.CallEvent
 	4,  // 3: wings.flow.v1.Event.fork:type_name -> wings.flow.v1.ForkEvent
 	6,  // 4: wings.flow.v1.Event.sleep:type_name -> wings.flow.v1.SleepEvent
 	7,  // 5: wings.flow.v1.Event.time:type_name -> wings.flow.v1.GetTimeEvent
 	8,  // 6: wings.flow.v1.Event.return:type_name -> wings.flow.v1.ReturnEvent
-	9,  // 7: wings.flow.v1.Event.run_start:type_name -> wings.flow.v1.RunStartEvent
-	10, // 8: wings.flow.v1.Event.run_end:type_name -> wings.flow.v1.RunEndEvent
-	12, // 9: wings.flow.v1.CallEvent.params:type_name -> wings.flow.v1.Data
-	13, // 10: wings.flow.v1.SleepEvent.duration:type_name -> google.protobuf.Duration
-	11, // 11: wings.flow.v1.GetTimeEvent.time:type_name -> google.protobuf.Timestamp
-	14, // 12: wings.flow.v1.ReturnEvent.result:type_name -> wings.flow.v1.Result
-	0,  // 13: wings.flow.v1.RunStartEvent.reason:type_name -> wings.flow.v1.StartReason
-	12, // 14: wings.flow.v1.RunStartEvent.input:type_name -> wings.flow.v1.Data
-	1,  // 15: wings.flow.v1.RunEndEvent.status:type_name -> wings.flow.v1.WorkflowStatus
-	14, // 16: wings.flow.v1.RunEndEvent.result:type_name -> wings.flow.v1.Result
-	11, // 17: wings.flow.v1.RunEndEvent.scheduled_for:type_name -> google.protobuf.Timestamp
-	18, // [18:18] is the sub-list for method output_type
-	18, // [18:18] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	11, // 7: wings.flow.v1.Event.run_start:type_name -> wings.flow.v1.RunStartEvent
+	12, // 8: wings.flow.v1.Event.run_end:type_name -> wings.flow.v1.RunEndEvent
+	9,  // 9: wings.flow.v1.Event.channel_send:type_name -> wings.flow.v1.ChannelSendEvent
+	10, // 10: wings.flow.v1.Event.channel_recv:type_name -> wings.flow.v1.ChannelRecvEvent
+	14, // 11: wings.flow.v1.CallEvent.params:type_name -> wings.flow.v1.Data
+	15, // 12: wings.flow.v1.SleepEvent.duration:type_name -> google.protobuf.Duration
+	13, // 13: wings.flow.v1.GetTimeEvent.time:type_name -> google.protobuf.Timestamp
+	16, // 14: wings.flow.v1.ReturnEvent.result:type_name -> wings.flow.v1.Result
+	14, // 15: wings.flow.v1.ChannelSendEvent.value:type_name -> wings.flow.v1.Data
+	0,  // 16: wings.flow.v1.RunStartEvent.reason:type_name -> wings.flow.v1.StartReason
+	14, // 17: wings.flow.v1.RunStartEvent.input:type_name -> wings.flow.v1.Data
+	1,  // 18: wings.flow.v1.RunEndEvent.status:type_name -> wings.flow.v1.WorkflowStatus
+	16, // 19: wings.flow.v1.RunEndEvent.result:type_name -> wings.flow.v1.Result
+	13, // 20: wings.flow.v1.RunEndEvent.scheduled_for:type_name -> google.protobuf.Timestamp
+	21, // [21:21] is the sub-list for method output_type
+	21, // [21:21] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_flow_protos_event_proto_init() }
@@ -955,6 +1163,8 @@ func file_flow_protos_event_proto_init() {
 		(*Event_Return)(nil),
 		(*Event_RunStart)(nil),
 		(*Event_RunEnd)(nil),
+		(*Event_ChannelSend)(nil),
+		(*Event_ChannelRecv)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -962,7 +1172,7 @@ func file_flow_protos_event_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_flow_protos_event_proto_rawDesc), len(file_flow_protos_event_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

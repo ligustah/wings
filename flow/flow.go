@@ -30,12 +30,42 @@
 //   - use [Sleep], not time.Sleep
 //   - do not read a random number, an environment variable, or a clock
 //   - do not let map iteration order change what it does
-//   - use [wings.Map] or [Go] to do things at once, never a bare goroutine
+//   - use [wings.Map], [Go] or [Spawn] to do things at once, never a bare
+//     goroutine
 //
 // A workflow that breaks these does not fail loudly on the first run — it fails
 // on the retry, as a continuity error, which is why [IsContinuity] names the
 // cause plainly. Work functions themselves are under no such constraint: they
 // run once, on a worker, and may do anything.
+//
+// # Threads and channels
+//
+// [Spawn] runs a piece of workflow code on a thread of its own, and [Channel]
+// passes typed values between threads. Both are the replayable versions of
+// things Go already has, and a channel is where the difference shows: a Go
+// receive takes whichever value happens to arrive first, and nothing about the
+// workflow decides which that is. So a receive is RECORDED — which thread's
+// which send it took — and a replay waits for exactly that item instead. A
+// send needs no such treatment, since a thread's nth send always carries the
+// same value; what a send records is when it COMPLETED, which on an unbuffered
+// channel is somebody else's decision.
+//
+//	ch := flow.NewChannel[Result](ctx)
+//	producer := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
+//		for _, item := range work {
+//			r, err := Digest(ctx, item)
+//			if err != nil {
+//				return 0, err
+//			}
+//			if err := ch.Send(ctx, r); err != nil {
+//				return 0, err
+//			}
+//		}
+//		return 0, ch.Close(ctx)
+//	})
+//
+// A workflow that deadlocks on a channel deadlocks the same way a Go program
+// would; there is no scheduler here doing anything clever about it.
 //
 // # What it is not
 //

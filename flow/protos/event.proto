@@ -46,6 +46,8 @@ message Event {
     ReturnEvent return = 25;
     RunStartEvent run_start = 26;
     RunEndEvent run_end = 27;
+    ChannelSendEvent channel_send = 28;
+    ChannelRecvEvent channel_recv = 29;
   }
 }
 
@@ -83,6 +85,50 @@ message ReturnEvent {
 
   // The serial of the call event for which this is the return
   uint64 call_serial = 2;
+}
+
+/*
+  Channels let threads of one workflow pass typed values to each other. Two
+  events, because a send and a receive are separately observable and only one of
+  them is naturally deterministic.
+
+  A thread's nth send on a channel always carries the same value, because the
+  thread's own execution is deterministic — so a send needs recording only for
+  WHEN it completed, which on an unbuffered channel depends on somebody
+  receiving. A receive is the opposite: which value arrives first is decided by
+  the operating system's scheduler, and nothing about the workflow determines
+  it. So the receive records WHICH item it took, and a replay waits for exactly
+  that one rather than taking whatever happens to be there.
+ */
+message ChannelSendEvent {
+  // The channel's name, derived from the thread that created it.
+  string channel = 1;
+
+  // This thread's nth send on this channel, counting from zero. Together with
+  // the thread id it identifies one item for a receive to name.
+  uint64 seq = 2;
+
+  // What was sent. Not needed to replay — the sender recomputes it — but a
+  // history that shows what actually flowed is worth the bytes.
+  Data value = 3;
+
+  // Set when this closed the channel rather than sending. A close is a send in
+  // every respect that matters here: it is a thing one thread does that another
+  // observes, and it has to be ordered against the sends around it.
+  bool closed = 4;
+}
+
+message ChannelRecvEvent {
+  string channel = 1;
+
+  // Which thread's send this took, and which of that thread's sends. Empty and
+  // zero when the receive observed a closed channel instead.
+  string from_thread_id = 2;
+  uint64 from_seq = 3;
+
+  // Set when the receive found the channel closed and drained, which is the
+  // one outcome that yields no value.
+  bool closed = 4;
 }
 
 enum StartReason {
