@@ -1,0 +1,22 @@
+# Scratch tree that `wings build` generates the two mains into. It lives under
+# the module root so the generated code can import your package by its normal
+# path, and a build removes it on the way out — it survives only a build that
+# was killed outright.
+.wings-build/
+
+# Coordinator and worker binaries. `wings build` writes wherever -o says, so
+# this catches the conventional spots rather than every possible one.
+/wings
+/wings.exe
+/digest
+/digest.exe
+*.test
+*.exe~
+
+# Broker data, if a Config.Dir is pointed here rather than at a temp directory.
+/data/
+
+# Local editor and tooling state.
+.claude/settings.local.json
+.idea/
+.vscode/

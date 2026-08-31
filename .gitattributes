@@ -1,0 +1,30 @@
+# Normalize line endings. Text files are stored as LF in the repository and
+# checked out as LF on every platform, whatever a developer's core.autocrlf
+# says -- an attribute beats that setting, which is the point of stating it
+# here rather than relying on everyone's git config.
+#
+# It matters more than usual for a Go repo: gofmt normalizes to LF, so a CRLF
+# working tree makes `gofmt -l .` report every file as needing a rewrite while
+# the repository holds them as LF and `git status` shows nothing. This repo is
+# developed with core.autocrlf=true, so without this file that is the default
+# outcome rather than an unlucky one.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# The worker blob `wings build` generates. It never reaches a commit -- the
+# scratch tree holding it is gitignored and removed -- but a line-ending pass
+# over an executable would corrupt it silently rather than fail, so it is
+# marked rather than left to auto-detect.
+*.gz  binary
+*.bin binary
+
+# Windows-only scripts must keep CRLF if any are ever added.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
