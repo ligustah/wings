@@ -84,6 +84,20 @@ type workerConn struct {
 	proc    *os.Process // local-process only
 	machine Machine     // remote only
 
+	// exited closes when a worker we can actually observe has stopped.
+	//
+	// It is what separates "gone" from "unreachable", and the distinction is the
+	// whole reason retrying is safe. A child process is a fact: we started it,
+	// we can wait on it, and once it has exited no amount of patience brings it
+	// back. A remote machine across a dropped connection is not a fact — it is
+	// probably fine — so that case waits out the reconnect window instead. Nil
+	// for a worker whose liveness cannot be observed directly.
+	exited chan struct{}
+
+	// mirror copies this worker's results onto the coordinator's own durable
+	// streams, and holds the offset to resume reading from.
+	mirror *mirror
+
 	// ctx bounds every goroutine belonging to THIS worker -- its result tail,
 	// and in process its run loop too -- and stop ends them. wg is how close
 	// waits for them.
@@ -108,6 +122,20 @@ type workerConn struct {
 
 // available reports whether new work may be sent here. Call with Cluster.mu.
 func (w *workerConn) available() bool { return !w.draining && !w.dead.Load() }
+
+// hasExited reports whether this worker is observably gone, as opposed to
+// merely unreachable.
+func (w *workerConn) hasExited() bool {
+	if w.exited == nil {
+		return false
+	}
+	select {
+	case <-w.exited:
+		return true
+	default:
+		return false
+	}
+}
 
 type pendingJob struct {
 	job    jobEnvelope
@@ -257,6 +285,9 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	if w.results, err = client.OpenStream[resultEnvelope](resultStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", resultStreamFor(id), id, err)
 	}
+	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
+		return nil, err
+	}
 	return w, nil
 }
 
@@ -302,28 +333,131 @@ func (c *Cluster) closeShared() error {
 	return err
 }
 
-// tail delivers a worker's results until the cluster stops or the worker dies.
+// tail mirrors a worker's results onto the coordinator's own streams and
+// delivers them, until the cluster stops or the worker is genuinely gone.
+//
+// "Genuinely" is the change from a version that treated any error as death. A
+// transient read failure — a five-second network blip, a broker restarting — is
+// indistinguishable at this line from a machine that burned down, and giving up
+// on the first one meant redispatching the jobs of a healthy worker and then
+// destroying the VM that was still holding them. The worker's queue survives a
+// dropped connection by design; throwing the worker away was the coordinator
+// declining to use that.
 func (c *Cluster) tail(w *workerConn) {
-	var from int64
+	from := w.mirror.next
+
+	var (
+		trouble  time.Time // when the current run of failures began
+		attempts int
+	)
+
 	for {
-		recs, err := w.results.ReadBlocking(w.ctx, from, 256)
-		if err != nil {
-			if w.ctx.Err() != nil {
-				return
-			}
-			if w.dead.Load() {
-				return // already retired deliberately
-			}
-			c.log.Error("wings: lost worker", "worker", w.id, "err", err)
-			c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: err.Error()})
+		if w.ctx.Err() != nil || w.dead.Load() {
+			return
+		}
+
+		// Checked BEFORE the read, not only after it. A wedged connection does
+		// not fail — it hangs — so a window enforced only on the way out of a
+		// read is a window a hung read never reaches. This is the difference
+		// between giving up in the configured time and never giving up at all.
+		if !trouble.IsZero() && time.Since(trouble) >= c.cfg.reconnect() {
+			c.log.Error("wings: worker did not come back", "worker", w.id, "after", time.Since(trouble))
+			c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "unreachable"})
 			w.dead.Store(true)
 			c.redispatchFrom(w)
 			return
 		}
+
+		// EVERY read is bounded, including the healthy one. A broken connection
+		// does not always fail: a read issued on one can simply never return,
+		// and an unbounded read there is a worker that is neither delivering
+		// results nor being given up on — the worst of both. While in trouble
+		// the bound is the remaining window, so retries cannot outlast it.
+		limit := pollInterval
+		if !trouble.IsZero() {
+			limit = min(c.cfg.reconnect()-time.Since(trouble), 5*time.Second)
+		}
+		readCtx, cancel := context.WithTimeout(w.ctx, limit)
+		recs, err := w.results.ReadBlocking(readCtx, from, 256)
+		cancel()
+
+		if err != nil {
+			if w.ctx.Err() != nil {
+				return
+			}
+			// Our own poll expiring on a healthy worker is not news: it means
+			// nothing was produced in that interval, which is what an idle
+			// worker looks like.
+			if trouble.IsZero() && errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			if w.dead.Load() {
+				return // already retired deliberately
+			}
+
+			// A worker we can see has exited is dead now, not in two minutes.
+			// Waiting out the window for it would leave its jobs unredispatched
+			// for no reason at all.
+			if w.hasExited() {
+				c.log.Error("wings: worker exited", "worker", w.id, "err", err)
+				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "process exited"})
+				w.dead.Store(true)
+				c.redispatchFrom(w)
+				return
+			}
+
+			if trouble.IsZero() {
+				trouble, attempts = time.Now(), 0
+				c.log.Warn("wings: lost contact with worker, retrying",
+					"worker", w.id, "err", err, "giving_up_after", c.cfg.reconnect())
+			}
+			attempts++
+			if !sleepCtx(w.ctx, reconnectBackoff(attempts)) {
+				return
+			}
+			continue
+		}
+
+		if !trouble.IsZero() {
+			c.log.Info("wings: worker is back", "worker", w.id, "after", time.Since(trouble))
+			trouble, attempts = time.Time{}, 0
+		}
+
 		for _, r := range recs {
+			// Written down before it is handed over, so a result a caller saw
+			// completed is never one a recovery would see outstanding.
+			if err := w.mirror.append(w.ctx, r.Offset, r.Record); err != nil {
+				if w.ctx.Err() != nil {
+					return
+				}
+				// The coordinator's own storage failing is not the worker's
+				// fault and retrying the read would not fix it, so this is
+				// reported and the result still delivered: losing the record is
+				// bad, losing the work as well is worse.
+				c.log.Error("wings: could not mirror result", "worker", w.id, "err", err)
+			}
 			from = r.Offset + 1
 			c.deliver(r.Record)
 		}
+	}
+}
+
+// reconnectBackoff grows to a ceiling, so a long outage costs a handful of
+// attempts rather than thousands.
+func reconnectBackoff(attempt int) time.Duration {
+	d := time.Duration(attempt) * 500 * time.Millisecond
+	return min(d, 5*time.Second)
+}
+
+// sleepCtx waits, and reports false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -594,10 +728,18 @@ func (w *workerConn) close(ctx context.Context) error {
 		// — killed by a test, preempted, or crashed — and on Windows killing an
 		// exited-but-unreaped process fails with "Access is denied", which would
 		// turn every ordinary shutdown after a worker loss into a Stop error.
-		// Wait is what actually establishes it is gone, and it returns
-		// immediately for a process that already exited.
 		_ = w.proc.Kill()
-		_, _ = w.proc.Wait()
+		// The watcher goroutine owns Wait, so this waits for IT rather than
+		// calling Wait a second time: two concurrent waits on one process is not
+		// something os/exec promises anything about.
+		if w.exited != nil {
+			select {
+			case <-w.exited:
+			case <-time.After(10 * time.Second):
+				// Bounded rather than indefinite. A process that will not die
+				// should cost a leaked handle, not a shutdown that never ends.
+			}
+		}
 	}
 	if w.machine != nil {
 		errs = append(errs, w.machine.Close(ctx))

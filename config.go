@@ -24,6 +24,14 @@ const (
 	// something else in between.
 	readyPrefix = "WINGS_READY "
 
+	// pollInterval bounds a single blocking read of a worker's results.
+	//
+	// It is not a timeout in the usual sense — nothing is wrong when it expires,
+	// it just means the worker produced nothing in that time. It exists because
+	// a read on a broken connection can hang rather than fail, and a read that
+	// can hang forever is a worker that can be lost silently.
+	pollInterval = 30 * time.Second
+
 	// defaultRemotePort is the loopback port a remote worker's broker binds.
 	// Fixed rather than negotiated because a freshly provisioned machine has
 	// nothing else on it, and the coordinator reaches it through a tunnel it
@@ -62,6 +70,18 @@ type Config struct {
 	// JobTimeout bounds a single work function call. Zero means no limit.
 	JobTimeout time.Duration
 
+	// ReconnectTimeout is how long a worker may be unreachable before the
+	// coordinator gives up on it, redispatches its work and releases it.
+	// Defaults to 2 minutes; a negative value gives up immediately.
+	//
+	// The right value is a judgement about which mistake is cheaper. Too short
+	// and a network blip costs a machine that was fine and still held its queue.
+	// Too long and a genuinely dead worker's jobs sit unredispatched for that
+	// whole period. Two minutes is on the patient side because a worker's queue
+	// survives a dropped connection — the work is not lost while we wait, it is
+	// only paused.
+	ReconnectTimeout time.Duration
+
 	// Build controls cross-compilation of the worker binary. Used only by
 	// [Remote].
 	Build BuildConfig
@@ -94,6 +114,13 @@ func (c *Config) logger() *slog.Logger {
 		return c.Logger
 	}
 	return slog.Default()
+}
+
+func (c *Config) reconnect() time.Duration {
+	if c.ReconnectTimeout != 0 {
+		return c.ReconnectTimeout
+	}
+	return 2 * time.Minute
 }
 
 func (c *Config) workers() int {
