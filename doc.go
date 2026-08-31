@@ -74,6 +74,14 @@
 // last recorded, so a retry resumes instead of starting over. Only the latest
 // survives — it is a position, not a log.
 //
+// [Step] is the same thing with the bookkeeping taken away: name the phases of a
+// long job, and a job that moves replays the ones that finished and runs the
+// rest. What can never move is the running goroutine itself — its stack, its
+// locals, its open sockets — so the only thing that crosses a machine boundary
+// is a value the work function made explicit. The phase that was in flight when
+// the move happened is paid for twice, and that cost is irreducible: nobody can
+// say whether it finished.
+//
 // # Communication
 //
 // Workers and the coordinator talk over durable streams, and that is an

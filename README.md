@@ -310,6 +310,47 @@ to guarantee delivery would cost the work.
 The clock for a heartbeat timeout starts at dispatch, so a function that declares
 one must actually beat.
 
+### Steps
+
+`wings.Step` is the same mechanism with the bookkeeping taken away. Name the
+phases of a long job and a move replays the ones that finished:
+
+```go
+func restore(ctx context.Context, in Backup) (Report, error) {
+    snap, err := wings.Step(ctx, "snapshot", func(ctx context.Context) (Snapshot, error) {
+        return takeSnapshot(ctx, in.Source)      // twenty minutes
+    })
+    if err != nil {
+        return Report{}, err
+    }
+    return wings.Step(ctx, "restore", func(ctx context.Context) (Report, error) {
+        return restoreInto(ctx, snap, in.Target) // another forty
+    })
+}
+```
+
+A job moved after the snapshot finished replays it — a decode, not twenty
+minutes — and starts the restore on the new worker. The phase that was actually
+in flight is paid for twice, and that cost is irreducible: nobody can say whether
+it finished.
+
+Steps are identified by their position, so they must be called in the same order
+every attempt, from one goroutine; a name that does not match the one recorded at
+that position is an error rather than somebody else's value. Each finished step
+is one message to the coordinator, which accumulates them, so a step costs the
+same however many came before it — but it is a message all the same. Use steps
+for coarse phases and `Heartbeat` for a position inside a loop.
+
+### What cannot be moved
+
+The running goroutine. Its stack, its locals, its open sockets and half-filled
+buffers are on that machine and stay there — Go cannot serialise a running
+goroutine, and much of what one holds is not serialisable at anyone's hands. So
+the only thing that can cross a machine boundary is a value the work function
+made explicit, which is what a checkpoint and a step are. Everything else the
+coordinator has — the pending set, the mirrored results, the queue — it already
+holds, and none of it is what a half-finished job knows.
+
 ## Configuration
 
 Used directly rather than through `wings build`:

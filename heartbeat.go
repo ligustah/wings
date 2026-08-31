@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/ligustah/durable_streams/dswire"
 )
@@ -68,22 +69,30 @@ func Checkpoint[T any](ctx context.Context) (T, bool, error) {
 
 // beatSink is where a worker's heartbeats go.
 type beatSink interface {
-	sendBeat(ctx context.Context, jobID string, checkpoint []byte) error
+	sendBeat(ctx context.Context, b beatEnvelope) error
 }
 
-// beatState is what a running job needs to heartbeat: somewhere to send, and
-// whatever the last attempt left behind.
+// beatState is what a running job needs to report progress: somewhere to send,
+// and whatever the last attempt left behind.
 type beatState struct {
 	job  string
 	sink beatSink
 	in   []byte
+
+	// steps are what a previous attempt completed, and next is how far this one
+	// has replayed through them. Guarded because Step may be called from a work
+	// function that does several things at once — though it must not be, and
+	// says so when it is.
+	mu    sync.Mutex
+	steps []stepRecord
+	next  int
 }
 
 func (b *beatState) send(ctx context.Context, checkpoint []byte) error {
 	if b.sink == nil {
 		return nil
 	}
-	return b.sink.sendBeat(ctx, b.job, checkpoint)
+	return b.sink.sendBeat(ctx, beatEnvelope{Job: b.job, Checkpoint: checkpoint})
 }
 
 type beatKey struct{}

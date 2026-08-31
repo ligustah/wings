@@ -45,6 +45,22 @@ type jobEnvelope struct {
 	// rather than starting over. Empty on a first attempt, and on a retry of
 	// something that never heartbeated.
 	Checkpoint []byte `json:"checkpoint,omitempty"`
+	// Steps are the [Step] calls a previous attempt completed, in order. A
+	// retry replays them from here instead of running them again.
+	Steps []stepRecord `json:"steps,omitempty"`
+}
+
+// stepRecord is one completed [Step]: where it sat in the job, what it was
+// called, and what it produced.
+//
+// The index is carried rather than implied by position because these arrive one
+// at a time over a best-effort channel, and one that goes missing must leave a
+// detectable hole rather than a silently shifted list — a step log off by one is
+// a retry that skips work it never did.
+type stepRecord struct {
+	Index int    `json:"i"`
+	Name  string `json:"name"`
+	Value []byte `json:"value,omitempty"`
 }
 
 // beatEnvelope is one report that a job is still running, and how far it has
@@ -56,6 +72,10 @@ type jobEnvelope struct {
 type beatEnvelope struct {
 	Job        string `json:"job"`
 	Checkpoint []byte `json:"checkpoint,omitempty"`
+	// Step is one newly completed [Step], if this beat reports one. Sent one at
+	// a time rather than as a growing log, so the cost of a step does not climb
+	// with how many came before it; the coordinator does the accumulating.
+	Step *stepRecord `json:"step,omitempty"`
 }
 
 // resultEnvelope is one outcome.

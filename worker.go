@@ -93,15 +93,12 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 // Outside the processor's transaction on purpose: a heartbeat is only useful if
 // it arrives WHILE the job is running, and anything written inside that
 // transaction becomes visible when the job finishes, which is exactly too late.
-func (n *workerNode) sendBeat(ctx context.Context, jobID string, checkpoint []byte) error {
+func (n *workerNode) sendBeat(ctx context.Context, b beatEnvelope) error {
 	// Deliberately not ctx: a job whose deadline has just expired is precisely
 	// the one whose last checkpoint is worth having, and sending on the dying
 	// context would drop it.
-	_, err := n.beats.Append(context.WithoutCancel(ctx), []beatEnvelope{{
-		Job: jobID, Checkpoint: checkpoint,
-	}})
-	if err != nil {
-		return fmt.Errorf("wings: send heartbeat for job %s: %w", jobID, err)
+	if _, err := n.beats.Append(context.WithoutCancel(ctx), []beatEnvelope{b}); err != nil {
+		return fmt.Errorf("wings: send progress for job %s: %w", b.Job, err)
 	}
 	return nil
 }
@@ -182,7 +179,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// timeout: calling Heartbeat is always allowed, and it is the checkpoint
 	// that makes a redispatch cheap whether or not anything is watching the
 	// clock.
-	ctx = withBeat(ctx, &beatState{job: job.ID, sink: n, in: job.Checkpoint})
+	ctx = withBeat(ctx, &beatState{job: job.ID, sink: n, in: job.Checkpoint, steps: job.Steps})
 
 	// A panicking work function must cost one job, not the worker.
 	defer func() {
