@@ -21,42 +21,47 @@ import (
 // wrong answer here looks like a hang rather than a failure.
 const readyTimeout = 2 * time.Minute
 
-// launchInProcess runs workers as goroutines over in-memory brokers.
+// launchInProcess runs workers as goroutines on the cluster's own embedded
+// durable-streams instance.
 //
-// The coordinator holds each worker's backend directly, so a call crosses no
-// socket and nothing is marshalled — but it is the same worker loop, the same
-// streams and the same encoding as the other two targets.
-func (c *Cluster) launchInProcess(ctx context.Context, dir string, n int) ([]*workerConn, error) {
+// All of them on ONE instance, and the coordinator on the same one: there is no
+// socket to cross and nothing to dial, because both halves are this process.
+// What keeps that from being a special case is that they still talk through
+// dsclient over their per-worker streams — the same loop, the same envelopes and
+// the same encoding as a worker on a machine in another country. Only the
+// backend under the client differs.
+func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+
 	var out []*workerConn
-	for i := range n {
-		id := fmt.Sprintf("inproc-%d", i)
-		node, err := startWorkerNode(ctx, workerConfig{
-			id:          id,
-			dir:         filepath.Join(dir, id),
-			concurrency: c.cfg.Concurrency,
-			timeout:     c.cfg.JobTimeout,
-			log:         c.log,
-		})
+	for range n {
+		id := c.workerID("inproc")
+		node, err := newWorkerNode(ctx, client, id, c.cfg.Concurrency, c.cfg.JobTimeout, c.log)
 		if err != nil {
 			return nil, closePartial(ctx, out, err)
 		}
 
-		c.wg.Add(1)
+		// ownsClient is false: the engine belongs to the cluster and outlives
+		// any one worker, so a retired worker must not close it.
+		w, err := c.connect(id, client, false)
+		if err != nil {
+			return nil, closePartial(ctx, out, err)
+		}
+		w.node = node
+
+		// Bound to the WORKER's context, so retiring one ends only its loop —
+		// and w.close waits for it before releasing anything it reads through.
+		w.wg.Add(1)
 		go func() {
-			defer c.wg.Done()
-			if err := node.run(c.ctx); err != nil && c.ctx.Err() == nil {
+			defer w.wg.Done()
+			if err := node.run(w.ctx); err != nil && w.ctx.Err() == nil {
 				c.log.Error("wings: in-process worker stopped", "worker", id, "err", err)
 			}
 		}()
 
-		// ownsClient is false: the node closes this backend itself, and closing
-		// it twice takes the broker down under the half still using it.
-		w, err := c.connect(id, node.backend(), false)
-		if err != nil {
-			_ = node.close()
-			return nil, closePartial(ctx, out, err)
-		}
-		w.node = node
 		out = append(out, w)
 	}
 	return out, nil
@@ -67,16 +72,16 @@ func (c *Cluster) launchInProcess(ctx context.Context, dir string, n int) ([]*wo
 // No cross-compilation: the child is this exact executable on this exact
 // machine, which is the whole reason this target is the cheap way to test the
 // process boundary.
-func (c *Cluster) launchLocalProcess(ctx context.Context, dir string, n int) ([]*workerConn, error) {
+func (c *Cluster) launchLocalProcess(ctx context.Context, n int) ([]*workerConn, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("wings: locate this executable: %w", err)
 	}
 
 	var out []*workerConn
-	for i := range n {
-		id := fmt.Sprintf("local-%d", i)
-		w, err := c.spawnLocal(ctx, exe, id, filepath.Join(dir, id))
+	for range n {
+		id := c.workerID("local")
+		w, err := c.spawnLocal(ctx, exe, id, filepath.Join(c.dir, id))
 		if err != nil {
 			return nil, closePartial(ctx, out, err)
 		}
@@ -112,7 +117,7 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 		return nil, fmt.Errorf("wings: dial worker %s at %s: %w", id, addr, err)
 	}
 
-	w, err := c.connect(id, backend, true)
+	w, err := c.connectBackend(id, backend)
 	if err != nil {
 		_ = backend.Close()
 		_ = cmd.Process.Kill()

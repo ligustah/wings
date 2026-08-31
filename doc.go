@@ -22,7 +22,7 @@
 //
 //	myapp -target inprocess
 //	myapp -target local -workers 4
-//	myapp -target remote -workers 8
+//	myapp -target remote -workers 8 -min-workers 2 -max-workers 16
 //
 // Nothing above changes between them.
 //
@@ -44,6 +44,13 @@
 // lines after it are coordinator-only by construction. That is the one
 // surprising thing here, so it is stated rather than discovered.
 //
+// # How many workers
+//
+// Either a fixed count ([Config.Workers]) or a policy ([Config.Scaling]) that
+// follows the queue. The policy is expressed only in jobs — how much backlog one
+// worker should carry, how long an idle one may linger — so the same numbers add
+// goroutines, child processes or cloud VMs depending on nothing but the target.
+//
 // # Delivery semantics
 //
 // Delivery is AT-LEAST-ONCE. Each worker owns the queue of work assigned to it,
@@ -57,5 +64,18 @@
 //
 // Workers and the coordinator talk over durable streams, and that is an
 // implementation detail on purpose: no stream, client, offset, or broker
-// appears anywhere in this package's API. See transport.go for the seam.
+// appears anywhere in this package's API.
+//
+// Every worker has a pair of streams of its own, one for its jobs and one for
+// its results, and the coordinator reaches them through a dsclient.Client — the
+// only durable-streams API this package's coordinator uses. What sits under
+// that client is the sole difference between the targets: in process it is the
+// cluster's own embedded engine, which every worker is on too, so there is no
+// socket and nothing to serve; out of process it is gRPC to a broker the worker
+// stood up for itself.
+//
+// The coordinator also keeps a durable record of its own decisions — which job
+// went where, what came back, which workers came and went — on that same
+// embedded engine. Broker-less by construction: nothing else reads it, and its
+// value is that it outlives the process that wrote it.
 package wings

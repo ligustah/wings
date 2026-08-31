@@ -16,84 +16,53 @@ import (
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/broker/protos"
 	"github.com/ligustah/durable_streams/dsclient"
-	"github.com/ligustah/durable_streams/dswire"
 	"google.golang.org/grpc"
 )
 
-// workerNode is one worker: a single-node broker plus the loop that drains its
-// job stream.
+// workerNode is the loop that drains one worker's job stream.
 //
-// The SAME type serves all three targets. An in-process worker is one with no
-// listener; a remote one is the identical thing with a socket in front of it.
-// That is deliberate — a bug that only reproduces on a cloud VM is a bug in
-// nine lines of transport, not in the worker.
+// It owns NO broker. Given a *dsclient.Client and a name, it declares its pair
+// of streams and consumes them — so the same type serves a goroutine sharing
+// one in-process engine with a dozen others, and a worker process that spun up
+// a broker of its own. What differs between the targets is which client it is
+// handed, and nothing else.
 type workerNode struct {
 	id          string
 	concurrency int
 	timeout     time.Duration
 	log         *slog.Logger
 
-	broker *embed.InProcess
 	client *dsclient.Client
 	jobs   *dsclient.Stream[jobEnvelope]
 	out    *dsclient.Stream[resultEnvelope]
-
-	srv *grpc.Server
-	lis net.Listener
 }
 
-type workerConfig struct {
-	id          string
-	dir         string
-	listen      string // empty means do not serve; in-process callers hold the backend directly
-	concurrency int
-	timeout     time.Duration
-	log         *slog.Logger
-}
-
-// startWorkerNode brings the broker up, declares the two streams, and — when
-// asked — starts serving gRPC. It does not begin consuming; call run for that.
-func startWorkerNode(ctx context.Context, cfg workerConfig) (*workerNode, error) {
-	if cfg.log == nil {
-		cfg.log = slog.Default()
+// newWorkerNode declares a worker's streams on client and returns its loop.
+func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, concurrency int, timeout time.Duration, log *slog.Logger) (*workerNode, error) {
+	if log == nil {
+		log = slog.Default()
 	}
-	if cfg.concurrency <= 0 {
-		cfg.concurrency = runtime.NumCPU()
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
 	}
-
-	b, err := embed.StartInProcess(embed.InProcessConfig{Dir: cfg.dir, Logger: streamLogger(cfg.log)})
-	if err != nil {
-		return nil, fmt.Errorf("wings: start broker for worker %s: %w", cfg.id, err)
-	}
-
 	n := &workerNode{
-		id:          cfg.id,
-		concurrency: cfg.concurrency,
-		timeout:     cfg.timeout,
-		log:         cfg.log.With("worker", cfg.id),
-		broker:      b,
-		client:      dsclient.Wrap(b.Client()),
+		id:          id,
+		concurrency: concurrency,
+		timeout:     timeout,
+		log:         log.With("worker", id),
+		client:      client,
 	}
-
 	if err := n.declareStreams(ctx); err != nil {
-		_ = n.close()
 		return nil, err
-	}
-
-	if cfg.listen != "" {
-		if err := n.serve(cfg.listen); err != nil {
-			_ = n.close()
-			return nil, err
-		}
 	}
 	return n, nil
 }
 
-// declareStreams creates the job and result streams if they are not already
-// there. StreamExists is node-local, which is exactly the right question for a
-// broker that is one node by construction.
+// declareStreams creates this worker's job and result streams if they are not
+// already there. StreamExists is node-local, which is the right question for
+// both an embedded engine and a single-node broker.
 func (n *workerNode) declareStreams(ctx context.Context) error {
-	for _, name := range []string{jobStream, resultStream} {
+	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
 		if err != nil {
 			return fmt.Errorf("wings: check stream %s: %w", name, err)
@@ -106,46 +75,14 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 		}
 	}
 	var err error
-	if n.jobs, err = n.client.OpenStream[jobEnvelope](jobStream); err != nil {
-		return fmt.Errorf("wings: open %s: %w", jobStream, err)
+	if n.jobs, err = n.client.OpenStream[jobEnvelope](jobStreamFor(n.id)); err != nil {
+		return fmt.Errorf("wings: open %s: %w", jobStreamFor(n.id), err)
 	}
-	if n.out, err = n.client.OpenStream[resultEnvelope](resultStream); err != nil {
-		return fmt.Errorf("wings: open %s: %w", resultStream, err)
+	if n.out, err = n.client.OpenStream[resultEnvelope](resultStreamFor(n.id)); err != nil {
+		return fmt.Errorf("wings: open %s: %w", resultStreamFor(n.id), err)
 	}
 	return nil
 }
-
-// serve exposes the broker on addr. The listener is always loopback in
-// practice: a remote worker is reached through a tunnel, and the broker speaks
-// no authentication of its own, so binding anything routable would publish an
-// open one.
-func (n *workerNode) serve(addr string) error {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("wings: listen on %s: %w", addr, err)
-	}
-	srv := grpc.NewServer()
-	protos.RegisterDurableStreamsServer(srv, n.broker.Service())
-	n.srv, n.lis = srv, lis
-	go func() {
-		if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			n.log.Error("wings: broker server stopped", "err", err)
-		}
-	}()
-	return nil
-}
-
-// addr is where this worker's broker is listening, or "" when it is not.
-func (n *workerNode) addr() string {
-	if n.lis == nil {
-		return ""
-	}
-	return n.lis.Addr().String()
-}
-
-// backend is the handle an in-process coordinator talks to directly, with no
-// socket and no marshalling in between.
-func (n *workerNode) backend() dswire.Backend { return n.broker.Client() }
 
 // run drains jobs until ctx is cancelled.
 //
@@ -230,21 +167,55 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	return res
 }
 
-func (n *workerNode) close() error {
-	if n == nil {
+// servedBroker is a broker a WORKER PROCESS stands up for itself, together with
+// the gRPC server that lets the coordinator in.
+//
+// Only the out-of-process targets build one. In process there is no socket and
+// no second process, so there is nothing to serve and the cluster's own engine
+// is used directly.
+type servedBroker struct {
+	broker *embed.InProcess
+	client *dsclient.Client
+	srv    *grpc.Server
+	lis    net.Listener
+}
+
+func startServedBroker(dir, listen string, log *slog.Logger) (*servedBroker, error) {
+	b, err := embed.StartInProcess(embed.InProcessConfig{Dir: dir, Logger: streamLogger(log)})
+	if err != nil {
+		return nil, fmt.Errorf("wings: start broker: %w", err)
+	}
+	s := &servedBroker{broker: b, client: dsclient.Wrap(b.Client())}
+
+	lis, err := net.Listen("tcp", listen)
+	if err != nil {
+		_ = b.Close()
+		return nil, fmt.Errorf("wings: listen on %s: %w", listen, err)
+	}
+	srv := grpc.NewServer()
+	protos.RegisterDurableStreamsServer(srv, b.Service())
+	s.srv, s.lis = srv, lis
+
+	go func() {
+		if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			log.Error("wings: broker server stopped", "err", err)
+		}
+	}()
+	return s, nil
+}
+
+func (s *servedBroker) addr() string { return s.lis.Addr().String() }
+
+func (s *servedBroker) close() error {
+	if s == nil {
 		return nil
 	}
-	if n.srv != nil {
-		n.srv.GracefulStop()
+	if s.srv != nil {
+		s.srv.GracefulStop()
 	}
-	var errs []error
-	if n.client != nil {
-		errs = append(errs, n.client.Close())
-	}
-	if n.broker != nil {
-		errs = append(errs, n.broker.Close())
-	}
-	return errors.Join(errs...)
+	// The client wraps the broker's own backend, which Close also releases, so
+	// only one of them may do it.
+	return s.broker.Close()
 }
 
 // isWorkerProcess reports whether this process was started by wings as a
@@ -257,6 +228,11 @@ func isWorkerProcess() bool { return os.Getenv(envMode) == modeWorker }
 func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	concurrency, _ := strconv.Atoi(os.Getenv(envConcurrency))
 	jobTimeout, _ := time.ParseDuration(os.Getenv(envJobTimeout))
+	id := os.Getenv(envWorkerID)
+	if id == "" {
+		id = "worker"
+	}
+
 	dir := os.Getenv(envDir)
 	if dir == "" {
 		var err error
@@ -264,29 +240,26 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 			return fmt.Errorf("wings: worker data dir: %w", err)
 		}
 	}
-
 	listen := os.Getenv(envListen)
 	if listen == "" {
 		listen = "127.0.0.1:0"
 	}
 
-	n, err := startWorkerNode(ctx, workerConfig{
-		id:          os.Getenv(envWorkerID),
-		dir:         dir,
-		listen:      listen,
-		concurrency: concurrency,
-		timeout:     jobTimeout,
-		log:         log,
-	})
+	b, err := startServedBroker(dir, listen, log)
 	if err != nil {
 		return err
 	}
-	defer n.close()
+	defer b.close()
+
+	n, err := newWorkerNode(ctx, b.client, id, concurrency, jobTimeout, log)
+	if err != nil {
+		return err
+	}
 
 	// The parent reads this to learn the port, so it must be the first thing on
 	// stdout and must be flushed before anything blocks.
-	fmt.Fprintln(os.Stdout, readyPrefix+n.addr())
+	fmt.Fprintln(os.Stdout, readyPrefix+b.addr())
 
-	n.log.Info("wings: worker serving", "addr", n.addr(), "concurrency", n.concurrency)
+	n.log.Info("wings: worker serving", "addr", b.addr(), "concurrency", n.concurrency)
 	return n.run(ctx)
 }

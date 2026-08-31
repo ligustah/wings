@@ -80,6 +80,16 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		dir         = flag.String("dir", "", "data directory; empty uses a temporary one that is removed on exit")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
+
+		// Autoscaling. Off unless -max-workers is set, and expressed only in
+		// jobs and durations — nothing here names a target, so the same numbers
+		// mean the same thing whether a worker is a goroutine or a VM.
+		maxWorkers    = flag.Int("max-workers", 0, "autoscale up to this many workers; 0 keeps the count fixed")
+		minWorkers    = flag.Int("min-workers", 0, "when autoscaling, never drop below this many workers")
+		jobsPerWorker = flag.Int("jobs-per-worker", 0, "when autoscaling, how much backlog one worker should carry")
+		idleTimeout   = flag.Duration("idle-timeout", 0, "when autoscaling, how long a worker must be idle before it is retired")
+		scaleInterval = flag.Duration("scale-interval", 0, "when autoscaling, how often the policy is evaluated")
+		maxScaleStep  = flag.Int("max-scale-step", 0, "when autoscaling, the most workers one decision may add")
 	)
 	// Every linked-in provider's flags, before parsing — which provider is
 	// selected is itself a parsed flag, so they all have to be declared first.
@@ -99,6 +109,14 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		Dir:         *dir,
 		JobTimeout:  *jobTimeout,
 		Logger:      log,
+		Scaling: Scaling{
+			Min:           *minWorkers,
+			Max:           *maxWorkers,
+			JobsPerWorker: *jobsPerWorker,
+			IdleTimeout:   *idleTimeout,
+			Interval:      *scaleInterval,
+			MaxStep:       *maxScaleStep,
+		},
 	}
 
 	switch strings.ToLower(*target) {

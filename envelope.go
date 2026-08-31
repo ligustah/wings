@@ -1,17 +1,25 @@
 package wings
 
-// Stream names on a worker's broker. Each worker owns exactly these two: the
-// coordinator writes jobs and reads results, and never the reverse. Workers do
-// not read each other's anything — there is no stream in this package that two
-// workers both touch.
+// Stream names. Each worker gets its own pair: the coordinator writes jobs to a
+// NAMED worker and reads that worker's results. Workers do not read each other's
+// anything — there is no stream in this package that two workers both touch.
+//
+// Naming them per worker rather than per broker is what lets the same code
+// serve both shapes. In process, every worker's pair lives on ONE shared
+// engine; distributed, each worker's pair lives on that worker's own broker and
+// the names simply do not collide with anyone. Nothing above has to know which
+// it is looking at.
 const (
-	jobStream    = "wings.jobs"
-	resultStream = "wings.results"
+	jobStreamPrefix    = "wings.jobs."
+	resultStreamPrefix = "wings.results."
 
-	// consumerGroup is the offset key a worker commits its progress under.
-	// One worker per broker, so it never needs to be more specific than this.
+	// consumerGroup is the offset key a worker commits its progress under. It
+	// need not be more specific: a worker consumes only its own job stream.
 	consumerGroup = "wings"
 )
+
+func jobStreamFor(workerID string) string    { return jobStreamPrefix + workerID }
+func resultStreamFor(workerID string) string { return resultStreamPrefix + workerID }
 
 // jobEnvelope is one unit of work on the wire.
 //

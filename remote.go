@@ -50,7 +50,7 @@ func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conns[i], errs[i] = c.deploy(ctx, m, binary, fmt.Sprintf("remote-%d", i))
+			conns[i], errs[i] = c.deploy(ctx, m, binary, c.workerID("remote"))
 		}()
 	}
 	wg.Wait()
@@ -116,7 +116,7 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, binary, id string) (*wo
 		return nil, err
 	}
 
-	w, err := c.connect(id, backend, true)
+	w, err := c.connectBackend(id, backend)
 	if err != nil {
 		_ = backend.Close()
 		return nil, err

@@ -39,7 +39,15 @@ type Config struct {
 	// Workers is how many workers to run. Defaults to 1 for [InProcess] — one
 	// in-process worker with Concurrency goroutines is the same machine either
 	// way — and to 2 otherwise.
+	//
+	// Ignored when Scaling is enabled, which decides the count instead.
 	Workers int
+
+	// Scaling makes the worker count follow the queue. The zero value is off.
+	//
+	// It is provider-independent: the same policy adds goroutines, processes or
+	// cloud VMs depending only on Target.
+	Scaling Scaling
 
 	// Concurrency is how many jobs one worker runs at once. Zero lets each
 	// worker decide from its own CPU count, which is the only correct default

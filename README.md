@@ -20,7 +20,15 @@ change to the code.
 ```sh
 ./myapp -target inprocess          # goroutines in this process
 ./myapp -target local -workers 4   # child processes on this machine
-./myapp -target remote -workers 8 -provider gcp         -gcp.project my-proj -gcp.zone europe-west1-b
+./myapp -target remote -workers 8 -provider gcp \
+        -gcp.project my-proj -gcp.zone europe-west1-b
+```
+
+The worker count can follow the queue instead of being chosen:
+
+```sh
+./myapp -target remote -min-workers 2 -max-workers 16 -jobs-per-worker 4 \
+        -provider gcp -gcp.project my-proj -gcp.zone europe-west1-b
 ```
 
 Your program names no cloud, imports no SDK and holds no credentials. It cannot
@@ -100,26 +108,81 @@ Flags you register in that package are parsed too — `CoordinatorMain` calls
 `flag.Parse()` on the default set, so your own flags sit beside `-target` and
 `-workers` without wings knowing about them.
 
+## Autoscaling
+
+Set `-max-workers` (or `Config.Scaling`) and wings sizes the cluster from the
+queue: workers wanted is outstanding jobs ÷ `-jobs-per-worker`, rounded up and
+clamped between `-min-workers` and `-max-workers`. A worker idle for longer than
+`-idle-timeout` is retired.
+
+The policy names no provider — it is jobs and durations only — so the same
+numbers add goroutines, child processes or VMs depending on nothing but
+`-target`. Which means a policy you tuned locally means the same thing in
+production.
+
+Scaling down never drops work: a worker is retired only while idle, and idle is
+decided under the same lock that assigns jobs, so nothing can be sent to a worker
+already on its way out. Failing to provision is not fatal — the cluster keeps
+running at its current size and tries again on the next tick, because a quota
+refusal should cost throughput, not the run.
+
+| flag | meaning |
+|---|---|
+| `-max-workers` | ceiling; setting it is what turns autoscaling on. A spend limit as much as a capacity one |
+| `-min-workers` | floor, held even with an empty queue (at least 1) |
+| `-jobs-per-worker` | backlog one worker is expected to carry (default 1) |
+| `-idle-timeout` | how long a worker must have had nothing to do (default 60s) |
+| `-scale-interval` | how often the policy is evaluated (default 2s) |
+| `-max-scale-step` | most workers one decision may add — lower it when provisioning is rate-limited |
+
+`-idle-timeout` is the one to think about, because the right value is dominated
+by what a *replacement* costs. A goroutine is free to recreate; a VM is minutes
+of boot plus an upload, so a timeout that looks thrifty locally can leave a
+remote cluster permanently rebuilding itself.
+
 ## How it works
 
-Each worker hosts its own single-node [durable-streams](../durable_streams)
-broker with two streams, `wings.jobs` and `wings.results`. The coordinator
-writes jobs to a chosen worker and tails that worker's results. **Workers never
-talk to each other**, and the coordinator only ever dials outward — so it works
-from a laptop behind NAT.
+Every worker owns a pair of [durable-streams](../durable_streams) streams,
+`wings.jobs.<worker>` and `wings.results.<worker>`. The coordinator writes jobs
+to a chosen worker and tails that worker's results. **Workers never talk to each
+other**, and the coordinator only ever dials outward — so it works from a laptop
+behind NAT.
+
+The coordinator speaks only `dsclient`. What sits under that client is the sole
+difference between the three targets:
 
 ```
 Coordinator ──dsclient.Client──> dswire.Backend
-                                   ├─ in-memory broker      (goroutine worker)
-                                   ├─ gRPC on 127.0.0.1     (child process)
-                                   └─ gRPC through an SSH tunnel (cloud VM)
+                                   ├─ the cluster's own embedded engine  (goroutine workers)
+                                   ├─ gRPC on 127.0.0.1                  (child process)
+                                   └─ gRPC through an SSH tunnel         (cloud VM)
 ```
+
+In process there is nothing to serve and nothing to dial, because both halves
+are the same program: coordinator and *all* its workers meet on one embedded
+engine, opening the same streams from either side. Out of process each worker
+stands up a single-node broker for itself and the coordinator reaches it over
+gRPC.
 
 One seam, three constructors. The worker loop, the encoding and the dispatch are
 identical in all three, which is why a bug that only shows up on a cloud VM is a
 bug in the transport rather than in your work.
 
 Streams, offsets, brokers and clients appear nowhere in the public API.
+
+### The coordinator's own record
+
+On that same embedded engine — broker-less, no listener, no port — the
+coordinator keeps a stream of what it decided: every job accepted and where it
+was sent, every result that came back, every redispatch after a worker was lost,
+every worker that entered or left service. Nothing reads it during the run. Its
+value is that it outlives the process, so a coordinator that died has still left
+an account of what it had done.
+
+Writes go through a buffered channel drained by one goroutine and batched, so
+recording never becomes backpressure on the work. A full buffer drops entries
+rather than blocking a submit — and counts them, so a gap in the record is
+reported rather than silent.
 
 ### Remote deployment
 
@@ -154,7 +217,7 @@ Used directly rather than through `wings build`:
 ```go
 c, err := wings.Start(ctx, wings.Config{
     Target:      wings.Remote(gcp.New(gcp.Config{Project: "p", Zone: "z"})),
-    Workers:     8,
+    Workers:     8,               // or a Scaling policy instead
     Concurrency: 4,               // jobs at once per worker; 0 = the worker decides
     JobTimeout:  5 * time.Minute,
 })
