@@ -299,6 +299,26 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 }
 
+// A caller that gives up on a job while moveJob has taken its worker away and
+// not yet failed it finds a pending job with no worker. Releasing nothing is
+// nothing, not a crash.
+func TestGivingUpOnAJobWithNoWorkerIsHarmless(t *testing.T) {
+	c := &Cluster{pending: map[string]*pendingJob{}}
+	p := &pendingJob{job: jobEnvelope{ID: "j"}, done: make(chan struct{}), waiters: 1}
+	c.pending["j"] = p
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	defer c.cancel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.await(ctx, p); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want the caller's cancellation", err)
+	}
+	if _, still := c.pending["j"]; still {
+		t.Fatal("the abandoned job is still pending")
+	}
+}
+
 func ExampleDefine() {
 	// Defined at package scope in real code, so a worker process has it too.
 	greet := Define("example.greet", func(ctx context.Context, name string) (string, error) {

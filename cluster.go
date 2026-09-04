@@ -770,7 +770,16 @@ func workerID(w *workerConn) string {
 }
 
 // release credits a finished job back to its worker. Call with mu held.
+//
+// A job briefly has no worker: moveJob credits the old one and clears it
+// before dropping the lock to fail the job, and a caller giving up on that
+// job in between finds it still pending and releases whatever it holds. That
+// worker was already credited, so there is nothing to do — and there used to
+// be a nil dereference instead.
 func (c *Cluster) release(w *workerConn) {
+	if w == nil {
+		return
+	}
 	if w.inflight > 0 {
 		w.inflight--
 	}
