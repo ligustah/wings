@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -59,6 +58,16 @@ type Cluster struct {
 	// coordinator that restarts knows what it left running.
 	machines *machineLog
 
+	// outputs is one mirror over the whole fleet, keeping a copy of everything
+	// jobs write. See output.go. Set once before any worker can run a job, and
+	// only read after, so it needs no lock.
+	outputs *dsclient.MirrorSetHandle
+
+	// dropped names the output streams being deleted right now, so the mirror
+	// declines them rather than starting a copy of something on its way out.
+	// Guarded by mu.
+	dropped map[string]bool
+
 	// mu guards workers, pending, closed, and every workerConn field that
 	// changes after construction (inflight, draining, idleSince).
 	//
@@ -108,11 +117,6 @@ type workerConn struct {
 	// job that has NOT finished and waiting for the result stream to produce
 	// would defeat the purpose.
 	beats *dsclient.Stream[beatEnvelope]
-
-	// blobs is bulk output from jobs running here, on its way to the
-	// coordinator's own storage. Tailed on its own goroutine, like beats,
-	// because it too describes a job that has not finished.
-	blobs *dsclient.Stream[artifactChunk]
 
 	// ownsClient is false for an in-process worker, whose backend the worker
 	// node itself closes. Closing it twice takes the broker down under the half
@@ -218,9 +222,6 @@ type pendingJob struct {
 	// checkpoint is the last progress reported, and is handed to the next
 	// attempt so it resumes rather than starting over.
 	checkpoint []byte
-	// artifacts are the bulk outputs this attempt has begun writing, so an
-	// attempt that is abandoned takes them with it.
-	artifacts []string
 	// steps are the phases this job has completed, accumulated here rather
 	// than resent by the worker each time — a step then costs one message
 	// whatever came before it. A report that arrives out of order is dropped
@@ -363,6 +364,10 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.adopt(w)
 	}
 
+	if err := c.startOutputMirror(); err != nil {
+		return nil, err
+	}
+
 	c.wg.Add(1)
 	go c.watchdog()
 
@@ -424,13 +429,10 @@ func (c *Cluster) adopt(w *workerConn) {
 		c.tailBeats(w)
 	}()
 
-	c.wg.Add(1)
-	w.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		defer w.wg.Done()
-		c.tailArtifacts(w)
-	}()
+	// A machine the mirror has not been told about yet. It will find this one on
+	// its own eventually, and eventually is a long time to be writing output
+	// nothing is keeping.
+	c.pokeOutputs()
 }
 
 // launch brings up n workers for the configured target.
@@ -470,9 +472,6 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	}
 	if w.beats, err = client.OpenStream[beatEnvelope](beatStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", beatStreamFor(id), id, err)
-	}
-	if w.blobs, err = client.OpenStream[artifactChunk](artifactStreamFor(id)); err != nil {
-		return nil, fmt.Errorf("wings: open %s on worker %s: %w", artifactStreamFor(id), id, err)
 	}
 	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
 		return nil, err
@@ -696,6 +695,19 @@ func (c *Cluster) forget(p *pendingJob) {
 		return
 	}
 	delete(c.pending, p.job.ID)
+	// Every attempt but the one that produced the result wrote something
+	// nobody holds a handle to. Only worth looking when there WAS an earlier
+	// attempt, which is rare.
+	if p.job.Attempt > 0 {
+		job, keep := p.job.ID, p.job.Attempt
+		// On the cluster's wait group, so Stop does not close the storage this
+		// is deleting through while it is still deleting.
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.dropOutputsOf(job, keep)
+		}()
+	}
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
 			delete(c.byOrigin, key)
@@ -792,7 +804,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 		return
 	}
 	from := p.worker
-	w := c.pick()
+	w := c.pickBut(from)
 	if w == nil {
 		if from != nil {
 			c.release(from)
@@ -805,10 +817,6 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	if from != nil {
 		c.release(from)
 	}
-	// Whatever the abandoned attempt was writing is unreachable: the handle
-	// only ever leaves in a result, and this attempt is not producing one.
-	c.dropArtifactsOf(p.job.ID)
-
 	job := p.job
 	job.Attempt++
 	job.Checkpoint = p.checkpoint
@@ -825,12 +833,40 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 		Worker: w.id, Attempt: job.Attempt, Err: why,
 	}.from(p.origin))
 
-	if _, err := w.jobs.Append(c.ctx, []jobEnvelope{job}); err != nil {
-		c.mu.Lock()
-		c.release(w)
-		c.mu.Unlock()
-		c.failPending(p, fmt.Errorf("wings: redispatch to worker %s: %w", w.id, err))
-	}
+	// Off the watchdog's goroutine: a retry carrying a large recording has to
+	// have it put on the new worker first, and a sweep must not wait on a copy.
+	go func() {
+		// What the abandoned attempts recorded goes with the job. Their handles
+		// never left — a handle only ever leaves in a result, and an attempt
+		// that was moved produced none — so this is the only way the work they
+		// did reaches the attempt that has to redo it.
+		// What the old worker recorded may not have reached the coordinator
+		// yet; a job can stall sooner than the mirror looks. Wait for it before
+		// deciding what the retry gets, or the retry resumes from less than
+		// actually survived.
+		c.drainOutputs(c.ctx, from, job.ID)
+
+		priors, err := c.priorsOf(c.ctx, w, job.ID)
+		if err != nil {
+			c.log.Warn("wings: could not look for what a job recorded",
+				"job", job.ID, "err", err)
+		}
+		job.Priors = priors
+		if err := c.hydrate(c.ctx, w, job.Priors); err != nil {
+			// Not fatal. A retry that cannot read what its predecessor wrote
+			// starts from the beginning, which is slow but correct; refusing to
+			// run it at all is neither.
+			c.log.Warn("wings: could not give a retry its predecessor's recordings",
+				"job", job.ID, "worker", w.id, "err", err)
+			job.Priors = nil
+		}
+		if _, err := w.jobs.Append(c.ctx, []jobEnvelope{job}); err != nil {
+			c.mu.Lock()
+			c.release(w)
+			c.mu.Unlock()
+			c.failPending(p, fmt.Errorf("wings: redispatch to worker %s: %w", w.id, err))
+		}
+	}()
 }
 
 // onBeat records that a job is still alive, and where it has got to.
@@ -929,17 +965,35 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 
 // pick chooses the available worker with the least work outstanding.
 // Call with mu held.
-func (c *Cluster) pick() *workerConn {
-	var best *workerConn
+func (c *Cluster) pick() *workerConn { return c.pickBut(nil) }
+
+// pickBut is pick, preferring anywhere but one worker.
+//
+// A job being moved is usually being moved BECAUSE of where it was — a machine
+// that stopped answering, or one whose clock says it is stuck — and sending it
+// straight back there wastes the whole timeout again. The old worker is still
+// the answer when it is the only one, since a retry on a busy worker beats no
+// retry at all.
+func (c *Cluster) pickBut(avoid *workerConn) *workerConn {
+	var best, fallback *workerConn
 	for _, w := range c.workers {
 		if !w.available() {
+			continue
+		}
+		if w == avoid {
+			if fallback == nil || w.inflight < fallback.inflight {
+				fallback = w
+			}
 			continue
 		}
 		if best == nil || w.inflight < best.inflight {
 			best = w
 		}
 	}
-	return best
+	if best != nil {
+		return best
+	}
+	return fallback
 }
 
 // submit places one job and returns a handle to its outcome.
@@ -1196,127 +1250,4 @@ func (c *Cluster) tailBeats(w *workerConn) {
 			from = r.Offset + 1
 		}
 	}
-}
-
-// tailArtifacts copies bulk output from a worker onto the coordinator's own
-// storage as it is produced.
-//
-// The same store-and-forward shape as the result mirror, and for the same
-// reason: what a worker holds dies with the worker, and a cloud machine is
-// destroyed the moment its work is done. A hundred megabytes of simulation
-// events that only existed on the VM would be a hundred megabytes nobody could
-// ever read.
-//
-// Read from the beginning, unlike beats. A beat is a position and only the
-// latest matters; a chunk is a piece of something, and a piece skipped is a
-// hole in a file.
-func (c *Cluster) tailArtifacts(w *workerConn) {
-	client, err := c.sharedClient()
-	if err != nil {
-		c.log.Error("wings: cannot store artifacts", "worker", w.id, "err", err)
-		return
-	}
-
-	// Where each artifact's copy has got to, so a reconnected tail does not
-	// write a chunk twice.
-	copied := map[string]int{}
-	var from int64
-
-	for {
-		if w.ctx.Err() != nil || w.dead.Load() {
-			return
-		}
-		readCtx, cancel := context.WithTimeout(w.ctx, pollInterval)
-		recs, err := w.blobs.ReadBlocking(readCtx, from, artifactBatch)
-		cancel()
-		if err != nil {
-			if w.ctx.Err() != nil {
-				return
-			}
-			// Nothing here declares a worker dead: that is the result tail's
-			// job, and it has the window and the exit signal to do it with.
-			if !errors.Is(err, context.DeadlineExceeded) {
-				select {
-				case <-w.ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
-			}
-			continue
-		}
-		for _, r := range recs {
-			from = r.Offset + 1
-			chunk := r.Record
-			if chunk.Seq < copied[chunk.ID] {
-				continue // already stored, on a previous pass
-			}
-			if err := c.storeChunk(client, chunk); err != nil {
-				c.log.Error("wings: storing artifact data", "worker", w.id,
-					"artifact", chunk.ID, "err", err)
-				continue
-			}
-			copied[chunk.ID] = chunk.Seq + 1
-			c.mu.Lock()
-			if p, ok := c.pending[chunk.Job]; ok {
-				p.artifacts = appendOnce(p.artifacts, chunk.ID)
-			}
-			c.mu.Unlock()
-		}
-	}
-}
-
-// storeChunk appends one chunk to the coordinator's copy of an artifact.
-func (c *Cluster) storeChunk(client *dsclient.Client, chunk artifactChunk) error {
-	name := artifactCopyOf(chunk.ID)
-	if chunk.Seq == 0 {
-		ok, err := client.StreamExists(c.ctx, name)
-		if err != nil {
-			return fmt.Errorf("wings: check %s: %w", name, err)
-		}
-		if !ok {
-			if err := client.CreateStream(c.ctx, name, nil); err != nil {
-				return fmt.Errorf("wings: create %s: %w", name, err)
-			}
-		}
-	}
-	stream, err := client.OpenStream[artifactChunk](name)
-	if err != nil {
-		return fmt.Errorf("wings: open %s: %w", name, err)
-	}
-	if _, err := stream.Append(c.ctx, []artifactChunk{chunk}); err != nil {
-		return fmt.Errorf("wings: append to %s: %w", name, err)
-	}
-	return nil
-}
-
-// dropArtifactsOf deletes what a job's abandoned attempt wrote. Call with mu
-// held.
-func (c *Cluster) dropArtifactsOf(jobID string) {
-	p, ok := c.pending[jobID]
-	if !ok || len(p.artifacts) == 0 {
-		return
-	}
-	ids := p.artifacts
-	p.artifacts = nil
-
-	client, err := c.sharedClient()
-	if err != nil {
-		return
-	}
-	// In the background: this is housekeeping, and a job waiting to be moved
-	// should not wait on a delete.
-	go func() {
-		for _, id := range ids {
-			if err := dropArtifact(context.WithoutCancel(c.ctx), client, id); err != nil {
-				c.log.Warn("wings: could not discard an abandoned artifact", "artifact", id, "err", err)
-			}
-		}
-	}()
-}
-
-func appendOnce(ids []string, id string) []string {
-	if slices.Contains(ids, id) {
-		return ids
-	}
-	return append(ids, id)
 }

@@ -17,6 +17,8 @@ import (
 	"github.com/ligustah/durable_streams/broker/protos"
 	"github.com/ligustah/durable_streams/dsclient"
 	"google.golang.org/grpc"
+
+	"github.com/ligustah/wings/internal/invoke"
 )
 
 // workerNode is the loop that drains one worker's job stream.
@@ -36,11 +38,12 @@ type workerNode struct {
 	jobs   *dsclient.Stream[jobEnvelope]
 	out    *dsclient.Stream[resultEnvelope]
 	beats  *dsclient.Stream[beatEnvelope]
-	blobs  *dsclient.Stream[artifactChunk]
 
-	// open names the artifacts this worker has already opened, so a second
-	// Create under one job and name is refused rather than silently producing
-	// two logs under one handle.
+	// open names the streams this worker has already stood up for a job, so one
+	// attempt opening the same name twice is refused rather than silently
+	// producing two under one handle. The names carry the attempt, so a retry
+	// that lands back on this same worker opens a new one rather than colliding
+	// with what its predecessor left here.
 	openMu sync.Mutex
 	open   map[string]bool
 }
@@ -70,7 +73,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 // already there. StreamExists is node-local, which is the right question for
 // both an embedded engine and a single-node broker.
 func (n *workerNode) declareStreams(ctx context.Context) error {
-	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id), artifactStreamFor(n.id)} {
+	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
 		if err != nil {
 			return fmt.Errorf("wings: check stream %s: %w", name, err)
@@ -92,42 +95,37 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 	if n.beats, err = n.client.OpenStream[beatEnvelope](beatStreamFor(n.id)); err != nil {
 		return fmt.Errorf("wings: open %s: %w", beatStreamFor(n.id), err)
 	}
-	if n.blobs, err = n.client.OpenStream[artifactChunk](artifactStreamFor(n.id)); err != nil {
-		return fmt.Errorf("wings: open %s: %w", artifactStreamFor(n.id), err)
-	}
 	return nil
 }
 
-// openArtifact mints an identity for one job's named output.
+// declareOutput stands a stream up on this worker for one attempt of one job to
+// write.
 //
-// The attempt is part of it because a job that is moved writes again from the
-// start, and the two logs must not be one: only the attempt that finished has a
-// handle anybody holds, and the other is deleted unread.
-func (n *workerNode) openArtifact(job, name string) (string, error) {
+// Nothing announces it. The coordinator's mirror finds it by listing this
+// worker, and the name says which job and which attempt it belongs to — so
+// there is no register here to be out of date with what is actually on disk.
+//
+// One stream per output, so a job writing a gigabyte of video cannot hold up
+// another job's events behind it.
+func (n *workerNode) declareOutput(ctx context.Context, stream, name string) (*dsclient.Client, error) {
 	n.openMu.Lock()
-	defer n.openMu.Unlock()
 	if n.open == nil {
 		n.open = map[string]bool{}
 	}
-	key := job + "." + name
-	if n.open[key] {
-		return "", fmt.Errorf("wings: job %s already has an artifact called %q", job, name)
+	if n.open[stream] {
+		n.openMu.Unlock()
+		return nil, fmt.Errorf("wings: this attempt already opened %q", name)
 	}
-	n.open[key] = true
-	return key, nil
-}
+	n.open[stream] = true
+	n.openMu.Unlock()
 
-// sendChunks ships artifact records to the coordinator.
-//
-// Outside the processor's transaction, like a heartbeat and for the same
-// reason: bulk output that only became visible when the job finished would have
-// to be held whole on the worker until then, which is the cost this exists to
-// avoid.
-func (n *workerNode) sendChunks(chunks []artifactChunk) error {
-	if _, err := n.blobs.Append(context.Background(), chunks); err != nil {
-		return fmt.Errorf("wings: send artifact data: %w", err)
+	// Deliberately not ctx: a job whose deadline expires between here and the
+	// first record would leave a stream half-made, and the next attempt looking
+	// at it.
+	if err := ensureStream(context.WithoutCancel(ctx), n.client, stream); err != nil {
+		return nil, err
 	}
-	return nil
+	return n.client, nil
 }
 
 // sendBeat publishes one progress report.
@@ -221,7 +219,14 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// timeout: calling Heartbeat is always allowed, and it is the checkpoint
 	// that makes a redispatch cheap whether or not anything is watching the
 	// clock.
-	ctx = withBeat(ctx, &beatState{job: job.ID, sink: n, in: job.Checkpoint, steps: job.Steps})
+	ctx = withBeat(ctx, &beatState{
+		job: job.ID, sink: n, in: job.Checkpoint, steps: job.Steps,
+		attempt: job.Attempt, priors: job.Priors,
+	})
+	// The worker's own broker, bound so a job can read what its previous
+	// attempts wrote. A worker is not a place work dispatches to and has no
+	// host; this is only storage, which is all Replay needs.
+	ctx = invoke.WithStreams(ctx, n.client)
 
 	// A panicking work function must cost one job, not the worker.
 	defer func() {

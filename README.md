@@ -352,20 +352,11 @@ copy would have thrown away is kept. The coordinator recognises it by the run,
 thread and position the call sits at, which replay puts in the same place every
 attempt.
 
-## Bulk output
+## Recordings
 
-A result is one record on one stream, held whole in memory at both ends. That is
-the wrong shape for a job whose output is measured in megabytes — a simulation's
-event log, a render, a scan — and past a few of them the transport will not carry
-it at all.
-
-Write it as an **artifact** instead. It leaves the worker in chunks as it is
-produced, lands on the coordinator's own durable streams, and outlives the
-machine that made it; what comes back in the result is a small handle.
-
-Two ways to write one, same storage underneath.
-
-**Events**, when the job produces a sequence of typed things as it runs:
+A long job's progress is usually a **sequence of events** — a simulation's ticks,
+a solver's moves, a crawl's fetches. wings can keep that sequence for you, and
+give it back to the job when the job has to start again somewhere else.
 
 ```go
 rec, err := wings.Record[Event](ctx, "replay")
@@ -373,7 +364,7 @@ for step := range simulation(ctx) {
     if err := rec.Record(step.Event()); err != nil { return Result{}, err }
 }
 if err := rec.Close(); err != nil { return Result{}, err }
-return Result{Replay: rec.Artifact()}, nil
+return Result{Replay: rec.Recording()}, nil    // a handle, not the events
 ```
 
 and on the coordinator:
@@ -385,30 +376,60 @@ for ev, err := range wings.Replay[Event](ctx, played.Replay) {
 }
 ```
 
-Neither end holds the log. Events are packed into chunks on the way out and
-unpacked as the range advances, so a log of millions of events is a few hundred
-records rather than a few million.
+**One event is one record.** They go onto a durable stream of their own on the
+worker, are copied onto the coordinator's own storage as they arrive, and come
+back out one at a time in the order they went in. Neither end ever holds the log:
+a reader takes as many as it wants and pays for no more, and breaking out of the
+range stops the reading.
 
-**Bytes**, when the producer wants an `io.Writer`:
+**A retry gets handed what its predecessor wrote.** This is the part that makes
+it worth doing at all. A simulation that streams a hundred megabytes of events
+and dies at minute fifty is no use if the retry starts from zero.
+
+```go
+if priors := wings.Priors(ctx); len(priors) > 0 {
+    for ev, err := range wings.Replay[Event](ctx, priors[len(priors)-1]) {
+        if err != nil { break }    // a log nobody closed stops early; that is fine
+        sim.Apply(ev)
+    }
+}
+```
+
+Each prior is a **prefix** of the same work, not a continuation — attempt 0 and
+attempt 1 both start from the beginning — so replay one of them, not all. None is
+`Complete` and none reports its `Events`, because the attempt that would have
+counted them did not survive to. A truncated log is precisely a record of how far
+the work got, and `Replay` reads one to whatever end it has.
+
+This is durability for the job's **own** state, deliberately outside the durable
+execution wings does for the job itself. `Step` and `Heartbeat` are for resuming
+a job; a recording is for describing what it did. wings stores the events and
+gives them back, and never reads one.
+
+**Cleaning up.** A recording lives on the coordinator's `Dir` until
+`rec.Discard(ctx)` — only the caller knows when it has been read. The recordings
+of attempts that were abandoned are removed without being asked once the job
+settles: nobody holds a handle to those.
+
+## Artifacts
+
+Separately, and with nothing in common but the word "big": a job can produce a
+**file**. A result is one record on one stream, held whole in memory at both
+ends, which is the wrong shape for a render, an archive or a core dump.
 
 ```go
 out, err := wings.Create(ctx, "render")
-_ = encode(ctx, out)          // an ordinary io.Writer
+_ = encode(ctx, out)                  // an ordinary io.Writer
 _ = out.Close()
 return Result{Video: out.Artifact()}, nil
 ```
 
-read back with `wings.Open(ctx, a)`, an `io.ReadCloser`. What a job writes is
-opaque either way: wings does not record it, replay it into the job, or have an
-opinion about it. This is deliberately **outside** durable execution — it is the
-job's own state, in the job's own shape, and `Step` and `Heartbeat` are for
-resuming a job rather than describing what it did.
+read back with `wings.Open(ctx, a)`, an `io.ReadCloser`, and removed with
+`a.Discard(ctx)`. What a job writes is opaque bytes in whatever format it and its
+caller agree on.
 
-**Cleaning up.** An artifact lives on the coordinator's `Dir` until
-`wings.Discard(ctx, a)` — only the caller knows when it has been read, and a run
-that produces one per job and never discards them fills a disk. Artifacts from
-attempts that were abandoned, because a job was moved or given up on, are removed
-without being asked: nobody holds a handle to those.
+Artifacts are not events and are not replayed into anything. A retry is not
+handed its predecessor's files, because a file is not a position.
 
 ### What cannot be moved
 

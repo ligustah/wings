@@ -48,6 +48,10 @@ type jobEnvelope struct {
 	// Steps are the [Step] calls a previous attempt completed, in order. A
 	// retry replays them from here instead of running them again.
 	Steps []stepRecord `json:"steps,omitempty"`
+	// Priors are the event logs earlier attempts of this job left behind,
+	// oldest attempt first. A retry reads them with [Priors] to pick up where
+	// one of them stopped instead of starting over.
+	Priors []Recording `json:"priors,omitempty"`
 }
 
 // stepRecord is one completed [Step]: where it sat in the job, what it was

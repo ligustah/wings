@@ -82,20 +82,30 @@
 // the move happened is paid for twice, and that cost is irreducible: nobody can
 // say whether it finished.
 //
-// # Bulk output
+// # Recordings
 //
-// A result is one record on one stream and is held whole in memory at both
-// ends, which is the wrong shape for output measured in megabytes. [Record]
-// writes a typed event log and [Create] a byte stream; both leave the worker in
-// chunks as they are produced, land on the coordinator's own storage, and
-// return a small handle that travels in the result. Read them back with
-// [Replay] and [Open], and remove them with [Discard].
+// A long job's progress is usually a sequence of events. [Record] keeps that
+// sequence: one event is one record on a durable stream of its own, copied onto
+// the coordinator's storage as it is produced, and read back one at a time with
+// [Replay]. What travels in the result is a small handle.
 //
-// This is deliberately outside durable execution. What a job writes here is its
-// own state in its own shape — wings stores it and gives it back, and never
-// reads it, records it or replays it into the job. [Step] and [Heartbeat] are
+// A job that is moved is handed what its earlier attempts recorded, through
+// [Priors], and can play those events back into itself to reach the point the
+// last one stopped at. That is the reason this is a stream of events and not a
+// file: a file is opaque, and a log is a position.
+//
+// This is durability for the job's OWN state, deliberately outside the durable
+// execution wings does for the job itself. wings stores the events and gives
+// them back, and never reads one. [Step] and [Heartbeat] are
 // the other thing: they are about resuming a job, not about describing what it
 // did.
+//
+// # Artifacts
+//
+// Separately, and sharing nothing with the above: a job can produce a file.
+// [Create] gives an io.Writer whose bytes leave the worker as they are written
+// and land on the coordinator's storage, and [Open] reads them back. A retry is
+// not handed its predecessor's files, because a file is not a position.
 //
 // # Communication
 //

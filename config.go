@@ -48,11 +48,6 @@ const (
 	// an [Artifact], which is streamed in chunks and never held whole.
 	maxMessage = 64 << 20
 
-	// artifactBatch is how many artifact chunks the coordinator asks for at
-	// once. Chunks are a quarter of a megabyte each, so this is what bounds one
-	// message; the tail is not short of round trips.
-	artifactBatch = 8
-
 	// watchdogInterval is how often outstanding jobs are checked against their
 	// deadlines.
 	//

@@ -79,6 +79,13 @@ type beatState struct {
 	sink beatSink
 	in   []byte
 
+	// attempt is which dispatch of this job is running, and priors are the
+	// event logs the ones before it left behind. Both are here rather than in a
+	// context value of their own because this is already the thing a running
+	// job carries.
+	attempt int
+	priors  []Recording
+
 	// steps are what a previous attempt completed, and next is how far this one
 	// has replayed through them. Guarded because Step may be called from a work
 	// function that does several things at once — though it must not be, and

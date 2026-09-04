@@ -73,6 +73,24 @@ func From(ctx context.Context) Host {
 	return h
 }
 
+type streamsKey struct{}
+
+// WithStreams binds durable streams to ctx without claiming to be a [Host].
+//
+// A worker has streams — its own broker — but it is not a place work dispatches
+// to, and giving it a Host whose Invoke lied would be worse than not having one.
+// This is the narrower thing: somewhere to read and write, for the parts of the
+// package that need storage rather than a cluster.
+func WithStreams(ctx context.Context, c *dsclient.Client) context.Context {
+	return context.WithValue(ctx, streamsKey{}, c)
+}
+
+// StreamsFrom returns streams bound directly to ctx, or nil.
+func StreamsFrom(ctx context.Context) *dsclient.Client {
+	c, _ := ctx.Value(streamsKey{}).(*dsclient.Client)
+	return c
+}
+
 // Origin says which larger piece of work a call belongs to.
 //
 // A bare Digest(ctx, w) has no origin and needs none. The same line inside a

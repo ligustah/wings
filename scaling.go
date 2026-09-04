@@ -210,12 +210,27 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 		w.draining = true
 		retire = append(retire, w)
 	}
-	if len(retire) > 0 {
-		c.workers = slices.DeleteFunc(c.workers, func(w *workerConn) bool {
-			return slices.Contains(retire, w)
-		})
-	}
 	c.mu.Unlock()
+
+	// Still in c.workers here, and that is the point: the fleet the output
+	// mirror is given is c.workers, so a worker taken out of it has its copies
+	// cancelled. Marked draining, so nothing new is sent to it either way.
+	for _, w := range retire {
+		// What its jobs wrote may still be mid-copy. They finished — that is why
+		// this worker is idle — but finishing is not the same as having been
+		// kept, and in a moment this machine stops being readable.
+		c.drainOutputs(context.WithoutCancel(c.ctx), w, "")
+	}
+
+	c.mu.Lock()
+	c.workers = slices.DeleteFunc(c.workers, func(w *workerConn) bool {
+		return slices.Contains(retire, w)
+	})
+	c.mu.Unlock()
+	// So the mirror lets go of them now rather than on its next pass. Its copies
+	// read through a client that is about to be closed, and every one of them
+	// would report a failure a tick at a time until it noticed.
+	c.pokeOutputs()
 
 	for _, w := range retire {
 		// Tell the tail goroutine this was deliberate, so the read error that
@@ -252,6 +267,11 @@ func (c *Cluster) reapDead() {
 		return false
 	})
 	c.mu.Unlock()
+	if len(reaped) > 0 {
+		// Same as retiring: the mirror is still copying from a machine that is
+		// gone, and would go on failing against it until its next pass.
+		c.pokeOutputs()
+	}
 
 	for _, w := range reaped {
 		c.log.Info("wings: releasing dead worker", "worker", w.id)
