@@ -1237,10 +1237,35 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	}
 	c.closed = true
 	workers := c.workers
-	c.workers = nil
 	c.mu.Unlock()
 
 	c.journal.record(journalEntry{Kind: journalClusterStop})
+
+	// Before the mirror is cancelled: what a job wrote in its last moments may
+	// still be on its way. Its result arrived and its caller has the handle,
+	// and the machine that holds the rest is about to be destroyed. Cancelling
+	// first left a persistent Dir holding the front of a file whose handle
+	// promised the whole of it. All at once, since each is bounded on its own
+	// and a fleet's worth of bounds in a row would be a long Stop.
+	//
+	// The workers are still in c.workers for this, and must be: the fleet the
+	// mirror follows IS c.workers, and a worker taken out of it has its copies
+	// cancelled and stops being a source the mirror will answer for. Nothing
+	// new reaches them meanwhile — closed is set, so submit refuses — and the
+	// scaler declines to run on a closing cluster.
+	var drains sync.WaitGroup
+	for _, w := range workers {
+		drains.Add(1)
+		go func() {
+			defer drains.Done()
+			c.drainOutputs(ctx, w, "")
+		}()
+	}
+	drains.Wait()
+
+	c.mu.Lock()
+	c.workers = nil
+	c.mu.Unlock()
 
 	c.cancel()
 	c.wg.Wait()

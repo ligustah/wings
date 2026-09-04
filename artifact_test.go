@@ -100,6 +100,52 @@ func TestDiscardRemovesAnArtifact(t *testing.T) {
 	}
 }
 
+// THE POINT: a handle promises the whole file, and the file is still being
+// copied off the worker when the handle arrives. A Stop that cancelled the
+// copy first, then destroyed the worker, left a persistent Dir holding the
+// front of a file — and a caller who reopened it later read to the end of what
+// had arrived and then waited for the rest of a machine that was gone.
+func TestStopKeepsWhatWasStillBeingCopied(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	dir := t.TempDir()
+	c, err := Start(t.Context(), Config{Target: LocalProcess(), Workers: 1, Concurrency: 1, Dir: dir})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Large, so the copy is still behind the result when Stop is called.
+	art, err := render(c.Bind(t.Context()), 48<<20)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// The worker is gone. Whatever the coordinator kept is all there is.
+	again, err := Start(t.Context(), Config{Target: InProcess(), Dir: dir})
+	if err != nil {
+		t.Fatalf("Start again: %v", err)
+	}
+	defer again.Stop(context.Background())
+
+	r, err := Open(again.Bind(t.Context()), art)
+	if err != nil {
+		t.Fatalf("Open after Stop: %v", err)
+	}
+	defer r.Close()
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		t.Fatalf("reading it back after Stop: %v", err)
+	}
+	if n != art.Size {
+		t.Fatalf("read %d bytes of the %d the handle promised; Stop let the worker go before its output was copied", n, art.Size)
+	}
+}
+
 // Outside a work function there is no job for an artifact to belong to.
 func TestCreatingAnArtifactOutsideAJobIsAnError(t *testing.T) {
 	if _, err := Create(context.Background(), "x"); err == nil {
