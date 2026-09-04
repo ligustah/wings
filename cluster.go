@@ -566,6 +566,11 @@ func (c *Cluster) tail(w *workerConn) {
 	var (
 		trouble  time.Time // when the current run of failures began
 		attempts int
+		// batch is how many results one read asks for. Every result is under
+		// maxResult on its own, but a read returns many, and a batch of large
+		// ones can together exceed what one message carries. That is not a
+		// dead worker; it is a read that asked for too much.
+		batch = resultBatch
 	)
 
 	for {
@@ -595,7 +600,7 @@ func (c *Cluster) tail(w *workerConn) {
 			limit = min(c.cfg.reconnect()-time.Since(trouble), 5*time.Second)
 		}
 		readCtx, cancel := context.WithTimeout(w.ctx, limit)
-		recs, err := w.results.ReadBlocking(readCtx, from, 256)
+		recs, err := w.results.ReadBlocking(readCtx, from, batch)
 		cancel()
 
 		if err != nil {
@@ -612,21 +617,27 @@ func (c *Cluster) tail(w *workerConn) {
 				return // already retired deliberately
 			}
 
-			// A message too large is not a link that might come back. Waiting
-			// out the reconnect window for it spends two minutes reaching a
-			// verdict already known, and says nothing about the actual cause —
-			// which is a result bigger than the transport will carry, and which
-			// belongs in an Artifact instead.
+			// A message too large is not a link that might come back, and it
+			// is not a dead worker either. Nearly always it is a batch of
+			// legal results that is too much at once, so ask for fewer. Only
+			// a single record that cannot be carried is a genuine oversized
+			// result — which a worker built from this source never sends — and
+			// even that costs the one job, not the worker holding it and the
+			// machine under it, which used to be declared dead and destroyed.
 			if status.Code(err) == codes.ResourceExhausted {
-				c.log.Error("wings: a result was too large for the connection to carry",
-					"worker", w.id, "err", err,
-					"hint", "return a wings.Artifact for output this size rather than a value")
-				c.journal.record(journalEntry{
-					Kind: journalWorkerGone, Worker: w.id, Err: "result too large: " + err.Error(),
-				})
-				w.dead.Store(true)
-				c.redispatchFrom(w)
-				return
+				if batch > 1 {
+					batch /= 2
+					continue
+				}
+				// Nothing can be decoded, so nothing says which job it was. It
+				// stays outstanding until its own bound settles it; the record
+				// is left where it is, since a resume would only skip it again.
+				c.log.Error("wings: skipping a result too large for the connection to carry",
+					"worker", w.id, "offset", from, "err", err,
+					"hint", "the worker that produced it was built from different source; "+
+						"a result this size belongs in a wings.Artifact")
+				from++
+				continue
 			}
 
 			// A worker we can see has exited is dead now, not in two minutes.
@@ -656,6 +667,9 @@ func (c *Cluster) tail(w *workerConn) {
 			c.log.Info("wings: worker is back", "worker", w.id, "after", time.Since(trouble))
 			trouble, attempts = time.Time{}, 0
 		}
+		// Grown back after a read that fit, so a run of large results costs a
+		// few smaller reads rather than a permanently timid one.
+		batch = min(batch*2, resultBatch)
 
 		for _, r := range recs {
 			// Written down before it is handed over, so a result a caller saw

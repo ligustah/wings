@@ -48,6 +48,23 @@ const (
 	// an [Artifact], which is streamed in chunks and never held whole.
 	maxMessage = 64 << 20
 
+	// maxResult is the largest encoded result a worker will send back. Below
+	// maxMessage by enough for the framing around a record, so a result at the
+	// limit still fits a message carrying it alone.
+	//
+	// Enforced by the WORKER, on every target, because the worker is the one
+	// place that has the result in hand before it is committed: a job whose
+	// result is too big fails with an error that names the size and the fix,
+	// and the worker, its queue and its machine carry on. The coordinator's
+	// side of this only ever sees a read it cannot carry, which names neither
+	// the job nor the cause.
+	maxResult = maxMessage - maxMessage/8
+
+	// resultBatch is how many results the coordinator asks a worker for in one
+	// read. Halved when a batch of legal results is together too large to
+	// carry, and grown back once reads succeed again.
+	resultBatch = 256
+
 	// watchdogInterval is how often outstanding jobs are checked against their
 	// deadlines.
 	//

@@ -261,6 +261,16 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		}
 		return res
 	}
+	// Refused here rather than discovered on the far side. A result the
+	// transport cannot carry does not fail cleanly there: the read that could
+	// not carry it looked like a dropped connection, and the worker holding it
+	// — and its machine — paid for one job's mistake. Here the job pays, with
+	// an error that says what to do instead.
+	if len(payload) > maxResult {
+		res.Error = fmt.Sprintf("wings: the result of %s is %d bytes, more than a result may be (%d); "+
+			"return a wings.Artifact for output this size rather than a value", job.Func, len(payload), maxResult)
+		return res
+	}
 	res.Payload = payload
 	return res
 }

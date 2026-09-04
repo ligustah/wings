@@ -299,6 +299,45 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 }
 
+var huge = Define("test.huge", func(ctx context.Context, n int) (string, error) {
+	return strings.Repeat("x", n), nil
+})
+
+// THE POINT: a result too large to carry is one job's mistake. It used to look
+// like a dropped connection to the coordinator, which declared the worker dead,
+// redispatched everything it held, and on a cloud target destroyed the machine
+// — then the retry produced the same result somewhere else. The worker knows
+// the size before anything is sent, and the job is what fails.
+func TestAResultTooLargeFailsTheJobNotTheWorker(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1})
+	ctx := c.Bind(t.Context())
+
+	_, err := huge(ctx, maxResult+1)
+	if err == nil {
+		t.Fatal("want an error from a result too large to carry")
+	}
+	if !strings.Contains(err.Error(), "Artifact") {
+		t.Fatalf("the error should say what to do instead: %v", err)
+	}
+
+	// The worker is untouched: still serving, never suspected.
+	if got, err := double(ctx, 21); err != nil || got != 42 {
+		t.Fatalf("the worker did not survive an oversized result: %v, %d", err, got)
+	}
+	if firstWorker(t, c).dead.Load() {
+		t.Fatal("the worker was declared dead over one job's result")
+	}
+	entries := awaitJournal(t, c, func(es []journalEntry) bool {
+		return countKind(es, journalCompleted) >= 2
+	})
+	if n := countKind(entries, journalWorkerGone); n != 0 {
+		t.Errorf("the record says a worker was lost %d times; none was", n)
+	}
+	if n := countKind(entries, journalRedispatch); n != 0 {
+		t.Errorf("the job was moved %d times; a result too large is the same everywhere", n)
+	}
+}
+
 // A caller that gives up on a job while moveJob has taken its worker away and
 // not yet failed it finds a pending job with no worker. Releasing nothing is
 // nothing, not a crash.
