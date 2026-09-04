@@ -347,12 +347,30 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 
 	c.journal.record(journalEntry{Kind: journalClusterStart})
 
-	fail := func(err error) (*Cluster, error) {
+	// fail undoes everything above and everything between here and a
+	// successful return: whatever goroutines have started, whatever workers
+	// were brought up — released properly, so a machine that was destroyed
+	// has its lease closed — and then the record and the engine. One path
+	// rather than one per failure, because the path that was written by hand
+	// for a late failure was the one that leaked.
+	fail := func(err error, workers []*workerConn) (*Cluster, error) {
 		cancel()
+		release := context.WithoutCancel(ctx)
+		for _, w := range workers {
+			_ = c.releaseWorker(release, w)
+		}
+		c.wg.Wait()
 		c.journal.close()
 		_ = c.closeShared()
 		c.cleanupDir()
 		return nil, err
+	}
+
+	// Before any worker exists. The mirror reads the fleet afresh on every
+	// pass, so it has nothing to wait for — and a failure here costs nothing,
+	// where a failure after the machines were up used to cost the machines.
+	if err := c.startOutputMirror(); err != nil {
+		return fail(err, nil)
 	}
 
 	// Before provisioning anything: whatever a previous coordinator left
@@ -364,27 +382,19 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	// created fresh and empty every time, which is correct: nothing was left.
 	workers, err := c.reattach(ctx)
 	if err != nil {
-		return fail(err)
+		return fail(err, nil)
 	}
 
 	n := cfg.Scaling.initialWorkers(cfg.workers()) - len(workers)
 	if n > 0 {
 		fresh, err := c.launch(ctx, n)
 		if err != nil {
-			release := context.WithoutCancel(ctx)
-			for _, w := range workers {
-				_ = w.close(release)
-			}
-			return fail(err)
+			return fail(err, workers)
 		}
 		workers = append(workers, fresh...)
 	}
 	for _, w := range workers {
 		c.adopt(w)
-	}
-
-	if err := c.startOutputMirror(); err != nil {
-		return nil, err
 	}
 
 	c.wg.Add(1)
