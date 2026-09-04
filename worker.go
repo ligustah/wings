@@ -191,6 +191,7 @@ func (n *workerNode) process(ctx context.Context, batch []jobEnvelope) ([]result
 
 func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnvelope) {
 	res.ID = job.ID
+	res.Attempt = job.Attempt
 
 	h, ok := lookup(job.Func)
 	if !ok {
@@ -228,7 +229,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// not counted against the work. Best-effort like every beat — a lost one
 	// is made good by the first real report, and until then the job is merely
 	// not yet under its bounds.
-	if err := n.sendBeat(ctx, beatEnvelope{Job: job.ID, Started: true}); err != nil {
+	if err := n.sendBeat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Started: true}); err != nil {
 		n.log.Warn("wings: could not report a job as started", "job", job.ID, "err", err)
 	}
 	// The worker's own broker, bound so a job can read what its previous
@@ -242,7 +243,8 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 			buf := make([]byte, 8192)
 			buf = buf[:runtime.Stack(buf, false)]
 			n.log.Error("wings: work function panicked", "fn", job.Func, "job", job.ID, "panic", r)
-			res = resultEnvelope{ID: job.ID, Error: fmt.Sprintf("wings: %s panicked: %v\n\n%s", job.Func, r, buf)}
+			res = resultEnvelope{ID: job.ID, Attempt: job.Attempt,
+				Error: fmt.Sprintf("wings: %s panicked: %v\n\n%s", job.Func, r, buf)}
 		}
 	}()
 

@@ -123,5 +123,5 @@ func (b *beatState) report(ctx context.Context, rec stepRecord) error {
 	if b.sink == nil {
 		return nil
 	}
-	return b.sink.sendBeat(ctx, beatEnvelope{Job: b.job, Step: &rec})
+	return b.sink.sendBeat(ctx, beatEnvelope{Job: b.job, Attempt: b.attempt, Step: &rec})
 }

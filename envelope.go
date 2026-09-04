@@ -75,6 +75,12 @@ type stepRecord struct {
 // belongs to.
 type beatEnvelope struct {
 	Job string `json:"job"`
+	// Attempt is which dispatch of the job this report is from. A job that was
+	// moved has an attempt still running where it was left, and that one may
+	// wake up and report: without this the coordinator could not tell its
+	// beats from the retry's, and would reset the retry's clock and hand it a
+	// checkpoint from behind where it already is.
+	Attempt int `json:"attempt,omitempty"`
 	// Started says the worker has taken this job off its queue and begun it.
 	// Sent once, first, so the coordinator's clocks run from when the work
 	// began rather than from when it was sent: a job can sit behind others on
@@ -95,7 +101,13 @@ type beatEnvelope struct {
 // re-raised on the coordinator. Only infrastructure trouble aborts the worker's
 // batch, which is what keeps one bad input from stalling a worker forever.
 type resultEnvelope struct {
-	ID      string `json:"id"`
+	ID string `json:"id"`
+	// Attempt is which dispatch produced this. A moved job's abandoned attempt
+	// can finish after the move, and a result from it is not the answer: its
+	// outputs are the ones the coordinator drops when the job settles, so
+	// delivering it would hand the caller handles to streams about to be
+	// deleted. Only the current attempt's result counts.
+	Attempt int    `json:"attempt,omitempty"`
 	Payload []byte `json:"payload,omitempty"`
 	Error   string `json:"error,omitempty"`
 }

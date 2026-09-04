@@ -690,9 +690,22 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // An unknown id is normal rather than alarming: a worker's stream survives the
 // coordinator that wrote to it, so a restart against a persistent Dir replays
 // results nobody is waiting for any more.
+//
+// So is a result from an attempt that was moved away. The job was taken off
+// that worker on the suspicion it was stuck, and a worker that was merely slow
+// finishes anyway. Its answer is not the answer: the retry is the attempt the
+// job now is, its worker was already credited back when the job left it, and
+// its outputs are exactly what the coordinator deletes once the job settles.
+// Delivering it would hand the caller handles to streams on their way out.
 func (c *Cluster) deliver(res resultEnvelope) {
 	c.mu.Lock()
 	p, ok := c.pending[res.ID]
+	if ok && res.Attempt != p.job.Attempt {
+		c.mu.Unlock()
+		c.log.Info("wings: ignoring a result from an attempt that was moved away",
+			"job", res.ID, "attempt", res.Attempt, "current", p.job.Attempt)
+		return
+	}
 	if ok {
 		c.forget(p)
 		c.release(p.worker)
@@ -893,12 +906,15 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 //
 // A beat for an id nobody is waiting for is ordinary rather than alarming: the
 // job may have just finished, or been moved elsewhere, and the worker's report
-// was already in flight.
+// was already in flight. So is one from an attempt the job has moved on from:
+// the worker it was left on may wake and report, and that report says nothing
+// about the attempt now running — crediting it would reset the retry's clock
+// and could replace its checkpoint with an older one.
 func (c *Cluster) onBeat(b beatEnvelope) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p, ok := c.pending[b.Job]
-	if !ok {
+	if !ok || b.Attempt != p.job.Attempt {
 		return
 	}
 	now := time.Now()

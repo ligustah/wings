@@ -639,6 +639,162 @@ func TestARetiredMachineTakesNothingWithIt(t *testing.T) {
 	}
 }
 
+// late stages an attempt that was moved away and then finishes anyway.
+var late struct {
+	release0 chan struct{} // lets attempt 0 finish
+	release1 chan struct{} // lets attempt 1 finish
+	started1 chan struct{} // closed once attempt 1 is running
+	once     sync.Once
+}
+
+// lateSim records events, then on its first attempt goes quiet until released;
+// on its second it stays alive until released. Either attempt, once released,
+// completes the recording and returns a handle to it — which is the situation
+// the coordinator has to get right: two attempts of one job, both finishing,
+// only one of them the job.
+var lateSim = Define("test.late", func(ctx context.Context, steps int) (Recording, error) {
+	rec, err := Record[Tick](ctx, "replay")
+	if err != nil {
+		return Recording{}, err
+	}
+	for i := range steps {
+		if err := rec.Record(Tick{At: i}); err != nil {
+			return Recording{}, err
+		}
+	}
+	if err := rec.Flush(); err != nil {
+		return Recording{}, err
+	}
+
+	switch Attempt(ctx) {
+	case 0:
+		// Quiet: no beats, so the coordinator moves the job. But not gone.
+		select {
+		case <-late.release0:
+		case <-ctx.Done():
+			return Recording{}, ctx.Err()
+		}
+	default:
+		late.once.Do(func() { close(late.started1) })
+		// Alive and saying so, so this attempt is not moved as well.
+		for {
+			select {
+			case <-late.release1:
+			case <-ctx.Done():
+				return Recording{}, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+				_ = Heartbeat(ctx, 0)
+				continue
+			}
+			break
+		}
+	}
+	if err := rec.Close(); err != nil {
+		return Recording{}, err
+	}
+	return rec.Recording(), nil
+}, WithHeartbeatTimeout(300*time.Millisecond))
+
+// THE POINT: a job that was moved because its worker went quiet may still
+// finish there. Its result carries no more authority than its beats do: the job
+// is now the retry. Delivering the stale result used to hand the caller a handle
+// to attempt 0's recording and then, in the same breath, delete every attempt
+// but attempt 1's — which is to say, exactly that recording.
+func TestAMovedAttemptThatFinishesAnywayIsNotTheAnswer(t *testing.T) {
+	late.release0 = make(chan struct{})
+	late.release1 = make(chan struct{})
+	late.started1 = make(chan struct{})
+	late.once = sync.Once{}
+
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1})
+	ctx := c.Bind(t.Context())
+
+	const steps = 8
+	type outcome struct {
+		rec Recording
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		rec, err := lateSim(ctx, steps)
+		done <- outcome{rec, err}
+	}()
+
+	// Wait for the move, and for the retry to be running.
+	select {
+	case <-late.started1:
+	case o := <-done:
+		t.Fatalf("the job finished before it could be moved: %+v", o)
+	case <-time.After(20 * time.Second):
+		t.Fatal("the retry never started")
+	}
+
+	// Now the abandoned attempt finishes. Its result must not be the caller's.
+	close(late.release0)
+	select {
+	case o := <-done:
+		t.Fatalf("the call returned with the moved attempt's result (attempt %d, err %v); "+
+			"the job is the retry now", o.rec.Attempt, o.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	close(late.release1)
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the retry never delivered")
+	}
+	if got.err != nil {
+		t.Fatalf("lateSim: %v", got.err)
+	}
+	if got.rec.Attempt != 1 {
+		t.Fatalf("the result is from attempt %d, want 1", got.rec.Attempt)
+	}
+
+	// And its handle must open, now and after the abandoned attempt's output
+	// has been cleaned up.
+	waitFor(t, "the abandoned attempt's recording to be discarded",
+		func() bool { return len(abandoned(t, c)) == 0 })
+	seen := 0
+	for ev, err := range Replay[Tick](ctx, got.rec) {
+		if err != nil {
+			t.Fatalf("replay at event %d: %v", seen, err)
+		}
+		if ev.At != seen {
+			t.Fatalf("event %d says it is %d", seen, ev.At)
+		}
+		seen++
+	}
+	if seen != steps {
+		t.Fatalf("replayed %d events, want %d", seen, steps)
+	}
+}
+
+// A beat from an attempt the job has moved on from says nothing about the
+// attempt now running, and must not touch its clock or its checkpoint.
+func TestABeatFromAMovedAttemptIsIgnored(t *testing.T) {
+	c := &Cluster{pending: map[string]*pendingJob{}}
+	p := &pendingJob{job: jobEnvelope{ID: "j", Attempt: 1}, checkpoint: []byte("new")}
+	c.pending["j"] = p
+
+	c.onBeat(beatEnvelope{Job: "j", Attempt: 0, Checkpoint: []byte("old")})
+	if !p.started.IsZero() || !p.beat.IsZero() {
+		t.Fatal("a beat from the abandoned attempt started the retry's clocks")
+	}
+	if string(p.checkpoint) != "new" {
+		t.Fatalf("the checkpoint is %q; the abandoned attempt's beat replaced the retry's", p.checkpoint)
+	}
+
+	c.onBeat(beatEnvelope{Job: "j", Attempt: 1, Checkpoint: []byte("newer")})
+	if p.started.IsZero() || p.beat.IsZero() {
+		t.Fatal("the retry's own beat was ignored")
+	}
+	if string(p.checkpoint) != "newer" {
+		t.Fatalf("the checkpoint is %q, want the retry's", p.checkpoint)
+	}
+}
+
 // waitFor blocks until cond holds, and names what it was waiting for when it
 // does not.
 func waitFor(t *testing.T, what string, cond func() bool) {

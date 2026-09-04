@@ -99,7 +99,7 @@ func (b *beatState) send(ctx context.Context, checkpoint []byte) error {
 	if b.sink == nil {
 		return nil
 	}
-	return b.sink.sendBeat(ctx, beatEnvelope{Job: b.job, Checkpoint: checkpoint})
+	return b.sink.sendBeat(ctx, beatEnvelope{Job: b.job, Attempt: b.attempt, Checkpoint: checkpoint})
 }
 
 type beatKey struct{}
