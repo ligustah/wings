@@ -168,3 +168,103 @@ func TestHeartbeatOutsideAJobIsAnError(t *testing.T) {
 		t.Fatalf("got (%v, %v), want the zero value and false", v, ok)
 	}
 }
+
+// quick is a short job with short bounds. It runs in a fraction of either, so
+// the only way it can fail is by being charged for time it spent waiting.
+var quick = Define("test.quick", func(ctx context.Context, _ int) (string, error) {
+	select {
+	case <-time.After(20 * time.Millisecond):
+		return "finished", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}, WithTimeout(300*time.Millisecond), WithHeartbeatTimeout(300*time.Millisecond))
+
+// THE POINT: a bound is on the work, not on the queue in front of it. One worker
+// with one slot is given a slow job, and then a quick one that waits behind it
+// for longer than its own bounds before it so much as starts. The coordinator
+// used to run both clocks from dispatch, so the quick job was moved as "stuck" —
+// to the back of the same queue, there being nowhere else — until it ran out of
+// attempts without ever having run.
+func TestAQueuedJobIsNotChargedForItsWait(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
+	ctx := c.Bind(t.Context())
+
+	blocker := make(chan error, 1)
+	go func() {
+		_, err := slow(ctx, 900*time.Millisecond)
+		blocker <- err
+	}()
+	// Let it take the only slot before the quick one is sent.
+	time.Sleep(100 * time.Millisecond)
+
+	got, err := quick(ctx, 0)
+	if err != nil {
+		t.Fatalf("a job that waited in a queue was charged for the wait: %v", err)
+	}
+	if got != "finished" {
+		t.Fatalf("got %q", got)
+	}
+	if err := <-blocker; err != nil {
+		t.Fatalf("slow: %v", err)
+	}
+
+	entries := awaitJournal(t, c, func(es []journalEntry) bool {
+		return countKind(es, journalCompleted) >= 2
+	})
+	if n := countKind(entries, journalRedispatch); n != 0 {
+		t.Errorf("a queued job was moved %d times; waiting is not being stuck", n)
+	}
+}
+
+// The clocks, in isolation: what each bound measures from, and what a job that
+// has not started is measured against at all.
+func TestBoundsRunFromWhenTheJobStarted(t *testing.T) {
+	t0 := time.Now()
+	p := &pendingJob{
+		opts:  defOptions{timeout: time.Minute, beat: 10 * time.Second},
+		since: t0,
+	}
+
+	// Queued for an hour: neither bound has begun.
+	if stuck, slow := p.overdue(t0.Add(time.Hour)); stuck || slow {
+		t.Fatalf("a job that has not started is overdue (stuck=%v slow=%v); nothing has been measured yet", stuck, slow)
+	}
+
+	started := t0.Add(time.Hour)
+	p.started = started
+
+	// The total bound counts from the start, not from dispatch.
+	if _, slow := p.overdue(started.Add(30 * time.Second)); slow {
+		t.Fatal("a job thirty seconds into a one-minute bound is too slow; the hour it queued was counted")
+	}
+	if _, slow := p.overdue(started.Add(2 * time.Minute)); !slow {
+		t.Fatal("a job two minutes into a one-minute bound is not too slow")
+	}
+
+	// So does the heartbeat bound, with the start standing in for a beat until
+	// there is one.
+	if stuck, _ := p.overdue(started.Add(5 * time.Second)); stuck {
+		t.Fatal("a job five seconds into a ten-second heartbeat bound is stuck")
+	}
+	if stuck, _ := p.overdue(started.Add(11 * time.Second)); !stuck {
+		t.Fatal("a job that has been silent for eleven seconds of a ten-second bound is not stuck")
+	}
+	p.beat = started.Add(10 * time.Second)
+	if stuck, _ := p.overdue(started.Add(15 * time.Second)); stuck {
+		t.Fatal("a job that beat five seconds ago is stuck")
+	}
+
+	// The start bound is the one thing that applies before the job runs.
+	q := &pendingJob{opts: defOptions{start: time.Minute}, since: t0}
+	if stuck, _ := q.overdue(t0.Add(30 * time.Second)); stuck {
+		t.Fatal("a job queued for thirty seconds of a one-minute start bound is overdue")
+	}
+	if stuck, _ := q.overdue(t0.Add(2 * time.Minute)); !stuck {
+		t.Fatal("a job queued for two minutes of a one-minute start bound is not overdue")
+	}
+	q.started = t0.Add(2 * time.Minute)
+	if stuck, _ := q.overdue(t0.Add(time.Hour)); stuck {
+		t.Fatal("the start bound still applies to a job that has started")
+	}
+}

@@ -211,14 +211,21 @@ type pendingJob struct {
 	// opts are the bounds declared on the work function. Read once at submit
 	// so the watchdog does not go through the registry per job per tick.
 	opts defOptions
-	// since is when the current attempt was dispatched, and beat when it last
-	// reported progress. Zero beat means it has not yet, which is why the
-	// heartbeat clock runs from since: a function that declares a heartbeat
-	// timeout and never beats must be caught, not exempted.
+	// since is when the current attempt was dispatched, started when the
+	// worker reported beginning it, and beat when it last reported progress.
+	//
+	// The bounds on the work run from started, not since: a job can sit behind
+	// others on a busy worker for longer than its own timeout, and none of that
+	// is time the work took. Until started is set neither bound applies, and
+	// only the start bound does. Zero beat means it has not beaten yet, which
+	// is why the heartbeat clock then runs from started: a function that
+	// declares a heartbeat timeout and never beats must be caught, not
+	// exempted.
 	//
 	// Guarded by Cluster.mu.
-	since time.Time
-	beat  time.Time
+	since   time.Time
+	started time.Time
+	beat    time.Time
 	// checkpoint is the last progress reported, and is handed to the next
 	// attempt so it resumes rather than starting over.
 	checkpoint []byte
@@ -236,16 +243,28 @@ type pendingJob struct {
 //
 // The two bounds mean different things and get different remedies, so this
 // answers with which one was hit rather than with a bare yes.
+//
+// A job the worker has not yet begun is measured against the start bound
+// alone. Its timeout and heartbeat bounds are about the work, and charging them
+// for a queue the job is waiting in would fail a quick job for being behind a
+// slow one — or move it, to the back of another queue, until it ran out of
+// attempts having never once run.
 func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
-	if p.opts.timeout > 0 && !p.since.IsZero() && now.Sub(p.since) > p.opts.timeout {
+	if p.started.IsZero() {
+		if p.opts.start > 0 && !p.since.IsZero() && now.Sub(p.since) > p.opts.start {
+			stuck = true
+		}
+		return stuck, false
+	}
+	if p.opts.timeout > 0 && now.Sub(p.started) > p.opts.timeout {
 		tooSlow = true
 	}
 	if p.opts.beat > 0 {
 		last := p.beat
 		if last.IsZero() {
-			last = p.since
+			last = p.started
 		}
-		if !last.IsZero() && now.Sub(last) > p.opts.beat {
+		if now.Sub(last) > p.opts.beat {
 			stuck = true
 		}
 	}
@@ -824,6 +843,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	p.job = job
 	p.worker = w
 	p.since = time.Now()
+	p.started = time.Time{}
 	p.beat = time.Time{}
 	c.charge(w)
 	c.mu.Unlock()
@@ -881,7 +901,20 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 	if !ok {
 		return
 	}
-	p.beat = time.Now()
+	now := time.Now()
+	// Any beat says the job is running, not only the one that says so: a
+	// worker's first report can go missing like any other, and a job that is
+	// visibly making progress must not stay exempt from its bounds for it.
+	if p.started.IsZero() {
+		p.started = now
+	}
+	if b.Started {
+		// The one report that is not progress. Leaving beat alone keeps the
+		// heartbeat clock honest: it runs from started until the job actually
+		// says something.
+		return
+	}
+	p.beat = now
 	if len(b.Checkpoint) > 0 {
 		p.checkpoint = b.Checkpoint
 	}
@@ -916,6 +949,7 @@ func (c *Cluster) watchdog() {
 func (c *Cluster) sweep(now time.Time) {
 	var (
 		stuck []*pendingJob
+		whys  []string
 		slow  []*pendingJob
 	)
 
@@ -929,7 +963,16 @@ func (c *Cluster) sweep(now time.Time) {
 			// the same time again somewhere else.
 			slow = append(slow, p)
 		case isStuck:
+			// Named under the lock, since which bound it was depends on state
+			// only the lock guards. The two are different complaints: one is
+			// about a job that went quiet, the other about a worker that never
+			// began it.
+			why := fmt.Sprintf("no heartbeat for %s", p.opts.beat)
+			if p.started.IsZero() {
+				why = fmt.Sprintf("not started within %s", p.opts.start)
+			}
 			stuck = append(stuck, p)
+			whys = append(whys, why)
 		}
 	}
 	c.mu.Unlock()
@@ -939,10 +982,10 @@ func (c *Cluster) sweep(now time.Time) {
 			"timeout", p.opts.timeout)
 		c.failPending(p, fmt.Errorf("wings: %s exceeded its %s timeout", p.job.Func, p.opts.timeout))
 	}
-	for _, p := range stuck {
-		c.log.Warn("wings: job stopped reporting progress, moving it", "job", p.job.ID,
-			"fn", p.job.Func, "worker", workerID(p.worker), "heartbeat-timeout", p.opts.beat)
-		c.moveJob(p, fmt.Sprintf("no heartbeat for %s", p.opts.beat))
+	for i, p := range stuck {
+		c.log.Warn("wings: job is overdue, moving it", "job", p.job.ID,
+			"fn", p.job.Func, "worker", workerID(p.worker), "why", whys[i])
+		c.moveJob(p, whys[i])
 	}
 }
 

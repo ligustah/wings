@@ -52,6 +52,7 @@ type def[In, Out any] struct {
 type defOptions struct {
 	timeout time.Duration
 	beat    time.Duration
+	start   time.Duration
 }
 
 // Option configures a work function at [Define] time.
@@ -80,11 +81,26 @@ func WithTimeout(d time.Duration) Option {
 // [WithTimeout]: here the suspicion falls on the machine, and moving is the
 // remedy.
 //
-// The clock starts when the job is dispatched, so a function that declares this
-// must heartbeat; one that never calls [Heartbeat] will be moved on every
+// The clock starts when a worker starts the job — not when it was sent, since a
+// job can wait behind others on a busy worker — so a function that declares
+// this must heartbeat; one that never calls [Heartbeat] will be moved on every
 // worker in turn. Zero means no such bound, and no obligation.
 func WithHeartbeatTimeout(d time.Duration) Option {
 	return func(o *defOptions) { o.beat = d }
+}
+
+// WithStartTimeout bounds how long a job may wait on a worker's queue before
+// the worker begins it.
+//
+// The other two bounds are about the work and run only once it has started;
+// this one is about the wait in front of it. A job that has not been started
+// within d is moved to another worker, on the suspicion that the one holding
+// it is not draining its queue. Nothing is lost by moving a job that has not
+// begun. Zero, the default, means a job waits as long as it must — the right
+// answer for a saturated cluster, where every worker's queue is long and moving
+// a job only puts it at the back of another.
+func WithStartTimeout(d time.Duration) Option {
+	return func(o *defOptions) { o.start = d }
 }
 
 // Define registers a work function under name and returns a callable handle.

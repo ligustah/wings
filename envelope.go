@@ -74,7 +74,13 @@ type stepRecord struct {
 // beats from several jobs interleave on one stream and each has to say which it
 // belongs to.
 type beatEnvelope struct {
-	Job        string `json:"job"`
+	Job string `json:"job"`
+	// Started says the worker has taken this job off its queue and begun it.
+	// Sent once, first, so the coordinator's clocks run from when the work
+	// began rather than from when it was sent: a job can sit behind others on
+	// a busy worker for longer than its own bound without a moment of it being
+	// the work's fault. Any beat implies it, so a lost one costs nothing.
+	Started    bool   `json:"started,omitempty"`
 	Checkpoint []byte `json:"checkpoint,omitempty"`
 	// Step is one newly completed [Step], if this beat reports one. Sent one at
 	// a time rather than as a growing log, so the cost of a step does not climb

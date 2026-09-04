@@ -223,6 +223,14 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		job: job.ID, sink: n, in: job.Checkpoint, steps: job.Steps,
 		attempt: job.Attempt, priors: job.Priors,
 	})
+	// Now, not when the job was appended: the coordinator's clocks on this job
+	// run from here, so time it spent waiting behind others on this worker is
+	// not counted against the work. Best-effort like every beat — a lost one
+	// is made good by the first real report, and until then the job is merely
+	// not yet under its bounds.
+	if err := n.sendBeat(ctx, beatEnvelope{Job: job.ID, Started: true}); err != nil {
+		n.log.Warn("wings: could not report a job as started", "job", job.ID, "err", err)
+	}
 	// The worker's own broker, bound so a job can read what its previous
 	// attempts wrote. A worker is not a place work dispatches to and has no
 	// host; this is only storage, which is all Replay needs.

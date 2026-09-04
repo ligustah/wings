@@ -307,8 +307,13 @@ exactly too late. Delivery is best-effort by design: a beat that goes missing
 costs a retry a little redone work, while a beat that blocked the work function
 to guarantee delivery would cost the work.
 
-The clock for a heartbeat timeout starts at dispatch, so a function that declares
-one must actually beat.
+Both clocks start when the worker begins the job, not when it was sent: a job can
+wait behind others on a busy worker for longer than its own bound, and none of
+that is the work's fault. The heartbeat clock then runs from that start, so a
+function that declares one must actually beat. A third bound, `WithStartTimeout`,
+is for the wait itself — how long a job may sit unstarted on a worker's queue
+before it is moved — and is off unless asked for, because on a saturated cluster
+moving a queued job only puts it at the back of another queue.
 
 ### Steps
 
