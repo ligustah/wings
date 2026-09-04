@@ -730,7 +730,13 @@ func (c *Cluster) forget(p *pendingJob) {
 	// Every attempt but the one that produced the result wrote something
 	// nobody holds a handle to. Only worth looking when there WAS an earlier
 	// attempt, which is rare.
-	if p.job.Attempt > 0 {
+	//
+	// Not once the cluster is stopping. This can be reached from a caller's
+	// own goroutine — one giving up on a result — which is not counted in the
+	// wait group, and adding to a group that Stop may already be waiting on
+	// is a misuse. closed is set under this same lock before Stop waits, so
+	// seeing it clear here means the add lands first.
+	if p.job.Attempt > 0 && !c.closed {
 		job, keep := p.job.ID, p.job.Attempt
 		// On the cluster's wait group, so Stop does not close the storage this
 		// is deleting through while it is still deleting.
@@ -868,7 +874,14 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 
 	// Off the watchdog's goroutine: a retry carrying a large recording has to
 	// have it put on the new worker first, and a sweep must not wait on a copy.
+	//
+	// On the cluster's wait group, so Stop waits for it. Every caller of this
+	// is itself counted, so the count cannot be zero here — and left uncounted
+	// it would outlive Stop and finish its move against a journal and an
+	// engine that had already been closed.
+	c.wg.Add(1)
 	go func() {
+		defer c.wg.Done()
 		// What the abandoned attempts recorded goes with the job. Their handles
 		// never left — a handle only ever leaves in a result, and an attempt
 		// that was moved produced none — so this is the only way the work they

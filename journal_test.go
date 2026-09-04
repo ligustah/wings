@@ -236,3 +236,15 @@ func TestABareCallLeavesTheRunColumnsEmpty(t *testing.T) {
 		}
 	}
 }
+
+// An entry can arrive after the journal has closed: a job being moved as Stop
+// began finishes its move against a journal already drained. A send on a
+// closed channel panics, select or no select, and this used to be one.
+func TestRecordingAfterTheJournalClosedIsNotAPanic(t *testing.T) {
+	c := start(t, Config{Target: InProcess()})
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	c.journal.record(journalEntry{Kind: journalFailed, Job: "late"})
+	c.journal.close() // and closing twice is not one either
+}

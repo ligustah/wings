@@ -85,8 +85,15 @@ type journal struct {
 	ch   chan journalEntry
 	done chan struct{}
 
+	// mu serialises record against close. A send on a closed channel panics,
+	// select or no select, and an entry can arrive after close: a goroutine
+	// that was moving a job when Stop began finishes its move against a
+	// journal that has already been drained. Those are counted, not written,
+	// and never a crash.
 	mu      sync.Mutex
+	closed  bool
 	dropped int
+	late    int
 }
 
 // openJournal declares the stream and starts the writer.
@@ -118,19 +125,27 @@ func openJournal(ctx context.Context, client *dsclient.Client, log *slog.Logger,
 	return j, nil
 }
 
-// record queues one entry. Never blocks.
+// record queues one entry. Never blocks, and is safe after close.
 func (j *journal) record(e journalEntry) {
 	if j == nil {
 		return
 	}
 	e.At = time.Now()
 	e.Epoch = j.epoch
+
+	// The lock is held across the send so close cannot slip in between the
+	// check and it. The send does not block, so nothing waits on this lock
+	// for longer than one channel operation.
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		j.late++
+		return
+	}
 	select {
 	case j.ch <- e:
 	default:
-		j.mu.Lock()
 		j.dropped++
-		j.mu.Unlock()
 	}
 }
 
@@ -190,14 +205,25 @@ func (j *journal) close() {
 	if j == nil {
 		return
 	}
+	j.mu.Lock()
+	if j.closed {
+		j.mu.Unlock()
+		return
+	}
+	j.closed = true
 	close(j.ch)
+	j.mu.Unlock()
 	<-j.done
 
 	j.mu.Lock()
-	dropped := j.dropped
+	dropped, late := j.dropped, j.late
 	j.mu.Unlock()
 	if dropped > 0 && j.log != nil {
 		j.log.Warn("wings: journal entries dropped", "count", dropped,
 			"why", "the journal fell behind; the record of this run has gaps")
+	}
+	if late > 0 && j.log != nil {
+		j.log.Warn("wings: journal entries arrived after the journal closed", "count", late,
+			"why", "something was still moving or failing a job as the cluster stopped")
 	}
 }
