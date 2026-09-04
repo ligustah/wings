@@ -86,7 +86,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		// mean the same thing whether a worker is a goroutine or a VM.
 		maxWorkers    = flag.Int("max-workers", 0, "autoscale up to this many workers; 0 keeps the count fixed")
 		minWorkers    = flag.Int("min-workers", 0, "when autoscaling, never drop below this many workers")
-		jobsPerWorker = flag.Int("jobs-per-worker", 0, "when autoscaling, how much backlog one worker should carry")
+		jobsPerWorker = flag.Int("jobs-per-worker", 0, "when autoscaling, how much backlog one worker should carry; 0 means -concurrency, or 1 if that is unset")
 		idleTimeout   = flag.Duration("idle-timeout", 0, "when autoscaling, how long a worker must be idle before it is retired")
 		scaleInterval = flag.Duration("scale-interval", 0, "when autoscaling, how often the policy is evaluated")
 		maxScaleStep  = flag.Int("max-scale-step", 0, "when autoscaling, the most workers one decision may add")

@@ -296,7 +296,7 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	}
 	// Normalised once, here, so nothing downstream has to ask whether a field
 	// was set — the scaling loop reads its policy as given.
-	cfg.Scaling = cfg.Scaling.withDefaults()
+	cfg.Scaling = cfg.Scaling.withDefaults(cfg.Concurrency)
 
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	c := &Cluster{

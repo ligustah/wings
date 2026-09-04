@@ -130,7 +130,7 @@ refusal should cost throughput, not the run.
 |---|---|
 | `-max-workers` | ceiling; setting it is what turns autoscaling on. A spend limit as much as a capacity one |
 | `-min-workers` | floor, held even with an empty queue (at least 1) |
-| `-jobs-per-worker` | backlog one worker is expected to carry (default 1) |
+| `-jobs-per-worker` | backlog one worker is expected to carry (default: `-concurrency` if set, else 1) |
 | `-idle-timeout` | how long a worker must have had nothing to do (default 60s) |
 | `-scale-interval` | how often the policy is evaluated (default 2s) |
 | `-max-scale-step` | most workers one decision may add — lower it when provisioning is rate-limited |

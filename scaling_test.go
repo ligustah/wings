@@ -7,7 +7,7 @@ import (
 )
 
 func TestScalingWantClampsToBounds(t *testing.T) {
-	s := Scaling{Min: 2, Max: 6, JobsPerWorker: 4}.withDefaults()
+	s := Scaling{Min: 2, Max: 6, JobsPerWorker: 4}.withDefaults(0)
 
 	for _, tc := range []struct {
 		outstanding, want int
@@ -31,7 +31,7 @@ func TestScalingWantClampsToBounds(t *testing.T) {
 // JobsPerWorker=10 and 9 jobs outstanding, 9/10 truncates to zero workers, and
 // nothing would ever pick the work up.
 func TestScalingRoundsUpSoAPartialBatchIsStillServed(t *testing.T) {
-	s := Scaling{Min: 0, Max: 10, JobsPerWorker: 10}.withDefaults()
+	s := Scaling{Min: 0, Max: 10, JobsPerWorker: 10}.withDefaults(0)
 
 	if got := s.want(9); got != 1 {
 		t.Fatalf("want(9) with JobsPerWorker=10 is %d; a partial batch must still get a worker", got)
@@ -45,12 +45,38 @@ func TestScalingRoundsUpSoAPartialBatchIsStillServed(t *testing.T) {
 // first job to, and the cluster would refuse work until a tick happened to
 // raise it.
 func TestScalingFloorIsAtLeastOne(t *testing.T) {
-	s := Scaling{Max: 4}.withDefaults()
+	s := Scaling{Max: 4}.withDefaults(0)
 	if s.Min != 1 {
 		t.Errorf("Min defaulted to %d, want 1", s.Min)
 	}
 	if got := s.want(0); got != 1 {
 		t.Errorf("want(0) = %d, want 1", got)
+	}
+}
+
+// THE POINT: a worker with four slots carries four jobs at once. A policy that
+// did not know that asked for a machine per queued job, and a backlog of forty
+// on a cloud target became forty VMs where ten would have done.
+func TestJobsPerWorkerDefaultsToConcurrency(t *testing.T) {
+	s := Scaling{Max: 100}.withDefaults(4)
+	if s.JobsPerWorker != 4 {
+		t.Fatalf("JobsPerWorker defaulted to %d with Concurrency 4, want 4", s.JobsPerWorker)
+	}
+	if got := s.want(40); got != 10 {
+		t.Fatalf("want(40) with four slots per worker = %d, want 10", got)
+	}
+
+	// Set explicitly, it stands: the caller may know the work is memory-bound
+	// and a slot is not a job's worth of machine.
+	s = Scaling{Max: 100, JobsPerWorker: 1}.withDefaults(4)
+	if s.JobsPerWorker != 1 {
+		t.Fatalf("an explicit JobsPerWorker of 1 became %d", s.JobsPerWorker)
+	}
+
+	// And with Concurrency left to the worker there is nothing to derive it
+	// from, so it is the conservative 1.
+	if s := (Scaling{Max: 100}).withDefaults(0); s.JobsPerWorker != 1 {
+		t.Fatalf("JobsPerWorker defaulted to %d with no Concurrency, want 1", s.JobsPerWorker)
 	}
 }
 

@@ -28,7 +28,13 @@ type Scaling struct {
 
 	// JobsPerWorker is how much backlog one worker is expected to carry.
 	// Workers wanted is outstanding jobs divided by this, so 1 means a worker
-	// per queued job and 10 means a worker per ten. Defaults to 1.
+	// per queued job and 10 means a worker per ten.
+	//
+	// Defaults to [Config.Concurrency] when that is set, and to 1 otherwise. A
+	// worker with four slots carries four jobs at once, and a policy that asked
+	// for a machine per queued job would build four times the fleet the queue
+	// needs. When Concurrency is left to the worker, nothing here knows how many
+	// slots one has, so the default is the conservative one.
 	JobsPerWorker int
 
 	// IdleTimeout is how long a worker must have had nothing to do before it is
@@ -71,8 +77,9 @@ func (s Scaling) validate() error {
 }
 
 // withDefaults fills the blanks. Applied once at Start so the loop never has to
-// ask whether a field was set.
-func (s Scaling) withDefaults() Scaling {
+// ask whether a field was set. concurrency is [Config.Concurrency], which is
+// what a worker's share of the backlog defaults to.
+func (s Scaling) withDefaults(concurrency int) Scaling {
 	if !s.enabled() {
 		return s
 	}
@@ -83,7 +90,7 @@ func (s Scaling) withDefaults() Scaling {
 		s.Max = s.Min
 	}
 	if s.JobsPerWorker < 1 {
-		s.JobsPerWorker = 1
+		s.JobsPerWorker = max(concurrency, 1)
 	}
 	if s.IdleTimeout <= 0 {
 		s.IdleTimeout = 60 * time.Second
