@@ -227,6 +227,24 @@ came back for are closed, so no later start hunts for a machine that is already
 gone. Recovered machines count towards the worker target, so a restart provisions
 only the difference.
 
+### What a coordinator restart keeps
+
+Be precise about which half may die. A **worker** may: its queue is on its own
+streams, and the coordinator redispatches what it had not heard back about. A
+**machine** may lose its coordinator: the lease record above brings it back.
+The **coordinator itself** may not, for a bare call. The goroutine that was
+waiting for the answer died with the process, and the new process — which reads
+its own record and each worker's mirror only for the position to continue from —
+drops a result for a job it never dispatched. The work a worker was still doing
+finishes and is written down, and nobody collects it.
+
+What does survive a coordinator restart is a **workflow** ([`flow`](flow)). Its
+history is the durable thing: rerun with the same instance it replays what
+returned and dispatches again what had not. An activity that was in flight when
+the coordinator died is therefore run twice, once by each coordinator, and the
+second copy is the one whose answer counts. Work functions are idempotent for
+exactly this reason.
+
 ### Remote deployment
 
 For `-target remote`, per machine: provision → wait for SSH → upload the

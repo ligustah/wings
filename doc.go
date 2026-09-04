@@ -143,4 +143,9 @@
 // worker is still alive is picked up where it left off, queue and results
 // intact; one that cannot be resumed is destroyed rather than left running.
 // Recovered machines count towards the worker target.
+//
+// What is NOT recovered is a call. A caller's goroutine died with the process
+// that made it, and a result that reaches the new coordinator for a job it never
+// dispatched is dropped. A workflow (package flow) is the exception: its history
+// is the durable thing, and a rerun dispatches again whatever had not returned.
 package wings

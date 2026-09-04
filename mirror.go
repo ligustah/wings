@@ -29,13 +29,19 @@ type mirroredResult struct {
 // mirror copies one worker's results onto the coordinator's own streams as they
 // are read.
 //
-// This is what keeps the coordinator from being the single point of failure for
-// its own state. A worker owns its queue and its results — that is deliberate,
-// and it is why a worker whose link drops keeps working — but everything the
-// coordinator has LEARNED lived only in a map in its memory, so a coordinator
-// crash lost the run even though every worker was fine. Mirroring makes the
-// learning durable on the coordinator's side too, so neither half is the one
-// that must not die.
+// A worker owns its queue and its results — that is deliberate, and it is why a
+// worker whose link drops keeps working — but everything the coordinator has
+// LEARNED lives in a map in its memory. Mirroring writes that learning down on
+// the coordinator's side too, so a run that died has left an account of every
+// result it saw and a position to read the worker from.
+//
+// What it does NOT do, yet, is resume a call. A restarted coordinator reads a
+// mirror only for the offset to continue from; the goroutine that was waiting
+// for a result died with the process, and a result that arrives for a job the
+// new process never dispatched is dropped as nobody's (see deliver). The half
+// that must not die is therefore still the coordinator, for a bare call. A
+// workflow (package flow) is the exception, because its history is the durable
+// thing and a rerun re-dispatches whatever had not returned.
 //
 // It is store-and-forward rather than replication in the durable-streams sense:
 // a reader that tails one stream and appends to another, with a position it can
