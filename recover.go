@@ -200,7 +200,10 @@ func (c *Cluster) outstandingInJournal(ctx context.Context) ([]*recoveredJob, er
 	}
 	var out []*recoveredJob
 	for _, id := range order {
-		if r, ok := jobs[id]; ok && r.job.Func != "" {
+		// A job is a function on an input, or a thread of run code reached
+		// by its lineage, which has no function and is known by its thread.
+		// An entry with neither is not a job the journal can describe.
+		if r, ok := jobs[id]; ok && (r.job.Func != "" || r.job.Thread != "") {
 			out = append(out, r)
 		}
 	}
