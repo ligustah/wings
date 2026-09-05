@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ligustah/durable_streams/dsclient"
+
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
 )
@@ -87,7 +89,23 @@ func (c *Cluster) hydrateLineage(ctx context.Context, w *workerConn, job jobEnve
 	if err != nil {
 		return err
 	}
-	if _, err := st.Append(ctx, events); err != nil {
+	// In a transaction, like everything else on the stream: the
+	// coordinator's copy of the attempt's history is made from the
+	// worker's transactions (see pull.go), and what was put there outside
+	// one would be missing from the history the next attempt is given.
+	producer, err := w.client.Producer(ctx, "wings.lineage."+dest)
+	if err != nil {
+		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
+	}
+	tx, err := producer.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
+	}
+	if _, err := dsclient.Output(tx, st).Append(ctx, events); err != nil {
+		_ = tx.Abort(ctx)
+		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
 	}
 	return nil

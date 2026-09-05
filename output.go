@@ -17,15 +17,18 @@ import (
 //
 // A worker owns its storage, and a cloud worker's storage is destroyed the
 // moment its work is done. Anything a job writes that has to outlive the machine
-// must be copied while the machine is still up. That copy is a mirror —
-// [dsclient.MirrorSet], which discovers streams on another deployment, forwards
-// each one verbatim, and commits how far it has got in the same transaction as
-// the records themselves.
+// must be copied while the machine is still up. What an attempt commits comes
+// home as the transactions it committed — see pull.go. What is written outside
+// one, a shared channel's outbox, comes by a mirror: [dsclient.MirrorSet],
+// which discovers streams on another deployment, forwards each one verbatim,
+// and commits how far it has got in the same transaction as the records
+// themselves. The mirror is also what carries a copy the OTHER way, onto the
+// worker a retry is about to run on.
 //
 // wings therefore keeps no bookkeeping about any of it. Where a copy has reached
 // lives at the destination beside the data, so the two cannot disagree; which
 // streams to copy is re-derived from their names on every pass, so it is never
-// stale. Both directions are the same machinery.
+// stale.
 //
 // Nothing here knows what a recording or an artifact is. They are separate
 // features that both need a stream to survive its worker, the way two programs
@@ -245,8 +248,10 @@ func awaitStream(ctx context.Context, client *dsclient.Client, name string, expe
 	}
 }
 
-// startOutputMirror begins keeping a copy of everything jobs write, anywhere in
-// the fleet, for as long as the cluster runs.
+// startOutputMirror begins keeping a copy of what jobs write OUTSIDE their
+// transactions, anywhere in the fleet, for as long as the cluster runs: the
+// outboxes of shared channels. What an attempt commits comes home as the
+// transactions it committed; see pull.go.
 //
 // ONE set over every worker, not one per worker. wings' machines come and go —
 // autoscaling adds and retires them, and a crash retires one without asking —
@@ -273,6 +278,13 @@ func (c *Cluster) startOutputMirror() error {
 			// there BY a mirror, and forwarding it back would be two mirrors
 			// writing one destination.
 			if !ok || o.Prefix == priorPrefix {
+				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
+			}
+			// What an attempt commits — its history, its recordings, its
+			// files — is pulled as the transactions that wrote it, which
+			// this mirror cannot see the boundaries of. Only what is written
+			// outside one comes this way.
+			if o.Prefix != chanoutPrefix {
 				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
 			}
 			// A stream this job has finished with. Declining it is what makes
@@ -516,7 +528,11 @@ func (c *Cluster) drainOutputs(ctx context.Context, from *workerConn, job string
 			return // not a source of this set; there is nothing to wait for
 		}
 		if done {
-			return
+			// And the transactions, which come the other way. See pull.go.
+			level, err := c.pulledLevel(ctx, from, job)
+			if err != nil || level {
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():

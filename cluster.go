@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ligustah/durable_streams/broker/client/dsremote"
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
@@ -49,6 +50,9 @@ type Cluster struct {
 	sharedOnce sync.Once
 	sharedErr  error
 	sharedStop func() error
+	// engine is the instance itself, for what only the engine can do: pull
+	// a worker's transactions. See pull.go.
+	engine *embed.InProcess
 
 	// journal is the coordinator's own durable record, on that same instance.
 	// It is the one thing the coordinator keeps for itself rather than for a
@@ -110,8 +114,13 @@ type Cluster struct {
 // broker, its two streams, and whatever resource has to be released when it
 // goes away.
 type workerConn struct {
-	id      string
-	client  *dsclient.Client
+	id     string
+	client *dsclient.Client
+	// remote is the connection to the worker's own broker, for what a worker
+	// with an engine of its own publishes and the client above cannot
+	// reach: its finished transactions. Nil for an in-process worker. See
+	// pull.go.
+	remote  *dsremote.Client
 	jobs    *dsclient.Stream[jobEnvelope]
 	results *dsclient.Stream[resultEnvelope]
 	// control is the coordinator's word to this worker about a job already
@@ -581,6 +590,7 @@ func (c *Cluster) adopt(w *workerConn) {
 	loop(c.tail)
 	loop(c.tailBeats)
 	loop(c.submitter)
+	loop(c.pull)
 
 	// A machine the mirror has not been told about yet. It will find this one on
 	// its own eventually, and eventually is a long time to be writing output
@@ -669,7 +679,14 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 // out-of-process targets, where the client exists only to talk to this one
 // worker and dies with it.
 func (c *Cluster) connectBackend(id string, backend dswire.Backend) (*workerConn, error) {
-	return c.connect(id, dsclient.Wrap(backend), true)
+	w, err := c.connect(id, dsclient.Wrap(backend), true)
+	if err != nil {
+		return nil, err
+	}
+	if r, ok := backend.(*dsremote.Client); ok {
+		w.remote = r
+	}
+	return w, nil
 }
 
 // sharedClient is the cluster's own embedded durable-streams instance, created
@@ -699,6 +716,7 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 		}
 		c.shared = dsclient.Wrap(b.Client())
 		c.sharedStop = b.Close
+		c.engine = b
 	})
 	return c.shared, c.sharedErr
 }

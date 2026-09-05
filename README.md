@@ -462,11 +462,15 @@ just not placed. Fan out with `Map` or `Go` when the point is other machines.
 Everything an attempt writes on its worker — that history, its recordings, its
 files — goes into **one transaction**, committed at the points that mean
 something: before every heartbeat and step report, when the function returns,
-and by age as a net under a function that reports nothing for a long time. What
-the coordinator is told about progress is therefore never ahead of what it can
-copy, and what a retry is handed is consistent across all of them: the history
-that says which recordings were made and the recordings themselves were
-committed together.
+and by age as a net under a function that reports nothing for a long time. The
+coordinator's copy is made **transaction by transaction**: its engine
+subscribes to each worker's finished transactions and applies every one
+whole, in commit order, with a durable cursor and a mark per writer, so a
+coordinator that restarts resumes where it was and nothing is applied twice.
+What the coordinator is told about progress is therefore never ahead of what
+it holds, and what a retry is handed is consistent across all of it: the
+history that says which recordings were made and the recordings themselves
+were committed together, and arrived together.
 
 A worker runs as many threads at once as its concurrency says, and **a thread
 that waits is not running**: waiting for a thread it forked, for a channel or
@@ -515,10 +519,11 @@ receives from it; two functions on two workers can share one the same way. A
 thread of run code sent to a worker may use any channel of the run, so every
 channel is shared when one leaves. On
 the wire a shared channel is a durable stream relayed through the coordinator:
-every run that uses it has an outbox — on a worker, copied home like a
-recording — and the coordinator merges the outboxes into one canonical stream
+every run that uses it has an outbox — on a worker, written outside the
+attempt's transaction so it is seen at once, and copied home by a stream
+mirror — and the coordinator merges the outboxes into one canonical stream
 and pushes it to every worker using the channel. A worker subscribes by
-creating its outbox, which the output mirror discovers; nothing asks.
+creating its outbox, which the mirror discovers; nothing asks.
 
 It behaves as a channel between threads does. **Each value goes to one
 receiver**, wherever that receiver runs: a receive is a request the coordinator
