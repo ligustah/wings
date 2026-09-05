@@ -20,7 +20,6 @@ replace (
 require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
-	github.com/google/uuid v1.6.0
 	github.com/ligustah/durable_streams/broker v0.241.0
 	github.com/ligustah/durable_streams/broker/client v0.51.2
 	github.com/ligustah/durable_streams/broker/protos v0.36.1

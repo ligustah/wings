@@ -32,7 +32,7 @@ func Now(ctx context.Context) (time.Time, error) {
 		return time.Time{}, errors.New("flow: Now called outside a Run")
 	}
 
-	ev, err := expect[*protos.GetTimeEvent](t)
+	ev, err := t.expect[*protos.GetTimeEvent]()
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -41,7 +41,7 @@ func Now(ctx context.Context) (time.Time, error) {
 	}
 
 	now := time.Now().Truncate(time.Microsecond)
-	record(t, &protos.GetTimeEvent{Time: timestamppb.New(now)})
+	t.record(&protos.GetTimeEvent{Time: timestamppb.New(now)})
 	return now, t.run.err()
 }
 
@@ -63,7 +63,7 @@ func Sleep(ctx context.Context, d time.Duration) error {
 	start := time.Now()
 
 	ev := t.peek()
-	recorded, err := expect[*protos.SleepEvent](t)
+	recorded, err := t.expect[*protos.SleepEvent]()
 	if err != nil {
 		return err
 	}
@@ -71,7 +71,7 @@ func Sleep(ctx context.Context, d time.Duration) error {
 		start = ev.GetTimestamp().AsTime()
 		d = recorded.GetDuration().AsDuration()
 	} else {
-		record(t, &protos.SleepEvent{Duration: durationpb.New(d)})
+		t.record(&protos.SleepEvent{Duration: durationpb.New(d)})
 		if err := t.run.err(); err != nil {
 			return err
 		}

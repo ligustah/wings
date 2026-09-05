@@ -543,8 +543,8 @@ func (m *gcpMachine) Alive(ctx context.Context) (bool, error) {
 
 // isNotFound reports whether the API said the instance does not exist.
 func isNotFound(err error) bool {
-	var gerr *googleapi.Error
-	return errors.As(err, &gerr) && gerr.Code == http.StatusNotFound
+	gerr, ok := errors.AsType[*googleapi.Error](err)
+	return ok && gerr.Code == http.StatusNotFound
 }
 
 // Close deletes the instance. Idempotent, because both a failed bring-up and a

@@ -138,8 +138,6 @@ func (s Scaling) want(outstanding int) int {
 // a loop that fired again while the last decision was still in flight would
 // answer the same backlog by creating the same machines twice.
 func (c *Cluster) autoscale() {
-	defer c.wg.Done()
-
 	s := c.cfg.Scaling
 	t := time.NewTicker(s.Interval)
 	defer t.Stop()

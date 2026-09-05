@@ -164,7 +164,7 @@ func (t *threadState) at() uint64 {
 // and this is where nearly all of them are caught: the run has reached a
 // point where last time it made a call and this time it wants to sleep, which
 // means the code changed underneath a live run.
-func expect[E protos.Events](t *threadState) (E, error) {
+func (t *threadState) expect[E protos.Events]() (E, error) {
 	var zero E
 
 	ev := t.peek()
@@ -189,10 +189,7 @@ func expect[E protos.Events](t *threadState) (E, error) {
 // The append is what makes the run durable, so a sink failure is kept and
 // fails the run: a run whose history was not written down cannot be replayed,
 // and carrying on as though it could is the one outcome worse than stopping.
-//
-// A free function rather than a method because it is generic in the payload,
-// and because every caller already has the thread in hand.
-func record[E protos.Events](t *threadState, payload E) *protos.Event {
+func (t *threadState) record[E protos.Events](payload E) *protos.Event {
 	t.run.mu.Lock()
 	defer t.run.mu.Unlock()
 
@@ -241,7 +238,7 @@ func (t *threadState) fork() *threadState {
 // call per attempt — and then the log claims the run forked more threads
 // than it did, which is a lie told to whoever reads it after a failure.
 func recordFork(parent, child *threadState) error {
-	ev, err := expect[*protos.ForkEvent](parent)
+	ev, err := parent.expect[*protos.ForkEvent]()
 	if err != nil {
 		return err
 	}
@@ -252,13 +249,13 @@ func recordFork(parent, child *threadState) error {
 		}
 		return parent.run.err()
 	}
-	record(parent, &protos.ForkEvent{ParentThreadId: parent.id, ThreadId: child.id})
+	parent.record(&protos.ForkEvent{ParentThreadId: parent.id, ThreadId: child.id})
 	return parent.run.err()
 }
 
 // recordJoin is recordFork for the other end.
 func recordJoin(parent, child *threadState) error {
-	ev, err := expect[*protos.JoinEvent](parent)
+	ev, err := parent.expect[*protos.JoinEvent]()
 	if err != nil {
 		return err
 	}
@@ -269,7 +266,7 @@ func recordJoin(parent, child *threadState) error {
 		}
 		return parent.run.err()
 	}
-	record(parent, &protos.JoinEvent{ThreadId: child.id})
+	parent.record(&protos.JoinEvent{ThreadId: child.id})
 	return parent.run.err()
 }
 

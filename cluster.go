@@ -428,11 +428,8 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.adopt(w)
 	}
 
-	c.wg.Add(1)
-	go c.watchdog()
-
-	c.wg.Add(1)
-	go c.autoscale()
+	c.wg.Go(c.watchdog)
+	c.wg.Go(c.autoscale)
 	if cfg.Scaling.fixed() {
 		log.Info("wings: cluster ready", "workers", len(workers), "target", cfg.Target.kind)
 	} else {
@@ -521,29 +518,18 @@ func (c *Cluster) adopt(w *workerConn) {
 
 	c.journal.record(journalEntry{Kind: journalWorkerUp, Worker: w.id})
 
-	c.wg.Add(1)
-	w.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		defer w.wg.Done()
-		c.tail(w)
-	}()
-
-	c.wg.Add(1)
-	w.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		defer w.wg.Done()
-		c.tailBeats(w)
-	}()
-
-	c.wg.Add(1)
-	w.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		defer w.wg.Done()
-		c.submitter(w)
-	}()
+	// Each loop is counted twice: on the worker, so closing it can wait for
+	// its own loops, and on the cluster, so Stop can wait for all of them.
+	loop := func(run func(*workerConn)) {
+		c.wg.Add(1)
+		w.wg.Go(func() {
+			defer c.wg.Done()
+			run(w)
+		})
+	}
+	loop(c.tail)
+	loop(c.tailBeats)
+	loop(c.submitter)
 
 	// A machine the mirror has not been told about yet. It will find this one on
 	// its own eventually, and eventually is a long time to be writing output
@@ -1187,8 +1173,6 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 // map of outstanding jobs once a second costs nothing next to the work they
 // represent.
 func (c *Cluster) watchdog() {
-	defer c.wg.Done()
-
 	t := time.NewTicker(watchdogInterval)
 	defer t.Stop()
 	for {

@@ -33,8 +33,8 @@ func MakePermanent[T any](value T, err error) (T, error) {
 
 // IsPermanent reports whether err will not be retried.
 func IsPermanent(err error) bool {
-	var e *permanentError
-	return errors.As(err, &e)
+	_, ok := errors.AsType[*permanentError](err)
+	return ok
 }
 
 type permanentError struct{ err error }
@@ -86,8 +86,8 @@ func (c *continuityError) Error() string {
 
 // IsContinuity reports whether err is a replay mismatch.
 func IsContinuity(err error) bool {
-	var e *continuityError
-	return errors.As(err, &e)
+	_, ok := errors.AsType[*continuityError](err)
+	return ok
 }
 
 func continuityf(format string, args ...any) error {

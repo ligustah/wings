@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 
@@ -42,7 +42,7 @@ type Store interface {
 // NewName mints a run name nothing else will have. Use it when a run has no
 // natural identity of its own; prefer a name derived from what the work is
 // about, since that is what makes a resumed run find its history.
-func NewName() string { return uuid.NewString() }
+func NewName() string { return uuid.New().String() }
 
 func streamName(run string) string {
 	return "flow.run." + run

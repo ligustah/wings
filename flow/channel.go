@@ -96,7 +96,7 @@ func (c *Channel[T]) Send(ctx context.Context, v T) error {
 	// Consumed before waiting, not after. The event says the send completed,
 	// and a replay that waited first would be waiting for a receive that has
 	// already been replayed away.
-	ev, err := expect[*protos.ChannelSendEvent](t)
+	ev, err := t.expect[*protos.ChannelSendEvent]()
 	if err != nil {
 		return err
 	}
@@ -111,7 +111,7 @@ func (c *Channel[T]) Send(ctx context.Context, v T) error {
 	if err := cs.awaitTaken(ctx, item); err != nil {
 		return err
 	}
-	record(t, &protos.ChannelSendEvent{
+	t.record(&protos.ChannelSendEvent{
 		Channel: c.name,
 		Seq:     seq,
 		Value:   &protos.Data{Serialized: data},
@@ -132,7 +132,7 @@ func (c *Channel[T]) Recv(ctx context.Context) (T, bool, error) {
 		return zero, false, err
 	}
 
-	ev, err := expect[*protos.ChannelRecvEvent](t)
+	ev, err := t.expect[*protos.ChannelRecvEvent]()
 	if err != nil {
 		return zero, false, err
 	}
@@ -162,10 +162,10 @@ func (c *Channel[T]) Recv(ctx context.Context) (T, bool, error) {
 		return zero, false, err
 	}
 	if item == nil {
-		record(t, &protos.ChannelRecvEvent{Channel: c.name, Closed: true})
+		t.record(&protos.ChannelRecvEvent{Channel: c.name, Closed: true})
 		return zero, false, t.run.err()
 	}
-	record(t, &protos.ChannelRecvEvent{
+	t.record(&protos.ChannelRecvEvent{
 		Channel:      c.name,
 		FromThreadId: item.from,
 		FromSeq:      item.seq,
@@ -198,7 +198,7 @@ func (c *Channel[T]) Close(ctx context.Context) error {
 	}
 
 	seq := t.nextSend(c.name)
-	ev, err := expect[*protos.ChannelSendEvent](t)
+	ev, err := t.expect[*protos.ChannelSendEvent]()
 	if err != nil {
 		return err
 	}
@@ -211,7 +211,7 @@ func (c *Channel[T]) Close(ctx context.Context) error {
 		return t.run.err()
 	}
 	cs.shut()
-	record(t, &protos.ChannelSendEvent{Channel: c.name, Seq: seq, Closed: true})
+	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Closed: true})
 	return t.run.err()
 }
 

@@ -81,6 +81,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -244,15 +245,10 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 // — deterministic — fails the same way again, which used to be ten attempts
 // and four minutes of backoff to reach the answer the first one had.
 func (r *runner) classify(err error) protos.WorkflowStatus {
-	var call *callError
 	switch {
 	case err == nil:
 		return protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED
-	case IsContinuity(err):
-		return protos.WorkflowStatus_WORKFLOW_STATUS_FAILED
-	case IsPermanent(err):
-		return protos.WorkflowStatus_WORKFLOW_STATUS_FAILED
-	case errors.As(err, &call):
+	case IsContinuity(err), IsPermanent(err), IsCallFailure(err):
 		return protos.WorkflowStatus_WORKFLOW_STATUS_FAILED
 	}
 	if ok, _ := IsSuspended(err); ok {
@@ -285,7 +281,7 @@ func (r *runner) backoff(attempt uint64) time.Duration {
 // finished — carrying the same origin, so an executor that can recognise the
 // call still in flight rejoins it.
 func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]byte, error) {
-	call, err := expect[*protos.CallEvent](t)
+	call, err := t.expect[*protos.CallEvent]()
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +301,7 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 				"(%d bytes recorded, %d bytes now)", t.id, name, len(stored), len(payload))
 		}
 
-		ret, err := expect[*protos.ReturnEvent](t)
+		ret, err := t.expect[*protos.ReturnEvent]()
 		if err != nil {
 			return nil, err
 		}
@@ -319,7 +315,7 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 		}
 		// Attempted but never finished: fall through and do it again.
 	} else {
-		record(t, &protos.CallEvent{
+		t.record(&protos.CallEvent{
 			Name:   name,
 			Params: &protos.Data{Serialized: payload},
 		})
@@ -352,7 +348,7 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// Recorded either way. A failed call is a fact about the run, and one that
 	// a retry must not repeat blindly — the error is what the next attempt
 	// replays.
-	record(t, &protos.ReturnEvent{Result: packResult(out, callErr)})
+	t.record(&protos.ReturnEvent{Result: packResult(out, callErr)})
 	if callErr != nil {
 		return nil, &callError{name: name, err: callErr}
 	}
@@ -378,8 +374,8 @@ func (e *callError) Unwrap() error { return e.err }
 // record and a retry would replay it; handle the error in the body instead
 // if the run can go on without that call.
 func IsCallFailure(err error) bool {
-	var e *callError
-	return errors.As(err, &e)
+	_, ok := errors.AsType[*callError](err)
+	return ok
 }
 
 func bytesEqual(a, b []byte) bool {
@@ -452,8 +448,8 @@ func threadsOf(history []*protos.Event) map[string][]*protos.Event {
 
 // finished reports the terminal outcome of a run, if it reached one.
 func finished(history []*protos.Event) (protos.WorkflowStatus, *protos.Result, bool) {
-	for i := len(history) - 1; i >= 0; i-- {
-		end := history[i].GetRunEnd()
+	for _, h := range slices.Backward(history) {
+		end := h.GetRunEnd()
 		if end == nil {
 			continue
 		}
