@@ -121,6 +121,9 @@ type workerConn struct {
 	// job that has NOT finished and waiting for the result stream to produce
 	// would defeat the purpose.
 	beats *dsclient.Stream[beatEnvelope]
+	// beatsFrom is where following beats begins: the end of the stream as it
+	// was before this worker could be given anything to beat about.
+	beatsFrom int64
 
 	// ownsClient is false for an in-process worker, whose backend the worker
 	// node itself closes. Closing it twice takes the broker down under the half
@@ -499,6 +502,21 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 
 // adopt puts a freshly launched worker into service and starts tailing it.
 func (c *Cluster) adopt(w *workerConn) {
+	// Beats are followed from the END of the stream: whatever a previous
+	// coordinator's jobs reported is about jobs no longer outstanding. The end
+	// is measured now, while nothing can be sent to this worker yet. Newest is
+	// the log end, and the beat stream is not transactional — nothing appends
+	// to it inside a transaction — so the record after it is the next one
+	// anybody will write.
+	if info, err := w.beats.Info(c.ctx); err != nil {
+		if c.ctx.Err() == nil {
+			c.log.Warn("wings: cannot find the end of a worker's heartbeats; following from the start",
+				"worker", w.id, "err", err)
+		}
+	} else {
+		w.beatsFrom = info.Newest + 1
+	}
+
 	c.mu.Lock()
 	w.idleSince = time.Now()
 	c.workers = append(c.workers, w)
@@ -1581,18 +1599,14 @@ func (w *workerConn) close(ctx context.Context) error {
 // previous coordinator's jobs reported is about jobs that are no longer
 // outstanding, and a checkpoint is a position rather than a record: only the
 // latest is ever wanted, and old ones name jobs nobody is waiting for.
+//
+// Where the end is was found by adopt, before the worker could be given a job:
+// found here, after, the first beats of a job dispatched in between were behind
+// the starting point and never read. A job whose start was missed that way had
+// no clock running on it, and one that then went quiet was never moved — the
+// step-replay test hung on exactly that under a loaded suite.
 func (c *Cluster) tailBeats(w *workerConn) {
-	info, err := w.beats.Info(w.ctx)
-	if err != nil {
-		if w.ctx.Err() == nil {
-			c.log.Warn("wings: cannot follow heartbeats", "worker", w.id, "err", err)
-		}
-		return
-	}
-	// Newest is the log end, and the beat stream is not transactional — nothing
-	// appends to it inside a transaction — so the record after it is the next
-	// one anybody will write.
-	from := info.Newest + 1
+	from := w.beatsFrom
 
 	for {
 		if w.ctx.Err() != nil || w.dead.Load() {
