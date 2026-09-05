@@ -36,8 +36,15 @@ func dialWorker(addr string) (*dsremote.Client, error) {
 }
 
 const (
-	// remoteWorkDir is where the worker binary and its data live on a machine.
-	remoteWorkDir = "/opt/wings"
+	// remoteWorkDir is where the worker binary and its data live on a machine,
+	// relative to the SSH user's home directory.
+	//
+	// Relative on purpose. It used to be /opt/wings, which the SSH user cannot
+	// create on a stock image without sudo, and wings asks a [Machine] for a
+	// shell and a file copy, not for root. Home is the one directory every
+	// account can write, and both scp and the shell resolve a relative path
+	// against it.
+	remoteWorkDir = "wings"
 	// remoteDialTimeout bounds waiting for a deployed worker's broker to answer
 	// through the tunnel.
 	remoteDialTimeout = 90 * time.Second
