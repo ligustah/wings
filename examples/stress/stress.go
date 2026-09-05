@@ -13,6 +13,7 @@ package stress
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -608,4 +609,198 @@ var Bulky = flow.DefineWorkflow("bulky", func(ctx flow.Context, in Params) error
 	}
 	fmt.Printf("bulky: %d values, %d MB\n", count, total>>20)
 	return ok("bulky")
+})
+
+// --- cancelled: a thread of run code cut short by its parent's context,
+// where it runs on another machine, and the workflow going on ---
+
+var Cancelled = flow.DefineWorkflow("cancelled", func(ctx flow.Context, in Params) error {
+	// A timeout on the wait, not on the thread: the thread is sleeping on
+	// some worker and the parent stops waiting for it.
+	tctx, cancel := ctx.WithTimeout(500 * time.Millisecond)
+	slow := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		if err := ctx.Sleep(5 * time.Second); err != nil {
+			return 0, err
+		}
+		return pid(ctx)
+	})
+	_, err := slow.Await(tctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("cancelled: the wait ended with %v, want a deadline", err)
+	}
+	fmt.Printf("cancelled: the wait ended with %v\n", err)
+	// Cancelled outright, before it could finish.
+	cctx, cancel := ctx.WithCancel()
+	stopped := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		if err := ctx.Sleep(5 * time.Second); err != nil {
+			return 0, err
+		}
+		return pid(ctx)
+	})
+	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
+	_, err = stopped.Await(cctx)
+	if !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("cancelled: the cancelled wait ended with %v", err)
+	}
+	// And after both, a thread that finishes, awaited normally.
+	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) { return 7, nil }).Await(ctx)
+	if err != nil || v != 7 {
+		return fmt.Errorf("cancelled: the thread after returned %d, %v", v, err)
+	}
+	return ok("cancelled")
+})
+
+// --- stepped: a thread of run code that uses the progress API — steps,
+// heartbeats, a checkpoint — where it runs ---
+
+var Stepped = flow.DefineWorkflow("stepped", func(ctx flow.Context, in Params) error {
+	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return 20, nil })
+		if err != nil {
+			return 0, err
+		}
+		for i := range 5 {
+			if err := ctx.Heartbeat(i); err != nil {
+				return 0, err
+			}
+		}
+		at, found, err := ctx.Checkpoint[int]()
+		if err != nil {
+			return 0, err
+		}
+		fmt.Printf("stepped: checkpoint %d found=%v\n", at, found)
+		b, err := ctx.Step("second", func(ctx flow.Context) (int, error) { return a + 22, nil })
+		if err != nil {
+			return 0, err
+		}
+		return b, nil
+	}).Await(ctx)
+	if err != nil {
+		return fmt.Errorf("stepped: %w", err)
+	}
+	if v != 42 {
+		return fmt.Errorf("stepped: got %d, want 42", v)
+	}
+	// The same, inside a work function, which is where steps were made for.
+	w, err := ctx.Go(Stepper, 1).Await(ctx)
+	if err != nil || w != 42 {
+		return fmt.Errorf("stepped: the stepping function returned %d, %v", w, err)
+	}
+	return ok("stepped")
+})
+
+var Stepper = flow.Define("stepper", func(ctx flow.Context, in int) (int, error) {
+	a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 19, nil })
+	if err != nil {
+		return 0, err
+	}
+	return ctx.Step("second", func(ctx flow.Context) (int, error) { return a + 22, nil })
+})
+
+// --- orphaned: a receiver whose only sender fails without closing, and a
+// sender whose channel was closed under it ---
+
+var Orphaned = flow.DefineWorkflow("orphaned", func(ctx flow.Context, in Params) error {
+	values := ctx.NewChannel[int]()
+	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		if err := values.Send(ctx, 1); err != nil {
+			return 0, err
+		}
+		return 0, flow.Permanent(errors.New("the producer gives up"))
+	})
+	v, more, err := values.Recv(ctx)
+	if err != nil || !more || v != 1 {
+		return fmt.Errorf("orphaned: the first receive got %d, %v, %v", v, more, err)
+	}
+	// Nobody will ever send or close: a receive would wait forever, so the
+	// wait is bounded, and reports the bound.
+	tctx, cancel := ctx.WithTimeout(500 * time.Millisecond)
+	_, _, err = values.Recv(tctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("orphaned: the orphaned receive ended with %v", err)
+	}
+	fmt.Printf("orphaned: the orphaned receive ended with %v\n", err)
+	_, err = producer.Await(ctx)
+	if err == nil || !strings.Contains(err.Error(), "gives up") {
+		return fmt.Errorf("orphaned: the producer returned %v", err)
+	}
+	// Closed under a sender: the sender's send fails rather than hangs.
+	closed := ctx.NewChannel[int]()
+	if err := closed.Close(ctx); err != nil {
+		return err
+	}
+	sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		err := closed.Send(ctx, 1)
+		fmt.Printf("orphaned: sending on a closed channel: %v\n", err)
+		if err == nil {
+			return 0, errors.New("a send on a closed channel succeeded")
+		}
+		return 1, nil
+	})
+	if _, err := sender.Await(ctx); err != nil {
+		return fmt.Errorf("orphaned: %w", err)
+	}
+	return ok("orphaned")
+})
+
+// --- crossed: a channel made by the workflow, sent into a work function on
+// one worker whose spawned thread sends on it, and received on by a thread
+// of the workflow's own on another ---
+
+type Outlet struct {
+	N   int
+	Out *flow.Channel[int]
+}
+
+var Pumps = flow.Define("pumps", func(ctx flow.Context, in Outlet) (int, error) {
+	p, _ := pid(ctx)
+	inner := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		q, _ := pid(ctx)
+		for i := range in.N {
+			if err := in.Out.Send(ctx, i); err != nil {
+				return 0, err
+			}
+		}
+		return q, in.Out.Close(ctx)
+	})
+	q, err := inner.Await(ctx)
+	if err != nil {
+		return 0, err
+	}
+	fmt.Printf("crossed: pumped from pid %d, its thread on pid %d\n", p, q)
+	return in.N, nil
+})
+
+var Crossed = flow.DefineWorkflow("crossed", func(ctx flow.Context, in Params) error {
+	n := cmp.Or(in.N, 25)
+	values := ctx.NewBufferedChannel[int](3)
+	pump := ctx.Go(Pumps, Outlet{N: n, Out: values})
+	drain := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		p, _ := pid(ctx)
+		sum := 0
+		for {
+			v, more, err := values.Recv(ctx)
+			if err != nil {
+				return 0, err
+			}
+			if !more {
+				fmt.Printf("crossed: drained on pid %d\n", p)
+				return sum, nil
+			}
+			sum += v
+		}
+	})
+	sum, err := drain.Await(ctx)
+	if err != nil {
+		return fmt.Errorf("crossed: drain: %w", err)
+	}
+	if _, err := pump.Await(ctx); err != nil {
+		return fmt.Errorf("crossed: pump: %w", err)
+	}
+	if want := n * (n - 1) / 2; sum != want {
+		return fmt.Errorf("crossed: sum %d, want %d", sum, want)
+	}
+	return ok("crossed")
 })
