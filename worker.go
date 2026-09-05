@@ -203,12 +203,13 @@ func (n *workerNode) tailControl(ctx context.Context) {
 	for ctx.Err() == nil {
 		readCtx, cancel := context.WithTimeout(ctx, pollInterval)
 		recs, err := n.control.ReadBlocking(readCtx, from, 64)
+		expired := readCtx.Err() != nil
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			if !errors.Is(err, context.DeadlineExceeded) {
+			if !expired {
 				select {
 				case <-ctx.Done():
 					return

@@ -118,6 +118,50 @@ func TestACallWithNoLiveWorkerWaitsForTheReplacement(t *testing.T) {
 	}
 }
 
+// THE POINT: a worker with nothing to do is not a worker that has gone quiet.
+// The coordinator's poll of a worker's results expires when the worker produced
+// nothing in the interval, and over gRPC that expiry arrives as a status rather
+// than the context's own error; it was being read as lost contact, and a worker
+// that then sat idle through the reconnect window — the replacement machine on
+// a fleet whose survivor had taken every job — was declared dead and its
+// machine deleted, twice over on the run that found this.
+func TestAnIdleWorkerIsNotALostOne(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	// Polls short enough that the worker sits through many of them, and a
+	// reconnect window they would exhaust several times over if any one of
+	// them were taken for trouble.
+	old := pollInterval
+	pollInterval = 200 * time.Millisecond
+	t.Cleanup(func() { pollInterval = old })
+
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1,
+		ReconnectTimeout: time.Second})
+	w := firstWorker(t, c)
+
+	time.Sleep(3 * time.Second)
+
+	if w.dead.Load() {
+		t.Fatal("an idle worker was declared dead")
+	}
+	if n := c.Workers(); n != 1 {
+		t.Fatalf("%d workers after sitting idle, want the 1 that was there", n)
+	}
+	entries := awaitJournal(t, c, func([]journalEntry) bool { return true })
+	if n := countKind(entries, journalWorkerGone); n != 0 {
+		t.Fatalf("%d worker-gone entries for a worker that only sat idle: %+v", n, entries)
+	}
+	got, err := double(c.Bind(t.Context()), 21)
+	if err != nil {
+		t.Fatalf("a call after the worker sat idle: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("got %d, want 42", got)
+	}
+}
+
 // THE POINT: a worker that is merely unreachable must not be thrown away. The
 // coordinator used to treat any read error as death, so a network blip cost a
 // healthy machine that was still holding its queue — and on a cloud target,

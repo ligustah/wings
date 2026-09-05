@@ -696,23 +696,39 @@ func (c *Cluster) tail(w *workerConn) {
 		// and an unbounded read there is a worker that is neither delivering
 		// results nor being given up on — the worst of both. While in trouble
 		// the bound is the remaining window, so retries cannot outlast it.
-		limit := pollInterval
-		if !trouble.IsZero() {
-			limit = min(c.cfg.reconnect()-time.Since(trouble), 5*time.Second)
+		var (
+			recs []dsclient.OffsetRecord[resultEnvelope]
+			err  error
+		)
+		if trouble.IsZero() {
+			readCtx, cancel := context.WithTimeout(w.ctx, pollInterval)
+			recs, err = w.results.ReadBlocking(readCtx, from, batch)
+			expired := readCtx.Err() != nil
+			cancel()
+			// Our own poll expiring on a healthy worker is not news: it means
+			// nothing was produced in that interval, which is what an idle
+			// worker looks like. Judged by the context, not the error: over
+			// gRPC the error is a status that does not wrap the context's, and
+			// a worker with nothing to say for thirty seconds was being taken
+			// for one that had gone quiet.
+			if err != nil && expired && w.ctx.Err() == nil {
+				continue
+			}
+		} else {
+			// A worker in trouble is asked a question it can answer at once. A
+			// blocking read on an idle worker times out however healthy the
+			// link is, so one that had recovered but had no result to deliver
+			// could never be seen to be back; a plain read of whatever is
+			// there returns immediately on a live link, empty or not.
+			limit := min(c.cfg.reconnect()-time.Since(trouble), 5*time.Second)
+			readCtx, cancel := context.WithTimeout(w.ctx, limit)
+			recs, err = w.results.Read(readCtx, from, batch)
+			cancel()
 		}
-		readCtx, cancel := context.WithTimeout(w.ctx, limit)
-		recs, err := w.results.ReadBlocking(readCtx, from, batch)
-		cancel()
 
 		if err != nil {
 			if w.ctx.Err() != nil {
 				return
-			}
-			// Our own poll expiring on a healthy worker is not news: it means
-			// nothing was produced in that interval, which is what an idle
-			// worker looks like.
-			if trouble.IsZero() && errors.Is(err, context.DeadlineExceeded) {
-				continue
 			}
 			if w.dead.Load() {
 				return // already retired deliberately
@@ -1584,6 +1600,7 @@ func (c *Cluster) tailBeats(w *workerConn) {
 		}
 		readCtx, cancel := context.WithTimeout(w.ctx, pollInterval)
 		recs, err := w.beats.ReadBlocking(readCtx, from, 256)
+		expired := readCtx.Err() != nil
 		cancel()
 		if err != nil {
 			if w.ctx.Err() != nil {
@@ -1593,7 +1610,7 @@ func (c *Cluster) tailBeats(w *workerConn) {
 			// job, and it has the reconnect window and the exit signal to do it
 			// with; two goroutines racing to reach the same verdict would only
 			// make the verdict harder to reason about.
-			if !errors.Is(err, context.DeadlineExceeded) {
+			if !expired {
 				select {
 				case <-w.ctx.Done():
 					return

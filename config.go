@@ -24,14 +24,6 @@ const (
 	// something else in between.
 	readyPrefix = "WINGS_READY "
 
-	// pollInterval bounds a single blocking read of a worker's results.
-	//
-	// It is not a timeout in the usual sense — nothing is wrong when it expires,
-	// it just means the worker produced nothing in that time. It exists because
-	// a read on a broken connection can hang rather than fail, and a read that
-	// can hang forever is a worker that can be lost silently.
-	pollInterval = 30 * time.Second
-
 	// maxMessage is the largest gRPC message the coordinator and a worker will
 	// exchange.
 	//
@@ -80,6 +72,18 @@ const (
 	// opened by number.
 	defaultRemotePort = 9440
 )
+
+// pollInterval bounds a single blocking read of a worker's results, beats or
+// cancellations.
+//
+// It is not a timeout in the usual sense — nothing is wrong when it expires,
+// it just means the worker produced nothing in that time. It exists because
+// a read on a broken connection can hang rather than fail, and a read that
+// can hang forever is a worker that can be lost silently.
+//
+// A variable so a test can make a worker idle for longer than it in seconds
+// rather than minutes.
+var pollInterval = 30 * time.Second
 
 // Config configures a [Cluster].
 type Config struct {
