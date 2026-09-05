@@ -41,7 +41,7 @@ func (c Context) Now() (time.Time, error) {
 
 	now := time.Now().Truncate(time.Microsecond)
 	t.record(&protos.GetTimeEvent{Time: timestamppb.New(now)})
-	return now, t.run.err()
+	return now, t.err()
 }
 
 // Sleep pauses the run for d.
@@ -72,7 +72,7 @@ func (c Context) Sleep(d time.Duration) error {
 		d = recorded.GetDuration().AsDuration()
 	} else {
 		t.record(&protos.SleepEvent{Duration: durationpb.New(d)})
-		if err := t.run.err(); err != nil {
+		if err := t.err(); err != nil {
 			return err
 		}
 	}

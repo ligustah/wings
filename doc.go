@@ -46,17 +46,21 @@
 // a worker process never runs a workflow, and a function defined inside one
 // would not exist in the process meant to run it.
 //
-// On the worker a call runs as a flow run of its own — see [flow.RunCall] —
-// so a work function may fork, use channels, sleep and call other functions,
-// and a retry replays what its predecessor already did. Everything an attempt
-// writes is committed as one transaction at its heartbeats, steps, calls and
-// return. A call a work function makes goes back to the cluster to be placed:
-// the coordinator reads it out of its copy of the run's history and answers
-// it on the worker's control stream, so a function that fans out fans out
-// across the fleet, and a worker never waits on itself. A flow.Channel handed
-// to a function in its input crosses machines too: a shared channel is a
-// durable stream relayed through the coordinator, a queue whose every value
-// reaches every run receiving from it.
+// What goes to a worker is a THREAD: one forked with flow.Context.Go or
+// flow.Context.Map, which runs one function on one input, and is what the
+// parent's history recorded at the fork. A function called directly runs on
+// the calling thread, where the call is made. On the worker the thread runs
+// as a flow run of its own — see [flow.RunThread] — so a work function may
+// fork, use channels, sleep and call other functions, and a retry replays
+// what its predecessor already did. Everything an attempt writes is committed
+// as one transaction at its heartbeats, steps, forks and return. A thread a
+// work function forks goes back to the cluster to be placed: the coordinator
+// reads the fork out of its copy of the run's history and answers it on the
+// worker's control stream, so a function that fans out fans out across the
+// fleet, and a worker never waits on itself. A flow.Channel handed to a
+// function in its input crosses machines too: a shared channel is a durable
+// stream relayed through the coordinator, a queue whose every value reaches
+// every run receiving from it.
 //
 // # Using this package directly
 //

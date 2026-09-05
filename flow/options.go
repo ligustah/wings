@@ -9,6 +9,7 @@ import (
 type runOptions struct {
 	store    Store
 	executor Executor
+	placer   Placer
 	host     ChannelHost
 
 	version      int
@@ -32,6 +33,7 @@ func inputOption(payload []byte, t reflect.Type) RunOption {
 func newRunOptions(fns []RunOption) runOptions {
 	o := runOptions{
 		executor:     Local(),
+		placer:       InProcess(),
 		version:      1,
 		maxAttempts:  10,
 		initialDelay: time.Second,
@@ -69,14 +71,16 @@ func Version(v int) RunOption { return func(o *runOptions) { o.version = v } }
 // MaxAttempts caps how many times a failing run is retried. Default 10.
 func MaxAttempts(n int) RunOption { return func(o *runOptions) { o.maxAttempts = n } }
 
-// Once gives the run a single attempt and returns the body's error as it
-// was, unwrapped and without backoff.
+// Once gives the run's main thread a single attempt and returns the body's
+// error as it was, unwrapped and without backoff.
 //
-// For a process that runs a run on somebody else's behalf — an executor's
+// For a process that runs a thread on somebody else's behalf — an executor's
 // worker, say — where whether and where to try again is decided elsewhere,
 // and the error is that decision's input rather than this run's verdict.
-// A continuity or permanent failure is still reported as such.
-func Once() RunOption { return func(o *runOptions) { o.once = true; o.maxAttempts = 1 } }
+// A continuity or permanent failure is still reported as such. The threads
+// the body forks in-process are not that process's to hand back, and keep
+// their retries.
+func Once() RunOption { return func(o *runOptions) { o.once = true } }
 
 // Backoff sets the delay before the first retry and the ceiling it doubles
 // towards. Defaults are 1s and 1m.

@@ -223,7 +223,10 @@ func (h *historyStore) stream(ctx context.Context) (*dsclient.Stream[*protos.Eve
 	return st, nil
 }
 
-func (h *historyStore) Events(ctx context.Context, _ string) ([]*protos.Event, error) {
+// Events reads one thread's events out of the attempt's stream, which holds
+// every thread of the job's run: the run's threads share a worker and a
+// transaction, and one stream is what keeps their events in one order.
+func (h *historyStore) Events(ctx context.Context, _, thread string) ([]*protos.Event, error) {
 	run := h.name
 	ok, err := h.a.node.client.StreamExists(ctx, run)
 	if err != nil {
@@ -247,15 +250,21 @@ func (h *historyStore) Events(ctx context.Context, _ string) ([]*protos.Event, e
 			return events, nil
 		}
 		for _, r := range recs {
-			events = append(events, r.Record)
+			if r.Record.GetThreadId() == thread {
+				events = append(events, r.Record)
+			}
 			from = r.Offset + 1
 		}
 	}
 }
 
-func (h *historyStore) Sink(ctx context.Context, _ string) (flow.Sink, error) {
+func (h *historyStore) Sink(ctx context.Context, _, _ string) (flow.Sink, error) {
 	return &historySink{h: h}, nil
 }
+
+// Drop is nothing here: a joined thread's events stay in the attempt's
+// stream, which goes as a whole when the job settles.
+func (h *historyStore) Drop(ctx context.Context, _, _ string) error { return nil }
 
 // historySink appends a run's events inside the attempt's transaction.
 //
@@ -278,7 +287,10 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 	defer s.mu.Unlock()
 
 	if s.stream == nil {
-		if ev.GetThreadId() == "" {
+		if ev.GetRunStart() != nil || ev.GetRunEnd() != nil {
+			// An attempt marker: held until the run records something
+			// worth a stream, so a function that records nothing leaves
+			// nothing behind.
 			s.held = append(s.held, ev)
 			return nil
 		}

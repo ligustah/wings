@@ -48,7 +48,7 @@ func TestAWorkflowRunsOnceUnderItsOwnName(t *testing.T) {
 		t.Fatalf("the body ran %d times; a finished workflow must not run again on the same store", n)
 	}
 
-	events, err := store.Events(context.Background(), counted.Name())
+	events, err := store.Events(context.Background(), counted.Name(), "main")
 	if err != nil {
 		t.Fatal(err)
 	}

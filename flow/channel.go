@@ -158,7 +158,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 			return continuityf("thread %q previously sent %s#%d at this point, but is now sending %s#%d",
 				t.id, ev.GetChannel(), ev.GetSeq(), c.name, seq)
 		}
-		return t.run.err()
+		return t.err()
 	}
 
 	if err := cs.awaitTaken(ctx, item); err != nil {
@@ -169,7 +169,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		Seq:     seq,
 		Value:   &protos.Data{Serialized: data},
 	})
-	return t.run.err()
+	return t.err()
 }
 
 // Recv takes the next value off the channel.
@@ -196,18 +196,22 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 				t.id, ev.GetChannel(), c.name)
 		}
 		if ev.GetClosed() {
-			return zero, false, t.run.err()
+			return zero, false, t.err()
 		}
-		// The one place replay differs from a live run: wait for THAT item,
-		// not for the first one going. Two sends racing produced one order last
-		// time and would produce another now, and the run already acted on
-		// the first.
-		item, err := cs.awaitItem(ctx, ev.GetFromThreadId(), ev.GetFromSeq())
+		// The one place replay differs from a live run: the value is the one
+		// the history says was taken, not the first one going. Two sends
+		// racing produced one order last time and would produce another
+		// now, and the run already acted on the first. The item itself is
+		// claimed rather than waited for — the thread that sent it may have
+		// been joined since, and a joined thread does not run again — so a
+		// copy of it that does turn up, from a sender replaying, is taken
+		// on arrival and not offered to a later receive.
+		cs.claim(ev.GetFromThreadId(), ev.GetFromSeq())
+		v, err := dswire.DecodeRecord(c.codec, ev.GetValue().GetSerialized())
 		if err != nil {
-			return zero, false, err
+			return zero, false, fmt.Errorf("flow: decode the recorded value from channel %s: %w", c.name, err)
 		}
-		v, err := c.decode(item)
-		return v, err == nil, err
+		return v, true, t.err()
 	}
 
 	item, err := cs.awaitAny(ctx)
@@ -216,18 +220,19 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	}
 	if item == nil {
 		t.record(&protos.ChannelRecvEvent{Channel: c.name, Closed: true})
-		return zero, false, t.run.err()
+		return zero, false, t.err()
 	}
 	t.record(&protos.ChannelRecvEvent{
 		Channel:      c.name,
 		FromThreadId: item.from,
 		FromSeq:      item.seq,
+		Value:        &protos.Data{Serialized: item.data},
 	})
 	v, err := c.decode(item)
 	if err != nil {
 		return zero, false, err
 	}
-	return v, true, t.run.err()
+	return v, true, t.err()
 }
 
 func (c *Channel[T]) decode(item *chanItem) (T, error) {
@@ -261,14 +266,14 @@ func (c *Channel[T]) Close(ctx Context) error {
 				t.id, ev.GetChannel(), ev.GetSeq(), c.name)
 		}
 		cs.shut()
-		return t.run.err()
+		return t.err()
 	}
 	if err := cs.announceClose(ctx); err != nil {
 		return err
 	}
 	cs.shut()
 	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Closed: true})
-	return t.run.err()
+	return t.err()
 }
 
 // bind resolves the calling thread and this channel's shared state.
@@ -331,6 +336,9 @@ type chanState struct {
 	items   []*chanItem
 	closed  bool
 	changed chan struct{}
+	// claimed names items a replayed receive has taken before they were
+	// queued, so that they are taken on arrival.
+	claimed map[string]bool
 	// link is set once the channel is shared with other runs. From then on a
 	// send is a queue put — complete when the host has it — and what other
 	// runs send arrives through pump.
@@ -381,9 +389,33 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	}
 	// Shared: a queue, so the send is complete. Local: only if there is room.
 	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.link != nil || pending < cs.capacity}
+	if cs.claimed[itemKey(from, seq)] {
+		delete(cs.claimed, itemKey(from, seq))
+		item.taken = true
+	}
 	cs.items = append(cs.items, item)
 	cs.broadcast()
 	return item, nil
+}
+
+func itemKey(from string, seq uint64) string { return fmt.Sprintf("%s#%d", from, seq) }
+
+// claim takes one named item on behalf of a replayed receive: now, if it is
+// queued, and otherwise on arrival.
+func (cs *chanState) claim(from string, seq uint64) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if it := cs.find(from, seq); it != nil {
+		if !it.taken {
+			it.taken = true
+			cs.broadcast()
+		}
+		return
+	}
+	if cs.claimed == nil {
+		cs.claimed = map[string]bool{}
+	}
+	cs.claimed[itemKey(from, seq)] = true
 }
 
 // find returns the queued item with an identity, or nil. Call with mu held.
@@ -435,32 +467,6 @@ func (cs *chanState) awaitTaken(ctx context.Context, item *chanItem) error {
 		case <-wait:
 		case <-ctx.Done():
 			return ctx.Err()
-		}
-	}
-}
-
-// awaitItem blocks until one named item is available, then takes it.
-//
-// Used only on replay, where the receive already happened and the history says
-// which item it took.
-func (cs *chanState) awaitItem(ctx context.Context, from string, seq uint64) (*chanItem, error) {
-	for {
-		cs.mu.Lock()
-		for _, it := range cs.items {
-			if it.from == from && it.seq == seq && !it.taken {
-				it.taken = true
-				cs.broadcast()
-				cs.mu.Unlock()
-				return it, nil
-			}
-		}
-		wait := cs.changed
-		cs.mu.Unlock()
-
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		}
 	}
 }

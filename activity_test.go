@@ -3,6 +3,7 @@ package wings
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ligustah/wings/flow"
+	"github.com/ligustah/wings/flow/protos"
 )
 
 // A work function is run code: it may fork, use a channel, call other
@@ -398,5 +400,66 @@ func TestADirectCallRunsWhereItIsMade(t *testing.T) {
 	}
 	if got.Child != got.Parent {
 		t.Fatalf("a direct call ran on %s, away from its caller on %s", got.Child, got.Parent)
+	}
+}
+
+// whoRunsMe reports which process is running it: a worker by its id, or the
+// coordinator, which has no job around the call.
+var whoRunsMe = flow.Define("test.whoRunsMe", func(ctx flow.Context, _ int) (string, error) {
+	if j := jobFrom(ctx); j != nil {
+		return j.node.id, nil
+	}
+	return "coordinator", nil
+})
+
+// THE POINT: the same rule on the coordinator. A workflow body that calls a
+// function directly runs it where the body is; the threads it forks are what
+// go to workers — and the history says which was which, a call and its
+// return for the one, a fork and its join for the others.
+func TestAWorkflowsDirectCallRunsOnTheCoordinator(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1})
+	name := "test-direct-" + strconv.FormatUint(runSeq.Add(1), 36)
+
+	var direct string
+	var forked []string
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		var err error
+		if direct, err = whoRunsMe(ctx, 0); err != nil {
+			return err
+		}
+		forked, err = ctx.Map(whoRunsMe, []int{0, 0})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if direct != "coordinator" {
+		t.Fatalf("the direct call ran on %q, want the coordinator", direct)
+	}
+	for i, w := range forked {
+		if w == "coordinator" || w == "" {
+			t.Fatalf("forked thread %d ran on %q, want a worker", i, w)
+		}
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := flow.NewStore(client).Events(t.Context(), name, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for _, ev := range events {
+		counts[protos.EventType(ev)]++
+	}
+	if counts["CallEvent"] != 1 || counts["ReturnEvent"] != 1 {
+		t.Errorf("main's history holds %d calls and %d returns, want 1 of each for the direct call: %v",
+			counts["CallEvent"], counts["ReturnEvent"], counts)
+	}
+	if counts["ForkEvent"] != 2 || counts["JoinEvent"] != 2 {
+		t.Errorf("main's history holds %d forks and %d joins, want 2 of each for the fan-out: %v",
+			counts["ForkEvent"], counts["JoinEvent"], counts)
 	}
 }

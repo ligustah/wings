@@ -39,10 +39,24 @@ func orders() [][]int {
 	return slices.Clone(received.byGo)
 }
 
+// allEvents is every event of every thread of a run that still has a
+// history — main's, and any thread not yet joined.
+func allEvents(store *flow.MemStore, run string) ([]*protos.Event, error) {
+	var all []*protos.Event
+	for _, thread := range store.Threads(run) {
+		evs, err := store.Events(context.Background(), run, thread)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, evs...)
+	}
+	return all, nil
+}
+
 // countEvents tallies a run's history by payload kind.
-func countEvents(t *testing.T, store flow.Store, run string) map[string]int {
+func countEvents(t *testing.T, store *flow.MemStore, run string) map[string]int {
 	t.Helper()
-	evs, err := store.Events(context.Background(), run)
+	evs, err := allEvents(store, run)
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
@@ -172,15 +186,16 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 	}
 
 	// And the history must not have grown a set of channel events per attempt.
-	// Eight values were sent and eight received, once, however many times the
-	// body ran.
+	// Eight values were received, once, however many times the body ran. (The
+	// sends are in the producers' own histories, which went when the
+	// producers were joined.)
 	counts := countEvents(t, store, name)
-	if counts["ChannelSendEvent"] != 8 {
-		t.Errorf("the history holds %d sends, want 8 — a replayed send must be consumed, not appended",
-			counts["ChannelSendEvent"])
-	}
 	if counts["ChannelRecvEvent"] != 8 {
-		t.Errorf("the history holds %d receives, want 8", counts["ChannelRecvEvent"])
+		t.Errorf("the history holds %d receives, want 8 — a replayed receive must be consumed, not appended",
+			counts["ChannelRecvEvent"])
+	}
+	if counts["JoinEvent"] != 2 {
+		t.Errorf("the history holds %d joins, want 2", counts["JoinEvent"])
 	}
 }
 

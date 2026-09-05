@@ -84,10 +84,25 @@ func TestDispatchedWorkNamesTheRunItBelongsTo(t *testing.T) {
 	}
 }
 
-// A fan-out is where the run alone stops being enough: three calls of the same
-// run at the same position, told apart only by the thread they are on.
+// placements is a placer that watches what a run forks and runs it here.
+type placements struct {
+	mu   sync.Mutex
+	seen []flow.Thread
+}
+
+func (p *placements) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
+	p.mu.Lock()
+	p.seen = append(p.seen, th)
+	p.mu.Unlock()
+	return flow.InProcess().Place(ctx, th, body)
+}
+
+// A fan-out is where the run alone stops being enough: three threads of the
+// same run running the same function, told apart only by their names — and
+// the placer is told everything it needs to run each one elsewhere: the run,
+// the thread, the function and its input.
 func TestForkedWorkNamesItsThread(t *testing.T) {
-	s := &spy{inner: flow.Local()}
+	p := &placements{}
 
 	var got int
 	err := flow.Run(t.Context(), "batch-1", func(ctx flow.Context) error {
@@ -97,7 +112,7 @@ func TestForkedWorkNamesItsThread(t *testing.T) {
 		}
 		got = outs[0] + outs[1] + outs[2]
 		return nil
-	}, flow.WithStore(flow.NewMemStore()), flow.WithExecutor(s))
+	}, flow.WithStore(flow.NewMemStore()), flow.WithPlacer(p))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -106,11 +121,20 @@ func TestForkedWorkNamesItsThread(t *testing.T) {
 	}
 
 	threads := map[string]bool{}
-	for _, o := range s.origins() {
-		if o.Run != "batch-1" {
-			t.Errorf("a forked call says it belongs to run %q, want \"batch-1\"", o.Run)
+	for _, th := range p.seen {
+		if th.Run != "batch-1" {
+			t.Errorf("a forked thread says it belongs to run %q, want \"batch-1\"", th.Run)
 		}
-		threads[o.Thread] = true
+		if th.Parent != "main" {
+			t.Errorf("thread %s says its parent is %q, want \"main\"", th.ID, th.Parent)
+		}
+		if th.Fn != "flow.double" {
+			t.Errorf("thread %s runs %q, want the function the fan-out was over", th.ID, th.Fn)
+		}
+		if len(th.Input) == 0 {
+			t.Errorf("thread %s carries no input; a placer running it elsewhere would have nothing to run it on", th.ID)
+		}
+		threads[th.ID] = true
 	}
 	if len(threads) != 3 {
 		t.Fatalf("three parallel calls report %d distinct threads: %v", len(threads), threads)
@@ -118,7 +142,7 @@ func TestForkedWorkNamesItsThread(t *testing.T) {
 	for i := range 3 {
 		want := fmt.Sprintf("main.%d", i)
 		if !threads[want] {
-			t.Errorf("no call was recorded on thread %q; the names must be the deterministic ones replay uses", want)
+			t.Errorf("no thread was placed as %q; the names must be the deterministic ones replay uses", want)
 		}
 	}
 }

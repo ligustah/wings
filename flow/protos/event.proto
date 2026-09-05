@@ -57,17 +57,34 @@ message CallEvent {
   Data params = 2;
 }
 
+// ForkEvent is a thread starting another. It carries the work the new thread
+// is to do, so a reader of the parent's stream alone — an executor placing
+// threads on machines — can start it: the function's name and its encoded
+// input for a thread that runs one function, and neither for a thread that
+// runs a piece of the run's own code, which only the process holding that
+// code can run.
 message ForkEvent {
   // The parent thread that is executing the fork
   string parent_thread_id = 1;
 
   // The thread id of the new thread
   string thread_id = 2;
+
+  // The function the new thread runs, and its input. Empty for a thread that
+  // runs a body of run code rather than a defined function.
+  string function = 3;
+  Data input = 4;
 }
 
+// JoinEvent is a thread taking another's result, after which the other
+// thread is over: the result is the parent's now, and a replay of the parent
+// never starts the child again.
 message JoinEvent {
   // The thread id that is being joined
   string thread_id = 1;
+
+  // What the joined thread produced.
+  Result result = 2;
 }
 
 message SleepEvent {
@@ -137,6 +154,10 @@ message ChannelRecvEvent {
   // Set when the receive found the channel closed and drained, which is the
   // one outcome that yields no value.
   bool closed = 4;
+
+  // What was received. Needed to replay: the sender may be a thread that has
+  // since been joined, and a joined thread is not run again.
+  Data value = 5;
 }
 
 enum StartReason {
@@ -146,7 +167,8 @@ enum StartReason {
   START_REASON_RETRY = 3;
 }
 
-// RunStartEvent opens an attempt. It carries everything needed to begin, so a
+// RunStartEvent opens an attempt of a thread. Every thread has its own stream
+// and its own attempts; workflow_name is the run, instance_id the thread. It carries everything needed to begin, so a
 // reader of the stream alone can tell what was run and with what.
 message RunStartEvent {
   uint64 attempt = 1;
@@ -155,6 +177,10 @@ message RunStartEvent {
   string instance_id = 4;
   uint64 version = 5;
   Data input = 6;
+
+  // The function the thread runs, for a thread that runs one; empty for a
+  // run's own body.
+  string function = 7;
 }
 
 // RunEndEvent closes an attempt, and says what became of it.

@@ -64,7 +64,7 @@ func (c Context) Effect[T any](f func() (T, error)) (T, error) {
 		}
 	}
 	t.record(&protos.EffectEvent{Result: packResult(payload, ferr)})
-	if err := t.run.err(); err != nil {
+	if err := t.err(); err != nil {
 		return zero, err
 	}
 	return out, ferr

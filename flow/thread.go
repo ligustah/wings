@@ -15,16 +15,22 @@ import (
 // named "<parent>.<n>", so a thread's name is also its lineage.
 const mainThread = "main"
 
-// runState is one attempt of one run, shared by every thread in it.
+// runState is what the threads of one run share while they run in one
+// process: the run's name, where its work goes, and the channels between
+// them.
 //
-// The mutex is not decoration: forked threads run concurrently and all of them
-// append to this run. What it protects is the log, not the ORDER of the log —
-// each thread has its own sequence, and threads never write to each other's.
-// That separation is the whole reason concurrency and replay can coexist here.
+// Made once per attempt of the main thread. The threads main forks belong to
+// that attempt — they are cancelled when it ends, and the next attempt forks
+// them again from its history — so the state they share ends with it too.
+// What does NOT live here is any thread's history: each thread has its own,
+// on its own stream, and threads never write to each other's. That
+// separation is the whole reason a thread can run on another machine.
 type runState struct {
-	name    string
-	attempt uint64
-	exec    Executor
+	name   string
+	store  Store
+	exec   Executor
+	placer Placer
+	opts   runOptions
 	// host carries channels to and from other runs; nil for a run that
 	// shares none. linkCtx bounds the links, and ends with the attempt.
 	host     ChannelHost
@@ -32,21 +38,29 @@ type runState struct {
 	linkStop context.CancelFunc
 
 	mu       sync.Mutex
-	threads  map[string][]*protos.Event
 	channels map[string]*chanState
-	sink     Sink
-	sinkErr  error // the first persistence failure, if any
-	over     bool  // this attempt has returned
+	over     bool // this attempt has returned
+}
+
+func newRunState(name string, opts runOptions) *runState {
+	return &runState{
+		name:   name,
+		store:  opts.store,
+		exec:   opts.executor,
+		placer: opts.placer,
+		opts:   opts,
+		host:   opts.host,
+	}
 }
 
 // finish marks an attempt over, after which nothing more of it is written down.
 //
-// A forked thread outlives the attempt that made it — the run's body can
-// return while one is still waiting on a work function — and when that thread
-// finally finishes it records what it found. Writing that into the history of a
-// run whose NEXT attempt is already under way is at best noise and at worst a
-// stale answer landing among fresh ones. The thread's own bookkeeping is left
-// alone; only the durable record is closed.
+// A forked thread can outlive the attempt that made it by a moment — the
+// attempt's context is cancelled, but the thread's goroutine has to notice —
+// and when it finally returns it records what it found. Writing that into a
+// history whose NEXT attempt is already under way is at best noise and at
+// worst a stale answer landing among fresh ones. The thread's own bookkeeping
+// is left alone; only the durable record is closed.
 func (r *runState) finish() {
 	r.mu.Lock()
 	r.over = true
@@ -77,14 +91,27 @@ func (r *runState) channel(name string) *chanState {
 	return r.channels[name]
 }
 
-// threadState is one thread's cursor through the log.
+// threadState is one attempt of one thread: its history, and a cursor
+// through it.
 //
 // serial is the position replay has reached. Everything before it has been
 // matched against history; at or after it is either still to be matched or has
 // not happened yet.
 type threadState struct {
-	id     string
+	id      string
+	attempt uint64
+	run     *runState
+
+	// events is this thread's history, minus the attempt markers, with what
+	// this attempt records appended as it goes. Guarded by run.mu, because
+	// the thread's own goroutine is not the only one that reads it: a fork
+	// looks ahead in the parent's history from the goroutine placing the
+	// child.
+	events []*protos.Event
 	serial uint64
+
+	sink    Sink
+	sinkErr error // the first persistence failure, if any
 
 	// counter names the next child thread. Deterministic by construction: the
 	// nth fork a thread performs is always "<id>.<n>", whatever order the
@@ -96,8 +123,6 @@ type threadState struct {
 	// receive on another thread can name exactly one of them.
 	channels uint64
 	sends    map[string]uint64
-
-	run *runState
 }
 
 // newChannelName mints the next channel name for this thread.
@@ -150,9 +175,8 @@ func threadFrom(ctx context.Context) *threadState {
 func (t *threadState) peek() *protos.Event {
 	t.run.mu.Lock()
 	defer t.run.mu.Unlock()
-	evs := t.run.threads[t.id]
-	if t.serial < uint64(len(evs)) {
-		return evs[t.serial]
+	if t.serial < uint64(len(t.events)) {
+		return t.events[t.serial]
 	}
 	return nil
 }
@@ -197,8 +221,8 @@ func (t *threadState) expect[E protos.Events]() (E, error) {
 
 // record appends an event to this thread and hands it to the sink.
 //
-// The append is what makes the run durable, so a sink failure is kept and
-// fails the run: a run whose history was not written down cannot be replayed,
+// The append is what makes the thread durable, so a sink failure is kept and
+// fails the thread: a history that was not written down cannot be replayed,
 // and carrying on as though it could is the one outcome worse than stopping.
 func (t *threadState) record[E protos.Events](payload E) *protos.Event {
 	t.run.mu.Lock()
@@ -207,39 +231,81 @@ func (t *threadState) record[E protos.Events](payload E) *protos.Event {
 	ev := &protos.Event{
 		Timestamp: timestamppb.New(time.Now().Truncate(time.Microsecond)),
 		Serial:    t.serial,
-		Attempt:   t.run.attempt,
+		Attempt:   t.attempt,
 		ThreadId:  t.id,
 		Payload:   protos.PackEventPayload(payload),
 	}
-	t.run.threads[t.id] = append(t.run.threads[t.id], ev)
+	t.events = append(t.events, ev)
 	t.serial++
-
-	if t.run.sink != nil && t.run.sinkErr == nil && !t.run.over {
-		// Background, not the run's context: an event describing what has
-		// already happened must be written even while the run is being torn
-		// down, or the history stops exactly where it is most interesting.
-		if err := t.run.sink.Append(context.Background(), ev); err != nil {
-			t.run.sinkErr = fmt.Errorf("flow: persist event: %w", err)
-		}
-	}
+	t.persistLocked(ev)
 	return ev
 }
 
-// fork creates a child thread, or re-adopts the one a previous attempt created.
+// marker records an attempt marker: an event about the thread's attempt
+// rather than about what its body did.
 //
-// Re-adoption is what makes a fork replayable: the child's name comes from the
-// parent's fork counter, not from when it started, so the same code produces the
-// same names in the same order however the goroutines happened to be scheduled.
-func (t *threadState) fork() *threadState {
+// Kept out of the thread's sequence deliberately: replay walks a thread's
+// events in order and compares each to what the body is doing, and a start
+// marker is not something the body did. It carries the thread's name all the
+// same, so a reader of a stream that holds several threads' events can tell
+// whose attempt it opens.
+func (t *threadState) marker[E protos.Events](payload E) {
 	t.run.mu.Lock()
 	defer t.run.mu.Unlock()
+	t.persistLocked(&protos.Event{
+		Timestamp: timestamppb.New(time.Now().Truncate(time.Microsecond)),
+		Attempt:   t.attempt,
+		ThreadId:  t.id,
+		Payload:   protos.PackEventPayload(payload),
+	})
+}
 
+// persistLocked hands an event to the sink. Call with run.mu held.
+func (t *threadState) persistLocked(ev *protos.Event) {
+	if t.sink == nil || t.sinkErr != nil || t.run.over {
+		return
+	}
+	// Background, not the run's context: an event describing what has
+	// already happened must be written even while the run is being torn
+	// down, or the history stops exactly where it is most interesting.
+	if err := t.sink.Append(context.Background(), ev); err != nil {
+		t.sinkErr = fmt.Errorf("flow: persist event: %w", err)
+	}
+}
+
+// err reports the first persistence failure of this thread, if any.
+func (t *threadState) err() error {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	return t.sinkErr
+}
+
+// nextChild names the next thread this one forks.
+//
+// The name comes from the parent's fork counter, not from when the child
+// started, so the same code produces the same names in the same order however
+// the goroutines happened to be scheduled — which is what lets a replay
+// re-adopt the child a previous attempt created.
+func (t *threadState) nextChild() string {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
 	id := fmt.Sprintf("%s.%d", t.id, t.counter)
 	t.counter++
-	if _, ok := t.run.threads[id]; !ok {
-		t.run.threads[id] = nil
+	return id
+}
+
+// joined reports whether this thread's history, from the cursor on, already
+// holds the join of child — in which case the child is over, its result is
+// here, and nothing needs to run for it.
+func (t *threadState) joined(child string) bool {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	for _, ev := range t.events[min(t.serial, uint64(len(t.events))):] {
+		if ev.GetJoin().GetThreadId() == child {
+			return true
+		}
 	}
-	return &threadState{id: id, run: t.run}
+	return false
 }
 
 // recordFork consumes the fork already in history, or records a new one.
@@ -248,44 +314,52 @@ func (t *threadState) fork() *threadState {
 // that appends them again grows the history by a fork and a join per parallel
 // call per attempt — and then the log claims the run forked more threads
 // than it did, which is a lie told to whoever reads it after a failure.
-func recordFork(parent, child *threadState) error {
-	ev, err := parent.expect[*protos.ForkEvent]()
+func (t *threadState) recordFork(th Thread) error {
+	ev, err := t.expect[*protos.ForkEvent]()
 	if err != nil {
 		return err
 	}
 	if ev != nil {
-		if ev.GetThreadId() != child.id {
+		if ev.GetThreadId() != th.ID {
 			return continuityf("thread %q previously forked %q at this point, but is now forking %q",
-				parent.id, ev.GetThreadId(), child.id)
+				t.id, ev.GetThreadId(), th.ID)
 		}
-		return parent.run.err()
+		if ev.GetFunction() != th.Fn {
+			return continuityf("thread %q previously forked %q to run %q, but now wants it to run %q",
+				t.id, th.ID, ev.GetFunction(), th.Fn)
+		}
+		if stored := ev.GetInput().GetSerialized(); !bytesEqual(stored, th.Input) {
+			return continuityf("thread %q previously forked %q with different input "+
+				"(%d bytes recorded, %d bytes now)", t.id, th.ID, len(stored), len(th.Input))
+		}
+		return t.err()
 	}
-	parent.record(&protos.ForkEvent{ParentThreadId: parent.id, ThreadId: child.id})
-	return parent.run.err()
+	fork := &protos.ForkEvent{ParentThreadId: t.id, ThreadId: th.ID, Function: th.Fn}
+	if th.Fn != "" {
+		fork.Input = &protos.Data{Serialized: th.Input}
+	}
+	t.record(fork)
+	return t.err()
 }
 
-// recordJoin is recordFork for the other end.
-func recordJoin(parent, child *threadState) error {
-	ev, err := parent.expect[*protos.JoinEvent]()
+// recordJoin is recordFork for the other end: it consumes the join already
+// in history and returns the result it holds, or records the result the
+// child just produced.
+func (t *threadState) recordJoin(child string, out []byte, callErr error) ([]byte, error, error) {
+	ev, err := t.expect[*protos.JoinEvent]()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if ev != nil {
-		if ev.GetThreadId() != child.id {
-			return continuityf("thread %q previously joined %q at this point, but is now joining %q",
-				parent.id, ev.GetThreadId(), child.id)
+		if ev.GetThreadId() != child {
+			return nil, nil, continuityf("thread %q previously joined %q at this point, but is now joining %q",
+				t.id, ev.GetThreadId(), child)
 		}
-		return parent.run.err()
+		out, callErr = unpackResult(ev.GetResult())
+		return out, callErr, t.err()
 	}
-	parent.record(&protos.JoinEvent{ThreadId: child.id})
-	return parent.run.err()
-}
-
-// err reports the first persistence failure of the run, if any.
-func (r *runState) err() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.sinkErr
+	t.record(&protos.JoinEvent{ThreadId: child, Result: packResult(out, callErr)})
+	return out, callErr, t.err()
 }
 
 // payloadName is the message name of an event payload type, for error messages.

@@ -463,11 +463,10 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// wrote can be read back.
 	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs}
 	ctx = withJob(ctx, state)
-	// A function this job calls is the cluster's to run, like any other: the
-	// call is read out of this job's history by the coordinator and its
-	// answer comes back on the control stream. See nested.go.
-	exec := nestedExecutor{n: n, job: state}
-	ctx = flow.Bind(ctx, exec)
+	// A thread this job forks is the cluster's to place, like any other: the
+	// fork is read out of this job's history by the coordinator and its
+	// result comes back on the control stream. See nested.go.
+	placer := nestedPlacer{n: n, job: state}
 	// Now, not when the job was appended: the coordinator's clocks on this job
 	// run from here, so time it spent waiting behind others on this worker is
 	// not counted against the work. Best-effort like every beat — a lost one
@@ -501,7 +500,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// as the same call, or the coordinator dispatches it twice.
 	payload, err := flow.RunCall(ctx, jobRunName(job.ID), job.Func, job.Payload,
 		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
-		flow.WithExecutor(exec), flow.WithChannelHost(nodeChannels{n: n, job: state}), flow.Once())
+		flow.WithPlacer(placer), flow.WithChannelHost(nodeChannels{n: n, job: state}), flow.Once())
 	// Whatever the attempt wrote is committed before its answer leaves: a
 	// result whose recordings could still be lost would be a handle to
 	// nothing. A commit that fails is the attempt failing.

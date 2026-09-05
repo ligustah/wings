@@ -30,34 +30,36 @@ var longWork = flow.Define("rejoin.long", func(ctx flow.Context, in int) (int, e
 	return in * 2, nil
 })
 
-// rejoining is an executor that recognises a call still in flight by its
-// origin and hands the second asker the first one's answer — what a cluster
-// does with the jobs it has outstanding.
+// rejoining is a placer that recognises a thread still in flight by its key
+// and hands the second asker the first one's answer — what a cluster does
+// with the threads it has outstanding. Each thread runs the way a worker
+// runs one: on its own, from its own history, with no parent in the process.
 type rejoining struct {
+	store flow.Store
+
 	mu       sync.Mutex
 	inflight map[string]*pending
 }
 
-// pending is one call in flight: done closes when its answer is in.
+// pending is one thread in flight: done closes when its answer is in.
 type pending struct {
 	done chan struct{}
 	out  []byte
 	err  error
 }
 
-func (r *rejoining) Invoke(ctx context.Context, name string, payload []byte) ([]byte, error) {
-	key := flow.OriginFrom(ctx).Key()
-
+func (r *rejoining) Place(ctx context.Context, th flow.Thread, _ func(flow.Context) ([]byte, error)) ([]byte, error) {
 	r.mu.Lock()
 	if r.inflight == nil {
 		r.inflight = map[string]*pending{}
 	}
-	p, ok := r.inflight[key]
+	p, ok := r.inflight[th.Key()]
 	if !ok {
 		p = &pending{done: make(chan struct{})}
-		r.inflight[key] = p
+		r.inflight[th.Key()] = p
 		go func() {
-			p.out, p.err = flow.Execute(context.WithoutCancel(ctx), name, payload)
+			p.out, p.err = flow.RunThread(context.WithoutCancel(ctx), th.Run, th.ID, th.Fn, th.Input,
+				flow.WithStore(r.store), flow.Once())
 			close(p.done)
 		}()
 	}
@@ -84,21 +86,22 @@ func TestARetriedRunRejoinsTheCallStillRunning(t *testing.T) {
 
 		var attempts atomic.Int64
 		var got int
+		store := flow.NewMemStore()
 		done := make(chan error, 1)
 		go func() {
 			done <- flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 				fut := ctx.Go(longWork, 21)
 
-				// The first attempt walks away while the call is still going. Its
-				// call is recorded and its return is not, which is exactly the
-				// state a crash or a failing body leaves behind.
+				// The first attempt walks away while the thread is still going.
+				// Its fork is recorded and its join is not, which is exactly
+				// the state a crash or a failing body leaves behind.
 				if attempts.Add(1) == 1 {
 					return errors.New("abandoned while the call ran")
 				}
 				var err error
 				got, err = fut.Await(ctx)
 				return err
-			}, flow.WithStore(flow.NewMemStore()), flow.WithExecutor(&rejoining{}), quick)
+			}, flow.WithStore(store), flow.WithPlacer(&rejoining{store: store}), quick)
 		}()
 
 		// A second on the bubble's clock is the first attempt walking away,
@@ -109,7 +112,7 @@ func TestARetriedRunRejoinsTheCallStillRunning(t *testing.T) {
 			t.Fatalf("the body ran %d times, want 2 by now", n)
 		}
 		if n := long.starts.Load(); n != 1 {
-			t.Fatalf("the call was started %d times; a retried run must rejoin the one already running, not add another", n)
+			t.Fatalf("the thread was started %d times; a retried run must rejoin the one already running, not add another", n)
 		}
 		close(long.release)
 

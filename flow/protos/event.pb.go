@@ -476,12 +476,22 @@ func (x *CallEvent) GetParams() *Data {
 	return nil
 }
 
+// ForkEvent is a thread starting another. It carries the work the new thread
+// is to do, so a reader of the parent's stream alone — an executor placing
+// threads on machines — can start it: the function's name and its encoded
+// input for a thread that runs one function, and neither for a thread that
+// runs a piece of the run's own code, which only the process holding that
+// code can run.
 type ForkEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The parent thread that is executing the fork
 	ParentThreadId string `protobuf:"bytes,1,opt,name=parent_thread_id,json=parentThreadId,proto3" json:"parent_thread_id,omitempty"`
 	// The thread id of the new thread
-	ThreadId      string `protobuf:"bytes,2,opt,name=thread_id,json=threadId,proto3" json:"thread_id,omitempty"`
+	ThreadId string `protobuf:"bytes,2,opt,name=thread_id,json=threadId,proto3" json:"thread_id,omitempty"`
+	// The function the new thread runs, and its input. Empty for a thread that
+	// runs a body of run code rather than a defined function.
+	Function      string `protobuf:"bytes,3,opt,name=function,proto3" json:"function,omitempty"`
+	Input         *Data  `protobuf:"bytes,4,opt,name=input,proto3" json:"input,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -530,10 +540,29 @@ func (x *ForkEvent) GetThreadId() string {
 	return ""
 }
 
+func (x *ForkEvent) GetFunction() string {
+	if x != nil {
+		return x.Function
+	}
+	return ""
+}
+
+func (x *ForkEvent) GetInput() *Data {
+	if x != nil {
+		return x.Input
+	}
+	return nil
+}
+
+// JoinEvent is a thread taking another's result, after which the other
+// thread is over: the result is the parent's now, and a replay of the parent
+// never starts the child again.
 type JoinEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The thread id that is being joined
-	ThreadId      string `protobuf:"bytes,1,opt,name=thread_id,json=threadId,proto3" json:"thread_id,omitempty"`
+	ThreadId string `protobuf:"bytes,1,opt,name=thread_id,json=threadId,proto3" json:"thread_id,omitempty"`
+	// What the joined thread produced.
+	Result        *Result `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -573,6 +602,13 @@ func (x *JoinEvent) GetThreadId() string {
 		return x.ThreadId
 	}
 	return ""
+}
+
+func (x *JoinEvent) GetResult() *Result {
+	if x != nil {
+		return x.Result
+	}
+	return nil
 }
 
 type SleepEvent struct {
@@ -862,7 +898,10 @@ type ChannelRecvEvent struct {
 	FromSeq      uint64 `protobuf:"varint,3,opt,name=from_seq,json=fromSeq,proto3" json:"from_seq,omitempty"`
 	// Set when the receive found the channel closed and drained, which is the
 	// one outcome that yields no value.
-	Closed        bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	Closed bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	// What was received. Needed to replay: the sender may be a thread that has
+	// since been joined, and a joined thread is not run again.
+	Value         *Data `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -925,16 +964,27 @@ func (x *ChannelRecvEvent) GetClosed() bool {
 	return false
 }
 
-// RunStartEvent opens an attempt. It carries everything needed to begin, so a
+func (x *ChannelRecvEvent) GetValue() *Data {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+// RunStartEvent opens an attempt of a thread. Every thread has its own stream
+// and its own attempts; workflow_name is the run, instance_id the thread. It carries everything needed to begin, so a
 // reader of the stream alone can tell what was run and with what.
 type RunStartEvent struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Attempt       uint64                 `protobuf:"varint,1,opt,name=attempt,proto3" json:"attempt,omitempty"`
-	Reason        StartReason            `protobuf:"varint,2,opt,name=reason,proto3,enum=wings.flow.v1.StartReason" json:"reason,omitempty"`
-	WorkflowName  string                 `protobuf:"bytes,3,opt,name=workflow_name,json=workflowName,proto3" json:"workflow_name,omitempty"`
-	InstanceId    string                 `protobuf:"bytes,4,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	Version       uint64                 `protobuf:"varint,5,opt,name=version,proto3" json:"version,omitempty"`
-	Input         *Data                  `protobuf:"bytes,6,opt,name=input,proto3" json:"input,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Attempt      uint64                 `protobuf:"varint,1,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	Reason       StartReason            `protobuf:"varint,2,opt,name=reason,proto3,enum=wings.flow.v1.StartReason" json:"reason,omitempty"`
+	WorkflowName string                 `protobuf:"bytes,3,opt,name=workflow_name,json=workflowName,proto3" json:"workflow_name,omitempty"`
+	InstanceId   string                 `protobuf:"bytes,4,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	Version      uint64                 `protobuf:"varint,5,opt,name=version,proto3" json:"version,omitempty"`
+	Input        *Data                  `protobuf:"bytes,6,opt,name=input,proto3" json:"input,omitempty"`
+	// The function the thread runs, for a thread that runs one; empty for a
+	// run's own body.
+	Function      string `protobuf:"bytes,7,opt,name=function,proto3" json:"function,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1009,6 +1059,13 @@ func (x *RunStartEvent) GetInput() *Data {
 		return x.Input
 	}
 	return nil
+}
+
+func (x *RunStartEvent) GetFunction() string {
+	if x != nil {
+		return x.Function
+	}
+	return ""
 }
 
 // RunEndEvent closes an attempt, and says what became of it.
@@ -1098,12 +1155,15 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\apayload\"L\n" +
 	"\tCallEvent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12+\n" +
-	"\x06params\x18\x02 \x01(\v2\x13.wings.flow.v1.DataR\x06params\"R\n" +
+	"\x06params\x18\x02 \x01(\v2\x13.wings.flow.v1.DataR\x06params\"\x99\x01\n" +
 	"\tForkEvent\x12(\n" +
 	"\x10parent_thread_id\x18\x01 \x01(\tR\x0eparentThreadId\x12\x1b\n" +
-	"\tthread_id\x18\x02 \x01(\tR\bthreadId\"(\n" +
+	"\tthread_id\x18\x02 \x01(\tR\bthreadId\x12\x1a\n" +
+	"\bfunction\x18\x03 \x01(\tR\bfunction\x12)\n" +
+	"\x05input\x18\x04 \x01(\v2\x13.wings.flow.v1.DataR\x05input\"W\n" +
 	"\tJoinEvent\x12\x1b\n" +
-	"\tthread_id\x18\x01 \x01(\tR\bthreadId\"C\n" +
+	"\tthread_id\x18\x01 \x01(\tR\bthreadId\x12-\n" +
+	"\x06result\x18\x02 \x01(\v2\x15.wings.flow.v1.ResultR\x06result\"C\n" +
 	"\n" +
 	"SleepEvent\x125\n" +
 	"\bduration\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\bduration\">\n" +
@@ -1119,12 +1179,13 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\achannel\x18\x01 \x01(\tR\achannel\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12)\n" +
 	"\x05value\x18\x03 \x01(\v2\x13.wings.flow.v1.DataR\x05value\x12\x16\n" +
-	"\x06closed\x18\x04 \x01(\bR\x06closed\"\x85\x01\n" +
+	"\x06closed\x18\x04 \x01(\bR\x06closed\"\xb0\x01\n" +
 	"\x10ChannelRecvEvent\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\tR\achannel\x12$\n" +
 	"\x0efrom_thread_id\x18\x02 \x01(\tR\ffromThreadId\x12\x19\n" +
 	"\bfrom_seq\x18\x03 \x01(\x04R\afromSeq\x12\x16\n" +
-	"\x06closed\x18\x04 \x01(\bR\x06closed\"\xe8\x01\n" +
+	"\x06closed\x18\x04 \x01(\bR\x06closed\x12)\n" +
+	"\x05value\x18\x05 \x01(\v2\x13.wings.flow.v1.DataR\x05value\"\x84\x02\n" +
 	"\rRunStartEvent\x12\x18\n" +
 	"\aattempt\x18\x01 \x01(\x04R\aattempt\x122\n" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1a.wings.flow.v1.StartReasonR\x06reason\x12#\n" +
@@ -1132,7 +1193,8 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\vinstance_id\x18\x04 \x01(\tR\n" +
 	"instanceId\x12\x18\n" +
 	"\aversion\x18\x05 \x01(\x04R\aversion\x12)\n" +
-	"\x05input\x18\x06 \x01(\v2\x13.wings.flow.v1.DataR\x05input\"\xb4\x01\n" +
+	"\x05input\x18\x06 \x01(\v2\x13.wings.flow.v1.DataR\x05input\x12\x1a\n" +
+	"\bfunction\x18\a \x01(\tR\bfunction\"\xb4\x01\n" +
 	"\vRunEndEvent\x125\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x1d.wings.flow.v1.WorkflowStatusR\x06status\x12-\n" +
 	"\x06result\x18\x02 \x01(\v2\x15.wings.flow.v1.ResultR\x06result\x12?\n" +
@@ -1183,8 +1245,8 @@ var file_flow_protos_event_proto_goTypes = []any{
 	(*RunEndEvent)(nil),           // 13: wings.flow.v1.RunEndEvent
 	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
 	(*Data)(nil),                  // 15: wings.flow.v1.Data
-	(*durationpb.Duration)(nil),   // 16: google.protobuf.Duration
-	(*Result)(nil),                // 17: wings.flow.v1.Result
+	(*Result)(nil),                // 16: wings.flow.v1.Result
+	(*durationpb.Duration)(nil),   // 17: google.protobuf.Duration
 }
 var file_flow_protos_event_proto_depIdxs = []int32{
 	14, // 0: wings.flow.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
@@ -1200,21 +1262,24 @@ var file_flow_protos_event_proto_depIdxs = []int32{
 	11, // 10: wings.flow.v1.Event.channel_recv:type_name -> wings.flow.v1.ChannelRecvEvent
 	8,  // 11: wings.flow.v1.Event.effect:type_name -> wings.flow.v1.EffectEvent
 	15, // 12: wings.flow.v1.CallEvent.params:type_name -> wings.flow.v1.Data
-	16, // 13: wings.flow.v1.SleepEvent.duration:type_name -> google.protobuf.Duration
-	14, // 14: wings.flow.v1.GetTimeEvent.time:type_name -> google.protobuf.Timestamp
-	17, // 15: wings.flow.v1.EffectEvent.result:type_name -> wings.flow.v1.Result
-	17, // 16: wings.flow.v1.ReturnEvent.result:type_name -> wings.flow.v1.Result
-	15, // 17: wings.flow.v1.ChannelSendEvent.value:type_name -> wings.flow.v1.Data
-	0,  // 18: wings.flow.v1.RunStartEvent.reason:type_name -> wings.flow.v1.StartReason
-	15, // 19: wings.flow.v1.RunStartEvent.input:type_name -> wings.flow.v1.Data
-	1,  // 20: wings.flow.v1.RunEndEvent.status:type_name -> wings.flow.v1.WorkflowStatus
-	17, // 21: wings.flow.v1.RunEndEvent.result:type_name -> wings.flow.v1.Result
-	14, // 22: wings.flow.v1.RunEndEvent.scheduled_for:type_name -> google.protobuf.Timestamp
-	23, // [23:23] is the sub-list for method output_type
-	23, // [23:23] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	15, // 13: wings.flow.v1.ForkEvent.input:type_name -> wings.flow.v1.Data
+	16, // 14: wings.flow.v1.JoinEvent.result:type_name -> wings.flow.v1.Result
+	17, // 15: wings.flow.v1.SleepEvent.duration:type_name -> google.protobuf.Duration
+	14, // 16: wings.flow.v1.GetTimeEvent.time:type_name -> google.protobuf.Timestamp
+	16, // 17: wings.flow.v1.EffectEvent.result:type_name -> wings.flow.v1.Result
+	16, // 18: wings.flow.v1.ReturnEvent.result:type_name -> wings.flow.v1.Result
+	15, // 19: wings.flow.v1.ChannelSendEvent.value:type_name -> wings.flow.v1.Data
+	15, // 20: wings.flow.v1.ChannelRecvEvent.value:type_name -> wings.flow.v1.Data
+	0,  // 21: wings.flow.v1.RunStartEvent.reason:type_name -> wings.flow.v1.StartReason
+	15, // 22: wings.flow.v1.RunStartEvent.input:type_name -> wings.flow.v1.Data
+	1,  // 23: wings.flow.v1.RunEndEvent.status:type_name -> wings.flow.v1.WorkflowStatus
+	16, // 24: wings.flow.v1.RunEndEvent.result:type_name -> wings.flow.v1.Result
+	14, // 25: wings.flow.v1.RunEndEvent.scheduled_for:type_name -> google.protobuf.Timestamp
+	26, // [26:26] is the sub-list for method output_type
+	26, // [26:26] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_flow_protos_event_proto_init() }

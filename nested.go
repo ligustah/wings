@@ -13,28 +13,31 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// A work function is a run, and a run makes calls. Those calls are the
+// A work function is a run, and a run forks threads. Those threads are the
 // cluster's to place like any other, and this file is how one gets from the
-// worker that made it to the coordinator and its answer back.
+// worker that forked it to the coordinator and its result back.
 //
 // There is no request message. The run's history already says what it
-// called and where: a CallEvent without a ReturnEvent after it is a call in
-// flight. The coordinator has a copy of every attempt's history — the same
-// copy a retry is handed — so it reads calls out of it, dispatches each with
-// the origin the event names, and sends the answer to the worker on the
-// control stream. Making a call is therefore a COMMIT POINT on the worker:
-// the event has to be visible to travel, which also means the run's state up
-// to the call is consistent before the call runs.
+// forked: a ForkEvent naming a function, without a JoinEvent for that thread
+// after it, is a thread in flight. The coordinator has a copy of every
+// attempt's history — the same copy a retry is handed — so it reads forks
+// out of it, dispatches each as a job with the thread as its origin, and
+// sends the result to the worker on the control stream. Forking is
+// therefore a COMMIT POINT on the worker: the event has to be visible to
+// travel, which also means the run's state up to the fork is consistent
+// before the thread runs. A function the job calls directly is not any of
+// this: it runs on the worker, on the calling thread, recorded and replayed
+// like any call.
 //
 // The origin is what makes a move safe. The run is named for the JOB, not
-// the attempt, so a retry that replays a call presents the same run, thread
-// and step, and the coordinator recognises the call it is already running —
+// the attempt, so a retry that replays a fork presents the same run and
+// thread, and the coordinator recognises the thread it is already running —
 // or already answered, since answers are kept until the job settles — rather
 // than dispatching it again.
 //
-// On the worker, calls arrive on a queue of their own and run without a
+// On the worker, threads arrive on a queue of their own and run without a
 // place in the batch. The job queue is taken in batches of the worker's
-// concurrency, and a batch is not over until every job in it is; a call
+// concurrency, and a batch is not over until every job in it is; a thread
 // queued behind the batch that is waiting for it would wait forever.
 
 // jobRunName is the run a job executes as. Stable across attempts, because it
@@ -48,13 +51,20 @@ func callKey(thread string, step uint64) string {
 	return thread + "#" + strconv.FormatUint(step, 10)
 }
 
+// forkedCall is one thread a job forked and has not joined: the function it
+// runs and the input.
+type forkedCall struct {
+	fn    string
+	input []byte
+}
+
 // followPoll is how often a history follower looks up from its read to see
 // whether the attempt it follows is still the one running.
 const followPoll = 5 * time.Second
 
 // --- coordinator ---
 
-// followHistory starts reading one attempt's history for the calls it makes.
+// followHistory starts reading one attempt's history for the threads it forks.
 // Once per attempt, from the first beat that says the attempt is running.
 // Call with mu held.
 func (c *Cluster) followHistory(p *pendingJob, attempt int) {
@@ -69,11 +79,11 @@ func (c *Cluster) followHistory(p *pendingJob, attempt int) {
 }
 
 // follow reads an attempt's history as it is copied home and dispatches the
-// calls in it that have no return yet.
+// threads forked in it that have no join yet.
 //
-// Calls are dispatched after each batch rather than per event, so a history
-// hydrated onto a retry — which arrives as one long batch, calls and their
-// returns together — dispatches nothing that was already answered.
+// Threads are dispatched after each batch rather than per event, so a history
+// hydrated onto a retry — which arrives as one long batch, forks and their
+// joins together — dispatches nothing that was already answered.
 func (c *Cluster) follow(p *pendingJob, attempt int) {
 	// The engine is up before any worker can beat; a cluster without one is
 	// a test feeding beats by hand, and has no history to read.
@@ -101,7 +111,7 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	var (
 		st         *dsclient.Stream[*protos.Event]
 		from       int64
-		open       = map[string]*protos.CallEvent{}
+		open       = map[string]forkedCall{}
 		dispatched = map[string]bool{}
 	)
 	for current() {
@@ -136,10 +146,14 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 			from = r.Offset + 1
 			ev := r.Record
 			switch e := protos.UnpackEventPayload(ev).(type) {
-			case *protos.CallEvent:
-				open[callKey(ev.GetThreadId(), ev.GetSerial())] = e
-			case *protos.ReturnEvent:
-				delete(open, callKey(ev.GetThreadId(), e.GetCallSerial()))
+			case *protos.ForkEvent:
+				// A thread of run code has no function a worker could be
+				// handed; it runs where its parent is, and is not ours.
+				if e.GetFunction() != "" {
+					open[callKey(e.GetThreadId(), 0)] = forkedCall{fn: e.GetFunction(), input: e.GetInput().GetSerialized()}
+				}
+			case *protos.JoinEvent:
+				delete(open, callKey(e.GetThreadId(), 0))
 			}
 		}
 		for key, call := range open {
@@ -155,13 +169,13 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	}
 }
 
-// dispatchNested runs one call a job made and sends the answer to whichever
-// attempt of the job is running when it comes.
+// dispatchNested runs one thread a job forked and sends the result to
+// whichever attempt of the job is running when it comes.
 //
-// An answer already kept for this call is sent straight back: that is a
-// retry replaying a call its predecessor had answered. A call still in flight
+// An answer already kept for this thread is sent straight back: that is a
+// retry replaying a fork its predecessor had joined. A thread still in flight
 // is rejoined by its origin, the same way a workflow's is.
-func (c *Cluster) dispatchNested(p *pendingJob, attempt int, thread string, step uint64, call *protos.CallEvent) {
+func (c *Cluster) dispatchNested(p *pendingJob, attempt int, thread string, step uint64, call forkedCall) {
 	key := callKey(thread, step)
 
 	c.mu.Lock()
@@ -187,7 +201,7 @@ func (c *Cluster) dispatchNested(p *pendingJob, attempt int, thread string, step
 		}
 	}()
 	origin := flow.Origin{Run: jobRunName(p.job.ID), Thread: thread, Step: step, Attempt: uint64(attempt)}
-	child, err := c.submit(flow.WithOrigin(ctx, origin), call.GetName(), call.GetParams().GetSerialized())
+	child, err := c.submit(flow.WithOrigin(ctx, origin), call.fn, call.input)
 	var res resultEnvelope
 	if err == nil {
 		res, err = c.await(ctx, child)
@@ -311,32 +325,24 @@ func (n *workerNode) answer(c controlEnvelope) {
 	}
 }
 
-// nestedExecutor is the [flow.Executor] a job's run makes its calls through:
-// commit, so the call is in the history the coordinator reads, and wait for
-// the answer.
-type nestedExecutor struct {
+// nestedPlacer is the [flow.Placer] a job's run forks its threads through:
+// commit, so the fork is in the history the coordinator reads, and wait for
+// the result. A thread of run code cannot travel and runs here.
+type nestedPlacer struct {
 	n   *workerNode
 	job *jobState
 }
 
-func (e nestedExecutor) Invoke(ctx context.Context, name string, payload []byte) ([]byte, error) {
-	o := flow.OriginFrom(ctx)
-	if o.Zero() {
-		return nil, errors.New("wings: " + name + " was called on a worker outside its job's run")
-	}
-	// A direct call runs here. It blocks its caller either way, so sending
-	// it to another worker would move the CPU while this one's slot sat
-	// idle, and pay a commit and a round trip for it. Recorded and replayed
-	// like any call. A fan-out — Go, Map — is the cluster's to place.
-	if !o.Forked {
-		return flow.Local().Invoke(ctx, name, payload)
+func (e nestedPlacer) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
+	if th.Fn == "" {
+		return flow.InProcess().Place(ctx, th, body)
 	}
 	attempt := attemptKey(e.job.id, e.job.attempt)
 	e.n.runMu.Lock()
-	box := e.n.boxLocked(attempt, callKey(o.Thread, o.Step))
+	box := e.n.boxLocked(attempt, callKey(th.ID, 0))
 	e.n.runMu.Unlock()
 
-	// The call event is in the open transaction. Committing is what makes
+	// The fork event is in the open transaction. Committing is what makes
 	// this a request: the coordinator reads the history's copy.
 	if err := e.job.outputs.commit(ctx); err != nil {
 		return nil, err
@@ -352,7 +358,7 @@ func (e nestedExecutor) Invoke(ctx context.Context, name string, payload []byte)
 	}
 }
 
-// serveNested runs the calls other jobs made, as they arrive, each on a
+// serveNested runs the threads other jobs forked, as they arrive, each on a
 // goroutine of its own. No batch and no bound: what bounds a worker's work is
 // its job queue, and a call is work a job on that queue is already waiting
 // for. Results go on the same result stream the batch loop writes, one at a

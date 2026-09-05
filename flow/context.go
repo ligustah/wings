@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/ligustah/durable_streams/dswire"
 )
 
 // Context is the context a run's body and a running function are given.
@@ -96,14 +98,20 @@ func (c Context) WithValue(key, val any) Context {
 // same code produces the same names in the same order on every attempt — which
 // a goroutine cannot promise, and which replay cannot do without.
 //
+// The thread runs f on in and nothing else, and that is what the fork
+// records, so the run's [Placer] can run it anywhere f is defined: this is
+// how work leaves the process. A direct call of f, by contrast, runs on the
+// calling thread, where it is made.
+//
 // For a fan-out over a slice, prefer [Context.Map]: it is this, once per
 // input, with the results kept in order.
 func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
-	return spawn(c, "Go", func(ctx Context) (Out, error) {
-		// The one call this thread exists for is a fan-out, and says so to
-		// its executor. See Origin.Forked.
-		return f(Context{withForked(ctx, true)}, in)
-	})
+	call, err := describe(c, f, in)
+	if err != nil {
+		return failedFuture[Out](err)
+	}
+	name, input := call.name, call.payload
+	return spawn(c, "Go", name, input, call.codec.(dswire.Codec[Out]), functionBody(name, input))
 }
 
 // Spawn runs body on a thread of its own and returns immediately.
@@ -112,6 +120,10 @@ func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
 // body may call functions, sleep, use a [Channel], fork further threads —
 // anything the run's own body may do. It is what makes channels worth having,
 // since a channel between threads needs threads that do more than one thing.
+// What it cannot do is leave the process: the fork records no function a
+// placer could run elsewhere, only that a thread of run code was started,
+// so the thread runs where its parent is. Its result must be encodable, as
+// a function's output must, since the join records it.
 //
 //	ch := ctx.NewChannel[int]()
 //	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
@@ -134,7 +146,25 @@ func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
 // child thread is bound to it, and code that uses the outer context records on
 // the parent thread instead — which replay will then find in the wrong order.
 func (c Context) Spawn[Out any](body func(ctx Context) (Out, error)) *Future[Out] {
-	return spawn(c, "Spawn", body)
+	codec := dswire.ReflectCodec[Out]{New: allocator[Out]()}
+	return spawn(c, "Spawn", "", nil, codec, func(ctx Context) ([]byte, error) {
+		out, err := body(ctx)
+		if err != nil {
+			return nil, err
+		}
+		b, err := dswire.EncodeRecord(codec, out)
+		if err != nil {
+			return nil, fmt.Errorf("flow: encode the result of a spawned thread: %w", err)
+		}
+		return b, nil
+	})
+}
+
+// failedFuture is a Future that failed before its thread was forked.
+func failedFuture[Out any](err error) *Future[Out] {
+	fut := &Future[Out]{err: err, done: make(chan struct{})}
+	close(fut.done)
+	return fut
 }
 
 // Map runs f on every input and returns the results in the order the inputs

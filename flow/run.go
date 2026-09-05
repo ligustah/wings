@@ -9,16 +9,17 @@
 // [Run] every call is written down before it happens and its answer is written
 // down after, so a run that fails part-way can be run again and will not
 // repeat the work it already paid for — it replays the history it has and
-// carries on from the end of it. The calls themselves go to the run's
-// [Executor]: [Local] runs them in this process, and a cluster runs them on
-// its workers. Nothing in the body below names either:
+// carries on from the end of it. A direct call runs where it is made; a call
+// forked with [Context.Go] or [Context.Map] is a THREAD, and threads go to
+// the run's [Placer]: [InProcess] runs them on goroutines, and a cluster runs
+// them on its workers. Nothing in the body below names either:
 //
 //	err := flow.Run(ctx, "pipeline", func(ctx flow.Context) error {
-//		first, err := Digest(ctx, head)      // dispatched, recorded, replayed on a retry
+//		first, err := Digest(ctx, head)      // here, recorded, replayed on a retry
 //		if err != nil {
 //			return err
 //		}
-//		rest, err := ctx.Map(Digest, tail)   // the same, once per input, in parallel
+//		rest, err := ctx.Map(Digest, tail)   // one thread per input, placed in parallel
 //		...
 //	}, flow.WithStore(store))
 //
@@ -26,9 +27,24 @@
 // package's operations as methods on it, so what a run can do is what its
 // context can do. A running function is given one too.
 //
+// # Threads
+//
+// A thread is the unit of everything here. The run's body is its main
+// thread; every fork makes another; and each has a history of its own, on a
+// stream of its own, that records what the thread did and is replayed when
+// the thread runs again. A thread's stream is written wherever the thread
+// runs and read wherever it runs next, and nothing else of the run has to
+// travel with it — which is what makes a thread the thing a cluster hands
+// to a machine. The parent's history holds the fork, with the work the
+// thread is to do, and later the join, with what it produced; a replay of
+// the parent that finds the join never runs the thread again, and one that
+// finds only the fork starts the thread, which replays ITS history and
+// carries on. A thread that has been joined is over, and its history is
+// dropped.
+//
 // # What you give up
 //
-// Replay means the run's body is re-executed from the top on every attempt,
+// Replay means a thread's body is re-executed from the top on every attempt,
 // so IT MUST BE DETERMINISTIC. Everything it decides must come from its input
 // or from something the history recorded:
 //
@@ -42,10 +58,12 @@
 //
 // A run that breaks these does not fail loudly on the first attempt — it fails
 // on the retry, as a continuity error, which is why [IsContinuity] names the
-// cause plainly. The functions a run calls are under no such constraint: each
-// runs once, wherever the executor puts it, and may do anything.
+// cause plainly. A function called directly is under the same constraint,
+// since it runs on the calling thread and its history is that thread's; a
+// function run as a thread of its own is too, since that thread is replayed
+// like any other.
 //
-// # Threads and channels
+// # Channels
 //
 // [Context.Spawn] runs a piece of run code on a thread of its own, and
 // [Channel] passes typed values between threads. Both are the replayable versions of
@@ -69,18 +87,18 @@
 // where it was, rather than from nothing; an executor that cannot ignores
 // them. The function is written the same way either way.
 //
-// A run adds a second way for a long call to be interrupted: the run itself
-// can fail and be retried while the call is still in flight. When the retry
-// reaches that call again it hands the executor the same origin, and an
-// executor that recognises one REJOINS the call already running rather than
+// A run adds a second way for a long thread to be interrupted: the parent
+// can fail and be retried while the thread is still running. When the retry
+// reaches the fork again it hands the placer the same [Thread], and a placer
+// that recognises one REJOINS the thread already running rather than
 // starting a second copy.
 //
 // # What it is not
 //
-// The run's body executes in the process that called Run, and only the calls
-// it makes go to the executor. That is the right trade for fanning work out of
-// one program, and the wrong one for orchestration that must outlive any
-// single machine.
+// The run's body executes in the process that called Run, and only the
+// threads it forks go to the placer. That is the right trade for fanning
+// work out of one program, and the wrong one for orchestration that must
+// outlive any single machine.
 package flow
 
 import (
@@ -89,6 +107,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"time"
 
@@ -113,7 +132,8 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 	if body == nil {
 		return errors.New("flow: Run requires a body")
 	}
-	_, err := execute(ctx, name, func(ctx Context) ([]byte, error) { return nil, body(ctx) }, opts)
+	_, err := execute(ctx, name, mainThread, "", nil,
+		func(ctx Context) ([]byte, error) { return nil, body(ctx) }, opts)
 	return err
 }
 
@@ -131,72 +151,135 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 // own runs it through here, and what it gets is a call that survives being
 // moved: the history is what has to travel, and it is a stream.
 func RunCall(ctx context.Context, name, fn string, payload []byte, opts ...RunOption) ([]byte, error) {
-	if fn == "" {
-		return nil, errors.New("flow: RunCall requires a function name")
-	}
-	return execute(ctx, name, func(ctx Context) ([]byte, error) {
-		return Execute(ctx, fn, payload)
-	}, opts)
+	return RunThread(ctx, name, mainThread, fn, payload, opts...)
 }
 
-// execute is Run and RunCall: a body whose output, if any, is kept with the
-// run's end.
-func execute(ctx context.Context, name string, body func(ctx Context) ([]byte, error), opts []RunOption) ([]byte, error) {
+// RunThread executes one thread of a run: the function defined under fn, on
+// payload, as thread thread of the run named run, and returns its encoded
+// output.
+//
+// For placers. A thread forked with [Context.Go] is a function on an input,
+// which is what the parent's fork recorded; a process that has been handed
+// one and has the thread's history in its store runs it through here, and
+// gets a thread that carries on from where it stopped rather than from the
+// beginning. The output is recorded with the thread's end, so entering a
+// thread that already completed returns what it produced without running
+// anything, and the caller records it in the parent's join.
+//
+// The thread runs alone here: it has no parent in this process, and the
+// threads it forks itself go to this run's placer.
+func RunThread(ctx context.Context, run, thread, fn string, payload []byte, opts ...RunOption) ([]byte, error) {
+	if fn == "" {
+		return nil, errors.New("flow: RunThread requires a function name")
+	}
+	if thread == "" {
+		return nil, errors.New("flow: RunThread requires a thread name")
+	}
+	return execute(ctx, run, thread, fn, payload, functionBody(fn, payload), opts)
+}
+
+// functionBody is the body of a thread that runs one function: the function
+// on its input, with its error marked as the function's own answer. A
+// function that fails has failed — that is a fact about the work, recorded
+// and replayed like a call's — where a body of run code that fails is
+// retried, since what dominates there is the transient.
+func functionBody(fn string, input []byte) func(ctx Context) ([]byte, error) {
+	return func(ctx Context) ([]byte, error) {
+		out, err := Execute(ctx, fn, input)
+		if err != nil {
+			return nil, &callError{name: fn, err: err}
+		}
+		return out, nil
+	}
+}
+
+// execute runs one thread of a run in a process where it has no parent: the
+// main thread, or a forked thread that was handed to this process.
+func execute(ctx context.Context, run, thread, fn string, input []byte, body func(ctx Context) ([]byte, error), opts []RunOption) ([]byte, error) {
 	ro := newRunOptions(opts)
 
-	if name == "" {
+	if run == "" {
 		return nil, errors.New("flow: Run requires a name; use flow.NewName for an arbitrary one")
 	}
 	if ro.store == nil {
 		return nil, errors.New("flow: Run requires a Store; pass flow.WithStore(flow.NewStore(...)) " +
 			"or flow.WithStore(flow.NewMemStore())")
 	}
+	r := &threadRunner{name: run, id: thread, fn: fn, input: input, body: body, opts: ro}
+	if thread == mainThread {
+		r.input = ro.input
+		r.inputType = ro.inputType
+	}
+	return r.execute(ctx)
+}
 
-	history, err := ro.store.Events(ctx, name)
+// threadRunner is one thread being run to completion: its body, its options,
+// and the run it belongs to.
+type threadRunner struct {
+	// run is the state the thread shares with its parent, when the parent
+	// is in this process; nil for a thread with no parent here, which makes
+	// its own for each attempt.
+	run *runState
+
+	name string // the run
+	id   string // the thread
+	fn   string // the function the thread runs, "" for a body of run code
+	body func(ctx Context) ([]byte, error)
+	opts runOptions
+
+	// input is what the body is given, in recorded form; nil for a body that
+	// takes nothing. inputType is what it expects, when that is known.
+	input     []byte
+	inputType reflect.Type
+}
+
+// execute runs the thread to completion: attempt after attempt over its
+// history, until one ends it.
+func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
+	store := r.opts.store
+
+	history, err := store.Events(ctx, r.name, r.id)
 	if err != nil {
 		return nil, err
 	}
 
-	// A run's input is fixed by its first attempt. Later attempts replay a
+	// A thread's input is fixed by its first attempt. Later attempts replay a
 	// history that was produced from it, so giving them anything else would
-	// be a different run wearing this one's name — checked before the
+	// be a different thread wearing this one's name — checked before the
 	// finished short-cut below, because a finished run handed different input
 	// is that same mistake, and answering it with silence would hide it.
-	input := ro.input
 	if recorded, ok := recordedInput(history); ok {
-		if input != nil && !bytes.Equal(input, recorded) {
+		if r.input != nil && !bytes.Equal(r.input, recorded) {
 			return nil, fmt.Errorf("flow: run %s was started with different input; "+
-				"a run's input is fixed by its first attempt, so leave it off to resume or use a new name", name)
+				"a run's input is fixed by its first attempt, so leave it off to resume or use a new name", r.name)
 		}
-		input = recorded
-	} else if input == nil && ro.inputType != nil {
+		r.input = recorded
+	} else if r.input == nil && r.inputType != nil {
 		return nil, fmt.Errorf("flow: run %s takes a %s as input and none was given; it looks like %s",
-			name, ro.inputType, exampleInput(ro.inputType))
+			r.name, r.inputType, exampleInput(r.inputType))
 	}
 
-	// A finished run is finished. Re-running it would repeat every effect its
-	// calls had, which is the opposite of what a durable run is for. What it
-	// produced is on record, and is the answer.
+	// A finished thread is finished. Re-running it would repeat every effect
+	// its calls had, which is the opposite of what a durable run is for. What
+	// it produced is on record, and is the answer.
 	if done, result, ok := finished(history); ok {
 		out, err := unpackResult(result)
 		if done == protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED {
 			return out, nil
 		}
-		return nil, fmt.Errorf("flow: run %s already failed permanently: %w", name, err)
+		return nil, fmt.Errorf("flow: %s already failed permanently: %w", r.describe(), err)
 	}
 
-	sink, err := ro.store.Sink(ctx, name)
+	sink, err := store.Sink(ctx, r.name, r.id)
 	if err != nil {
 		return nil, err
 	}
-
-	r := &runner{name: name, body: body, opts: ro, sink: sink, input: input}
 
 	attempt := lastAttempt(history)
 	for {
 		attempt++
 
-		out, status, runErr := r.attempt(ctx, history, attempt)
+		out, status, runErr := r.attempt(ctx, history, attempt, sink)
 
 		switch status {
 		case protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED:
@@ -212,13 +295,13 @@ func execute(ctx context.Context, name string, body func(ctx Context) ([]byte, e
 			}
 
 		default: // backoff
-			if ro.once {
+			if r.opts.once && r.id == mainThread {
 				// Somebody else decides about retries, and wants the error as
 				// the body gave it.
 				return nil, runErr
 			}
-			if attempt >= uint64(ro.maxAttempts) {
-				return nil, fmt.Errorf("flow: run %s failed after %d attempts: %w", name, attempt, runErr)
+			if attempt >= uint64(r.opts.maxAttempts) {
+				return nil, fmt.Errorf("flow: %s failed after %d attempts: %w", r.describe(), attempt, runErr)
 			}
 			if err := wait(ctx, r.backoff(attempt)); err != nil {
 				return nil, err
@@ -227,72 +310,74 @@ func execute(ctx context.Context, name string, body func(ctx Context) ([]byte, e
 
 		// The next attempt replays everything recorded so far, including what
 		// this one managed to do before it stopped.
-		if history, err = ro.store.Events(ctx, name); err != nil {
+		if history, err = store.Events(ctx, r.name, r.id); err != nil {
 			return nil, err
 		}
 	}
 }
 
-// runner is one Run in progress: its body, its options and its sink.
-type runner struct {
-	name string
-	body func(ctx Context) ([]byte, error)
-	opts runOptions
-	sink Sink
-
-	// input is what the body is given, in recorded form; nil for a body that
-	// takes nothing.
-	input []byte
+// describe names the thread in an error: the run alone for main, which is
+// what the caller knows the run by.
+func (r *threadRunner) describe() string {
+	if r.id == mainThread {
+		return "run " + r.name
+	}
+	return "thread " + r.id + " of run " + r.name
 }
 
 // attempt runs the body once over the history it is given, and returns what
 // it produced along with what became of it.
-func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt uint64) ([]byte, protos.WorkflowStatus, error) {
-	run := &runState{
-		name:    r.name,
-		attempt: attempt,
-		threads: threadsOf(history),
-		sink:    r.sink,
-		exec:    r.opts.executor,
-		host:    r.opts.host,
+func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, attempt uint64, sink Sink) ([]byte, protos.WorkflowStatus, error) {
+	run := r.run
+	if run == nil {
+		run = newRunState(r.name, r.opts)
+		// Whatever a thread of this attempt does after it returns is this
+		// attempt's business and not the record's — and the threads it
+		// forked are told to stop, so the next attempt, which forks them
+		// again from its history, is not racing them.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer run.finish()
+		defer cancel()
 	}
-	main := &threadState{id: mainThread, run: run}
-	// Whatever a thread of this attempt does after it returns is this attempt's
-	// business and not the record's.
-	defer run.finish()
+	t := &threadState{
+		id:      r.id,
+		attempt: attempt,
+		run:     run,
+		events:  replayable(history),
+		sink:    sink,
+	}
 
 	reason := protos.StartReason_START_REASON_INIT
 	if len(history) > 0 {
 		reason = protos.StartReason_START_REASON_RETRY
 	}
-	// Recorded on the run's own bookkeeping rather than main's cursor: a start
-	// marker is about the attempt, not about what the body did, and putting it
-	// in main's sequence would shift every replay position by one.
 	start := &protos.RunStartEvent{
 		Attempt:      attempt,
 		Reason:       reason,
 		WorkflowName: r.name,
-		InstanceId:   r.name,
+		InstanceId:   r.id,
 		Version:      uint64(r.opts.version),
+		Function:     r.fn,
 	}
 	if r.input != nil {
 		start.Input = &protos.Data{Serialized: r.input}
 	}
-	appendMarker(run, start)
+	t.marker(start)
 
-	out, err := r.body(Context{withThread(withInput(ctx, r.input), main)})
+	out, err := r.body(Context{withThread(withInput(ctx, r.input), t)})
 
-	if perr := run.err(); perr != nil {
+	if perr := t.err(); perr != nil {
 		// Persistence failed somewhere in there. Not retryable in any useful
 		// sense: the next attempt would replay an incomplete history.
-		appendMarker(run, &protos.RunEndEvent{
+		t.marker(&protos.RunEndEvent{
 			Status: protos.WorkflowStatus_WORKFLOW_STATUS_FAILED,
 			Result: packResult(nil, perr),
 		})
 		return nil, protos.WorkflowStatus_WORKFLOW_STATUS_FAILED, perr
 	}
 
-	status := r.classify(err)
+	status := r.classify(ctx, err)
 
 	end := &protos.RunEndEvent{Status: status, Result: packResult(out, err)}
 	if status == protos.WorkflowStatus_WORKFLOW_STATUS_SUSPENDED {
@@ -300,7 +385,7 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 			end.ScheduledFor = timestamppb.New(until)
 		}
 	}
-	appendMarker(run, end)
+	t.marker(end)
 	return out, status, err
 }
 
@@ -314,10 +399,16 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 // not handle: the call's failure is recorded, a retry replays it, and the body
 // — deterministic — fails the same way again, which used to be ten attempts
 // and four minutes of backoff to reach the answer the first one had.
-func (r *runner) classify(err error) protos.WorkflowStatus {
+//
+// An attempt whose own context ended did not fail; it was interrupted, and
+// the error it returned — whatever it says — is not the work's verdict. It
+// backs off, which is to say it is resumed by whoever runs the thread next.
+func (r *threadRunner) classify(ctx context.Context, err error) protos.WorkflowStatus {
 	switch {
 	case err == nil:
 		return protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED
+	case ctx.Err() != nil:
+		return protos.WorkflowStatus_WORKFLOW_STATUS_BACKOFF
 	case IsContinuity(err), IsPermanent(err), IsCallFailure(err):
 		return protos.WorkflowStatus_WORKFLOW_STATUS_FAILED
 	}
@@ -332,7 +423,7 @@ func (r *runner) classify(err error) protos.WorkflowStatus {
 	return protos.WorkflowStatus_WORKFLOW_STATUS_BACKOFF
 }
 
-func (r *runner) backoff(attempt uint64) time.Duration {
+func (r *threadRunner) backoff(attempt uint64) time.Duration {
 	delay := time.Duration(float64(r.opts.initialDelay) * math.Pow(2, float64(attempt-1)))
 	if delay > r.opts.maxDelay || delay <= 0 {
 		return r.opts.maxDelay
@@ -391,7 +482,7 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 		})
 	}
 
-	if err := t.run.err(); err != nil {
+	if err := t.err(); err != nil {
 		return nil, err
 	}
 
@@ -400,12 +491,11 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// and that is the number a reader of an executor's record can find in the
 	// history.
 	step := t.at() - 1
-	out, callErr := t.run.exec.Invoke(WithOrigin(withForked(ctx, false), Origin{
+	out, callErr := t.run.exec.Invoke(WithOrigin(ctx, Origin{
 		Run:     t.run.name,
 		Thread:  t.id,
 		Step:    step,
-		Attempt: t.run.attempt,
-		Forked:  forkedFrom(ctx),
+		Attempt: t.attempt,
 	}), name, payload)
 
 	// A call cut short by the caller's own context did not fail; it was
@@ -420,17 +510,17 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// Recorded either way. A failed call is a fact about the run, and one that
 	// a retry must not repeat blindly — the error is what the next attempt
 	// replays.
-	// Named for its call, so a reader of the history that dispatches calls
-	// for the run — an executor following it from outside — can tell an
-	// answered call from one still open without pairing events by order.
+	// Named for its call, so a reader of the history can tell an answered
+	// call from one still open without pairing events by order.
 	t.record(&protos.ReturnEvent{Result: packResult(out, callErr), CallSerial: step})
 	if callErr != nil {
 		return nil, &callError{name: name, err: callErr}
 	}
-	return out, t.run.err()
+	return out, t.err()
 }
 
-// callError is the failure of a call, as the run's body sees it.
+// callError is the failure of a call the run made, or of a thread it forked,
+// as the run's body sees it.
 //
 // Its own type so the run can tell a failure that is recorded — and would be
 // replayed — from one in the body's own logic that a retry might not repeat.
@@ -445,9 +535,9 @@ func (e *callError) Error() string { return e.err.Error() }
 func (e *callError) Unwrap() error { return e.err }
 
 // IsCallFailure reports whether err is, or wraps, the failure of a call the
-// run made. A run that returns one is not retried, since the failure is on
-// record and a retry would replay it; handle the error in the body instead
-// if the run can go on without that call.
+// run made or a thread it forked. A run that returns one is not retried,
+// since the failure is on record and a retry would replay it; handle the
+// error in the body instead if the run can go on without that call.
 func IsCallFailure(err error) bool {
 	_, ok := errors.AsType[*callError](err)
 	return ok
@@ -485,43 +575,25 @@ func unpackResult(r *protos.Result) ([]byte, error) {
 	return r.GetData().GetSerialized(), nil
 }
 
-// appendMarker records a run-level event, which belongs to no thread.
-//
-// Kept out of every thread's sequence deliberately: replay walks a thread's
-// events in order and compares each to what the body is doing, and a start
-// marker is not something the body did.
-func appendMarker[E protos.Events](run *runState, payload E) {
-	run.mu.Lock()
-	defer run.mu.Unlock()
-
-	ev := &protos.Event{
-		Timestamp: timestamppb.New(time.Now().Truncate(time.Microsecond)),
-		Attempt:   run.attempt,
-		Payload:   protos.PackEventPayload(payload),
-	}
-	if run.sink != nil && run.sinkErr == nil {
-		if err := run.sink.Append(context.Background(), ev); err != nil {
-			run.sinkErr = fmt.Errorf("flow: persist event: %w", err)
-		}
-	}
+// isMarker reports whether an event is about a thread's attempt rather than
+// about what its body did: the events replay does not compare against.
+func isMarker(ev *protos.Event) bool {
+	return ev.GetRunStart() != nil || ev.GetRunEnd() != nil
 }
 
-// threadsOf rebuilds each thread's sequence from a flat history.
-//
-// Run-level markers have no thread and are skipped, which is what keeps them
-// out of the positions replay compares against.
-func threadsOf(history []*protos.Event) map[string][]*protos.Event {
-	threads := map[string][]*protos.Event{mainThread: nil}
+// replayable is a thread's history without its attempt markers: the sequence
+// replay walks, one event per thing the body did.
+func replayable(history []*protos.Event) []*protos.Event {
+	var out []*protos.Event
 	for _, ev := range history {
-		if ev.GetThreadId() == "" {
-			continue
+		if !isMarker(ev) {
+			out = append(out, ev)
 		}
-		threads[ev.GetThreadId()] = append(threads[ev.GetThreadId()], ev)
 	}
-	return threads
+	return out
 }
 
-// finished reports the terminal outcome of a run, if it reached one.
+// finished reports the terminal outcome of a thread, if it reached one.
 func finished(history []*protos.Event) (protos.WorkflowStatus, *protos.Result, bool) {
 	for _, h := range slices.Backward(history) {
 		end := h.GetRunEnd()
@@ -538,7 +610,7 @@ func finished(history []*protos.Event) (protos.WorkflowStatus, *protos.Result, b
 	return protos.WorkflowStatus_WORKFLOW_STATUS_UNKNOWN, nil, false
 }
 
-// recordedInput is the input the run's first attempt was given, if the
+// recordedInput is the input the thread's first attempt was given, if the
 // history has one.
 func recordedInput(history []*protos.Event) ([]byte, bool) {
 	for _, ev := range history {

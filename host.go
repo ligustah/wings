@@ -11,14 +11,15 @@ import (
 
 // Run executes body as a durable run on this cluster.
 //
-// Every function the body calls goes to a worker and is recorded in the run's
-// history, which lives on the cluster's own storage under Dir. Run the same
+// Every thread the body forks — [flow.Context.Go], [flow.Context.Map] — goes
+// to a worker; a function it calls directly runs here. Both are recorded in
+// the run's history, which lives on the cluster's own storage under Dir. Run the same
 // name in the same Dir again and the body is replayed to where it stopped and
 // carried on from there — a coordinator that crashed mid-run resumes rather
 // than restarts, and one that already finished does nothing. The body must
 // therefore be deterministic; [flow] says what that costs.
 //
-// opts are passed through to [flow.Run]; the store and the executor are this
+// opts are passed through to [flow.Run]; the store and the placer are this
 // cluster's and cannot be overridden.
 func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Context) error, opts ...flow.RunOption) error {
 	all, err := c.runOptions(opts)
@@ -52,8 +53,9 @@ func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) er
 	return flow.RunWorkflow(withCluster(ctx, c), name, input, all...)
 }
 
-// runOptions is opts with this cluster's store and executor appended, so
-// that they win.
+// runOptions is opts with this cluster's store and placer appended, so that
+// they win. No executor: a function the body calls directly runs where the
+// body is, on the coordinator, and only the threads it forks go to workers.
 func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -61,7 +63,7 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 	}
 	return append(append([]flow.RunOption{}, opts...),
 		flow.WithStore(flow.NewStore(client)),
-		flow.WithExecutor(clusterExecutor{c}),
+		flow.WithPlacer(clusterPlacer{c}),
 		flow.WithChannelHost(clusterChannels{c}),
 	), nil
 }
@@ -99,6 +101,26 @@ func (e clusterExecutor) Invoke(ctx context.Context, name string, payload []byte
 		return nil, errors.New(res.Error)
 	}
 	return res.Payload, nil
+}
+
+// clusterPlacer is the cluster as a [flow.Placer]: a thread that runs a
+// function is a job sent to a worker, and the join is what came back. A
+// thread of run code has no function a worker could be handed, and runs
+// here.
+type clusterPlacer struct{ c *Cluster }
+
+func (p clusterPlacer) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
+	if th.Fn == "" {
+		return flow.InProcess().Place(ctx, th, body)
+	}
+	return clusterExecutor{p.c}.Invoke(flow.WithOrigin(ctx, threadOrigin(th)), th.Fn, th.Input)
+}
+
+// threadOrigin is the origin a thread's job carries: the thread itself, at
+// step zero — a thread is one piece of work, and its name is what a retry
+// of the parent presents again, which is how the job is rejoined.
+func threadOrigin(th flow.Thread) flow.Origin {
+	return flow.Origin{Run: th.Run, Thread: th.ID}
 }
 
 type clusterKey struct{}

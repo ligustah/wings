@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -138,13 +139,61 @@ func Define[In, Out any](name string, fn func(Context, In) (Out, error), opts ..
 	}
 }
 
+// capture is how [Context.Go] learns which function a Func is without
+// running it: it calls the Func on a context carrying one of these, and
+// dispatch, finding it, writes down the name and the encoded input and
+// returns without doing anything.
+//
+// The alternative — recovering the definition from the function value — has
+// nothing to hold on to: a Func is a closure, and Go gives closures no
+// identity worth comparing.
+type capture struct {
+	taken   bool
+	name    string
+	payload []byte
+	codec   any // the function's output codec, a dswire.Codec[Out]
+	err     error
+}
+
+type captureKey struct{}
+
+// describe calls f on a context that captures the call rather than making
+// it, and reports what f would have dispatched.
+func describe[In, Out any](ctx Context, f Func[In, Out], in In) (*capture, error) {
+	if f == nil {
+		return nil, errors.New("flow: Go requires a function made by Define, and was given nil")
+	}
+	cap := &capture{}
+	_, _ = f(Context{context.WithValue(ctx.base(), captureKey{}, cap)}, in)
+	if !cap.taken {
+		return nil, errors.New("flow: Go requires a function made by Define; " +
+			"a closure of your own has no name a thread could be placed under")
+	}
+	return cap, cap.err
+}
+
+func (d *def[In, Out]) encodeInput(in In) ([]byte, error) {
+	payload, err := dswire.EncodeRecord(d.inCodec, in)
+	if err != nil {
+		return nil, fmt.Errorf("flow: encode input for %q: %w", d.name, err)
+	}
+	return payload, nil
+}
+
 // dispatch sends one call wherever the context says calls go.
 func (d *def[In, Out]) dispatch(ctx Context, in In) (Out, error) {
 	var zero Out
 
-	payload, err := dswire.EncodeRecord(d.inCodec, in)
+	if cap, ok := ctx.Value(captureKey{}).(*capture); ok && !cap.taken {
+		// Asked what this call would be, not to make it. See capture.
+		cap.taken, cap.name, cap.codec = true, d.name, d.outCodec
+		cap.payload, cap.err = d.encodeInput(in)
+		return zero, nil
+	}
+
+	payload, err := d.encodeInput(in)
 	if err != nil {
-		return zero, fmt.Errorf("flow: encode input for %q: %w", d.name, err)
+		return zero, err
 	}
 
 	var out []byte
@@ -337,12 +386,6 @@ type Origin struct {
 	Thread  string
 	Step    uint64
 	Attempt uint64
-	// Forked says the call was made with [Context.Go] or [Context.Map] — a
-	// fan-out — rather than directly. An executor that can run a call where
-	// it is made or somewhere else may use this to decide: a direct call
-	// blocks its caller, so sending it elsewhere gains nothing, while a
-	// fan-out is the case where placing calls across machines is the point.
-	Forked bool
 }
 
 // Zero reports whether o names nothing.
@@ -373,20 +416,6 @@ func WithOrigin(ctx context.Context, o Origin) context.Context {
 func OriginFrom(ctx context.Context) Origin {
 	o, _ := ctx.Value(originKey{}).(Origin)
 	return o
-}
-
-// forkedKey marks the context a forked thread calls its function on, so the
-// call can say it was a fan-out. Cleared again on the context the executor is
-// given, or a call the function makes inside would inherit the mark.
-type forkedKey struct{}
-
-func withForked(ctx context.Context, forked bool) context.Context {
-	return context.WithValue(ctx, forkedKey{}, forked)
-}
-
-func forkedFrom(ctx context.Context) bool {
-	f, _ := ctx.Value(forkedKey{}).(bool)
-	return f
 }
 
 // allocator returns a factory for T when T is a pointer type, and nil

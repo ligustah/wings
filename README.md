@@ -104,8 +104,10 @@ var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
 ```
 
 That is the whole file. No cloud appears in it — and no cluster either. The
-cluster reaches the body through its context: every call a flow makes goes to
-the executor bound there, which for the coordinator is the cluster's workers.
+cluster reaches the body through its context: every thread a flow forks —
+`ctx.Map`, `ctx.Go` — goes to the placer bound there, which for the
+coordinator is the cluster's workers. A function called directly runs where
+the call is made, on the thread that made it.
 
 A package that defines one workflow is a binary that runs it. Define several
 and the binary takes `-workflow <name>`; leave it off and it lists them. Each
@@ -215,14 +217,14 @@ worker was lost, every worker that entered or left service. Nothing reads it
 during the run. Its value is that it outlives the process, so a coordinator that
 died has still left an account of what it had done.
 
-When the job was a call of a flow run — which on a coordinator every job is,
-since the workflow itself is one — the entry says so: the run, the thread and
-the position in that run's history. That is what makes the record answerable at
-the level anyone actually asks at: not "job 3f went to remote-2" but "the second
-call of order-77 went to remote-2 and never came back". Only the run knows which
-run a call belongs to, so it stamps it on the dispatch and the coordinator
-writes it down. A bare call made on `Cluster.Bind` belongs to nothing larger and
-leaves those columns empty.
+When the job was a thread of a flow run — which on a coordinator every job is,
+since the workflow itself is one — the entry says so: the run and the thread.
+That is what makes the record answerable at the level anyone actually asks
+at: not "job 3f went to remote-2" but "thread main.1 of order-77 went to
+remote-2 and never came back". Only the run knows which run a thread belongs
+to, so it stamps it on the dispatch and the coordinator writes it down. A bare
+call made on `Cluster.Bind` belongs to nothing larger and leaves those columns
+empty.
 
 Writes go through a buffered channel drained by one goroutine and batched, so
 recording never becomes backpressure on the work. A full buffer drops entries
@@ -416,23 +418,39 @@ for coarse phases and `Heartbeat` for a position inside a loop.
 A work function checkpoints the same way whatever called it — `Step` and
 `Heartbeat` do not know or care which run they are part of. What the run adds
 is a second way to be interrupted: the run itself can fail and be retried while
-the call is still running. The retry **rejoins** the call
-already in flight instead of dispatching a second copy, so the progress that
-copy would have thrown away is kept. The coordinator recognises it by the run,
-thread and position the call sits at, which replay puts in the same place every
-attempt.
+the thread is still running. The retry **rejoins** the thread already in
+flight instead of dispatching a second copy, so the progress that copy would
+have thrown away is kept. The coordinator recognises it by the run and the
+thread's name, which replay gives it again on every attempt.
 
-### A work function is a run
+### The thread is the unit
 
-On the worker, a call does not execute as a bare function: it runs as a **flow
-run of its own**, with its history on the worker's storage. So a work function
-may do everything a workflow body may — fork with `ctx.Go` and `ctx.Spawn`, use
-a channel between its threads, `ctx.Map` over other functions, read `ctx.Now`,
-`ctx.Sleep`, wrap an outside answer in `ctx.Effect` — and a retry **replays** all of it from the history instead of
-doing it again. A nested call it made before it was moved is answered from the
-record; the one it was in the middle of is made again. The same determinism
-rules apply as to any run body, and a function that uses none of those
-primitives records nothing and behaves exactly as before.
+A flow run is made of **threads**: the body is the main thread, and every
+`ctx.Go`, `ctx.Map` and `ctx.Spawn` forks another. Each thread has a history
+of its own, on a stream of its own. The fork in the parent's history says what
+the thread is to do — the function and its input — and the join says what it
+produced; a replay of the parent that finds the join never runs the thread
+again, and one that finds only the fork starts the thread, which replays *its*
+history and carries on. That is the whole reason a thread is what the cluster
+hands to a machine: its stream is all that has to travel.
+
+So what goes to a worker is a thread that runs a function, and it runs there
+as a **flow run of its own**, with its history on the worker's storage. A work
+function may do everything a workflow body may — fork with `ctx.Go` and
+`ctx.Spawn`, use a channel between its threads, `ctx.Map` over other
+functions, read `ctx.Now`, `ctx.Sleep`, wrap an outside answer in
+`ctx.Effect` — and a retry **replays** all of it from the history instead of
+doing it again. A thread it forked before it was moved is answered from the
+record; the one it was waiting on is rejoined. The same determinism rules
+apply as to any run body, and a function that uses none of those primitives
+records nothing and behaves exactly as before.
+
+A function called **directly** — `Digest(ctx, w)` rather than
+`ctx.Go(Digest, w)` — runs on the calling thread, wherever that is: on the
+coordinator in a workflow body, on the worker inside a work function. It
+blocks its caller either way, so sending it elsewhere would move the CPU while
+the caller's slot sat idle. It is recorded and replayed like any call; it is
+just not placed. Fan out with `Map` or `Go` when the point is other machines.
 
 Everything an attempt writes on its worker — that history, its recordings, its
 files — goes into **one transaction**, committed at the points that mean
@@ -443,16 +461,17 @@ copy, and what a retry is handed is consistent across all of them: the history
 that says which recordings were made and the recordings themselves were
 committed together.
 
-A call a work function makes is **the cluster's to place**, like any other.
+A thread a work function forks is **the cluster's to place**, like any other.
 There is no request message: the coordinator keeps a copy of every attempt's
-history, reads the calls out of it, runs each where the load is lowest and
-sends the answer back on the worker's control stream. Making a call is
-therefore a commit point on the worker. The run is named for the job, not the
-attempt, so a retry that replays a call presents the same one, and the
-coordinator hands back the answer it kept — or lets the retry rejoin the call
-still in flight — rather than running it twice. A job waiting on a call it made
-is not moved for silence, however long the call takes; its total timeout still
-runs.
+history, reads the forks out of it, runs each where the load is lowest and
+sends the result back on the worker's control stream. Forking is therefore a
+commit point on the worker. The run is named for the job, not the attempt, so
+a retry that replays a fork presents the same thread, and the coordinator
+hands back the result it kept — or lets the retry rejoin the thread still in
+flight — rather than running it twice. A job waiting on a thread it forked is
+not moved for silence, however long the thread takes; its total timeout still
+runs. A thread of run code — `ctx.Spawn` — has no function a worker could be
+handed, and runs where its parent is.
 
 ### Channels across machines
 

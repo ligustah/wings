@@ -106,7 +106,7 @@ func TestStoredHistoryIsReadableAsEvents(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	events, err := store.Events(context.Background(), name)
+	events, err := store.Events(context.Background(), name, "main")
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
