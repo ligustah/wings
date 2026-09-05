@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +16,7 @@ import (
 	compute "cloud.google.com/go/compute/apiv1"
 	"cloud.google.com/go/compute/apiv1/computepb"
 	"golang.org/x/crypto/ssh"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/protobuf/proto"
 
@@ -40,6 +43,11 @@ type Config struct {
 	// Preemptible requests Spot instances — much cheaper, and they can be
 	// reclaimed mid-job. wings redispatches what a lost worker owed, so this is
 	// a real option rather than a trap, but only if your work is idempotent.
+	//
+	// A preempted instance deletes itself rather than stopping, since wings
+	// never restarts one, and the coordinator asks the API whether a worker
+	// that stopped answering still exists, so a preemption costs seconds
+	// rather than the whole reconnect window.
 	Preemptible bool
 
 	// NamePrefix prefixes generated instance names. Defaults to "wings".
@@ -270,6 +278,20 @@ func (p *gcpProvisioner) reattachOne(
 		return nil, fmt.Errorf("not found: %w", err)
 	}
 	if status := got.GetStatus(); status != "RUNNING" {
+		// It exists and is not serving: a Spot instance that was preempted
+		// and stopped, one somebody stopped by hand, one still booting when
+		// the previous coordinator died. None will be resumed — wings never
+		// restarts a machine — and reporting it as not recovered would close
+		// the lease and leave a stopped instance billing for its disk. So it
+		// is deleted here, where it was found.
+		log.Info("wings: deleting an instance that is not running", "status", status)
+		if op, err := client.Delete(ctx, &computepb.DeleteInstanceRequest{
+			Project: p.cfg.Project, Zone: p.cfg.Zone, Instance: name,
+		}); err != nil {
+			log.Warn("wings: could not delete it", "err", err)
+		} else if err := op.Wait(ctx); err != nil {
+			log.Warn("wings: could not delete it", "err", err)
+		}
 		return nil, fmt.Errorf("instance is %s, not RUNNING", status)
 	}
 	ip := externalIP(got)
@@ -363,6 +385,11 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 		inst.Scheduling = &computepb.Scheduling{
 			ProvisioningModel: proto.String("SPOT"),
 			Preemptible:       proto.Bool(true),
+			// Delete on preemption rather than stop. A stopped instance keeps
+			// its disk and bills for it, and wings never restarts one: a
+			// preempted worker is a lost worker, its jobs are moved, and the
+			// scaler replaces the machine with a fresh one.
+			InstanceTerminationAction: proto.String("DELETE"),
 		}
 	}
 
@@ -469,6 +496,36 @@ func (m *gcpMachine) Start(ctx context.Context, cmd string, env map[string]strin
 
 func (m *gcpMachine) Forward(ctx context.Context, remotePort int) (string, error) {
 	return m.ssh.Forward(ctx, remotePort)
+}
+
+// Alive asks the API whether the instance still exists and is running.
+//
+// This is what lets a preempted Spot worker be given up on in seconds rather
+// than at the end of the reconnect window: the connection to it dropped, and
+// the cloud can say outright that nothing is coming back.
+func (m *gcpMachine) Alive(ctx context.Context) (bool, error) {
+	got, err := m.client.Get(ctx, &computepb.GetInstanceRequest{
+		Project:  m.cfg.Project,
+		Zone:     m.cfg.Zone,
+		Instance: m.name,
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	switch got.GetStatus() {
+	case "RUNNING", "STAGING", "PROVISIONING", "REPAIRING":
+		return true, nil
+	}
+	return false, nil
+}
+
+// isNotFound reports whether the API said the instance does not exist.
+func isNotFound(err error) bool {
+	var gerr *googleapi.Error
+	return errors.As(err, &gerr) && gerr.Code == http.StatusNotFound
 }
 
 // Close deletes the instance. Idempotent, because both a failed bring-up and a

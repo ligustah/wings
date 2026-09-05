@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeCloud is a Provisioner whose "machines" are child processes on this
@@ -124,10 +125,11 @@ type fakeMachine struct {
 	cloud *fakeCloud
 	dir   string
 
-	mu     sync.Mutex
-	proc   *os.Process
-	port   string
-	closed bool
+	mu        sync.Mutex
+	proc      *os.Process
+	port      string
+	closed    bool
+	preempted bool
 }
 
 func (m *fakeMachine) ID() string { return m.lease }
@@ -214,10 +216,30 @@ func (m *fakeMachine) Close(ctx context.Context) error {
 	return nil
 }
 
+// Alive is what a cloud answers when asked whether the machine still exists.
+func (m *fakeMachine) Alive(ctx context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return !m.closed && !m.preempted, nil
+}
+
+// preempt is the cloud taking the machine back: the worker on it is killed
+// and the cloud says so when asked. The machine is not closed, because nothing
+// on the coordinator's side has released it yet.
+func (m *fakeMachine) preempt() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc != nil {
+		_ = m.proc.Kill()
+		_, _ = m.proc.Wait()
+	}
+	m.preempted = true
+}
+
 func (m *fakeMachine) kill() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.proc != nil && !m.closed {
+	if m.proc != nil && !m.closed && !m.preempted {
 		_ = m.proc.Kill()
 		_, _ = m.proc.Wait()
 	}
@@ -497,6 +519,65 @@ func TestLeasesAreUsableAsCloudNames(t *testing.T) {
 			t.Fatalf("lease %q was minted twice", l)
 		}
 		seen[l] = true
+	}
+}
+
+// THE POINT: a worker whose connection drops is given the reconnect window to
+// come back, because a dropped connection is usually the network. A Spot
+// instance that was preempted is not coming back, and the cloud will say so
+// when asked. A coordinator that asks moves the jobs in seconds; one that
+// does not leaves them sitting for the whole window.
+func TestAPreemptedMachineIsGivenUpOnAtOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	cloud := newFakeCloud(t)
+	c, err := Start(t.Context(), Config{
+		Target:           Remote(cloud.provisioner()),
+		Dir:              t.TempDir(),
+		Workers:          2,
+		Concurrency:      1,
+		ReconnectTimeout: 2 * time.Minute, // the window we must NOT wait out
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Stop(context.Background())
+
+	// A job long enough to be mid-flight when its machine goes.
+	done := make(chan error, 1)
+	began := time.Now()
+	go func() {
+		_, err := slow(c.Bind(t.Context()), 3*time.Second)
+		done <- err
+	}()
+
+	// Find where it landed, and take that machine away.
+	var victim *workerConn
+	waitFor(t, "the job to be dispatched", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, p := range c.pending {
+			victim = p.worker
+		}
+		return victim != nil
+	})
+	cloud.mu.Lock()
+	m := cloud.live[victim.lease]
+	cloud.mu.Unlock()
+	m.preempt()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the job was not moved off the preempted machine: %v", err)
+		}
+		if took := time.Since(began); took > 45*time.Second {
+			t.Fatalf("the job took %s; the coordinator waited out the reconnect window instead of asking the cloud", took)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the job never finished; its preempted worker was never given up on")
 	}
 }
 

@@ -715,6 +715,17 @@ func (c *Cluster) tail(w *workerConn) {
 				c.log.Warn("wings: lost contact with worker, retrying",
 					"worker", w.id, "err", err, "giving_up_after", c.cfg.reconnect())
 			}
+			// A cloud that can say the machine is gone is not waited for.
+			// The window exists because a dropped connection is usually the
+			// network; a preempted or deleted instance is not coming back,
+			// and its jobs would sit unmoved for the whole of it.
+			if c.machineGone(w) {
+				c.log.Error("wings: worker's machine is gone", "worker", w.id, "after", time.Since(trouble))
+				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "machine is gone"})
+				w.dead.Store(true)
+				c.redispatchFrom(w)
+				return
+			}
 			attempts++
 			if !sleepCtx(w.ctx, reconnectBackoff(attempts)) {
 				return
@@ -747,6 +758,24 @@ func (c *Cluster) tail(w *workerConn) {
 			c.deliver(r.Record)
 		}
 	}
+}
+
+// machineGone asks a worker's machine, if it is one that can be asked, whether
+// it has ceased to exist. Only a definite no counts: an unanswered question is
+// the ordinary reconnect wait.
+func (c *Cluster) machineGone(w *workerConn) bool {
+	p, ok := w.machine.(Prober)
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+	alive, err := p.Alive(ctx)
+	if err != nil {
+		c.log.Debug("wings: could not ask whether a worker's machine is alive", "worker", w.id, "err", err)
+		return false
+	}
+	return !alive
 }
 
 // reconnectBackoff grows to a ceiling, so a long outage costs a handful of

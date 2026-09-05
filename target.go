@@ -86,6 +86,24 @@ type Machine interface {
 	Close(ctx context.Context) error
 }
 
+// Prober is a Machine that can say whether it still exists.
+//
+// Optional, and worth implementing for any cloud that can answer. A worker
+// that stops answering is given [Config.ReconnectTimeout] to come back,
+// because a dropped connection is usually the network and the machine behind
+// it is fine. A cloud can often say outright that it is not — a Spot instance
+// that was preempted, one that somebody deleted — and a coordinator that can
+// ask gives such a worker up at once, moves its jobs and replaces it, rather
+// than at the end of the window.
+type Prober interface {
+	Machine
+
+	// Alive reports whether the machine still exists and is running, or is on
+	// its way to running. An error means the question could not be answered,
+	// and the coordinator keeps waiting.
+	Alive(ctx context.Context) (bool, error)
+}
+
 // Target says where workers run. Use [InProcess], [LocalProcess] or [Remote].
 //
 // The three kinds are fixed and the type is opaque, because extending wings

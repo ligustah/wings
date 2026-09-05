@@ -256,6 +256,13 @@ Nothing wings starts is reachable from the internet, and no firewall rule is
 needed. An ephemeral ed25519 keypair is minted per run and installed via
 instance metadata; nothing wings creates outlives the cluster.
 
+**Spot instances** (`-gcp.spot`) are the cheap option and a real one: a
+preempted worker is a lost worker, its jobs are moved and the scaler replaces
+the machine. A preempted instance deletes itself rather than stopping, and the
+coordinator asks the cloud whether a worker that stopped answering still
+exists, so a preemption costs seconds rather than the whole reconnect window.
+Idempotent work is the price.
+
 The worker goes up **straight from memory** — it is decompressed once and each
 machine's upload reads from that one copy, so nothing is written to the
 coordinator's disk merely to have a path to hand to something. The transfer
