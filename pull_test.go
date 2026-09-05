@@ -69,7 +69,8 @@ func TestWhatAJobCommitsComesHomeAsTransactions(t *testing.T) {
 // from, a job that has settled — rather than stopping over one it cannot
 // copy whole: the coordinator discards such attempts' streams on the
 // worker, and their late transactions are exactly the ones with records
-// missing.
+// missing. A settled job is still wanted: its last transaction is pulled
+// after it finishes.
 func TestThePullerDeclinesWhatNoAttemptWants(t *testing.T) {
 	c := &Cluster{pending: map[string]*pendingJob{}}
 	c.pending["ep-1"] = &pendingJob{job: jobEnvelope{ID: "ep-1", Attempt: 2}}
@@ -81,7 +82,7 @@ func TestThePullerDeclinesWhatNoAttemptWants(t *testing.T) {
 		{"wings.job.ep-1.3", true},          // one the coordinator has yet to hear of
 		{"wings.job.ep-1.1", false},         // an attempt the job moved on from
 		{"wings.job.ep-1.0", false},         // ditto
-		{"wings.job.ep-2.0", false},         // a job that settled
+		{"wings.job.ep-2.0", true},          // a settled job: its output may still be arriving home
 		{"wings.lineage.some.stream", true}, // not an attempt's at all
 		{"wings.job.odd", true},             // not the shape expected; the engine's to judge
 	} {

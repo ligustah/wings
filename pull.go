@@ -121,10 +121,20 @@ func (c *Cluster) pullWanted(workload string) bool {
 	defer c.mu.Unlock()
 	for id, p := range c.pending {
 		if streamPart(id) == part {
-			return p.job.Attempt <= attempt
+			// Decline only an attempt the job has already moved PAST: those
+			// are the streams the coordinator discards, so those are the
+			// transactions that arrive with their records gone. The current
+			// attempt and any the coordinator has yet to hear of are wanted.
+			return attempt >= p.job.Attempt
 		}
 	}
-	return false
+	// Not pending: settled, or not yet known here. Its outputs may still be
+	// on their way home — a job's last transaction is pulled after it
+	// finishes — so it is wanted. A truly abandoned attempt's incomplete
+	// transaction is the rare exception the pull loop still guards against;
+	// declining every settled job to catch it would lose the outputs of
+	// every job that finishes before its transaction is pulled.
+	return true
 }
 
 // pulledStream says where a record of a worker's transaction goes here: the
