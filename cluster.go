@@ -1276,10 +1276,10 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 				"job", job.ID, "worker", w.id, "err", err)
 		}
 		if err := c.send(c.ctx, w, job); err != nil {
-			c.mu.Lock()
-			c.release(w)
-			c.mu.Unlock()
-			c.failPending(p, fmt.Errorf("wings: redispatch to worker %s: %w", w.id, err))
+			// As at submit: the worker's failing, not the job's.
+			c.log.Warn("wings: could not hand a moved job to a worker; moving it again",
+				"job", job.ID, "worker", w.id, "err", err)
+			c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true)
 		}
 	})
 }
@@ -1587,11 +1587,17 @@ func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, 
 		err = c.send(ctx, w, job)
 	}
 	if err != nil {
-		c.mu.Lock()
-		c.forget(p)
-		c.release(w)
-		c.mu.Unlock()
-		return nil, fmt.Errorf("wings: submit to worker %s: %w", w.id, err)
+		// The worker, not the work: it was picked a moment ago and does not
+		// answer now — dying, as a rule, its jobs about to be moved off it
+		// — so this job is moved off it too, rather than failed, which
+		// made a fork that landed on a machine in its last second the
+		// thread's own failure: one its parent, waiting on a channel the
+		// thread was to feed, never saw. Counted against the job, so that
+		// one nothing can be handed to fails rather than loops.
+		c.log.Warn("wings: could not hand a job to a worker; moving it",
+			"job", job.ID, "worker", w.id, "err", err)
+		c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true)
+		return p, nil
 	}
 	c.journal.record(journalEntry{
 		Kind: journalSubmitted, Job: job.ID, Func: job.Func, Worker: w.id,

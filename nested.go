@@ -289,6 +289,9 @@ func (c *Cluster) dispatchNested(p *pendingJob, attempt int, thread string, step
 	}()
 	origin := flow.Origin{Run: runOf(p.job), Thread: thread, Step: step, Attempt: uint64(attempt)}
 	child, err := c.submitJob(flow.WithOrigin(ctx, origin), call.job())
+	if err != nil && ctx.Err() == nil {
+		c.log.Warn("wings: could not start a thread a job forked", "job", p.job.ID, "thread", thread, "err", err)
+	}
 	var res resultEnvelope
 	if err == nil {
 		res, err = c.await(ctx, child)
