@@ -177,11 +177,10 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	// A thread of run code has its ancestors' histories in its stream too,
 	// put there for the replay that reaches it — see lineage.go — and the
 	// forks in those are the ancestors', already dispatched from wherever
-	// the ancestors are. Only what the job's own threads fork is its.
-	replayed := map[string]bool{}
-	for _, id := range p.job.Lineage[:max(len(p.job.Lineage)-1, 0)] {
-		replayed[id] = true
-	}
+	// the ancestors are. Only what the job's own threads fork is its: the
+	// thread it runs as, and the threads named under it.
+	own := threadOf(p.job)
+	owned := func(id string) bool { return id == own || strings.HasPrefix(id, own+".") }
 
 	var (
 		st         *dsclient.Stream[*protos.Event]
@@ -227,7 +226,7 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 		for _, r := range recs {
 			from = r.Offset + 1
 			ev := r.Record
-			if replayed[ev.GetThreadId()] {
+			if !owned(ev.GetThreadId()) {
 				continue
 			}
 			switch e := protos.UnpackEventPayload(ev).(type) {
