@@ -108,7 +108,8 @@ func RunLineage(ctx context.Context, run string, root Root, lineage []string, op
 	rs.fragment = true
 	defer rs.finish()
 
-	p := &lineagePlacer{ctx: ctx, rs: rs, path: lineage, inner: ro.placer, done: make(chan lineageResult, 1)}
+	p := &lineagePlacer{ctx: ctx, rs: rs, path: lineage, inner: ro.placer,
+		done: make(chan lineageResult, 1), changed: make(chan struct{}, 1)}
 	rs.placer = p
 	rs.forked = p.forked
 
@@ -124,29 +125,42 @@ func RunLineage(ctx context.Context, run string, root Root, lineage []string, op
 		rootDone <- err
 	}()
 
+	var rootErr error
 	select {
 	case res := <-p.done:
 		return res.out, res.err
-	case err := <-rootDone:
-		// The root stopped. If the target's fork is on record it is on its
-		// way to the placer, or running there, and the root's replay only
-		// outran it; otherwise the history does not reach the fork, or the
-		// replay failed first.
-		if p.expected() {
-			select {
-			case res := <-p.done:
-				return res.out, res.err
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		if err == nil || errors.Is(err, errExhausted) {
-			return nil, fmt.Errorf("flow: the history of thread %s does not reach the fork of %s", lineage[0], lineage[1])
-		}
-		return nil, fmt.Errorf("flow: replay thread %s to the fork of %s: %w", lineage[0], lineage[1], err)
+	case rootErr = <-rootDone:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+
+	// The root stopped, and the target has not reported. A thread on the
+	// path whose fork is on record is on its way to the placer, or being
+	// replayed there on a goroutine of its own, and may yet reach the
+	// target's fork: the root's replay only outran it. Wait until nothing
+	// on the path is in flight; if the target has not come by then, the
+	// histories do not reach it.
+	for p.inflight() > 0 {
+		select {
+		case res := <-p.done:
+			return res.out, res.err
+		case <-p.changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	select {
+	case res := <-p.done:
+		return res.out, res.err
+	default:
+	}
+	if failed := p.failure(); failed != nil {
+		return nil, failed
+	}
+	if rootErr != nil && !errors.Is(rootErr, errExhausted) {
+		return nil, fmt.Errorf("flow: replay thread %s to the fork of %s: %w", lineage[0], lineage[1], rootErr)
+	}
+	return nil, fmt.Errorf("flow: the histories on the lineage of %s do not reach its fork", p.target())
 }
 
 // rootBody is the body of a lineage's root thread.
@@ -190,37 +204,82 @@ type lineagePlacer struct {
 	inner Placer // where the target's own forks go
 	done  chan lineageResult
 
+	// changed is nudged whenever a thread on the path stops being in
+	// flight, for RunLineage to look again.
+	changed chan struct{}
+
 	mu       sync.Mutex
-	pending  bool // the target's fork is recorded and on its way here
+	flying   int   // threads on the path forked and not yet done replaying
+	failed   error // what an ancestor's replay failed with, if one did
 	taken    bool
 	reported bool
 }
 
 func (p *lineagePlacer) target() string { return p.path[len(p.path)-1] }
 
-// forked is told of every fork as it is recorded, before the placer sees it:
-// a fork of the target means the target is coming, and a root whose replay
-// ends first has not outrun the history, only the goroutine.
+// onPath reports whether a thread is an ancestor of the target, or the
+// target: one this process replays or runs.
+func (p *lineagePlacer) onPath(id string) bool {
+	for _, want := range p.path[1:] {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+// forked is told of every fork as it is recorded, before the placer sees it.
+// A fork of a thread on the path means that thread is coming — to be
+// replayed toward the target, or run as it — and a root whose replay ends
+// first has not outrun the history, only the goroutine.
 func (p *lineagePlacer) forked(th Thread, joined bool) {
-	if th.ID != p.target() {
+	if !p.onPath(th.ID) {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.pending = true
-	if joined && !p.reported {
-		// Its parent's history already holds its join: it is over, and its
-		// own history — what this process would have run it from — is gone.
-		p.reported = true
-		p.done <- lineageResult{nil, fmt.Errorf("flow: thread %s has already finished: its parent's history holds its join", th.ID)}
+	if joined {
+		// Its parent's history already holds its join: it is over, and so
+		// is everything under it, the target included. The histories this
+		// process would have run them from are gone.
+		if th.ID == p.target() && !p.reported {
+			p.reported = true
+			p.done <- lineageResult{nil, fmt.Errorf("flow: thread %s has already finished: its parent's history holds its join", th.ID)}
+		}
+		return
+	}
+	p.flying++
+}
+
+// landed is forked's other end: a thread on the path is done replaying.
+func (p *lineagePlacer) landed(err error) {
+	p.mu.Lock()
+	p.flying--
+	if err != nil && !errors.Is(err, errExhausted) && p.failed == nil {
+		p.failed = err
+	}
+	p.mu.Unlock()
+	select {
+	case p.changed <- struct{}{}:
+	default:
 	}
 }
 
-// expected reports whether the target's fork has been recorded.
-func (p *lineagePlacer) expected() bool {
+// inflight is how many threads on the path are forked and still replaying.
+func (p *lineagePlacer) inflight() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pending
+	return p.flying
+}
+
+// failure is what an ancestor's replay failed with, wrapped to say so.
+func (p *lineagePlacer) failure() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failed == nil {
+		return nil
+	}
+	return fmt.Errorf("flow: replay the lineage of %s: %w", p.target(), p.failed)
 }
 
 func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Context) ([]byte, error)) ([]byte, error) {
@@ -247,16 +306,20 @@ func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Cont
 		// An ancestor: replayed to the next fork, and no further.
 		r := &threadRunner{run: p.rs, name: th.Run, id: th.ID, fn: th.Fn, input: th.Input,
 			body: body, opts: p.rs.opts, readonly: true}
-		return r.execute(ctx)
+		out, err := r.execute(ctx)
+		p.landed(err)
+		return out, err
 	}
 
 	p.mu.Lock()
 	if p.taken {
 		p.mu.Unlock()
+		p.landed(errors.New("flow: the target of a lineage was forked twice"))
 		return nil, errors.New("flow: the target of a lineage was forked twice")
 	}
 	p.taken = true
 	p.mu.Unlock()
+	defer p.landed(nil)
 
 	// The target, for real: on RunLineage's own context, since the ancestor
 	// that forked it is stopped once it is over.

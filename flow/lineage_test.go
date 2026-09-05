@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ligustah/wings/flow"
 )
@@ -162,5 +163,45 @@ func TestAThreadOfABareRunStaysHome(t *testing.T) {
 	}
 	if len(p.roots) != 1 || p.roots[0].Workflow != "" || p.roots[0].Function != "" {
 		t.Fatalf("a bare run's thread was offered with root %+v, want none", p.roots)
+	}
+}
+
+var spawnsSlowly = flow.DefineWorkflow("test.spawnsSlowly", func(ctx flow.Context, base int) error {
+	// A thread off the lineage, not joined by the time the target is
+	// forked: the root's replay, reaching its join and finding none, is
+	// over at once.
+	other := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		time.Sleep(400 * time.Millisecond)
+		return 0, nil
+	})
+	outer := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		// Computation between the events of a history is done again by a
+		// replay, and takes as long: the process replaying this thread to
+		// the fork below is still here while the root's replay, which has
+		// nothing to do but read, runs out of history.
+		time.Sleep(150 * time.Millisecond)
+		return ctx.Spawn(func(ctx flow.Context) (int, error) { return base + 1, nil }).Await(ctx)
+	})
+	if _, err := other.Await(ctx); err != nil {
+		return err
+	}
+	var err error
+	slowly, err = outer.Await(ctx)
+	return err
+})
+
+var slowly int
+
+// THE POINT: a root whose replay ends before an ancestor's has reached the
+// target's fork has not outrun the histories, only the goroutine replaying
+// the ancestor. RunLineage waits for every thread on the path.
+func TestALineageWaitsForAnAncestorStillReplaying(t *testing.T) {
+	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	slowly = 0
+	if err := spawnsSlowly.Run(t.Context(), 41, p.opts()...); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if slowly != 42 {
+		t.Fatalf("got %d, want 42", slowly)
 	}
 }
