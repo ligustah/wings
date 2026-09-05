@@ -3,7 +3,7 @@
 //
 // A function is declared once with [Define] and called like any other:
 //
-//	var Digest = flow.Define("digest", func(ctx context.Context, w Work) (Result, error) { ... })
+//	var Digest = flow.Define("digest", func(ctx flow.Context, w Work) (Result, error) { ... })
 //
 // Where a call runs is decided by the context, not by the call. Inside a
 // [Run] every call is written down before it happens and its answer is written
@@ -13,14 +13,18 @@
 // [Executor]: [Local] runs them in this process, and a cluster runs them on
 // its workers. Nothing in the body below names either:
 //
-//	err := flow.Run(ctx, "pipeline", func(ctx context.Context) error {
-//		first, err := Digest(ctx, head)         // dispatched, recorded, replayed on a retry
+//	err := flow.Run(ctx, "pipeline", func(ctx flow.Context) error {
+//		first, err := Digest(ctx, head)      // dispatched, recorded, replayed on a retry
 //		if err != nil {
 //			return err
 //		}
-//		rest, err := flow.Map(ctx, Digest, tail) // the same, once per input, in parallel
+//		rest, err := ctx.Map(Digest, tail)   // the same, once per input, in parallel
 //		...
 //	}, flow.WithStore(store))
+//
+// The context a body is given is a [Context]: a context.Context with this
+// package's operations as methods on it, so what a run can do is what its
+// context can do. A running function is given one too.
 //
 // # What you give up
 //
@@ -28,11 +32,12 @@
 // so IT MUST BE DETERMINISTIC. Everything it decides must come from its input
 // or from something the history recorded:
 //
-//   - use [Now], not time.Now
-//   - use [Sleep], not time.Sleep
+//   - use [Context.Now], not time.Now
+//   - use [Context.Sleep], not time.Sleep
 //   - do not read a random number, an environment variable, or a clock
 //   - do not let map iteration order change what it does
-//   - use [Map], [Go] or [Spawn] to do things at once, never a bare goroutine
+//   - use [Context.Map], [Context.Go] or [Context.Spawn] to do things at
+//     once, never a bare goroutine
 //
 // A run that breaks these does not fail loudly on the first attempt — it fails
 // on the retry, as a continuity error, which is why [IsContinuity] names the
@@ -41,8 +46,8 @@
 //
 // # Threads and channels
 //
-// [Spawn] runs a piece of run code on a thread of its own, and [Channel]
-// passes typed values between threads. Both are the replayable versions of
+// [Context.Spawn] runs a piece of run code on a thread of its own, and
+// [Channel] passes typed values between threads. Both are the replayable versions of
 // things Go already has, and a channel is where the difference shows: a Go
 // receive takes whichever value happens to arrive first, and nothing about the
 // run decides which that is. So a receive is RECORDED — which thread's which
@@ -56,8 +61,9 @@
 //
 // # Long calls
 //
-// A function that takes a long time reports where it has got to: [Step] for
-// coarse phases, [Heartbeat] for a position inside one. An executor that can
+// A function that takes a long time reports where it has got to:
+// [Context.Step] for coarse phases, [Context.Heartbeat] for a position inside
+// one. An executor that can
 // lose a machine uses those reports to run the call again elsewhere from
 // where it was, rather than from nothing; an executor that cannot ignores
 // them. The function is written the same way either way.
@@ -101,7 +107,7 @@ import (
 // [Permanent] error, lets a call's failure through (see [IsCallFailure]), or
 // runs out of attempts. A run that suspends is waited for. Both of those are
 // why this can take a long time and why ctx matters.
-func Run(ctx context.Context, name string, body func(ctx context.Context) error, opts ...RunOption) error {
+func Run(ctx context.Context, name string, body func(ctx Context) error, opts ...RunOption) error {
 	ro := newRunOptions(opts)
 
 	if name == "" {
@@ -176,7 +182,7 @@ func Run(ctx context.Context, name string, body func(ctx context.Context) error,
 // runner is one Run in progress: its body, its options and its sink.
 type runner struct {
 	name string
-	body func(ctx context.Context) error
+	body func(ctx Context) error
 	opts runOptions
 	sink Sink
 }
@@ -210,7 +216,7 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 		Version:      uint64(r.opts.version),
 	})
 
-	err := r.body(withThread(ctx, main))
+	err := r.body(Context{withThread(ctx, main)})
 
 	if perr := run.err(); perr != nil {
 		// Persistence failed somewhere in there. Not retryable in any useful

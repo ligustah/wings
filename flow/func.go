@@ -23,7 +23,7 @@ import (
 // same in both, which is the point.
 //
 // Create one with [Define] at package scope.
-type Func[In, Out any] func(ctx context.Context, in In) (Out, error)
+type Func[In, Out any] func(ctx Context, in In) (Out, error)
 
 // def is everything a Func needs that a function value cannot carry: its name,
 // its bounds and its codecs.
@@ -32,7 +32,7 @@ type Func[In, Out any] func(ctx context.Context, in In) (Out, error)
 // so nothing ever has to recover metadata FROM a function value.
 type def[In, Out any] struct {
 	name   string
-	fn     func(context.Context, In) (Out, error)
+	fn     func(Context, In) (Out, error)
 	bounds Bounds
 
 	inCodec  dswire.Codec[In]
@@ -77,7 +77,7 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // WithHeartbeatTimeout requires this function to report progress at least this
-// often, using [Heartbeat] or [Step].
+// often, using [Context.Heartbeat] or [Context.Step].
 //
 // A call that goes quiet for longer is presumed stuck rather than slow, and an
 // executor that can do so runs it again elsewhere — carrying the last
@@ -115,7 +115,7 @@ func WithStartTimeout(d time.Duration) Option {
 //
 // Panics if name is empty or already defined. Both are programming errors, and
 // at package-init time a panic is the report that cannot be ignored.
-func Define[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...Option) Func[In, Out] {
+func Define[In, Out any](name string, fn func(Context, In) (Out, error), opts ...Option) Func[In, Out] {
 	if name == "" {
 		panic("flow: Define requires a non-empty name")
 	}
@@ -133,13 +133,13 @@ func Define[In, Out any](name string, fn func(context.Context, In) (Out, error),
 	}
 	register(d)
 
-	return func(ctx context.Context, in In) (Out, error) {
+	return func(ctx Context, in In) (Out, error) {
 		return d.dispatch(ctx, in)
 	}
 }
 
 // dispatch sends one call wherever the context says calls go.
-func (d *def[In, Out]) dispatch(ctx context.Context, in In) (Out, error) {
+func (d *def[In, Out]) dispatch(ctx Context, in In) (Out, error) {
 	var zero Out
 
 	payload, err := dswire.EncodeRecord(d.inCodec, in)
@@ -158,7 +158,7 @@ func (d *def[In, Out]) dispatch(ctx context.Context, in In) (Out, error) {
 		// work would silently execute in one process, at the speed of one
 		// machine, and nothing would look broken.
 		return zero, fmt.Errorf("flow: %s was called on a context that is not inside a Run "+
-			"and not bound to an executor; use the context the run's body was given, or Bind", d.name)
+			"and not bound to an executor; use the Context the run's body was given, or Bind", d.name)
 	}
 	if err != nil {
 		return zero, err
@@ -189,7 +189,7 @@ func (d *def[In, Out]) invoke(ctx context.Context, payload []byte) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("decode input for %q: %w", d.name, err)
 	}
-	out, err := d.fn(ctx, in)
+	out, err := d.fn(From(ctx), in)
 	if err != nil {
 		return nil, err
 	}
@@ -308,8 +308,8 @@ type executorKey struct{}
 // for a call made outside any run — a script, a test, a function running on a
 // worker that calls another — which is dispatched and not recorded: nothing
 // replays it, because there is no history for it to be in.
-func Bind(ctx context.Context, e Executor) context.Context {
-	return context.WithValue(ctx, executorKey{}, e)
+func Bind(ctx context.Context, e Executor) Context {
+	return Context{context.WithValue(ctx, executorKey{}, e)}
 }
 
 func executorFrom(ctx context.Context) Executor {

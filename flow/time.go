@@ -1,7 +1,6 @@
 package flow
 
 import (
-	"context"
 	"errors"
 	"time"
 
@@ -26,8 +25,8 @@ const shortSleep = time.Minute
 // Use it instead of time.Now inside a run. A run that reads the real
 // clock decides something different on every attempt, and the first retry then
 // contradicts its own history.
-func Now(ctx context.Context) (time.Time, error) {
-	t := threadFrom(ctx)
+func (c Context) Now() (time.Time, error) {
+	t := threadFrom(c)
 	if t == nil {
 		return time.Time{}, errors.New("flow: Now called outside a Run")
 	}
@@ -52,7 +51,8 @@ func Now(ctx context.Context) (time.Time, error) {
 // carries on. Either way the sleep is recorded, so it is not served twice — a
 // run that slept an hour and then failed does not sleep another hour on
 // its retry.
-func Sleep(ctx context.Context, d time.Duration) error {
+func (c Context) Sleep(d time.Duration) error {
+	ctx := c
 	t := threadFrom(ctx)
 	if t == nil {
 		return errors.New("flow: Sleep called outside a Run")

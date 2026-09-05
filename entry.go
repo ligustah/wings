@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 
+	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/internal/payload"
 )
 
@@ -30,7 +31,7 @@ type CoordinatorOptions struct {
 	// Coordinate is your code. It runs as a durable run on a cluster that is
 	// already up — see [Cluster.Run] — and the cluster is torn down when it
 	// returns.
-	Coordinate func(context.Context) error
+	Coordinate func(flow.Context) error
 }
 
 // coordinateRun is the name Coordinate's history is kept under in Dir. One

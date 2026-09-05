@@ -22,16 +22,16 @@ var calls struct {
 	slow   atomic.Int64
 }
 
-var double = flow.Define("flow.double", func(ctx context.Context, in int) (int, error) {
+var double = flow.Define("flow.double", func(ctx flow.Context, in int) (int, error) {
 	calls.double.Add(1)
 	return in * 2, nil
 })
 
-var boom = flow.Define("flow.boom", func(ctx context.Context, in string) (string, error) {
+var boom = flow.Define("flow.boom", func(ctx flow.Context, in string) (string, error) {
 	return "", errors.New("deliberate failure: " + in)
 })
 
-var slow = flow.Define("flow.slow", func(ctx context.Context, d time.Duration) (string, error) {
+var slow = flow.Define("flow.slow", func(ctx flow.Context, d time.Duration) (string, error) {
 	calls.slow.Add(1)
 	select {
 	case <-time.After(d):
@@ -47,7 +47,7 @@ var gate struct {
 	open   chan struct{}
 }
 
-var gated = flow.Define("flow.gated", func(ctx context.Context, in int) (int, error) {
+var gated = flow.Define("flow.gated", func(ctx flow.Context, in int) (int, error) {
 	gate.starts.Add(1)
 	select {
 	case <-gate.open:
@@ -62,7 +62,7 @@ var quick = flow.Backoff(time.Millisecond, time.Millisecond)
 
 func TestARunExecutesItsBodyOnce(t *testing.T) {
 	var got int
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		a, err := double(ctx, 5)
 		if err != nil {
 			return err
@@ -85,7 +85,7 @@ func TestRetryReplaysCompletedWorkInsteadOfRepeatingIt(t *testing.T) {
 	var attempts atomic.Int64
 	var got int
 
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		a, err := double(ctx, 3)
 		if err != nil {
 			return err
@@ -118,7 +118,7 @@ func TestRetryReplaysCompletedWorkInsteadOfRepeatingIt(t *testing.T) {
 
 func TestPermanentErrorIsNotRetried(t *testing.T) {
 	var attempts atomic.Int64
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		attempts.Add(1)
 		return flow.Permanent(errors.New("malformed input"))
 	}, flow.WithStore(flow.NewMemStore()), quick)
@@ -137,7 +137,7 @@ func TestDeclaredPermanentErrorIsNotRetried(t *testing.T) {
 	sentinel := errors.New("no such account")
 	var attempts atomic.Int64
 
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		attempts.Add(1)
 		return fmt.Errorf("looking up %d: %w", 1, sentinel)
 	}, flow.WithStore(flow.NewMemStore()), flow.PermanentErrors(sentinel), quick)
@@ -151,7 +151,7 @@ func TestDeclaredPermanentErrorIsNotRetried(t *testing.T) {
 
 func TestGivesUpAfterMaxAttempts(t *testing.T) {
 	var attempts atomic.Int64
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		attempts.Add(1)
 		return errors.New("always fails")
 	}, flow.WithStore(flow.NewMemStore()), flow.MaxAttempts(3), quick)
@@ -170,7 +170,7 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 // something that kills the run.
 func TestACallsFailureReachesTheBody(t *testing.T) {
 	var got string
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		_, err := boom(ctx, "x")
 		if err == nil {
 			return errors.New("expected the function to fail")
@@ -195,7 +195,7 @@ func TestACallsFailureReachesTheBody(t *testing.T) {
 // lets a call's failure through is done.
 func TestARunThatFailsBecauseACallFailedIsNotRetried(t *testing.T) {
 	var attempts atomic.Int64
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		attempts.Add(1)
 		_, err := boom(ctx, "y")
 		return err
@@ -222,7 +222,7 @@ func TestAnInterruptedCallIsNotRecordedAsFailed(t *testing.T) {
 		gate.starts.Store(0)
 
 		var got int
-		body := func(ctx context.Context) error {
+		body := func(ctx flow.Context) error {
 			var err error
 			got, err = gated(ctx, 21)
 			return err
@@ -262,8 +262,8 @@ func TestMapReplays(t *testing.T) {
 	var attempts atomic.Int64
 	var got []int
 
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		outs, err := flow.Map(ctx, double, []int{1, 2, 3, 4})
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		outs, err := ctx.Map(double, []int{1, 2, 3, 4})
 		if err != nil {
 			return err
 		}
@@ -286,8 +286,8 @@ func TestMapReplays(t *testing.T) {
 
 // Map keeps every successful output and names each failure by its index.
 func TestMapReportsEachFailureInItsPlace(t *testing.T) {
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		outs, err := flow.Map(ctx, boom, []string{"a", "b"})
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		outs, err := ctx.Map(boom, []string{"a", "b"})
 		if err == nil {
 			return errors.New("want an error")
 		}
@@ -316,9 +316,9 @@ func TestFuturesRunConcurrentlyAndReplay(t *testing.T) {
 		var got string
 
 		start := time.Now()
-		err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-			a := flow.Go(ctx, slow, 300*time.Millisecond)
-			b := flow.Go(ctx, slow, 300*time.Millisecond)
+		err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			a := ctx.Go(slow, 300*time.Millisecond)
+			b := ctx.Go(slow, 300*time.Millisecond)
 
 			x, err := a.Await(ctx)
 			if err != nil {
@@ -354,8 +354,8 @@ func TestFuturesRunConcurrentlyAndReplay(t *testing.T) {
 // Awaiting twice would record a second join that the next attempt never
 // produces, so it is refused rather than quietly served from the cache.
 func TestAwaitingAFutureTwiceIsRefused(t *testing.T) {
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		f := flow.Go(ctx, double, 3)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		f := ctx.Go(double, 3)
 		if _, err := f.Await(ctx); err != nil {
 			return flow.Permanent(err)
 		}
@@ -378,8 +378,8 @@ func TestNowIsRecordedAndReplayed(t *testing.T) {
 
 		// A backoff long enough that the clock has visibly moved on by the
 		// retry, so a Now that re-read it would show.
-		err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-			now, err := flow.Now(ctx)
+		err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			now, err := ctx.Now()
 			if err != nil {
 				return err
 			}
@@ -410,8 +410,8 @@ func TestSleepIsNotServedTwice(t *testing.T) {
 		var attempts atomic.Int64
 
 		start := time.Now()
-		err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-			if err := flow.Sleep(ctx, 400*time.Millisecond); err != nil {
+		err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			if err := ctx.Sleep(400 * time.Millisecond); err != nil {
 				return err
 			}
 			if attempts.Add(1) == 1 {
@@ -437,7 +437,7 @@ func TestACompletedRunDoesNotRunAgain(t *testing.T) {
 	name := flow.NewName()
 	var attempts atomic.Int64
 
-	body := func(ctx context.Context) error {
+	body := func(ctx flow.Context) error {
 		attempts.Add(1)
 		_, err := double(ctx, 21)
 		return err
@@ -463,7 +463,7 @@ func TestAChangedBodyIsReportedAsAContinuityError(t *testing.T) {
 	// First shape: one call, then a RETRYABLE failure — so the run gives up
 	// without reaching a terminal state and its history is left mid-flight,
 	// which is exactly the situation a redeploy creates.
-	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
 		if _, err := double(ctx, 2); err != nil {
 			return err
 		}
@@ -475,8 +475,8 @@ func TestAChangedBodyIsReportedAsAContinuityError(t *testing.T) {
 
 	// Second shape: sleeps where the first called. Same name, so it replays
 	// into the history the first one left.
-	err = flow.Run(t.Context(), name, func(ctx context.Context) error {
-		return flow.Sleep(ctx, time.Millisecond)
+	err = flow.Run(t.Context(), name, func(ctx flow.Context) error {
+		return ctx.Sleep(time.Millisecond)
 	}, flow.WithStore(store), flow.MaxAttempts(2), quick)
 	if err == nil {
 		t.Fatal("want a continuity error")
@@ -493,7 +493,7 @@ func TestAChangedBodyIsReportedAsAContinuityError(t *testing.T) {
 }
 
 func TestRunRequiresAStore(t *testing.T) {
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error { return nil })
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error { return nil })
 	if err == nil {
 		t.Fatal("want an error when no Store is given")
 	}
@@ -503,7 +503,7 @@ func TestRunRequiresAStore(t *testing.T) {
 // outside one it has to be said, and a call with neither is refused rather
 // than quietly run in place.
 func TestACallOutsideARunNeedsAnExecutor(t *testing.T) {
-	if _, err := double(context.Background(), 1); err == nil {
+	if _, err := double(flow.From(context.Background()), 1); err == nil {
 		t.Fatal("want an error for a call with nowhere to go")
 	} else if !strings.Contains(err.Error(), "not inside a Run") {
 		t.Fatalf("the error should say what is missing: %v", err)
@@ -523,12 +523,12 @@ func TestACallOutsideARunNeedsAnExecutor(t *testing.T) {
 func TestAFanOutOutsideARunIsRefused(t *testing.T) {
 	ctx := flow.Bind(context.Background(), flow.Local())
 
-	if _, err := flow.Map(ctx, double, []int{1}); err == nil {
+	if _, err := ctx.Map(double, []int{1}); err == nil {
 		t.Fatal("want an error from Map outside a run")
 	} else if !strings.Contains(err.Error(), "outside a Run") {
 		t.Fatalf("got %v", err)
 	}
-	if _, err := flow.Go(ctx, double, 1).Await(ctx); err == nil {
+	if _, err := ctx.Go(double, 1).Await(ctx); err == nil {
 		t.Fatal("want an error from Go outside a run")
 	}
 }
@@ -543,8 +543,8 @@ func TestReplayDoesNotDuplicateForkAndJoinEvents(t *testing.T) {
 	name := flow.NewName()
 
 	var attempts atomic.Int64
-	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
-		if _, err := flow.Map(ctx, double, []int{1, 2, 3}); err != nil {
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
+		if _, err := ctx.Map(double, []int{1, 2, 3}); err != nil {
 			return err
 		}
 		if attempts.Add(1) < 3 {

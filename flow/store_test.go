@@ -56,7 +56,7 @@ func TestHistorySurvivesReopeningTheStore(t *testing.T) {
 		client, closeStreams := streams(t, dir)
 		defer closeStreams()
 
-		err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+		err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
 			if _, err := double(ctx, 21); err != nil {
 				return err
 			}
@@ -76,7 +76,7 @@ func TestHistorySurvivesReopeningTheStore(t *testing.T) {
 	client, _ := streams(t, dir)
 
 	var got int
-	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
 		var err error
 		got, err = double(ctx, 21)
 		return err
@@ -98,7 +98,7 @@ func TestStoredHistoryIsReadableAsEvents(t *testing.T) {
 	store := flow.NewStore(client)
 	name := flow.NewName()
 
-	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
 		_, err := double(ctx, 2)
 		return err
 	}, flow.WithStore(store))
@@ -143,7 +143,7 @@ func TestRunsAreIsolated(t *testing.T) {
 	var ran atomic.Int64
 	run := func(name string, in int) (int, error) {
 		var out int
-		err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+		err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
 			ran.Add(1)
 			var err error
 			out, err = double(ctx, in)
@@ -177,7 +177,7 @@ func TestARunLeftMidFlightResumesLater(t *testing.T) {
 	name := flow.NewName()
 
 	var attempts atomic.Int64
-	body := func(ctx context.Context) error {
+	body := func(ctx flow.Context) error {
 		if _, err := double(ctx, 1); err != nil {
 			return err
 		}

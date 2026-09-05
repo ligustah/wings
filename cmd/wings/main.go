@@ -9,11 +9,11 @@
 //
 //	package job
 //
-//	var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) { … })
+//	var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) { … })
 //
 //	// Coordinate is run as a flow once the cluster is up.
-//	func Coordinate(ctx context.Context) error {
-//		imgs, err := flow.Map(ctx, Render, frames)
+//	func Coordinate(ctx flow.Context) error {
+//		imgs, err := ctx.Map(Render, frames)
 //		…
 //	}
 //
@@ -119,7 +119,7 @@ Flags:
   -v                print the go build commands
 
 Your package must export:
-  func Coordinate(ctx context.Context) error   (required)
+  func Coordinate(ctx flow.Context) error   (required)
   func Provisioner() wings.Provisioner         (optional; overrides -provider)
 
 Example:
@@ -194,7 +194,7 @@ func build(args []string) error {
 	}
 	if !api.hasCoordinate {
 		return fmt.Errorf("package %s does not export Coordinate.\n"+
-			"Add:\n\n\tfunc Coordinate(ctx context.Context) error { … }\n",
+			"Add:\n\n\tfunc Coordinate(ctx flow.Context) error { … }\n",
 			coordinate.ImportPath)
 	}
 

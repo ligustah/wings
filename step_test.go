@@ -41,10 +41,10 @@ var stall struct {
 // restore is a long job in three phases, the middle of which goes quiet on its
 // first attempt — a worker that has not died but has stopped saying anything,
 // which is the case a job gets moved for.
-var restore = flow.Define("test.restore", func(ctx context.Context, _ int) (string, error) {
+var restore = flow.Define("test.restore", func(ctx flow.Context, _ int) (string, error) {
 	first := stall.attempts.Add(1) == 1
 
-	a, err := flow.Step(ctx, "snapshot", func(ctx context.Context) (string, error) {
+	a, err := ctx.Step("snapshot", func(ctx flow.Context) (string, error) {
 		ranPhase("snapshot")
 		return "s", nil
 	})
@@ -52,7 +52,7 @@ var restore = flow.Define("test.restore", func(ctx context.Context, _ int) (stri
 		return "", err
 	}
 
-	b, err := flow.Step(ctx, "copy", func(ctx context.Context) (string, error) {
+	b, err := ctx.Step("copy", func(ctx flow.Context) (string, error) {
 		ranPhase("copy")
 		if first {
 			select {
@@ -67,7 +67,7 @@ var restore = flow.Define("test.restore", func(ctx context.Context, _ int) (stri
 		return "", err
 	}
 
-	c, err := flow.Step(ctx, "verify", func(ctx context.Context) (string, error) {
+	c, err := ctx.Step("verify", func(ctx flow.Context) (string, error) {
 		ranPhase("verify")
 		return "v", nil
 	})
@@ -128,12 +128,12 @@ func TestAMovedJobReplaysThePhasesItAlreadyFinished(t *testing.T) {
 // A step is identified by its position, so a work function that reorders them
 // between attempts would hand back somebody else's value. It is told instead.
 func TestAStepThatMovesIsReported(t *testing.T) {
-	ctx := flow.WithProgress(context.Background(), nil, flow.Resume{
+	ctx := flow.From(flow.WithProgress(context.Background(), nil, flow.Resume{
 		Attempt: 1,
 		Steps:   []flow.StepRecord{{Index: 0, Name: "first"}},
-	})
+	}))
 
-	if _, err := flow.Step(ctx, "second", func(ctx context.Context) (int, error) {
+	if _, err := ctx.Step("second", func(ctx flow.Context) (int, error) {
 		t.Error("the body ran despite the position holding a different step")
 		return 0, nil
 	}); err == nil {
@@ -147,7 +147,7 @@ func TestAStepThatMovesIsReported(t *testing.T) {
 // body anyway would be a silent lie about what Step does.
 func TestStepOutsideAJobIsAnError(t *testing.T) {
 	ran := false
-	_, err := flow.Step(context.Background(), "x", func(ctx context.Context) (int, error) {
+	_, err := flow.From(context.Background()).Step("x", func(ctx flow.Context) (int, error) {
 		ran = true
 		return 1, nil
 	})

@@ -17,7 +17,7 @@ import (
 // on its machine rather than slow, and an executor that can do so moves it to
 // another. And progress is the checkpoint that makes moving it cheap: whatever
 // was last passed here is handed to the next attempt, which reads it with
-// [Checkpoint] and carries on from there instead of starting over.
+// [Context.Checkpoint] and carries on from there instead of starting over.
 //
 // Only the LATEST value survives. This is a position, not a log: the point is
 // for a retry to know where to resume, and every earlier answer to that
@@ -30,7 +30,8 @@ import (
 // Cheap to call, but not free — each one is a report — so call it per unit of
 // real progress rather than per loop iteration. Outside a running call it is
 // an error: there is no attempt to report on.
-func Heartbeat[T any](ctx context.Context, progress T) error {
+func (c Context) Heartbeat[T any](progress T) error {
+	ctx := c
 	st := progressFrom(ctx)
 	if st == nil {
 		return errors.New("flow: Heartbeat was called outside a running function; " +
@@ -55,12 +56,12 @@ func Heartbeat[T any](ctx context.Context, progress T) error {
 // is idempotent in the only sense that matters here, since an executor that
 // moves calls delivers at least once and a retry is always possible.
 //
-// T must be what [Heartbeat] was called with. A mismatch is reported as a
+// T must be what [Context.Heartbeat] was called with. A mismatch is reported as a
 // decode error rather than a wrong answer.
-func Checkpoint[T any](ctx context.Context) (T, bool, error) {
+func (c Context) Checkpoint[T any]() (T, bool, error) {
 	var zero T
 
-	st := progressFrom(ctx)
+	st := progressFrom(c)
 	if st == nil || len(st.resume.Checkpoint) == 0 {
 		return zero, false, nil
 	}
@@ -73,20 +74,20 @@ func Checkpoint[T any](ctx context.Context) (T, bool, error) {
 
 // Step runs a phase of a long call once, and remembers what it produced.
 //
-// This is [Heartbeat] and [Checkpoint] with the bookkeeping taken away. A call
+// This is [Context.Heartbeat] and [Context.Checkpoint] with the bookkeeping taken away. A call
 // that is moved to another machine — because its own went quiet, or died —
 // replays the steps that already finished, which costs a decode each, and
 // carries on from the first one that did not. The function reads as though
 // none of that were happening:
 //
-//	func restore(ctx context.Context, in Backup) (Report, error) {
-//	    snap, err := flow.Step(ctx, "snapshot", func(ctx context.Context) (Snapshot, error) {
+//	func restore(ctx flow.Context, in Backup) (Report, error) {
+//	    snap, err := ctx.Step("snapshot", func(ctx flow.Context) (Snapshot, error) {
 //	        return takeSnapshot(ctx, in.Source)      // twenty minutes
 //	    })
 //	    if err != nil {
 //	        return Report{}, err
 //	    }
-//	    return flow.Step(ctx, "restore", func(ctx context.Context) (Report, error) {
+//	    return ctx.Step("restore", func(ctx flow.Context) (Report, error) {
 //	        return restoreInto(ctx, snap, in.Target) // another forty
 //	    })
 //	}
@@ -98,7 +99,7 @@ func Checkpoint[T any](ctx context.Context) (T, bool, error) {
 //
 // It is for coarse phases, not for loops. Each completed step is one report to
 // the executor, so a few dozen is nothing and a few hundred thousand is a
-// different program — report a position with [Heartbeat] for the inside of a
+// different program — report a position with [Context.Heartbeat] for the inside of a
 // loop, and use steps for the phases the loop sits between.
 //
 // A step that fails is not recorded. The call fails, and the next attempt runs
@@ -107,8 +108,9 @@ func Checkpoint[T any](ctx context.Context) (T, bool, error) {
 // Delivery of the record is best-effort, like every heartbeat: a report that
 // does not reach the executor before the machine dies means that step runs
 // again. Steps are therefore at-least-once, exactly as calls are.
-func Step[T any](ctx context.Context, name string, body func(ctx context.Context) (T, error)) (T, error) {
+func (c Context) Step[T any](name string, body func(ctx Context) (T, error)) (T, error) {
 	var zero T
+	ctx := c
 
 	if name == "" {
 		return zero, errors.New("flow: Step requires a name")
@@ -159,8 +161,8 @@ func Step[T any](ctx context.Context, name string, body func(ctx context.Context
 //
 // A function that resumes rather than restarting wants to know; without this
 // a retry looks exactly like a first run. Zero outside a running call.
-func Attempt(ctx context.Context) int {
-	st := progressFrom(ctx)
+func (c Context) Attempt() int {
+	st := progressFrom(c)
 	if st == nil {
 		return 0
 	}
@@ -169,16 +171,16 @@ func Attempt(ctx context.Context) int {
 
 // Progress is where a running function's reports go. An executor that runs
 // functions somewhere they can be lost implements one and installs it with
-// [WithProgress] around each call it starts; [Heartbeat] and [Step] find it on
+// [WithProgress] around each call it starts; [Context.Heartbeat] and [Context.Step] find it on
 // the context.
 type Progress interface {
 	// Heartbeat delivers one checkpoint: the latest position, encoded.
 	Heartbeat(ctx context.Context, checkpoint []byte) error
-	// Step delivers one newly completed [Step].
+	// Step delivers one newly completed [Context.Step].
 	Step(ctx context.Context, step StepRecord) error
 }
 
-// StepRecord is one completed [Step]: where it sat in the call, what it was
+// StepRecord is one completed [Context.Step]: where it sat in the call, what it was
 // called, and what it produced.
 //
 // The index is carried rather than implied by position because these travel
@@ -197,16 +199,17 @@ type Resume struct {
 	// Attempt counts prior starts of this call, from zero.
 	Attempt int
 	// Checkpoint is the last progress a previous attempt reported through
-	// [Heartbeat]. Empty on a first attempt, and on a retry of something that
+	// [Context.Heartbeat]. Empty on a first attempt, and on a retry of something that
 	// never heartbeated.
 	Checkpoint []byte
-	// Steps are the [Step] calls a previous attempt completed, in order. A
+	// Steps are the [Context.Step] calls a previous attempt completed, in order. A
 	// retry replays them instead of running them again.
 	Steps []StepRecord
 }
 
-// WithProgress returns a context on which [Heartbeat], [Step], [Checkpoint]
-// and [Attempt] work: reports go to p, and r is what a previous attempt left.
+// WithProgress returns a context on which [Context.Heartbeat],
+// [Context.Step], [Context.Checkpoint] and [Context.Attempt] work: reports go
+// to p, and r is what a previous attempt left.
 //
 // For executors. Install it for every call rather than only for functions
 // that declare a heartbeat bound: calling Heartbeat is always allowed, and it

@@ -9,13 +9,13 @@
 //
 //	package job
 //
-//	var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) {
+//	var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
 //		return render(f)
 //	})
 //
 //	// Coordinate is run as a flow once the cluster is up.
-//	func Coordinate(ctx context.Context) error {
-//		images, err := flow.Map(ctx, Render, frames)
+//	func Coordinate(ctx flow.Context) error {
+//		images, err := ctx.Map(Render, frames)
 //		...
 //	}
 //
@@ -90,12 +90,12 @@
 // heartbeat bound MOVES it to another worker, on the suspicion that the machine
 // rather than the work is at fault.
 //
-// Moving is affordable because a job reports where it has got to. flow.Heartbeat
-// records a position; flow.Checkpoint reads back whatever the previous attempt
+// Moving is affordable because a job reports where it has got to. flow.Context.Heartbeat
+// records a position; flow.Context.Checkpoint reads back whatever the previous attempt
 // last recorded, so a retry resumes instead of starting over. Only the latest
 // survives — it is a position, not a log.
 //
-// flow.Step is the same thing with the bookkeeping taken away: name the phases of a
+// flow.Context.Step is the same thing with the bookkeeping taken away: name the phases of a
 // long job, and a job that moves replays the ones that finished and runs the
 // rest. What can never move is the running goroutine itself — its stack, its
 // locals, its open sockets — so the only thing that crosses a machine boundary
@@ -117,7 +117,7 @@
 //
 // This is durability for the job's OWN state, deliberately outside the durable
 // execution wings does for the job itself. wings stores the events and gives
-// them back, and never reads one. flow.Step and flow.Heartbeat are the other
+// them back, and never reads one. flow.Context.Step and flow.Context.Heartbeat are the other
 // thing: they are about resuming a job, not about describing what it did.
 //
 // # Artifacts

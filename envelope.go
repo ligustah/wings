@@ -61,11 +61,11 @@ type jobEnvelope struct {
 	// on the worker say which it was.
 	Attempt int `json:"attempt,omitempty"`
 	// Checkpoint is the last progress a previous attempt reported through
-	// [flow.Heartbeat], and is what makes a retry cheap: the work resumes from
+	// [flow.Context.Heartbeat], and is what makes a retry cheap: the work resumes from
 	// it rather than starting over. Empty on a first attempt, and on a retry
 	// of something that never heartbeated.
 	Checkpoint []byte `json:"checkpoint,omitempty"`
-	// Steps are the [flow.Step] calls a previous attempt completed, in order.
+	// Steps are the [flow.Context.Step] calls a previous attempt completed, in order.
 	// A retry replays them from here instead of running them again. The index
 	// each carries is what lets one that went missing leave a detectable hole
 	// rather than a silently shifted list.
@@ -102,7 +102,7 @@ type beatEnvelope struct {
 	// the work's fault. Any beat implies it, so a lost one costs nothing.
 	Started    bool   `json:"started,omitempty"`
 	Checkpoint []byte `json:"checkpoint,omitempty"`
-	// Step is one newly completed flow.Step, if this beat reports one. Sent one at
+	// Step is one newly completed flow.Context.Step, if this beat reports one. Sent one at
 	// a time rather than as a growing log, so the cost of a step does not climb
 	// with how many came before it; the coordinator does the accumulating.
 	Step *flow.StepRecord `json:"step,omitempty"`

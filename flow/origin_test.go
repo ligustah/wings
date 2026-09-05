@@ -43,7 +43,7 @@ func TestDispatchedWorkNamesTheRunItBelongsTo(t *testing.T) {
 	s := &spy{inner: flow.Local()}
 
 	var got int
-	err := flow.Run(t.Context(), "order-77", func(ctx context.Context) error {
+	err := flow.Run(t.Context(), "order-77", func(ctx flow.Context) error {
 		n := 1
 		for range 3 {
 			var err error
@@ -90,8 +90,8 @@ func TestForkedWorkNamesItsThread(t *testing.T) {
 	s := &spy{inner: flow.Local()}
 
 	var got int
-	err := flow.Run(t.Context(), "batch-1", func(ctx context.Context) error {
-		outs, err := flow.Map(ctx, double, []int{1, 2, 3})
+	err := flow.Run(t.Context(), "batch-1", func(ctx flow.Context) error {
+		outs, err := ctx.Map(double, []int{1, 2, 3})
 		if err != nil {
 			return err
 		}

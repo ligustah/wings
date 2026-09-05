@@ -23,7 +23,7 @@ type Tick struct {
 
 // simulate produces a long event log and returns only a handle to it. The point
 // of the whole feature: the log never travels as a value.
-var simulate = flow.Define("test.simulate", func(ctx context.Context, steps int) (Recording, error) {
+var simulate = flow.Define("test.simulate", func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[Tick](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -179,11 +179,11 @@ var resume struct {
 //
 // That is the whole feature in one function: durable execution for the job, and
 // a log the job keeps for itself alongside it.
-var resumeSim = flow.Define("test.resume", func(ctx context.Context, total int) (int, error) {
+var resumeSim = flow.Define("test.resume", func(ctx flow.Context, total int) (int, error) {
 	// The dispatch count, not a counter of our own: a worker in another process
 	// has its own copy of every package variable, and both attempts would think
 	// they were the first.
-	attempt := flow.Attempt(ctx)
+	attempt := ctx.Attempt()
 
 	from := 0
 	priors := Priors(ctx)
@@ -232,7 +232,7 @@ var resumeSim = flow.Define("test.resume", func(ctx context.Context, total int) 
 		if err := rec.Record(Tick{At: i, What: fmt.Sprintf("step %d", i)}); err != nil {
 			return 0, err
 		}
-		if err := flow.Heartbeat(ctx, i+1); err != nil {
+		if err := ctx.Heartbeat(i + 1); err != nil {
 			return 0, err
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -406,7 +406,7 @@ type Beat struct {
 	What string `json:"what"`
 }
 
-var pulse = flow.Define("test.pulse", func(ctx context.Context, steps int) (Recording, error) {
+var pulse = flow.Define("test.pulse", func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[*Beat](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -472,7 +472,7 @@ func (n *Note) UnmarshalBinary(b []byte) error {
 
 // emit records protobuf events, which is what a simulation's replay actually
 // is. A generated message type is a pointer, always.
-var emit = flow.Define("test.emit", func(ctx context.Context, steps int) (Recording, error) {
+var emit = flow.Define("test.emit", func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[*protos.Data](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -489,7 +489,7 @@ var emit = flow.Define("test.emit", func(ctx context.Context, steps int) (Record
 })
 
 // scribble records a pointer event with its own binary marshalling.
-var scribble = flow.Define("test.scribble", func(ctx context.Context, steps int) (Recording, error) {
+var scribble = flow.Define("test.scribble", func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[*Note](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -653,7 +653,7 @@ var late struct {
 // completes the recording and returns a handle to it — which is the situation
 // the coordinator has to get right: two attempts of one job, both finishing,
 // only one of them the job.
-var lateSim = flow.Define("test.late", func(ctx context.Context, steps int) (Recording, error) {
+var lateSim = flow.Define("test.late", func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[Tick](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -667,7 +667,7 @@ var lateSim = flow.Define("test.late", func(ctx context.Context, steps int) (Rec
 		return Recording{}, err
 	}
 
-	switch flow.Attempt(ctx) {
+	switch ctx.Attempt() {
 	case 0:
 		// Quiet: no beats, so the coordinator moves the job. But not gone.
 		select {
@@ -684,7 +684,7 @@ var lateSim = flow.Define("test.late", func(ctx context.Context, steps int) (Rec
 			case <-ctx.Done():
 				return Recording{}, ctx.Err()
 			case <-time.After(50 * time.Millisecond):
-				_ = flow.Heartbeat(ctx, 0)
+				_ = ctx.Heartbeat(0)
 				continue
 			}
 			break

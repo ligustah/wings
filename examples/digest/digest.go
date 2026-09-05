@@ -16,7 +16,6 @@
 package digest
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -57,7 +56,7 @@ type Result struct {
 // process that links this package — including a worker, which never runs
 // Coordinate. Nothing here mentions wings: a work function is a flow function,
 // and wings is one place it can be sent to run.
-var Digest = flow.Define("digest", func(ctx context.Context, in Work) (Result, error) {
+var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, error) {
 	host, _ := os.Hostname()
 
 	sum := sha256.Sum256([]byte(in.Seed))
@@ -74,14 +73,14 @@ var Digest = flow.Define("digest", func(ctx context.Context, in Work) (Result, e
 // is up, and tears the cluster down when it returns. Because it is a flow, a
 // coordinator restarted over the same -dir replays what this already did
 // rather than doing it again.
-func Coordinate(ctx context.Context) error {
+func Coordinate(ctx flow.Context) error {
 	work := make([]Work, *jobs)
 	for i := range work {
 		work[i] = Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: *rounds}
 	}
 
 	start := time.Now()
-	results, err := flow.Map(ctx, Digest, work)
+	results, err := ctx.Map(Digest, work)
 	elapsed := time.Since(start)
 	if err != nil {
 		return err

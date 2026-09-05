@@ -181,7 +181,7 @@ func TestTheJournalSaysWhichRunAJobBelongedTo(t *testing.T) {
 	// What a run stamps on the context; here set directly so this tests the
 	// coordinator's half without dragging the run engine in.
 	origin := flow.Origin{Run: "order-77", Thread: "main.2", Step: 4}
-	ctx := flow.WithOrigin(c.Bind(t.Context()), origin)
+	ctx := flow.From(flow.WithOrigin(c.Bind(t.Context()), origin))
 
 	if got, err := double(ctx, 21); err != nil {
 		t.Fatalf("double: %v", err)

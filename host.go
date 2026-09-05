@@ -21,7 +21,7 @@ import (
 //
 // opts are passed through to [flow.Run]; the store and the executor are this
 // cluster's and cannot be overridden.
-func (c *Cluster) Run(ctx context.Context, name string, body func(ctx context.Context) error, opts ...flow.RunOption) error {
+func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Context) error, opts ...flow.RunOption) error {
 	client, err := c.sharedClient()
 	if err != nil {
 		return err
@@ -39,7 +39,7 @@ func (c *Cluster) Run(ctx context.Context, name string, body func(ctx context.Co
 // A call made this way is dispatched and not recorded: nothing replays it.
 // That is right for a script or a test that wants one answer from the fleet;
 // anything that should survive a restart belongs in [Cluster.Run].
-func (c *Cluster) Bind(ctx context.Context) context.Context {
+func (c *Cluster) Bind(ctx context.Context) flow.Context {
 	return flow.Bind(withCluster(ctx, c), clusterExecutor{c})
 }
 

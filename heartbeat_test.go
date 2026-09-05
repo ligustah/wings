@@ -30,8 +30,8 @@ var wedge struct {
 // chunks processes items one at a time, heartbeating its position, and can be
 // told to go quiet part-way through. That combination is the whole feature: a
 // job that stops reporting is moved, and the move is cheap because it resumes.
-var chunks = flow.Define("test.chunks", func(ctx context.Context, total int) (int, error) {
-	from, _, err := flow.Checkpoint[int](ctx)
+var chunks = flow.Define("test.chunks", func(ctx flow.Context, total int) (int, error) {
+	from, _, err := ctx.Checkpoint[int]()
 	if err != nil {
 		return 0, err
 	}
@@ -50,7 +50,7 @@ var chunks = flow.Define("test.chunks", func(ctx context.Context, total int) (in
 			return 0, errors.New("test.chunks: first attempt was abandoned")
 		}
 		did++
-		if err := flow.Heartbeat(ctx, i+1); err != nil {
+		if err := ctx.Heartbeat(i + 1); err != nil {
 			return 0, err
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -62,7 +62,7 @@ var chunks = flow.Define("test.chunks", func(ctx context.Context, total int) (in
 	return total, nil
 }, flow.WithHeartbeatTimeout(300*time.Millisecond))
 
-var forever = flow.Define("test.forever", func(ctx context.Context, _ int) (int, error) {
+var forever = flow.Define("test.forever", func(ctx flow.Context, _ int) (int, error) {
 	<-ctx.Done()
 	return 0, ctx.Err()
 }, flow.WithTimeout(200*time.Millisecond))
@@ -158,10 +158,11 @@ func TestAFunctionsOwnTimeoutWinsOverTheClusterDefault(t *testing.T) {
 // Heartbeat outside a work function has no job to report on, and says so rather
 // than quietly doing nothing.
 func TestHeartbeatOutsideAJobIsAnError(t *testing.T) {
-	if err := flow.Heartbeat(context.Background(), 1); err == nil {
+	ctx := flow.From(context.Background())
+	if err := ctx.Heartbeat(1); err == nil {
 		t.Fatal("want an error from a heartbeat with no job")
 	}
-	v, ok, err := flow.Checkpoint[int](context.Background())
+	v, ok, err := ctx.Checkpoint[int]()
 	if err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
@@ -172,7 +173,7 @@ func TestHeartbeatOutsideAJobIsAnError(t *testing.T) {
 
 // quick is a short job with short bounds. It runs in a fraction of either, so
 // the only way it can fail is by being charged for time it spent waiting.
-var quick = flow.Define("test.quick", func(ctx context.Context, _ int) (string, error) {
+var quick = flow.Define("test.quick", func(ctx flow.Context, _ int) (string, error) {
 	select {
 	case <-time.After(20 * time.Millisecond):
 		return "finished", nil

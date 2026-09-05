@@ -3,19 +3,21 @@
 Define a typed Go function. Call it across a cluster that did not exist a minute ago.
 
 ```go
-var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) {
+var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
 })
 
-func Coordinate(ctx context.Context) error {
-    images, err := flow.Map(ctx, Render, frames)   // runs wherever the workers are
+func Coordinate(ctx flow.Context) error {
+    images, err := ctx.Map(Render, frames)   // runs wherever the workers are
     ...
 }
 ```
 
 That is the whole API. The functions and the body are written against
 [`flow`](flow), a durable-execution framework that knows nothing about
-clusters; wings is where a flow's calls go to run. Where that is — goroutines
+clusters; wings is where a flow's calls go to run. The context they are given
+is a `flow.Context` — a `context.Context`, so it goes anywhere one is wanted,
+with everything flow can do for that code as methods on it. Where that is — goroutines
 here, child processes on this machine, or GCP VMs provisioned on demand — is a
 flag at run time, not a change to the code.
 
@@ -82,22 +84,18 @@ imports your package into each.
 ```go
 package job
 
-import (
-    "context"
-
-    "github.com/ligustah/wings/flow"
-)
+import "github.com/ligustah/wings/flow"
 
 // Work functions are package-scope vars, so a worker process — which never runs
 // Coordinate — still has them registered.
-var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) {
+var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
 })
 
 // Coordinate is run as a flow once the cluster is up. A coordinator restarted
 // over the same -dir replays what it already did rather than doing it again.
-func Coordinate(ctx context.Context) error {
-    images, err := flow.Map(ctx, Render, frames)
+func Coordinate(ctx flow.Context) error {
+    images, err := ctx.Map(Render, frames)
     if err != nil {
         return err
     }
@@ -336,14 +334,14 @@ goes quiet for longer is moved to another worker. Moving it is affordable
 because the job reports where it has got to as it goes:
 
 ```go
-func transcode(ctx context.Context, in Job) (Out, error) {
-    from, _, err := flow.Checkpoint[int](ctx)   // 0 on the first attempt
+func transcode(ctx flow.Context, in Job) (Out, error) {
+    from, _, err := ctx.Checkpoint[int]()   // 0 on the first attempt
     if err != nil {
         return Out{}, err
     }
     for i := from; i < in.Frames; i++ {
         // ... one frame ...
-        flow.Heartbeat(ctx, i+1)
+        ctx.Heartbeat(i+1)
     }
 }
 ```
@@ -366,18 +364,18 @@ moving a queued job only puts it at the back of another queue.
 
 ### Steps
 
-`flow.Step` is the same mechanism with the bookkeeping taken away. Name the
+`Step` is the same mechanism with the bookkeeping taken away. Name the
 phases of a long job and a move replays the ones that finished:
 
 ```go
-func restore(ctx context.Context, in Backup) (Report, error) {
-    snap, err := flow.Step(ctx, "snapshot", func(ctx context.Context) (Snapshot, error) {
+func restore(ctx flow.Context, in Backup) (Report, error) {
+    snap, err := ctx.Step("snapshot", func(ctx flow.Context) (Snapshot, error) {
         return takeSnapshot(ctx, in.Source)      // twenty minutes
     })
     if err != nil {
         return Report{}, err
     }
-    return flow.Step(ctx, "restore", func(ctx context.Context) (Report, error) {
+    return ctx.Step("restore", func(ctx flow.Context) (Report, error) {
         return restoreInto(ctx, snap, in.Target) // another forty
     })
 }

@@ -22,9 +22,9 @@ import (
 // recorded about a send is when it COMPLETED, which on an unbuffered channel is
 // somebody else's decision.
 //
-// Create one with [NewChannel] or [NewBufferedChannel], inside a Run, at a
+// Create one with [Context.NewChannel] or [Context.NewBufferedChannel], inside a Run, at a
 // point every attempt reaches — the same rule as everything else in a run's
-// body. Pass it to threads forked by [Go] or [Map]
+// body. Pass it to threads forked by [Context.Go] or [Context.Map]
 // the way you would pass a Go channel to a goroutine; it is safe to use from all
 // of them at once.
 //
@@ -39,20 +39,20 @@ type Channel[T any] struct {
 
 // NewChannel returns an unbuffered channel: a send completes when a receive
 // takes it.
-func NewChannel[T any](ctx context.Context) *Channel[T] {
-	return newChannel[T](ctx, 0)
+func (c Context) NewChannel[T any]() *Channel[T] {
+	return newChannel[T](c, 0)
 }
 
 // NewBufferedChannel returns a channel that accepts capacity values before a
 // send has to wait for a receive.
-func NewBufferedChannel[T any](ctx context.Context, capacity int) *Channel[T] {
+func (c Context) NewBufferedChannel[T any](capacity int) *Channel[T] {
 	if capacity < 0 {
 		capacity = 0
 	}
-	return newChannel[T](ctx, capacity)
+	return newChannel[T](c, capacity)
 }
 
-func newChannel[T any](ctx context.Context, capacity int) *Channel[T] {
+func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	t := threadFrom(ctx)
 	if t == nil {
 		// Deliberately a channel that fails on use rather than a nil one: the
@@ -79,7 +79,7 @@ func (c *Channel[T]) Name() string { return c.name }
 // completed on a previous attempt returns as soon as the value is queued: it is
 // already known to have got through, and making a replay wait again for
 // something that already happened is how a resumed run deadlocks.
-func (c *Channel[T]) Send(ctx context.Context, v T) error {
+func (c *Channel[T]) Send(ctx Context, v T) error {
 	t, cs, err := c.bind(ctx)
 	if err != nil {
 		return err
@@ -124,7 +124,7 @@ func (c *Channel[T]) Send(ctx context.Context, v T) error {
 // The second result is false when the channel is closed and everything sent has
 // been taken, exactly as a Go receive reports it. It blocks until there is
 // something to take or the channel is closed.
-func (c *Channel[T]) Recv(ctx context.Context) (T, bool, error) {
+func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	var zero T
 
 	t, cs, err := c.bind(ctx)
@@ -191,7 +191,7 @@ func (c *Channel[T]) decode(item *chanItem) (T, error) {
 // Receives drain what is already there and then report the channel closed.
 // Recorded like a send, and ordered against the closing thread's other sends,
 // because a receiver observes it exactly as it observes them.
-func (c *Channel[T]) Close(ctx context.Context) error {
+func (c *Channel[T]) Close(ctx Context) error {
 	t, cs, err := c.bind(ctx)
 	if err != nil {
 		return err
@@ -216,7 +216,7 @@ func (c *Channel[T]) Close(ctx context.Context) error {
 }
 
 // bind resolves the calling thread and this channel's shared state.
-func (c *Channel[T]) bind(ctx context.Context) (*threadState, *chanState, error) {
+func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 	if c.run == nil {
 		return nil, nil, errors.New("flow: this channel was created outside a Run; " +
 			"create it inside the run's body, with the context it was given")

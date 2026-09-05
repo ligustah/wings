@@ -20,7 +20,7 @@ var long struct {
 	release chan struct{}
 }
 
-var longWork = flow.Define("rejoin.long", func(ctx context.Context, in int) (int, error) {
+var longWork = flow.Define("rejoin.long", func(ctx flow.Context, in int) (int, error) {
 	long.starts.Add(1)
 	select {
 	case <-long.release:
@@ -86,8 +86,8 @@ func TestARetriedRunRejoinsTheCallStillRunning(t *testing.T) {
 		var got int
 		done := make(chan error, 1)
 		go func() {
-			done <- flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-				fut := flow.Go(ctx, longWork, 21)
+			done <- flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+				fut := ctx.Go(longWork, 21)
 
 				// The first attempt walks away while the call is still going. Its
 				// call is recorded and its return is not, which is exactly the

@@ -57,10 +57,10 @@ func countEvents(t *testing.T, store flow.Store, run string) map[string]int {
 // the replay machinery underneath it matters.
 func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 	var got int
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		ch := flow.NewChannel[int](ctx)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
 
-		producer := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
+		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for i := 1; i <= 3; i++ {
 				v, err := double(ctx, i)
 				if err != nil {
@@ -111,14 +111,14 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 	var got int
 	name := flow.NewName()
 	store := flow.NewMemStore()
-	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
-		ch := flow.NewChannel[int](ctx)
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
 
 		// Two producers racing. Each sends its own numbers as fast as it can,
 		// so the interleaving is genuinely up to the scheduler.
 		var producers []*flow.Future[int]
 		for p := range 2 {
-			producers = append(producers, flow.Spawn(ctx, func(ctx context.Context) (int, error) {
+			producers = append(producers, ctx.Spawn(func(ctx flow.Context) (int, error) {
 				for i := range n {
 					if err := ch.Send(ctx, p*100+i); err != nil {
 						return 0, err
@@ -189,13 +189,13 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
 	const n = 4
 	var got int
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		ch := flow.NewBufferedChannel[int](ctx, n)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewBufferedChannel[int](n)
 
 		// Fills the buffer and returns without anybody having received. On an
 		// unbuffered channel this thread would still be blocked on its first
 		// send when Await was called, and the run would deadlock.
-		filler := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
+		filler := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for i := range n {
 				if err := ch.Send(ctx, i); err != nil {
 					return 0, err
@@ -230,10 +230,10 @@ func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
 // channel: receives drain first and only then report the channel closed.
 func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
 	var got string
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		ch := flow.NewBufferedChannel[string](ctx, 2)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewBufferedChannel[string](2)
 
-		sender := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
+		sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			if err := ch.Send(ctx, "a"); err != nil {
 				return 0, err
 			}
@@ -272,13 +272,13 @@ func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
 // attempts, and this one cannot.
 func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
 	var names []string
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		names = nil
-		names = append(names, flow.NewChannel[int](ctx).Name())
-		names = append(names, flow.NewChannel[int](ctx).Name())
+		names = append(names, ctx.NewChannel[int]().Name())
+		names = append(names, ctx.NewChannel[int]().Name())
 
-		child := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
-			names = append(names, flow.NewChannel[int](ctx).Name())
+		child := ctx.Spawn(func(ctx flow.Context) (int, error) {
+			names = append(names, ctx.NewChannel[int]().Name())
 			return 0, nil
 		})
 		_, err := child.Await(ctx)
@@ -297,17 +297,18 @@ func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
 // there is exactly the non-determinism the type exists to remove. It says so
 // rather than working by accident.
 func TestAChannelOutsideARunRefusesToBeUsed(t *testing.T) {
-	ch := flow.NewChannel[int](context.Background())
+	ctx := flow.From(context.Background())
+	ch := ctx.NewChannel[int]()
 
-	if err := ch.Send(context.Background(), 1); err == nil {
+	if err := ch.Send(ctx, 1); err == nil {
 		t.Fatal("want an error from a send outside a run")
 	} else if !strings.Contains(err.Error(), "outside a Run") {
 		t.Fatalf("got %v", err)
 	}
-	if _, _, err := ch.Recv(context.Background()); err == nil {
+	if _, _, err := ch.Recv(ctx); err == nil {
 		t.Fatal("want an error from a receive outside a run")
 	}
-	if err := ch.Close(context.Background()); err == nil {
+	if err := ch.Close(ctx); err == nil {
 		t.Fatal("want an error from a close outside a run")
 	}
 }

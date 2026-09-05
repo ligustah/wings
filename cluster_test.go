@@ -35,23 +35,23 @@ type point struct {
 	X, Y int
 }
 
-var double = flow.Define("test.double", func(ctx context.Context, in int) (int, error) {
+var double = flow.Define("test.double", func(ctx flow.Context, in int) (int, error) {
 	return in * 2, nil
 })
 
-var sum = flow.Define("test.sum", func(ctx context.Context, in point) (int, error) {
+var sum = flow.Define("test.sum", func(ctx flow.Context, in point) (int, error) {
 	return in.X + in.Y, nil
 })
 
-var boom = flow.Define("test.boom", func(ctx context.Context, in string) (string, error) {
+var boom = flow.Define("test.boom", func(ctx flow.Context, in string) (string, error) {
 	return "", errors.New("deliberate failure: " + in)
 })
 
-var panics = flow.Define("test.panics", func(ctx context.Context, in int) (int, error) {
+var panics = flow.Define("test.panics", func(ctx flow.Context, in int) (int, error) {
 	panic("deliberate panic")
 })
 
-var slow = flow.Define("test.slow", func(ctx context.Context, d time.Duration) (string, error) {
+var slow = flow.Define("test.slow", func(ctx flow.Context, d time.Duration) (string, error) {
 	select {
 	case <-time.After(d):
 		return "finished", nil
@@ -73,8 +73,8 @@ func mapOn[In, Out any](ctx context.Context, c *Cluster, f flow.Func[In, Out], i
 		mapErr error
 	)
 	name := "test-map-" + strconv.FormatUint(runSeq.Add(1), 36)
-	err := c.Run(ctx, name, func(ctx context.Context) error {
-		outs, mapErr = flow.Map(ctx, f, ins)
+	err := c.Run(ctx, name, func(ctx flow.Context) error {
+		outs, mapErr = ctx.Map(f, ins)
 		return nil
 	})
 	if err != nil {
@@ -355,7 +355,7 @@ func TestAWorkerThatIsGoneLeavesNothingBehind(t *testing.T) {
 func TestGivingUpOnAJobStopsItOnTheWorker(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
 
-	ctx, giveUp := context.WithCancel(c.Bind(t.Context()))
+	ctx, giveUp := c.Bind(t.Context()).WithCancel()
 	defer giveUp()
 	abandoned := make(chan error, 1)
 	go func() {
@@ -407,7 +407,7 @@ func TestDuplicateDefinePanics(t *testing.T) {
 			t.Fatal("want a panic on duplicate Define")
 		}
 	}()
-	_ = flow.Define("test.double", func(ctx context.Context, in int) (int, error) { return in, nil })
+	_ = flow.Define("test.double", func(ctx flow.Context, in int) (int, error) { return in, nil })
 }
 
 func TestStopIsIdempotent(t *testing.T) {
@@ -449,7 +449,7 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 }
 
-var huge = flow.Define("test.huge", func(ctx context.Context, n int) (string, error) {
+var huge = flow.Define("test.huge", func(ctx flow.Context, n int) (string, error) {
 	return strings.Repeat("x", n), nil
 })
 
@@ -510,7 +510,7 @@ func TestGivingUpOnAJobWithNoWorkerIsHarmless(t *testing.T) {
 
 func ExampleDefine() {
 	// Defined at package scope in real code, so a worker process has it too.
-	greet := flow.Define("example.greet", func(ctx context.Context, name string) (string, error) {
+	greet := flow.Define("example.greet", func(ctx flow.Context, name string) (string, error) {
 		return "hello, " + name, nil
 	})
 

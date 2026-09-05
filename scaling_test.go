@@ -1,7 +1,6 @@
 package wings
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -13,7 +12,7 @@ import (
 )
 
 // whereRun waits and then says which worker it ran on.
-var whereRun = flow.Define("test.where", func(ctx context.Context, d time.Duration) (string, error) {
+var whereRun = flow.Define("test.where", func(ctx flow.Context, d time.Duration) (string, error) {
 	select {
 	case <-time.After(d):
 		return jobFrom(ctx).node.id, nil
