@@ -470,7 +470,7 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 	}
 	names := []string{mirrorStreamFor(w.id)}
 	if w.client == client {
-		names = append(names, jobStreamFor(w.id), resultStreamFor(w.id), beatStreamFor(w.id))
+		names = append(names, jobStreamFor(w.id), resultStreamFor(w.id), beatStreamFor(w.id), controlStreamFor(w.id))
 	}
 	for _, name := range names {
 		if err := dropStream(ctx, client, name); err != nil {
