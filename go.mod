@@ -21,10 +21,10 @@ require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
 	github.com/ligustah/durable_streams/broker v0.241.0
-	github.com/ligustah/durable_streams/broker/client v0.53.0
-	github.com/ligustah/durable_streams/broker/protos v0.38.0
-	github.com/ligustah/durable_streams/dsclient v0.50.0
-	github.com/ligustah/durable_streams/dswire v0.31.0
+	github.com/ligustah/durable_streams/broker/client v0.54.0
+	github.com/ligustah/durable_streams/broker/protos v0.39.0
+	github.com/ligustah/durable_streams/dsclient v0.51.0
+	github.com/ligustah/durable_streams/dswire v0.32.0
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.83.2
@@ -56,7 +56,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/ligustah/commitlog v0.104.0 // indirect
-	github.com/ligustah/durable_streams v0.148.0 // indirect
+	github.com/ligustah/durable_streams v0.154.0 // indirect
 	github.com/ligustah/durable_streams/dsembedded v0.79.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
