@@ -81,6 +81,15 @@ func TestAThreadOfRunCodeIsPlacedOnAWorker(t *testing.T) {
 			if produced.Ran == "" {
 				t.Fatalf("the thread ran on the coordinator, not on a worker")
 			}
+			// The worker's copy of the job's history holds the workflow's
+			// too, put there for the replay, with the fork of this very
+			// thread in it. That fork is the workflow's, already dispatched
+			// — not one the job made — and must not be dispatched again
+			// from the job's history, which would attach the job to itself.
+			entries := awaitJournal(t, c, func(es []journalEntry) bool { return countKind(es, journalCompleted) >= 1 })
+			if n := countKind(entries, journalAttached); n != 0 {
+				t.Fatalf("the journal shows %d forks attached to jobs in flight, want none: every fork was made once", n)
+			}
 		})
 	}
 }
