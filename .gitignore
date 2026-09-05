@@ -21,3 +21,8 @@
 .idea/
 .vscode/
 firebase-debug.log
+
+# Cloud credentials for test runs. Never committed.
+/*-????????????.json
+/*.iam.json
+/*-credentials.json
