@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,13 +16,11 @@ import (
 
 	compute "cloud.google.com/go/compute/apiv1"
 	"cloud.google.com/go/compute/apiv1/computepb"
+	"github.com/ligustah/wings"
+	"github.com/ligustah/wings/internal/sshx"
 	"golang.org/x/crypto/ssh"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
-	"google.golang.org/protobuf/proto"
-
-	"github.com/ligustah/wings"
-	"github.com/ligustah/wings/internal/sshx"
 )
 
 // Config describes the machines to provision on Google Compute Engine.
@@ -164,12 +163,10 @@ func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wing
 
 	var wg sync.WaitGroup
 	for i, lease := range leases {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			m, err := p.createOne(ctx, client, lease, signer, authorizedKey)
 			machines[i], errs[i] = m, err
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -235,9 +232,7 @@ func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings
 	found := make([]wings.Machine, len(leases))
 	var wg sync.WaitGroup
 	for i, lease := range leases {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			m, err := p.reattachOne(ctx, client, lease, signer, authorizedKey)
 			if err != nil {
 				// Not fatal, and not even unusual: a lease whose machine was
@@ -246,7 +241,7 @@ func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings
 				return
 			}
 			found[i] = m
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -307,8 +302,8 @@ func (p *gcpProvisioner) reattachOne(
 	// stale one is refused rather than clobbering somebody else's change.
 	meta := got.GetMetadata()
 	items := []*computepb.Items{{
-		Key:   proto.String("ssh-keys"),
-		Value: proto.String(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
+		Key:   new("ssh-keys"),
+		Value: new(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
 	}}
 	for _, it := range meta.GetItems() {
 		if it.GetKey() != "ssh-keys" {
@@ -356,28 +351,28 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 	log := p.cfg.Logger.With("instance", name, "lease", lease)
 
 	inst := &computepb.Instance{
-		Name:        proto.String(name),
-		MachineType: proto.String(fmt.Sprintf("zones/%s/machineTypes/%s", p.cfg.Zone, p.cfg.MachineType)),
+		Name:        new(name),
+		MachineType: new(fmt.Sprintf("zones/%s/machineTypes/%s", p.cfg.Zone, p.cfg.MachineType)),
 		Disks: []*computepb.AttachedDisk{{
-			Boot:       proto.Bool(true),
-			AutoDelete: proto.Bool(true),
+			Boot:       new(true),
+			AutoDelete: new(true),
 			InitializeParams: &computepb.AttachedDiskInitializeParams{
-				SourceImage: proto.String(p.cfg.SourceImage),
-				DiskSizeGb:  proto.Int64(p.cfg.DiskSizeGB),
+				SourceImage: new(p.cfg.SourceImage),
+				DiskSizeGb:  new(p.cfg.DiskSizeGB),
 			},
 		}},
 		NetworkInterfaces: []*computepb.NetworkInterface{{
-			Network: proto.String(p.cfg.Network),
+			Network: new(p.cfg.Network),
 			AccessConfigs: []*computepb.AccessConfig{{
-				Name: proto.String("External NAT"),
-				Type: proto.String("ONE_TO_ONE_NAT"),
+				Name: new("External NAT"),
+				Type: new("ONE_TO_ONE_NAT"),
 			}},
 		}},
 		Metadata: &computepb.Metadata{
 			Items: []*computepb.Items{
 				{
-					Key:   proto.String("ssh-keys"),
-					Value: proto.String(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
+					Key:   new("ssh-keys"),
+					Value: new(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
 				},
 				// The key above is installed by the guest agent from
 				// metadata, and OS Login — which a project may enforce by
@@ -385,8 +380,8 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 				// on the instance, so the run does not depend on a project
 				// setting nobody remembers.
 				{
-					Key:   proto.String("enable-oslogin"),
-					Value: proto.String("FALSE"),
+					Key:   new("enable-oslogin"),
+					Value: new("FALSE"),
 				},
 			},
 		},
@@ -394,13 +389,13 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 	}
 	if p.cfg.Preemptible {
 		inst.Scheduling = &computepb.Scheduling{
-			ProvisioningModel: proto.String("SPOT"),
-			Preemptible:       proto.Bool(true),
+			ProvisioningModel: new("SPOT"),
+			Preemptible:       new(true),
 			// Delete on preemption rather than stop. A stopped instance keeps
 			// its disk and bills for it, and wings never restarts one: a
 			// preempted worker is a lost worker, its jobs are moved, and the
 			// scaler replaces the machine with a fresh one.
-			InstanceTerminationAction: proto.String("DELETE"),
+			InstanceTerminationAction: new("DELETE"),
 		}
 	}
 
@@ -507,9 +502,7 @@ func (m *gcpMachine) Start(ctx context.Context, cmd string, env map[string]strin
 		// is being taken back; wait_for_change makes the request block until
 		// it does. The worker hands its work over in that time.
 		withNotice := make(map[string]string, len(env)+1)
-		for k, v := range env {
-			withNotice[k] = v
-		}
+		maps.Copy(withNotice, env)
 		withNotice[wings.PreemptionURLEnv] = preemptionURL
 		env = withNotice
 	}

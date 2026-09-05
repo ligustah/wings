@@ -109,9 +109,7 @@ func (c *Cluster) deployAll(ctx context.Context, machines []Machine, image *work
 
 	var wg sync.WaitGroup
 	for i, m := range machines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			id := c.workerID("remote")
 			conns[i], errs[i] = c.deploy(ctx, m, image, id)
 			if errs[i] == nil {
@@ -120,7 +118,7 @@ func (c *Cluster) deployAll(ctx context.Context, machines []Machine, image *work
 					Kind: machineReady, Lease: m.ID(), Worker: id,
 				})
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -212,9 +210,7 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 	release := context.WithoutCancel(ctx)
 	var wg sync.WaitGroup
 	for i, m := range found {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			w, err := c.reconnect(ctx, m)
 			if err != nil {
 				c.log.Warn("wings: could not resume a recovered machine, destroying it",
@@ -226,7 +222,7 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 				return
 			}
 			conns[i] = w
-		}()
+		})
 	}
 	wg.Wait()
 

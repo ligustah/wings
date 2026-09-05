@@ -52,13 +52,11 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 
 		// Bound to the WORKER's context, so retiring one ends only its loop —
 		// and w.close waits for it before releasing anything it reads through.
-		w.wg.Add(1)
-		go func() {
-			defer w.wg.Done()
+		w.wg.Go(func() {
 			if err := node.run(w.ctx); err != nil && w.ctx.Err() == nil && !node.leaving.Load() {
 				c.log.Error("wings: in-process worker stopped", "worker", id, "err", err)
 			}
-		}()
+		})
 
 		out = append(out, w)
 	}
