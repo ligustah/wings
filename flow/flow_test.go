@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/ligustah/wings/flow"
@@ -214,39 +215,44 @@ func TestARunThatFailsBecauseACallFailedIsNotRetried(t *testing.T) {
 // the interruption is nearly always a shutdown, and the restart that follows
 // would otherwise replay a failure that never happened.
 func TestAnInterruptedCallIsNotRecordedAsFailed(t *testing.T) {
-	store := flow.NewMemStore()
-	name := flow.NewName()
-	gate.open = make(chan struct{})
-	gate.starts.Store(0)
+	synctest.Test(t, func(t *testing.T) {
+		store := flow.NewMemStore()
+		name := flow.NewName()
+		gate.open = make(chan struct{})
+		gate.starts.Store(0)
 
-	var got int
-	body := func(ctx context.Context) error {
-		var err error
-		got, err = gated(ctx, 21)
-		return err
-	}
+		var got int
+		body := func(ctx context.Context) error {
+			var err error
+			got, err = gated(ctx, 21)
+			return err
+		}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	go func() {
-		waitFor(t, func() bool { return gate.starts.Load() == 1 })
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- flow.Run(ctx, name, body, flow.WithStore(store)) }()
+		// Everything in the bubble is blocked: the call is waiting on the gate.
+		synctest.Wait()
+		if n := gate.starts.Load(); n != 1 {
+			t.Fatalf("the call was started %d times before the interruption, want 1", n)
+		}
 		cancel()
-	}()
-	err := flow.Run(ctx, name, body, flow.WithStore(store))
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("got %v, want the cancellation", err)
-	}
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want the cancellation", err)
+		}
 
-	// Resumed: the call is made again, and this time it is let through.
-	close(gate.open)
-	if err := flow.Run(t.Context(), name, body, flow.WithStore(store)); err != nil {
-		t.Fatalf("resumed Run: %v", err)
-	}
-	if got != 42 {
-		t.Fatalf("got %d, want 42", got)
-	}
-	if n := gate.starts.Load(); n != 2 {
-		t.Fatalf("the call was started %d times, want 2: once interrupted, once through", n)
-	}
+		// Resumed: the call is made again, and this time it is let through.
+		close(gate.open)
+		if err := flow.Run(t.Context(), name, body, flow.WithStore(store)); err != nil {
+			t.Fatalf("resumed Run: %v", err)
+		}
+		if got != 42 {
+			t.Fatalf("got %d, want 42", got)
+		}
+		if n := gate.starts.Load(); n != 2 {
+			t.Fatalf("the call was started %d times, want 2: once interrupted, once through", n)
+		}
+	})
 }
 
 // Map must work inside a run — it is the fan-out — and it must survive a
@@ -300,45 +306,49 @@ func TestMapReportsEachFailureInItsPlace(t *testing.T) {
 	}
 }
 
+// Under synctest's clock the timing is exact rather than bounded: two 300ms
+// calls that overlap take 300ms, the retry's backoff is the 1ms it was told,
+// and the replayed attempt runs neither call.
 func TestFuturesRunConcurrentlyAndReplay(t *testing.T) {
-	before := calls.slow.Load()
-	var attempts atomic.Int64
-	var got string
+	synctest.Test(t, func(t *testing.T) {
+		before := calls.slow.Load()
+		var attempts atomic.Int64
+		var got string
 
-	start := time.Now()
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		a := flow.Go(ctx, slow, 300*time.Millisecond)
-		b := flow.Go(ctx, slow, 300*time.Millisecond)
+		start := time.Now()
+		err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+			a := flow.Go(ctx, slow, 300*time.Millisecond)
+			b := flow.Go(ctx, slow, 300*time.Millisecond)
 
-		x, err := a.Await(ctx)
+			x, err := a.Await(ctx)
+			if err != nil {
+				return err
+			}
+			y, err := b.Await(ctx)
+			if err != nil {
+				return err
+			}
+			if attempts.Add(1) == 1 {
+				return errors.New("fail once, after both futures")
+			}
+			got = x + "+" + y
+			return nil
+		}, flow.WithStore(flow.NewMemStore()), quick)
+		elapsed := time.Since(start)
+
 		if err != nil {
-			return err
+			t.Fatalf("Run: %v", err)
 		}
-		y, err := b.Await(ctx)
-		if err != nil {
-			return err
+		if got != "finished+finished" {
+			t.Fatalf("got %q", got)
 		}
-		if attempts.Add(1) == 1 {
-			return errors.New("fail once, after both futures")
+		if n := calls.slow.Load() - before; n != 2 {
+			t.Fatalf("the function ran %d times across 2 attempts; replay should have held it to 2", n)
 		}
-		got = x + "+" + y
-		return nil
-	}, flow.WithStore(flow.NewMemStore()), quick)
-	elapsed := time.Since(start)
-
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got != "finished+finished" {
-		t.Fatalf("got %q", got)
-	}
-	if n := calls.slow.Load() - before; n != 2 {
-		t.Fatalf("the function ran %d times across 2 attempts; replay should have held it to 2", n)
-	}
-	// Two 300ms calls concurrently, then a replayed attempt that does neither.
-	if elapsed > 900*time.Millisecond {
-		t.Errorf("took %s; the two futures should have overlapped", elapsed)
-	}
+		if want := 300*time.Millisecond + time.Millisecond; elapsed != want {
+			t.Errorf("took %s, want %s: the two calls overlapping, one backoff, and a replay that runs nothing", elapsed, want)
+		}
+	})
 }
 
 // Awaiting twice would record a second join that the next attempt never
@@ -362,52 +372,62 @@ func TestAwaitingAFutureTwiceIsRefused(t *testing.T) {
 // Now must be stable across attempts, or every retry decides something
 // different from the run it is supposed to be continuing.
 func TestNowIsRecordedAndReplayed(t *testing.T) {
-	var attempts atomic.Int64
-	var seen []time.Time
+	synctest.Test(t, func(t *testing.T) {
+		var attempts atomic.Int64
+		var seen []time.Time
 
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		now, err := flow.Now(ctx)
+		// A backoff long enough that the clock has visibly moved on by the
+		// retry, so a Now that re-read it would show.
+		err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+			now, err := flow.Now(ctx)
+			if err != nil {
+				return err
+			}
+			seen = append(seen, now)
+			if attempts.Add(1) == 1 {
+				return errors.New("fail once")
+			}
+			return nil
+		}, flow.WithStore(flow.NewMemStore()), flow.Backoff(time.Second, time.Second))
 		if err != nil {
-			return err
+			t.Fatalf("Run: %v", err)
 		}
-		seen = append(seen, now)
-		if attempts.Add(1) == 1 {
-			return errors.New("fail once")
+		if len(seen) != 2 {
+			t.Fatalf("saw %d times, want 2", len(seen))
 		}
-		return nil
-	}, flow.WithStore(flow.NewMemStore()), flow.Backoff(20*time.Millisecond, 20*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if len(seen) != 2 {
-		t.Fatalf("saw %d times, want 2", len(seen))
-	}
-	if !seen[0].Equal(seen[1]) {
-		t.Fatalf("Now returned %s then %s; it must replay the recorded instant", seen[0], seen[1])
-	}
+		if !seen[0].Equal(seen[1]) {
+			t.Fatalf("Now returned %s then %s; it must replay the recorded instant", seen[0], seen[1])
+		}
+		if time.Since(seen[1]) < time.Second {
+			t.Fatalf("the retry ran %s after the recorded instant; the clock should have moved a second",
+				time.Since(seen[1]))
+		}
+	})
 }
 
 func TestSleepIsNotServedTwice(t *testing.T) {
-	var attempts atomic.Int64
+	synctest.Test(t, func(t *testing.T) {
+		var attempts atomic.Int64
 
-	start := time.Now()
-	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
-		if err := flow.Sleep(ctx, 400*time.Millisecond); err != nil {
-			return err
+		start := time.Now()
+		err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+			if err := flow.Sleep(ctx, 400*time.Millisecond); err != nil {
+				return err
+			}
+			if attempts.Add(1) == 1 {
+				return errors.New("fail once, after the sleep")
+			}
+			return nil
+		}, flow.WithStore(flow.NewMemStore()), quick)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
 		}
-		if attempts.Add(1) == 1 {
-			return errors.New("fail once, after the sleep")
+		// One 400ms sleep and one 1ms backoff, not two sleeps: the second
+		// attempt replays a sleep that is already over.
+		if elapsed, want := time.Since(start), 400*time.Millisecond+time.Millisecond; elapsed != want {
+			t.Errorf("took %s, want %s", elapsed, want)
 		}
-		return nil
-	}, flow.WithStore(flow.NewMemStore()), quick)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	// One 400ms sleep, not two: the second attempt replays a sleep that is
-	// already over.
-	if elapsed := time.Since(start); elapsed > 750*time.Millisecond {
-		t.Errorf("took %s; the sleep was served twice", elapsed)
-	}
+	})
 }
 
 // A completed run must not run again, whatever the caller does — its calls
