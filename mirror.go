@@ -35,13 +35,14 @@ type mirroredResult struct {
 // the coordinator's side too, so a run that died has left an account of every
 // result it saw and a position to read the worker from.
 //
-// What it does NOT do, yet, is resume a call. A restarted coordinator reads a
-// mirror only for the offset to continue from; the goroutine that was waiting
-// for a result died with the process, and a result that arrives for a job the
-// new process never dispatched is dropped as nobody's (see deliver). The half
-// that must not die is therefore still the coordinator, for a bare call. A
-// workflow (package flow) is the exception, because its history is the durable
-// thing and a rerun re-dispatches whatever had not returned.
+// A restarted coordinator reads a mirror for the offset to continue from, and
+// for the results its predecessor saw: a job the journal still shows
+// outstanding whose result is here is over (see recover.go). What it cannot
+// do is resume a bare call: the goroutine that was waiting for the answer
+// died with the process, and a result for a job nothing forked again is
+// dropped as nobody's (see deliver). A workflow is different, because its
+// history is the durable thing and a rerun forks again what had not
+// returned, and the fork rejoins the job the predecessor left running.
 //
 // It is store-and-forward rather than replication in the durable-streams sense:
 // a reader that tails one stream and appends to another, with a position it can

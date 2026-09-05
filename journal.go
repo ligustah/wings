@@ -29,6 +29,7 @@ const (
 	journalRedispatch   = "redispatch"  // a lost worker's job was sent somewhere else
 	journalHeld         = "held"        // no worker was live; the job waits for one
 	journalYielded      = "yielded"     // the job let its worker go, until something happens
+	journalRecovered    = "recovered"   // a restarted coordinator took the job back from its record
 	journalCompleted    = "completed"   // a result came back
 	journalFailed       = "failed"      // the coordinator gave up on the job
 	journalWorkerUp     = "worker-up"   // a worker entered service
@@ -76,6 +77,10 @@ type journalEntry struct {
 	Run    string `json:"run,omitempty"`
 	Thread string `json:"thread,omitempty"`
 	Step   uint64 `json:"step,omitempty"`
+
+	// Yield is what a yielded job waits for, on a yielded entry: what a
+	// coordinator that restarts needs to wake it.
+	Yield *yieldEnvelope `json:"yield,omitempty"`
 }
 
 // from copies a call's origin onto an entry.

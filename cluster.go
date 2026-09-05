@@ -273,6 +273,12 @@ type pendingJob struct {
 	// waiting for what would bring it back. See yield.go. Guarded by
 	// Cluster.mu.
 	yield *yieldEnvelope
+	// recovered says a restarted coordinator took this job back from its
+	// journal rather than dispatching it (recover.go), and incomplete that
+	// nothing has yet forked it in this process: the envelope has no input,
+	// so it cannot be sent anywhere. Both guarded by Cluster.mu.
+	recovered  bool
+	incomplete bool
 	// since is when the current attempt was dispatched, started when the
 	// worker reported beginning it, and beat when it last reported progress.
 	//
@@ -455,6 +461,11 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	if err != nil {
 		return fail(err, nil)
 	}
+	// And whatever it left running on them, before any of them is read:
+	// a result that arrives must find its job.
+	if err := c.recoverJobs(ctx, workers); err != nil {
+		return fail(err, workers)
+	}
 
 	n := cfg.Scaling.initialWorkers(cfg.workers()) - len(workers)
 	if n > 0 {
@@ -587,8 +598,9 @@ func (c *Cluster) placeHeld() {
 	c.mu.Lock()
 	for _, p := range c.pending {
 		// Not one that is off every worker by choice: that one is waiting
-		// for something other than a worker.
-		if p.worker == nil && p.yield == nil {
+		// for something other than a worker. Nor one with nothing to send
+		// yet, or nothing left to do.
+		if p.worker == nil && p.yield == nil && !p.incomplete && !p.finished() {
 			held = append(held, p)
 		}
 	}
@@ -934,7 +946,7 @@ func (c *Cluster) deliver(res resultEnvelope) {
 		c.mu.Unlock()
 		c.journal.record(journalEntry{
 			Kind: journalYielded, Job: p.job.ID, Func: p.job.Func,
-			Attempt: p.job.Attempt, Err: res.Yield.describe(),
+			Attempt: p.job.Attempt, Err: res.Yield.describe(), Yield: res.Yield,
 		}.from(p.origin))
 		if c.yieldSettled(p, res.Yield) {
 			c.wake(p, "what it was waiting for had already arrived")
@@ -944,8 +956,17 @@ func (c *Cluster) deliver(res resultEnvelope) {
 	var wake *pendingJob
 	if ok {
 		wake = c.noteSettledLocked(p, res)
-		c.forget(p)
-		c.release(p.worker)
+		if p.recovered && p.waiters == 0 {
+			// Recovered, and nothing has forked it again yet: the result is
+			// kept, unclaimed, for the fork that will. Off its worker,
+			// which has no more to do with it.
+			c.unblockLocked(p)
+			c.release(p.worker)
+			p.worker = nil
+		} else {
+			c.forget(p)
+			c.release(p.worker)
+		}
 	}
 	c.mu.Unlock()
 	if wake != nil {
@@ -1098,10 +1119,28 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		return
 	}
 	c.unblockLocked(p)
+	from, left := p.worker, p.job.Attempt
+	if p.incomplete {
+		// Recovered from the journal, which has no input: there is nothing
+		// to send until the replay forks it again. Held until then.
+		if from != nil {
+			c.release(from)
+		}
+		p.worker = nil
+		p.since, p.started, p.beat = time.Time{}, time.Time{}, time.Time{}
+		job := p.job
+		c.mu.Unlock()
+		c.log.Warn("wings: a recovered job has nothing to run it on; holding it until it is forked again",
+			"job", job.ID, "fn", job.Func, "why", why)
+		c.journal.record(journalEntry{
+			Kind: journalHeld, Job: job.ID, Func: job.Func, Attempt: left, Err: why,
+		}.from(p.origin))
+		c.stopOn(from, job.ID, left, why)
+		return
+	}
 	// At-least-once has no natural end, and a job that kills whatever worker it
 	// lands on would be moved forever while the caller waited on a cluster that
 	// merely looked busy.
-	from, left := p.worker, p.job.Attempt
 	if counted && p.placed && p.job.Attempt+1 >= c.cfg.attempts() {
 		if from != nil {
 			c.release(from)
@@ -1300,6 +1339,9 @@ func (c *Cluster) sweep(now time.Time) {
 
 	c.mu.Lock()
 	for _, p := range c.pending {
+		if p.finished() {
+			continue // settled, kept for a fork that has not come yet
+		}
 		if p.yield != nil {
 			if !p.yield.Until.IsZero() && !now.Before(p.yield.Until) {
 				due = append(due, p)
@@ -1462,11 +1504,17 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	if key != "" {
 		if live, ok := c.byOrigin[key]; ok {
 			live.waiters++
+			// A job a restarted coordinator recovered has been waiting for
+			// exactly this: the fork that carries its input.
+			place := live.complete(job)
 			c.mu.Unlock()
 			c.journal.record(journalEntry{
 				Kind: journalAttached, Job: live.job.ID, Func: live.job.Func,
 				Worker: workerID(live.worker), Attempt: live.job.Attempt,
 			}.from(live.origin))
+			if place {
+				c.moveJob(live, "recovered with nothing to run it on, and now forked again")
+			}
 			return live, nil
 		}
 	}
@@ -1522,6 +1570,10 @@ func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, err
 	case <-p.done:
 		c.mu.Lock()
 		p.waiters--
+		if p.recovered && p.waiters <= 0 {
+			// Kept unclaimed until now. See deliver.
+			c.forget(p)
+		}
 		c.mu.Unlock()
 		return p.res, nil
 
@@ -1555,7 +1607,10 @@ func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, err
 		c.mu.Lock()
 		p.waiters--
 		c.mu.Unlock()
-		return resultEnvelope{}, errors.New("wings: cluster stopped while waiting for a result")
+		// A context error, because that is what it is to the run waiting:
+		// an interruption, to be resumed by the next coordinator, and not
+		// the job's answer.
+		return resultEnvelope{}, fmt.Errorf("wings: cluster stopped while waiting for a result: %w", context.Canceled)
 	}
 }
 

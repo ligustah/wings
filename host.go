@@ -16,7 +16,8 @@ import (
 // the run's history, which lives on the cluster's own storage under Dir. Run the same
 // name in the same Dir again and the body is replayed to where it stopped and
 // carried on from there — a coordinator that crashed mid-run resumes rather
-// than restarts, and one that already finished does nothing. The body must
+// than restarts, rejoining the threads it had forked where they are still
+// running (recover.go), and one that already finished does nothing. The body must
 // therefore be deterministic; [flow] says what that costs.
 //
 // opts are passed through to [flow.Run]; the store and the placer are this
@@ -26,7 +27,9 @@ func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Conte
 	if err != nil {
 		return err
 	}
-	return flow.Run(withCluster(ctx, c), name, body, all...)
+	ctx, done := c.hosting(ctx)
+	defer done()
+	return flow.Run(ctx, name, body, all...)
 }
 
 // RunWorkflow runs a defined workflow on in, on this cluster, the way
@@ -40,7 +43,9 @@ func (c *Cluster) RunWorkflow[In any](ctx context.Context, w flow.Workflow[In], 
 	if err != nil {
 		return err
 	}
-	return w.Run(withCluster(ctx, c), in, all...)
+	ctx, done := c.hosting(ctx)
+	defer done()
+	return w.Run(ctx, in, all...)
 }
 
 // runWorkflow is RunWorkflow for a coordinator, which has the workflow as a
@@ -50,7 +55,9 @@ func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) er
 	if err != nil {
 		return err
 	}
-	return flow.RunWorkflow(withCluster(ctx, c), name, input, all...)
+	ctx, done := c.hosting(ctx)
+	defer done()
+	return flow.RunWorkflow(ctx, name, input, all...)
 }
 
 // runOptions is opts with this cluster's store and placer appended, so that
@@ -130,6 +137,18 @@ type clusterKey struct{}
 // can find it.
 func withCluster(ctx context.Context, c *Cluster) context.Context {
 	return context.WithValue(ctx, clusterKey{}, c)
+}
+
+// hosting binds a run's context to the cluster's: a cluster that stops takes
+// its runs with it, as an INTERRUPTION and not a failure. A run whose
+// context ends is resumed by whoever runs it next — a coordinator started
+// again over the same Dir — where one that merely got an error from a call
+// records that the run failed. The cluster's threads on its workers carry
+// on meanwhile, and the next coordinator rejoins them; see recover.go.
+func (c *Cluster) hosting(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(withCluster(ctx, c))
+	stop := context.AfterFunc(c.ctx, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 func clusterFrom(ctx context.Context) *Cluster {

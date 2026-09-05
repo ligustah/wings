@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // fakeCloud is a Provisioner whose "machines" are child processes on this
@@ -699,5 +702,83 @@ func TestARetiredMachinesLeaseIsClosed(t *testing.T) {
 	}
 	if got := cloud.leases(); len(got) != 0 {
 		t.Fatalf("the cloud holds %d machines after a clean stop", len(got))
+	}
+}
+
+// THE POINT: a coordinator that dies mid-workflow and starts again over the
+// same Dir resumes the workflow from its history, and the thread it had
+// forked — still running on the machine it recovered, or already finished
+// there — is REJOINED, not forked a second time. The journal shows one
+// submit for the thread across both runs of the coordinator, and the
+// workflow gets the thread's result.
+func TestARestartedCoordinatorRejoinsTheThreadsItLeftRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	for _, tc := range []struct {
+		name  string
+		takes time.Duration // how long the forked thread takes
+		gap   time.Duration // how long the coordinator is down
+	}{
+		{"still running", 4 * time.Second, 0},
+		{"finished meanwhile", 300 * time.Millisecond, 1500 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud := newFakeCloud(t)
+			dir := t.TempDir()
+			run := "test-rejoin-" + strconv.FormatUint(runSeq.Add(1), 36)
+			var got string
+			body := func(ctx flow.Context) error {
+				var err error
+				got, err = ctx.Go(slowChild, tc.takes).Await(ctx)
+				return err
+			}
+
+			first := startRemote(t, dir, cloud, 1)
+			firstCtx, stopFirst := context.WithCancel(t.Context())
+			firstDone := make(chan error, 1)
+			go func() { firstDone <- first.Run(firstCtx, run, body) }()
+			awaitJournal(t, first, func(es []journalEntry) bool {
+				return countKind(es, journalSubmitted) >= 1
+			})
+			abandon(t, first)
+			stopFirst()
+			<-firstDone
+			time.Sleep(tc.gap)
+
+			second := startRemote(t, dir, cloud, 1)
+			defer func() {
+				if err := second.Stop(context.Background()); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			}()
+			if err := second.Run(t.Context(), run, body); err != nil {
+				t.Fatalf("Run after the restart: %v", err)
+			}
+			if got != "finished" {
+				t.Fatalf("got %q, want the thread's result", got)
+			}
+			entries := awaitJournal(t, second, func(es []journalEntry) bool {
+				return countKind(es, journalCompleted) >= 1 && countKind(es, journalAttached) >= 1
+			})
+			var submitted, recovered, attached int
+			for _, e := range entries {
+				if e.Run != run {
+					continue
+				}
+				switch e.Kind {
+				case journalSubmitted:
+					submitted++
+				case journalRecovered:
+					recovered++
+				case journalAttached:
+					attached++
+				}
+			}
+			if submitted != 1 || recovered != 1 || attached != 1 {
+				t.Fatalf("journal: %d submitted, %d recovered, %d attached; want 1 of each — "+
+					"the thread was forked once, taken back, and rejoined", submitted, recovered, attached)
+			}
+		})
 	}
 }

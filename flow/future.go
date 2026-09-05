@@ -109,10 +109,11 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	}
 
 	// Interrupted rather than finished: the thread was cut short by the
-	// caller's own context, and recording that as its result would have the
-	// next attempt replay a failure that never happened. The fork stays
-	// without a join, which is what makes that attempt run the thread again.
-	if f.err != nil && ctx.Err() != nil {
+	// caller's own context, or by whatever was running it stopping, and
+	// recording that as its result would have the next attempt replay a
+	// failure that never happened. The fork stays without a join, which is
+	// what makes that attempt run the thread again.
+	if f.err != nil && (ctx.Err() != nil || errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded)) {
 		return zero, f.err
 	}
 	replaying := f.parent.peek() != nil

@@ -271,19 +271,24 @@ only the difference.
 Be precise about which half may die. A **worker** may: its queue is on its own
 streams, and the coordinator redispatches what it had not heard back about. A
 **machine** may lose its coordinator: the lease record above brings it back.
-The **coordinator itself** may not, for a bare call. The goroutine that was
-waiting for the answer died with the process, and the new process — which reads
-its own record and each worker's mirror only for the position to continue from —
-drops a result for a job it never dispatched. The work a worker was still doing
-finishes and is written down, and nobody collects it.
+The **coordinator itself** may not, for a bare call: the goroutine that was
+waiting for the answer died with the process, and nobody collects the result.
 
 What does survive a coordinator restart is a **flow run** ([`flow`](flow)), and
 a workflow is one: its history is kept under `-dir`, and a coordinator started
-again over the same directory replays what returned and dispatches again what
-had not. A call that was in flight when the coordinator died is therefore run
-twice, once by each coordinator, and the second copy is the one whose answer
-counts. Work functions are idempotent for exactly this reason. A workflow
-that already finished does nothing at all on a restart.
+again over the same directory replays it to where it stopped. The threads it
+had forked are **rejoined, not forked again**: before the new coordinator reads
+a single worker, it reads its own journal for the jobs its predecessor left
+outstanding — which thread of which run, on which machine, which attempt —
+and puts them back under the same names, so the replay's fork finds the job
+that is already running, exactly as a retried workflow rejoins a call. A thread
+that finished while no coordinator was listening has its result kept for the
+fork; one whose machine is gone waits for the fork, which brings its input, and
+is placed then; one that was sleeping or waiting is woken by what it waited
+for. The journal is written off the hot path, so a crash can lose its last
+lines: a thread the record does not mention is forked afresh, and that is the
+one way a thread runs twice. Work functions are idempotent for exactly this
+reason. A workflow that already finished does nothing at all on a restart.
 
 ### Remote deployment
 
