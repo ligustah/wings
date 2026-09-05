@@ -533,3 +533,79 @@ var StepsThenSpawns = flow.Define("stepsThenSpawns", func(ctx flow.Context, in i
 	}
 	return ctx.Spawn(func(ctx flow.Context) (int, error) { return v * 2, nil }).Await(ctx)
 })
+
+// --- panicky: a closure that panics on a worker, and one that returns a
+// permanent error, and the workflow going on ---
+
+var Panicky = flow.DefineWorkflow("panicky", func(ctx flow.Context, in Params) error {
+	_, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		p, _ := pid(ctx)
+		panic(fmt.Sprintf("a closure panicking on pid %d", p))
+	}).Await(ctx)
+	if err == nil || !strings.Contains(err.Error(), "panicking on pid") {
+		return fmt.Errorf("panicky: the panicking closure returned %v", err)
+	}
+	fmt.Printf("panicky: %v\n", err)
+	_, err = ctx.Spawn(func(ctx flow.Context) (int, error) {
+		return 0, flow.Permanent(errors.New("permanently wrong"))
+	}).Await(ctx)
+	if err == nil || !strings.Contains(err.Error(), "permanently wrong") {
+		return fmt.Errorf("panicky: the permanent failure returned %v", err)
+	}
+	// A closure that fails on its first attempt only is retried where it
+	// is, by the thread's own retry, and succeeds.
+	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		n, err := ctx.Effect(func() (int, error) { return 0, nil })
+		if err != nil {
+			return 0, err
+		}
+		return n + 41, nil
+	}).Await(ctx)
+	if err != nil || v != 41 {
+		return fmt.Errorf("panicky: after the failures a closure returned %d, %v", v, err)
+	}
+	return ok("panicky")
+})
+
+// --- bulky: values of some size through a channel that crosses machines ---
+
+var Bulky = flow.DefineWorkflow("bulky", func(ctx flow.Context, in Params) error {
+	n := cmp.Or(in.N, 12)
+	const size = 256 << 10
+	values := ctx.NewBufferedChannel[[]byte](2)
+	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		for i := range n {
+			b := make([]byte, size)
+			for j := range b {
+				b[j] = byte(i + j)
+			}
+			if err := values.Send(ctx, b); err != nil {
+				return 0, err
+			}
+		}
+		return n, values.Close(ctx)
+	})
+	total, count := 0, 0
+	for {
+		b, more, err := values.Recv(ctx)
+		if err != nil {
+			return err
+		}
+		if !more {
+			break
+		}
+		if len(b) != size || b[1] != byte(count+1) {
+			return fmt.Errorf("bulky: value %d is %d bytes and starts %v", count, len(b), b[:2])
+		}
+		total += len(b)
+		count++
+	}
+	if _, err := producer.Await(ctx); err != nil {
+		return err
+	}
+	if count != n {
+		return fmt.Errorf("bulky: received %d values, want %d", count, n)
+	}
+	fmt.Printf("bulky: %d values, %d MB\n", count, total>>20)
+	return ok("bulky")
+})
