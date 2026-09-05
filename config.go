@@ -115,9 +115,12 @@ type Config struct {
 	// cloud VMs depending only on Target.
 	Scaling Scaling
 
-	// Concurrency is how many jobs one worker runs at once. Zero lets each
-	// worker decide from its own CPU count, which is the only correct default
-	// when the worker is on hardware the coordinator has never seen.
+	// Concurrency is how many threads one worker RUNS at once. A thread that
+	// is waiting — for a thread it forked, for a channel, for the clock — is
+	// not running and does not count, so a worker holds more jobs than this
+	// when some of them wait. Zero lets each worker decide from its own CPU
+	// count, which is the only correct default when the worker is on
+	// hardware the coordinator has never seen.
 	Concurrency int
 
 	// Dir is where broker data lives. Empty uses a temporary directory that is

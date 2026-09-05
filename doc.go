@@ -82,8 +82,11 @@
 // worker should carry, how long an idle one may linger — so the same numbers add
 // goroutines, child processes or cloud VMs depending on nothing but the target.
 //
-// A job is placed on the least loaded worker when it is submitted, and queued
-// work is evened out afterwards: a worker that arrives later, or frees up
+// A worker runs as many threads at once as its concurrency says, and a
+// thread that waits — for a thread it forked, for a channel, for the clock —
+// gives its slot up until the wait is over, so a worker's load is what it is
+// running rather than what it holds. A job is placed on the least loaded
+// worker when it is submitted, and queued work is evened out afterwards: a worker that arrives later, or frees up
 // sooner, is given jobs still waiting unstarted on another's queue. Without
 // that, a fleet grown or repaired mid-run would have done nothing for the work
 // already queued.

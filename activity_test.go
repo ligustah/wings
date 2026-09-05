@@ -502,3 +502,37 @@ func TestAJobIsAThreadOfItsRun(t *testing.T) {
 		}
 	}
 }
+
+// THE POINT: a thread that waits is not running, and the slot it held is
+// free for the thread it is waiting on. One worker with one slot: a function
+// blocked on a channel the workflow will only feed once ANOTHER function has
+// returned. If the waiting function held the slot this would deadlock — the
+// other could never run — and it used to.
+func TestAWaitingThreadGivesUpItsSlot(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
+	name := "test-parked-" + strconv.FormatUint(runSeq.Add(1), 36)
+
+	var total int
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		receiver := ctx.Go(sums, feed{Values: ch}) // takes the slot, then waits
+		v, err := ctx.Go(double, 21).Await(ctx)     // needs the slot
+		if err != nil {
+			return err
+		}
+		if err := ch.Send(ctx, v); err != nil {
+			return err
+		}
+		if err := ch.Close(ctx); err != nil {
+			return err
+		}
+		total, err = receiver.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if total != 42 {
+		t.Fatalf("got %d, want 42", total)
+	}
+}

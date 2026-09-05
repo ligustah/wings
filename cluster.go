@@ -180,8 +180,11 @@ type workerConn struct {
 	stop context.CancelFunc
 	wg   sync.WaitGroup
 
-	// Guarded by Cluster.mu.
+	// Guarded by Cluster.mu. blocked is how many of the inflight jobs have
+	// reported a thread waiting; what the worker is running is the
+	// difference, and that is its load.
 	inflight  int
+	blocked   int
 	draining  bool
 	idleSince time.Time
 
@@ -192,6 +195,10 @@ type workerConn struct {
 
 // available reports whether new work may be sent here. Call with Cluster.mu.
 func (w *workerConn) available() bool { return !w.draining && !w.dead.Load() }
+
+// load is how many jobs are running here, as opposed to waiting. Call with
+// Cluster.mu.
+func (w *workerConn) load() int { return w.inflight - w.blocked }
 
 // hasExited reports whether this worker is observably gone, as opposed to
 // merely unreachable.
@@ -259,6 +266,9 @@ type pendingJob struct {
 	followed map[int]bool
 	children int
 	answers  map[string]resultEnvelope
+	// blocked says the job's worker reported a thread of it waiting, and
+	// has not yet reported it woken. Guarded by Cluster.mu.
+	blocked bool
 	// since is when the current attempt was dispatched, started when the
 	// worker reported beginning it, and beat when it last reported progress.
 	//
@@ -307,10 +317,11 @@ func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	if p.bounds.Timeout > 0 && now.Sub(p.started) > p.bounds.Timeout {
 		tooSlow = true
 	}
-	// A job waiting on a call it made is quiet for as long as the call takes,
-	// and is not stuck: the coordinator itself is running what it is waiting
-	// for. Its total bound still runs.
-	if p.bounds.Heartbeat > 0 && p.children == 0 {
+	// A job waiting on a thread it forked is quiet for as long as the thread
+	// takes, and is not stuck: the coordinator itself is running what it is
+	// waiting for. Nor is one whose worker says it is waiting — on a channel,
+	// on the clock. Its total bound still runs.
+	if p.bounds.Heartbeat > 0 && p.children == 0 && !p.blocked {
 		last := p.beat
 		if last.IsZero() {
 			last = p.started
@@ -928,11 +939,24 @@ func (c *Cluster) deliver(res resultEnvelope) {
 	p.settle(res)
 }
 
+// unblockLocked takes back a job's report that it is waiting: it woke, or
+// it is leaving the worker that said so. Call with mu held.
+func (c *Cluster) unblockLocked(p *pendingJob) {
+	if !p.blocked {
+		return
+	}
+	p.blocked = false
+	if p.worker != nil && p.worker.blocked > 0 {
+		p.worker.blocked--
+	}
+}
+
 // forget takes a job out of the outstanding set. Call with mu held.
 func (c *Cluster) forget(p *pendingJob) {
 	if cur, ok := c.pending[p.job.ID]; !ok || cur != p {
 		return
 	}
+	c.unblockLocked(p)
 	delete(c.pending, p.job.ID)
 	// Every attempt but the one that produced the result wrote something
 	// nobody holds a handle to. Only worth looking when there WAS an earlier
@@ -1051,6 +1075,7 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		c.mu.Unlock()
 		return
 	}
+	c.unblockLocked(p)
 	// At-least-once has no natural end, and a job that kills whatever worker it
 	// lands on would be moved forever while the caller waited on a cluster that
 	// merely looked busy.
@@ -1204,6 +1229,15 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 		return
 	}
 	p.beat = now
+	if b.Wait != "" && !p.blocked {
+		p.blocked = true
+		if p.worker != nil {
+			p.worker.blocked++
+		}
+	}
+	if b.Woke {
+		c.unblockLocked(p)
+	}
 	if len(b.Checkpoint) > 0 {
 		p.checkpoint = b.Checkpoint
 	}
@@ -1339,12 +1373,12 @@ func (c *Cluster) pickBut(avoid *workerConn) *workerConn {
 			continue
 		}
 		if w == avoid {
-			if fallback == nil || w.inflight < fallback.inflight {
+			if fallback == nil || w.load() < fallback.load() {
 				fallback = w
 			}
 			continue
 		}
-		if best == nil || w.inflight < best.inflight {
+		if best == nil || w.load() < best.load() {
 			best = w
 		}
 	}

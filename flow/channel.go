@@ -161,7 +161,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		return t.err()
 	}
 
-	if err := cs.awaitTaken(ctx, item); err != nil {
+	if err := cs.awaitTaken(ctx, t, item); err != nil {
 		return err
 	}
 	t.record(&protos.ChannelSendEvent{
@@ -214,7 +214,7 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return v, true, t.err()
 	}
 
-	item, err := cs.awaitAny(ctx)
+	item, err := cs.awaitAny(ctx, t)
 	if err != nil {
 		return zero, false, err
 	}
@@ -452,17 +452,22 @@ func (cs *chanState) shut() {
 }
 
 // awaitTaken blocks until a sent item has been received, or returns at once if
-// the channel had room for it.
-func (cs *chanState) awaitTaken(ctx context.Context, item *chanItem) error {
+// the channel had room for it. The thread is parked while it waits.
+func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, item *chanItem) error {
+	parked := false
+	resume := noResume
 	for {
 		cs.mu.Lock()
 		if item.taken || item.buffered {
 			cs.mu.Unlock()
-			return nil
+			return resume(ctx)
 		}
 		wait := cs.changed
 		cs.mu.Unlock()
 
+		if !parked {
+			parked, resume = true, t.park(ctx, WaitSend)
+		}
 		select {
 		case <-wait:
 		case <-ctx.Done():
@@ -472,8 +477,10 @@ func (cs *chanState) awaitTaken(ctx context.Context, item *chanItem) error {
 }
 
 // awaitAny blocks until something can be taken, and returns nil when the
-// channel is closed and drained.
-func (cs *chanState) awaitAny(ctx context.Context) (*chanItem, error) {
+// channel is closed and drained. The thread is parked while it waits.
+func (cs *chanState) awaitAny(ctx context.Context, t *threadState) (*chanItem, error) {
+	parked := false
+	resume := noResume
 	for {
 		cs.mu.Lock()
 		for _, it := range cs.items {
@@ -481,16 +488,19 @@ func (cs *chanState) awaitAny(ctx context.Context) (*chanItem, error) {
 				it.taken = true
 				cs.broadcast()
 				cs.mu.Unlock()
-				return it, nil
+				return it, resume(ctx)
 			}
 		}
 		if cs.closed {
 			cs.mu.Unlock()
-			return nil, nil
+			return nil, resume(ctx)
 		}
 		wait := cs.changed
 		cs.mu.Unlock()
 
+		if !parked {
+			parked, resume = true, t.park(ctx, WaitRecv)
+		}
 		select {
 		case <-wait:
 		case <-ctx.Done():

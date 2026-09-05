@@ -461,6 +461,14 @@ copy, and what a retry is handed is consistent across all of them: the history
 that says which recordings were made and the recordings themselves were
 committed together.
 
+A worker runs as many threads at once as its concurrency says, and **a thread
+that waits is not running**: waiting for a thread it forked, for a channel or
+for the clock, it gives its slot up, and takes one back — ahead of any job
+still queued — when the wait is over. A wait that lasts is reported, so the
+coordinator neither moves the job for silence nor counts it against the
+worker's load. One worker with one slot can therefore run a job and the
+thread that job is waiting on.
+
 A thread a work function forks is **the cluster's to place**, like any other.
 There is no request message: the coordinator keeps a copy of every attempt's
 history, reads the forks out of it, runs each where the load is lowest and
@@ -591,7 +599,7 @@ Used directly rather than through `wings build`:
 c, err := wings.Start(ctx, wings.Config{
     Target:      wings.Remote(gcp.New(gcp.Config{Project: "p", Zone: "z"})),
     Workers:     8,               // or a Scaling policy instead
-    Concurrency: 4,               // jobs at once per worker; 0 = the worker decides
+    Concurrency: 4,               // running threads per worker; 0 = the worker decides
     JobTimeout:  5 * time.Minute,
 })
 defer c.Stop(ctx)

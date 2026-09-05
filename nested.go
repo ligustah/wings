@@ -37,10 +37,10 @@ import (
 // Which job a thread's parent is follows from the thread's name, since a
 // thread is named under its parent.
 //
-// On the worker, threads arrive on a queue of their own and run without a
-// place in the batch. The job queue is taken in batches of the worker's
-// concurrency, and a batch is not over until every job in it is; a thread
-// queued behind the batch that is waiting for it would wait forever.
+// On the worker, threads forked by jobs arrive on a queue of their own,
+// served like the job queue: continuously, each on a goroutine, in a
+// running slot. The job waiting for one has given its slot up — see
+// slots.go — so on a worker with one slot the thread still runs.
 
 // jobRunName is the run a bare call executes as on the worker: one made on
 // [Cluster.Bind], which belongs to no run of its own. Stable across attempts,
@@ -417,58 +417,5 @@ func (e nestedPlacer) Place(ctx context.Context, th flow.Thread, body func(flow.
 		return a.Payload, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	}
-}
-
-// serveNested runs the threads other jobs forked, as they arrive, each on a
-// goroutine of its own. No batch and no bound: what bounds a worker's work is
-// its job queue, and a call is work a job on that queue is already waiting
-// for. Results go on the same result stream the batch loop writes, one at a
-// time.
-func (n *workerNode) serveNested(ctx context.Context) {
-	info, err := n.nested.Info(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			n.log.Warn("wings: cannot read the calls other jobs make", "err", err)
-		}
-		return
-	}
-	from := max(info.Oldest, 0)
-
-	for ctx.Err() == nil {
-		readCtx, cancel := context.WithTimeout(ctx, pollInterval)
-		recs, err := n.nested.ReadBlocking(readCtx, from, 64)
-		expired := readCtx.Err() != nil
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if !expired {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
-			}
-			continue
-		}
-		for _, r := range recs {
-			from = r.Offset + 1
-			go n.runNested(ctx, r.Record)
-		}
-	}
-}
-
-func (n *workerNode) runNested(ctx context.Context, job jobEnvelope) {
-	res := n.runOne(ctx, job)
-	// The batch loop's rule, kept: a worker whose machine is being taken back
-	// reports nothing, since the coordinator has moved the job and an error
-	// from here could arrive as its answer.
-	if n.leaving.Load() {
-		return
-	}
-	if _, err := n.out.Append(context.WithoutCancel(ctx), []resultEnvelope{res}); err != nil && ctx.Err() == nil {
-		n.log.Error("wings: could not deliver the result of a call", "job", job.ID, "err", err)
 	}
 }

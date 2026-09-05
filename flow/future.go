@@ -95,8 +95,17 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 
 	select {
 	case <-f.done:
-	case <-ctx.Done():
-		return zero, ctx.Err()
+	default:
+		// Not over yet: the thread waits, and is not running while it does.
+		resume := f.parent.park(ctx, WaitJoin)
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		}
+		if err := resume(ctx); err != nil {
+			return zero, err
+		}
 	}
 
 	// Interrupted rather than finished: the thread was cut short by the

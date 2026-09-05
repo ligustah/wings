@@ -10,6 +10,7 @@ type runOptions struct {
 	store    Store
 	executor Executor
 	placer   Placer
+	parker   Parker
 	host     ChannelHost
 
 	version      int

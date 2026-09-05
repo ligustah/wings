@@ -30,6 +30,7 @@ type runState struct {
 	store  Store
 	exec   Executor
 	placer Placer
+	parker Parker
 	opts   runOptions
 	// host carries channels to and from other runs; nil for a run that
 	// shares none. linkCtx bounds the links, and ends with the attempt.
@@ -48,6 +49,7 @@ func newRunState(name string, opts runOptions) *runState {
 		store:  opts.store,
 		exec:   opts.executor,
 		placer: opts.placer,
+		parker: opts.parker,
 		opts:   opts,
 		host:   opts.host,
 	}

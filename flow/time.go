@@ -83,7 +83,11 @@ func (c Context) Sleep(d time.Duration) error {
 	case remaining <= 0:
 		return nil
 	case remaining < shortSleep:
-		return wait(ctx, remaining)
+		resume := t.park(ctx, WaitSleep)
+		if err := wait(ctx, remaining); err != nil {
+			return err
+		}
+		return resume(ctx)
 	default:
 		return Suspend(until)
 	}

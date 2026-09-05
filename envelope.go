@@ -25,13 +25,9 @@ const (
 	// that queue only as slots free, and the message that matters most is
 	// about the job holding the slot.
 	controlStreamPrefix = "wings.control."
-	// nestedStreamPrefix is the queue of calls made BY jobs, one per worker.
-	// Apart from the job queue on purpose: see the worker's serveNested.
+	// nestedStreamPrefix is the queue of threads forked BY jobs, one per
+	// worker. Apart from the job queue on purpose: see nested.go.
 	nestedStreamPrefix = "wings.nested."
-
-	// consumerGroup is the offset key a worker commits its progress under. It
-	// need not be more specific: a worker consumes only its own job stream.
-	consumerGroup = "wings"
 )
 
 func jobStreamFor(workerID string) string     { return jobStreamPrefix + workerID }
@@ -90,7 +86,7 @@ type jobEnvelope struct {
 	// one of them stopped instead of starting over.
 	Priors []Recording `json:"priors,omitempty"`
 	// Nested says this job is a thread forked BY another job, and goes on
-	// the worker's nested queue rather than its job queue. See serveNested.
+	// the worker's nested queue rather than its job queue. See nested.go.
 	Nested bool `json:"nested,omitempty"`
 }
 
@@ -130,6 +126,12 @@ type beatEnvelope struct {
 	// the work's fault. Any beat implies it, so a lost one costs nothing.
 	Started    bool   `json:"started,omitempty"`
 	Checkpoint []byte `json:"checkpoint,omitempty"`
+	// Wait says a thread of the job has been waiting — on what — for long
+	// enough to be worth saying, and Woke that the job's last waiting thread
+	// is running again. A job that is waiting is silent for as long as the
+	// wait lasts, and is not counted towards its worker's load. See slots.go.
+	Wait string `json:"wait,omitempty"`
+	Woke bool   `json:"woke,omitempty"`
 	// Step is one newly completed flow.Context.Step, if this beat reports one. Sent one at
 	// a time rather than as a growing log, so the cost of a step does not climb
 	// with how many came before it; the coordinator does the accumulating.

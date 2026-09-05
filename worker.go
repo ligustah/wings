@@ -37,6 +37,9 @@ type workerNode struct {
 	timeout     time.Duration
 	log         *slog.Logger
 
+	// slots bounds how many threads run here at once. See slots.go.
+	slots *slots
+
 	client  *dsclient.Client
 	jobs    *dsclient.Stream[jobEnvelope]
 	out     *dsclient.Stream[resultEnvelope]
@@ -88,6 +91,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 		timeout:     timeout,
 		log:         log.With("worker", id),
 		client:      client,
+		slots:       newSlots(concurrency),
 	}
 	if err := n.declareStreams(ctx); err != nil {
 		return nil, err
@@ -203,24 +207,23 @@ func (n *workerNode) sendBeat(ctx context.Context, b beatEnvelope) error {
 	return nil
 }
 
-// run drains jobs until ctx is cancelled.
+// run serves the worker's two queues until ctx is cancelled or the machine
+// is being taken back.
 //
-// Batch is the worker's concurrency, so a worker takes exactly as much work as
-// it can start at once. A larger batch would commit more results per
-// transaction but hold every one of them back until the slowest in the batch
-// finished, which is the wrong trade when the coordinator is waiting on each.
+// Both queues are read continuously and every job runs on a goroutine of
+// its own, taking a running slot when it starts and giving it up while it
+// waits — see slots.go. A worker therefore takes as much work as the
+// coordinator sends it, which is bounded by what the coordinator counts as
+// running here, and a job never waits behind a batch that is waiting on it.
 func (n *workerNode) run(ctx context.Context) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	go n.tailControl(ctx)
-	go n.serveNested(ctx)
-	return n.client.Run(ctx, "wings-worker-"+n.id, dsclient.Processor[jobEnvelope, resultEnvelope]{
-		In:      n.jobs,
-		Out:     n.out,
-		Group:   consumerGroup,
-		Batch:   n.concurrency,
-		Process: n.process,
-	})
+	var wg sync.WaitGroup
+	wg.Go(func() { n.serve(ctx, n.jobs, false) })
+	wg.Go(func() { n.serve(ctx, n.nested, true) })
+	wg.Wait()
+	return nil
 }
 
 // tailControl follows the coordinator's word about jobs already here, and
@@ -380,47 +383,66 @@ func (n *workerNode) stopAttempt(c controlEnvelope) {
 	cancel(fmt.Errorf("wings: the coordinator stopped this job: %s", why))
 }
 
-// process runs a batch, up to concurrency at a time.
+// serve runs the jobs on one queue as they arrive, each on a goroutine of
+// its own. Results go on the result stream one at a time.
 //
-// It never returns an error. A work function that fails or panics produces a
-// result carrying that error, because the alternative — surfacing it here —
-// aborts the transaction and redelivers the whole batch, and a deterministic
-// failure would then do that forever. Transport and encoding trouble is the
-// only thing that legitimately fails a batch, and by this point neither is
-// still possible.
-func (n *workerNode) process(ctx context.Context, batch []jobEnvelope) ([]resultEnvelope, error) {
-	out := make([]resultEnvelope, len(batch))
-	sem := make(chan struct{}, n.concurrency)
-	var wg sync.WaitGroup
-	for i, job := range batch {
-		wg.Go(func() {
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				out[i] = resultEnvelope{ID: job.ID, Error: ctx.Err().Error()}
+// The loop ends when the machine is being taken back. The coordinator was
+// told and is moving these jobs, and a result from here — an error saying an
+// attempt was cut short — could reach it BEFORE the move and be delivered as
+// the job's answer; so nothing is reported after that, and nothing more is
+// taken.
+func (n *workerNode) serve(ctx context.Context, queue *dsclient.Stream[jobEnvelope], nested bool) {
+	info, err := queue.Info(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			n.log.Warn("wings: cannot read the worker's queue", "err", err)
+		}
+		return
+	}
+	from := max(info.Oldest, 0)
+
+	for ctx.Err() == nil && !n.leaving.Load() {
+		readCtx, cancel := context.WithTimeout(ctx, pollInterval)
+		recs, err := queue.ReadBlocking(readCtx, from, 64)
+		expired := readCtx.Err() != nil
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
 				return
 			}
-			defer func() { <-sem }()
-			out[i] = n.runOne(ctx, job)
-		})
+			if !expired {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			continue
+		}
+		for _, r := range recs {
+			from = r.Offset + 1
+			go n.runJob(ctx, r.Record)
+		}
 	}
-	wg.Wait()
-	// The one other thing that fails a batch: the machine is being taken
-	// back. The coordinator was told and is moving these jobs, and a result
-	// from here — an error saying the attempt was cut short — could reach it
-	// BEFORE the move and be delivered as the job's answer. Failing the batch
-	// aborts the transaction, so nothing from this batch is ever committed,
-	// and the loop ends: this worker takes no more.
-	if n.leaving.Load() {
-		return nil, errLeaving
-	}
-	return out, nil
 }
 
-// errLeaving ends a worker's loop once its machine is being taken back.
-var errLeaving = errors.New("wings: this worker's machine is being taken back")
+// runJob runs one job in a slot and reports its result.
+func (n *workerNode) runJob(ctx context.Context, job jobEnvelope) {
+	slot := &jobSlot{n: n, job: job}
+	if err := slot.take(ctx, false); err != nil {
+		return
+	}
+	res := n.runOne(ctx, job, slot)
+	slot.give()
+	if n.leaving.Load() {
+		return
+	}
+	if _, err := n.out.Append(context.WithoutCancel(ctx), []resultEnvelope{res}); err != nil && ctx.Err() == nil {
+		n.log.Error("wings: could not deliver a result", "job", job.ID, "err", err)
+	}
+}
 
-func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnvelope) {
+func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot) (res resultEnvelope) {
 	res.ID = job.ID
 	res.Attempt = job.Attempt
 
@@ -465,7 +487,8 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	ctx = withJob(ctx, state)
 	// A thread this job forks is the cluster's to place, like any other: the
 	// fork is read out of this job's history by the coordinator and its
-	// result comes back on the control stream. See nested.go.
+	// result comes back on the control stream. See nested.go. And a thread
+	// that waits gives the job's slot up while it does. See slots.go.
 	placer := nestedPlacer{n: n, job: state}
 	// Now, not when the job was appended: the coordinator's clocks on this job
 	// run from here, so time it spent waiting behind others on this worker is
@@ -503,7 +526,8 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// up for the job.
 	payload, err := flow.RunThread(ctx, runOf(job), threadOf(job), job.Func, job.Payload,
 		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
-		flow.WithPlacer(placer), flow.WithChannelHost(nodeChannels{n: n, job: state}), flow.Once())
+		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
+		flow.Once())
 	// Whatever the attempt wrote is committed before its answer leaves: a
 	// result whose recordings could still be lost would be a handle to
 	// nothing. A commit that fails is the attempt failing.
