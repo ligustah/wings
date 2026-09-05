@@ -18,15 +18,33 @@ const (
 	// that consumed it — and a heartbeat is neither one per job nor something
 	// worth a transaction.
 	beatStreamPrefix = "wings.beats."
+	// controlStreamPrefix is the coordinator's word to a worker about a job
+	// already on it. The jobs stream cannot carry it: a worker takes jobs off
+	// that queue only as slots free, and the message that matters most is
+	// about the job holding the slot.
+	controlStreamPrefix = "wings.control."
 
 	// consumerGroup is the offset key a worker commits its progress under. It
 	// need not be more specific: a worker consumes only its own job stream.
 	consumerGroup = "wings"
 )
 
-func jobStreamFor(workerID string) string    { return jobStreamPrefix + workerID }
-func resultStreamFor(workerID string) string { return resultStreamPrefix + workerID }
-func beatStreamFor(workerID string) string   { return beatStreamPrefix + workerID }
+func jobStreamFor(workerID string) string     { return jobStreamPrefix + workerID }
+func resultStreamFor(workerID string) string  { return resultStreamPrefix + workerID }
+func beatStreamFor(workerID string) string    { return beatStreamPrefix + workerID }
+func controlStreamFor(workerID string) string { return controlStreamPrefix + workerID }
+
+// controlEnvelope tells a worker to stop one attempt of one job.
+//
+// Sent when nobody wants the answer any more: the last caller gave up, the job
+// was moved elsewhere, or the coordinator failed it. The worker was already
+// credited back for the job, and without this it went on running it, so the
+// next job sent there waited behind work that had no reader.
+type controlEnvelope struct {
+	Job     string `json:"job"`
+	Attempt int    `json:"attempt,omitempty"`
+	Why     string `json:"why,omitempty"`
+}
 
 // jobEnvelope is one unit of work on the wire.
 //

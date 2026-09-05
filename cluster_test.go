@@ -321,6 +321,48 @@ func TestAWorkerThatIsGoneLeavesNothingBehind(t *testing.T) {
 	}
 }
 
+// THE POINT: a caller that gave up stopped waiting and the coordinator
+// credited the worker back — but the worker kept running the job, so the next
+// job sent to that worker waited behind work nobody wanted, and a scaler that
+// saw an idle worker could retire it mid-job. Giving up now stops the job
+// where it runs.
+func TestGivingUpOnAJobStopsItOnTheWorker(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
+
+	ctx, giveUp := context.WithCancel(c.Bind(t.Context()))
+	defer giveUp()
+	abandoned := make(chan error, 1)
+	go func() {
+		_, err := slow(ctx, 30*time.Second)
+		abandoned <- err
+	}()
+	waitFor(t, "the job to start on the worker", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, p := range c.pending {
+			return !p.started.IsZero()
+		}
+		return false
+	})
+	giveUp()
+	if err := <-abandoned; err == nil {
+		t.Fatal("the abandoned call returned no error")
+	}
+
+	// The one slot on the one worker is free again, or is about to be.
+	began := time.Now()
+	got, err := double(c.Bind(t.Context()), 21)
+	if err != nil {
+		t.Fatalf("the job after it: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("got %d, want 42", got)
+	}
+	if took := time.Since(began); took > 10*time.Second {
+		t.Fatalf("the next job waited %s behind a job nobody wanted", took)
+	}
+}
+
 func TestMapEmptyInput(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 

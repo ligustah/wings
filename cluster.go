@@ -112,6 +112,9 @@ type workerConn struct {
 	client  *dsclient.Client
 	jobs    *dsclient.Stream[jobEnvelope]
 	results *dsclient.Stream[resultEnvelope]
+	// control is the coordinator's word to this worker about a job already
+	// on it: stop this one, nobody wants the answer.
+	control *dsclient.Stream[controlEnvelope]
 
 	// beats is progress reported by jobs still running here. Read on its own
 	// goroutine rather than with results, because it says something about a
@@ -559,6 +562,9 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	if w.beats, err = client.OpenStream[beatEnvelope](beatStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", beatStreamFor(id), id, err)
 	}
+	if w.control, err = client.OpenStream[controlEnvelope](controlStreamFor(id)); err != nil {
+		return nil, fmt.Errorf("wings: open %s on worker %s: %w", controlStreamFor(id), id, err)
+	}
 	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
 		return nil, err
 	}
@@ -952,18 +958,18 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	// At-least-once has no natural end, and a job that kills whatever worker it
 	// lands on would be moved forever while the caller waited on a cluster that
 	// merely looked busy.
+	from, left := p.worker, p.job.Attempt
 	if p.job.Attempt+1 >= c.cfg.attempts() {
-		from := p.worker
 		if from != nil {
 			c.release(from)
 			p.worker = nil
 		}
 		c.mu.Unlock()
+		c.stopOn(from, p.job.ID, left, why)
 		c.failPending(p, fmt.Errorf("wings: %s gave up after %d attempts; last: %s",
 			p.job.Func, c.cfg.attempts(), why))
 		return
 	}
-	from := p.worker
 	w := c.pickBut(from)
 	if w == nil {
 		if from != nil {
@@ -971,6 +977,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 			p.worker = nil
 		}
 		c.mu.Unlock()
+		c.stopOn(from, p.job.ID, left, why)
 		c.failPending(p, fmt.Errorf("wings: %s and no live worker remains", why))
 		return
 	}
@@ -1008,6 +1015,12 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		// The attempt being left behind may well still be running — a worker
+		// that was merely slow finishes anyway — and its answer is not the
+		// answer. Stop it, so the slot it holds is not lost to an attempt
+		// nobody will read. After the copy of what it wrote is level, since
+		// stopping it first would cut that short.
+		defer c.stopOn(from, job.ID, left, why)
 		// What the abandoned attempts recorded goes with the job. Their handles
 		// never left — a handle only ever leaves in a result, and an attempt
 		// that was moved produced none — so this is the only way the work they
@@ -1150,15 +1163,43 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	if ok && cur == p {
 		c.forget(p)
 	}
+	w, attempt := p.worker, p.job.Attempt
 	c.mu.Unlock()
 	if !ok || cur != p {
 		return
 	}
+	// A job failed for taking too long is usually still taking it. The worker
+	// enforces the same bound itself, but only the bound it knows. Off this
+	// goroutine, which is the watchdog's: every caller of this is counted in
+	// the group, so the count cannot be zero here.
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.stopOn(w, p.job.ID, attempt, err.Error())
+	}()
 	c.journal.record(journalEntry{
 		Kind: journalFailed, Job: p.job.ID, Func: p.job.Func,
 		Worker: workerID(p.worker), Attempt: p.job.Attempt, Err: err.Error(),
 	}.from(p.origin))
 	p.settle(resultEnvelope{ID: p.job.ID, Error: err.Error()})
+}
+
+// stopOn tells a worker to stop an attempt nobody wants the answer to.
+//
+// Best effort, and cheap to be wrong about: a worker that is gone, or one too
+// old to read the control stream, simply runs the attempt to its end as it
+// always did, and the result is dropped as it always was. What this buys when
+// it works is the slot — a worker credited back for a job it is still running
+// is a worker the picker overloads and the scaler may retire mid-job.
+func (c *Cluster) stopOn(w *workerConn, job string, attempt int, why string) {
+	if w == nil || w.control == nil || w.dead.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 10*time.Second)
+	defer cancel()
+	if _, err := w.control.Append(ctx, []controlEnvelope{{Job: job, Attempt: attempt, Why: why}}); err != nil {
+		c.log.Debug("wings: could not tell a worker to stop a job", "worker", w.id, "job", job, "err", err)
+	}
 }
 
 // pick chooses the available worker with the least work outstanding.
@@ -1283,6 +1324,18 @@ func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, err
 			if cur, ok := c.pending[p.job.ID]; ok && cur == p {
 				c.forget(p)
 				c.release(p.worker)
+				// The worker was just credited back for a job it is still
+				// running. Tell it to stop, off this goroutine — the caller is
+				// leaving — and only if Stop is not already waiting on the
+				// group, which closed says under this same lock.
+				if w := p.worker; w != nil && !c.closed {
+					job, attempt := p.job.ID, p.job.Attempt
+					c.wg.Add(1)
+					go func() {
+						defer c.wg.Done()
+						c.stopOn(w, job, attempt, "its caller gave up")
+					}()
+				}
 			}
 		}
 		c.mu.Unlock()

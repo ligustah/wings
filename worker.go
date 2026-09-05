@@ -34,10 +34,22 @@ type workerNode struct {
 	timeout     time.Duration
 	log         *slog.Logger
 
-	client *dsclient.Client
-	jobs   *dsclient.Stream[jobEnvelope]
-	out    *dsclient.Stream[resultEnvelope]
-	beats  *dsclient.Stream[beatEnvelope]
+	client  *dsclient.Client
+	jobs    *dsclient.Stream[jobEnvelope]
+	out     *dsclient.Stream[resultEnvelope]
+	beats   *dsclient.Stream[beatEnvelope]
+	control *dsclient.Stream[controlEnvelope]
+
+	// running is how to stop each attempt in flight here, keyed by job and
+	// attempt. A cancellation names both, so one for an attempt already moved
+	// away cannot stop the one that replaced it on this same worker.
+	runMu   sync.Mutex
+	running map[string]context.CancelCauseFunc
+	// stopped names attempts the coordinator stopped BEFORE they started here:
+	// a job moved for waiting too long on this queue is still on this queue,
+	// and would otherwise run in full when its turn came. Cleared when the
+	// attempt is taken off the queue and refused on the spot.
+	stopped map[string]string
 
 	// open names the streams this worker has already stood up for a job, so one
 	// attempt opening the same name twice is refused rather than silently
@@ -73,7 +85,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 // already there. StreamExists is node-local, which is the right question for
 // both an embedded engine and a single-node broker.
 func (n *workerNode) declareStreams(ctx context.Context) error {
-	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id)} {
+	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id), controlStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
 		if err != nil {
 			return fmt.Errorf("wings: check stream %s: %w", name, err)
@@ -94,6 +106,9 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 	}
 	if n.beats, err = n.client.OpenStream[beatEnvelope](beatStreamFor(n.id)); err != nil {
 		return fmt.Errorf("wings: open %s: %w", beatStreamFor(n.id), err)
+	}
+	if n.control, err = n.client.OpenStream[controlEnvelope](controlStreamFor(n.id)); err != nil {
+		return fmt.Errorf("wings: open %s: %w", controlStreamFor(n.id), err)
 	}
 	return nil
 }
@@ -150,6 +165,9 @@ func (n *workerNode) sendBeat(ctx context.Context, b beatEnvelope) error {
 // transaction but hold every one of them back until the slowest in the batch
 // finished, which is the wrong trade when the coordinator is waiting on each.
 func (n *workerNode) run(ctx context.Context) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	go n.tailControl(ctx)
 	return n.client.Run(ctx, "wings-worker-"+n.id, dsclient.Processor[jobEnvelope, resultEnvelope]{
 		In:      n.jobs,
 		Out:     n.out,
@@ -157,6 +175,100 @@ func (n *workerNode) run(ctx context.Context) error {
 		Batch:   n.concurrency,
 		Process: n.process,
 	})
+}
+
+// tailControl follows the coordinator's word about jobs already here, and
+// stops the attempts it names.
+//
+// Read from the END of the stream: whatever a previous coordinator said is
+// about attempts that are long gone, and a cancellation for an attempt not
+// running here is nothing to do either way.
+func (n *workerNode) tailControl(ctx context.Context) {
+	info, err := n.control.Info(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			n.log.Warn("wings: cannot follow the coordinator's cancellations", "err", err)
+		}
+		return
+	}
+	from := info.Newest + 1
+
+	for ctx.Err() == nil {
+		readCtx, cancel := context.WithTimeout(ctx, pollInterval)
+		recs, err := n.control.ReadBlocking(readCtx, from, 64)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			continue
+		}
+		for _, r := range recs {
+			from = r.Offset + 1
+			n.stopAttempt(r.Record)
+		}
+	}
+}
+
+// attemptKey names one attempt of one job, for running.
+func attemptKey(job string, attempt int) string { return job + "/" + strconv.Itoa(attempt) }
+
+// startAttempt registers an attempt as running and returns the context to run
+// it under, which a cancellation from the coordinator ends.
+func (n *workerNode) startAttempt(ctx context.Context, job jobEnvelope) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	key := attemptKey(job.ID, job.Attempt)
+	n.runMu.Lock()
+	if n.running == nil {
+		n.running = map[string]context.CancelCauseFunc{}
+	}
+	n.running[key] = cancel
+	why, early := n.stopped[key]
+	delete(n.stopped, key)
+	n.runMu.Unlock()
+	if early {
+		n.log.Info("wings: not starting a job the coordinator already stopped", "job", job.ID, "attempt", job.Attempt, "why", why)
+		cancel(fmt.Errorf("wings: the coordinator stopped this job: %s", why))
+	}
+	return ctx, func() {
+		n.runMu.Lock()
+		delete(n.running, key)
+		n.runMu.Unlock()
+		cancel(nil)
+	}
+}
+
+// stopAttempt ends an attempt the coordinator no longer wants, if it is
+// running here.
+func (n *workerNode) stopAttempt(c controlEnvelope) {
+	why := c.Why
+	if why == "" {
+		why = "nobody is waiting for it"
+	}
+	key := attemptKey(c.Job, c.Attempt)
+	n.runMu.Lock()
+	cancel, ok := n.running[key]
+	if !ok {
+		// Not running yet, or already finished. Either way the answer is the
+		// same: if it turns up on the queue later, it is not run.
+		if n.stopped == nil {
+			n.stopped = map[string]string{}
+		}
+		n.stopped[key] = why
+	}
+	n.runMu.Unlock()
+	if !ok {
+		return
+	}
+	n.log.Info("wings: stopping a job the coordinator no longer wants", "job", c.Job, "attempt", c.Attempt, "why", why)
+	cancel(fmt.Errorf("wings: the coordinator stopped this job: %s", why))
 }
 
 // process runs a batch, up to concurrency at a time.
@@ -214,6 +326,11 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	// Stoppable from the coordinator's side. A job whose last caller gave up,
+	// or that was moved elsewhere, is one nobody wants the answer to, and the
+	// slot it holds is worth more than the answer.
+	ctx, finish := n.startAttempt(ctx, job)
+	defer finish()
 
 	// Progress reporting, and whatever the last attempt got to. Installed for
 	// every job rather than only for functions that declare a heartbeat
@@ -258,6 +375,12 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		// shut down is not a slow job.
 		if timeout > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
 			res.Error = fmt.Sprintf("wings: %s exceeded its %s timeout", job.Func, timeout)
+		}
+		// Likewise a job the coordinator stopped: say so, rather than
+		// "context canceled". Nobody reads this result, but the worker's log
+		// does.
+		if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.Canceled) && cause != context.Canceled {
+			res.Error = cause.Error()
 		}
 		return res
 	}
