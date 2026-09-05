@@ -481,6 +481,16 @@ not moved for silence, however long the thread takes; its total timeout still
 runs. A thread of run code — `ctx.Spawn` — has no function a worker could be
 handed, and runs where its parent is.
 
+A wait that lasts is **unloaded**. A thread parked for a minute — on a join, a
+receive, a send — has its attempt ended where it stands, history committed,
+and the job handed back to the coordinator with a note of what it was waiting
+for; a sleep past `flow.ShortSleep` is handed back at once, with the wake-up
+time. The coordinator keeps the job off every worker until the condition
+holds — the deadline passes, the thread it was joining finishes, something
+arrives on the channel — then dispatches it afresh to whichever worker is
+least loaded, history first, and it replays to the wait and finds what it was
+waiting for. A worker keeps nothing of a thread that is waiting for tomorrow.
+
 ### Channels across machines
 
 A `flow.Channel` **travels in a call's input** like any other value. The

@@ -311,12 +311,19 @@ func (c *Cluster) keepAnswerLocked(p *pendingJob, key string, res resultEnvelope
 // that is a thread forked by another job has its result kept against that
 // job here, at the moment it stops being outstanding, so a retry of the
 // parent that asks in the same instant finds the answer rather than a gap.
-func (c *Cluster) noteSettledLocked(child *pendingJob, res resultEnvelope) {
+// It returns the parent when the parent is off every worker waiting for a
+// thread to finish, which this may be; the caller wakes it once the lock is
+// dropped.
+func (c *Cluster) noteSettledLocked(child *pendingJob, res resultEnvelope) *pendingJob {
 	parent := c.parentJobLocked(child.origin)
 	if parent == nil {
-		return
+		return nil
 	}
 	c.keepAnswerLocked(parent, callKey(child.origin.Thread, child.origin.Step), res)
+	if parent.yield != nil && parent.yield.Wait == flow.WaitJoin {
+		return parent
+	}
+	return nil
 }
 
 // answerOn sends the outcome of a call to the worker running the attempt

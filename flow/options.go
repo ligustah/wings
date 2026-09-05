@@ -78,7 +78,9 @@ func MaxAttempts(n int) RunOption { return func(o *runOptions) { o.maxAttempts =
 // For a process that runs a thread on somebody else's behalf — an executor's
 // worker, say — where whether and where to try again is decided elsewhere,
 // and the error is that decision's input rather than this run's verdict.
-// A continuity or permanent failure is still reported as such. The threads
+// A continuity or permanent failure is still reported as such, and so is a
+// suspension: a thread that sleeps past [ShortSleep] returns an error
+// [IsSuspended] recognises, saying when it is to be run again. The threads
 // the body forks in-process are not that process's to hand back, and keep
 // their retries.
 func Once() RunOption { return func(o *runOptions) { o.once = true } }

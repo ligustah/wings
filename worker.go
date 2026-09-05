@@ -535,6 +535,12 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		err = cerr
 	}
 	if err != nil {
+		// Not an answer but a yield: the thread is to be run again later,
+		// somewhere, and says when. See yield.go.
+		if y := yieldOf(ctx, err); y != nil {
+			res.Yield = y
+			return res
+		}
 		res.Error = err.Error()
 		// Say what actually happened. A work function that gives up on its
 		// context reports "context deadline exceeded", which names neither the

@@ -28,6 +28,7 @@ const (
 	journalAttached     = "attached"    // a workflow retry rejoined a job already running
 	journalRedispatch   = "redispatch"  // a lost worker's job was sent somewhere else
 	journalHeld         = "held"        // no worker was live; the job waits for one
+	journalYielded      = "yielded"     // the job let its worker go, until something happens
 	journalCompleted    = "completed"   // a result came back
 	journalFailed       = "failed"      // the coordinator gave up on the job
 	journalWorkerUp     = "worker-up"   // a worker entered service

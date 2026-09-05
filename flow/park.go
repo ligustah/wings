@@ -7,6 +7,9 @@ type Wait struct {
 	Run, Thread string
 	// On is what the thread waits on: one of the Wait constants.
 	On string
+	// Channel names the channel, for a wait on one: the run's name and the
+	// channel's, as [ChannelHost] knows it.
+	Channel string
 }
 
 // What a thread can wait on.
@@ -41,10 +44,15 @@ func WithParker(p Parker) RunOption { return func(o *runOptions) { o.parker = p 
 // park tells the run's parker this thread is about to wait, and returns what
 // to call when it is done. Never nil.
 func (t *threadState) park(ctx context.Context, on string) func(ctx context.Context) error {
+	return t.parkOn(ctx, on, "")
+}
+
+// parkOn is park for a wait on a channel, which names it.
+func (t *threadState) parkOn(ctx context.Context, on, channel string) func(ctx context.Context) error {
 	if t.run.parker == nil {
 		return noResume
 	}
-	resume := t.run.parker.Park(ctx, Wait{Run: t.run.name, Thread: t.id, On: on})
+	resume := t.run.parker.Park(ctx, Wait{Run: t.run.name, Thread: t.id, On: on, Channel: channel})
 	if resume == nil {
 		return noResume
 	}

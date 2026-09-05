@@ -156,7 +156,8 @@ func (s *jobSlot) give() {
 
 // Park is the [flow.Parker]: the thread gives the job's slot up, and takes
 // one back — ahead of new work — when its wait is over. A wait that lasts
-// is reported to the coordinator, and its end too.
+// is reported to the coordinator, and its end too; one that lasts longer
+// still has the attempt unloaded. See yield.go.
 func (s *jobSlot) Park(ctx context.Context, w flow.Wait) func(context.Context) error {
 	s.give()
 	reported := make(chan struct{})
@@ -170,7 +171,14 @@ func (s *jobSlot) Park(ctx context.Context, w flow.Wait) func(context.Context) e
 		}
 		close(reported)
 	})
+	var unload *time.Timer
+	if unloadable(w) {
+		unload = time.AfterFunc(unloadAfter, func() { s.n.unload(s.job, w) })
+	}
 	return func(ctx context.Context) error {
+		if unload != nil {
+			unload.Stop()
+		}
 		if !timer.Stop() {
 			<-reported
 			s.mu.Lock()

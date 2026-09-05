@@ -269,6 +269,10 @@ type pendingJob struct {
 	// blocked says the job's worker reported a thread of it waiting, and
 	// has not yet reported it woken. Guarded by Cluster.mu.
 	blocked bool
+	// yield is set while the job is off every worker by its own choice,
+	// waiting for what would bring it back. See yield.go. Guarded by
+	// Cluster.mu.
+	yield *yieldEnvelope
 	// since is when the current attempt was dispatched, started when the
 	// worker reported beginning it, and beat when it last reported progress.
 	//
@@ -582,7 +586,9 @@ func (c *Cluster) placeHeld() {
 	var held []*pendingJob
 	c.mu.Lock()
 	for _, p := range c.pending {
-		if p.worker == nil {
+		// Not one that is off every worker by choice: that one is waiting
+		// for something other than a worker.
+		if p.worker == nil && p.yield == nil {
 			held = append(held, p)
 		}
 	}
@@ -923,12 +929,25 @@ func (c *Cluster) deliver(res resultEnvelope) {
 			"job", res.ID, "attempt", res.Attempt, "current", p.job.Attempt)
 		return
 	}
+	if ok && res.Yield != nil {
+		c.yieldLocked(p, res.Yield)
+		c.mu.Unlock()
+		c.journal.record(journalEntry{
+			Kind: journalYielded, Job: p.job.ID, Func: p.job.Func,
+			Attempt: p.job.Attempt, Err: res.Yield.describe(),
+		}.from(p.origin))
+		return
+	}
+	var wake *pendingJob
 	if ok {
-		c.noteSettledLocked(p, res)
+		wake = c.noteSettledLocked(p, res)
 		c.forget(p)
 		c.release(p.worker)
 	}
 	c.mu.Unlock()
+	if wake != nil {
+		c.wake(wake, "the thread it was waiting for finished")
+	}
 	if !ok {
 		return
 	}
@@ -1273,10 +1292,17 @@ func (c *Cluster) sweep(now time.Time) {
 		stuck []*pendingJob
 		whys  []string
 		slow  []*pendingJob
+		due   []*pendingJob
 	)
 
 	c.mu.Lock()
 	for _, p := range c.pending {
+		if p.yield != nil {
+			if !p.yield.Until.IsZero() && !now.Before(p.yield.Until) {
+				due = append(due, p)
+			}
+			continue
+		}
 		isStuck, isSlow := p.overdue(now)
 		switch {
 		case isSlow:
@@ -1309,19 +1335,26 @@ func (c *Cluster) sweep(now time.Time) {
 			"fn", p.job.Func, "worker", workerID(p.worker), "why", whys[i])
 		c.moveJob(p, whys[i])
 	}
+	for _, p := range due {
+		c.wake(p, "its sleep is over")
+	}
 }
 
 func (c *Cluster) failPending(p *pendingJob, err error) {
 	c.mu.Lock()
 	cur, ok := c.pending[p.job.ID]
+	var wake *pendingJob
 	if ok && cur == p {
-		c.noteSettledLocked(p, resultEnvelope{ID: p.job.ID, Error: err.Error()})
+		wake = c.noteSettledLocked(p, resultEnvelope{ID: p.job.ID, Error: err.Error()})
 		c.forget(p)
 	}
 	w, attempt := p.worker, p.job.Attempt
 	c.mu.Unlock()
 	if !ok || cur != p {
 		return
+	}
+	if wake != nil {
+		c.wake(wake, "the thread it was waiting for failed")
 	}
 	// A job failed for taking too long is usually still taking it. The worker
 	// enforces the same bound itself, but only the bound it knows. Off this

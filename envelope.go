@@ -1,6 +1,10 @@
 package wings
 
-import "github.com/ligustah/wings/flow"
+import (
+	"time"
+
+	"github.com/ligustah/wings/flow"
+)
 
 // Stream names. Each worker gets its own pair: the coordinator writes jobs to a
 // NAMED worker and reads that worker's results. Workers do not read each other's
@@ -154,4 +158,18 @@ type resultEnvelope struct {
 	Attempt int    `json:"attempt,omitempty"`
 	Payload []byte `json:"payload,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// Yield says the attempt ended without an answer, on purpose, and when
+	// the job is to be run again. The worker has let it go; the coordinator
+	// dispatches it afresh when the condition holds. See yield.go.
+	Yield *yieldEnvelope `json:"yield,omitempty"`
+}
+
+// yieldEnvelope is why a job's attempt gave up its place, and what would
+// bring it back: a deadline, for a thread that slept past flow.ShortSleep;
+// or a wait — on a thread it forked, or on a channel — that lasted long
+// enough for the worker to unload it.
+type yieldEnvelope struct {
+	Until   time.Time `json:"until,omitempty"`
+	Wait    string    `json:"wait,omitempty"`
+	Channel string    `json:"channel,omitempty"`
 }

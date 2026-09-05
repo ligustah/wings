@@ -187,6 +187,11 @@ func functionBody(fn string, input []byte) func(ctx Context) ([]byte, error) {
 	return func(ctx Context) ([]byte, error) {
 		out, err := Execute(ctx, fn, input)
 		if err != nil {
+			// A suspension is not the function's answer either: it says
+			// when to ask again.
+			if ok, _ := IsSuspended(err); ok {
+				return nil, err
+			}
 			return nil, &callError{name: fn, err: err}
 		}
 		return out, nil
@@ -289,15 +294,22 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 			return nil, runErr
 
 		case protos.WorkflowStatus_WORKFLOW_STATUS_SUSPENDED:
+			if r.opts.once && r.run == nil {
+				// Somebody else decides when to try again, and the
+				// suspension says when; see IsSuspended.
+				return nil, runErr
+			}
 			_, until := IsSuspended(runErr)
 			if err := wait(ctx, time.Until(until)); err != nil {
 				return nil, err
 			}
 
 		default: // backoff
-			if r.opts.once && r.id == mainThread {
+			if r.opts.once && r.run == nil {
 				// Somebody else decides about retries, and wants the error as
-				// the body gave it.
+				// the body gave it. Only for the thread this process was
+				// asked to run: the threads it forks in-process are its
+				// own to retry.
 				return nil, runErr
 			}
 			if attempt >= uint64(r.opts.maxAttempts) {

@@ -265,6 +265,9 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 					return
 				}
 			}
+			if len(recs) > 0 {
+				c.wakeOnChannel(id)
+			}
 		}
 	})
 }

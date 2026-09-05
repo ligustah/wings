@@ -10,15 +10,17 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// shortSleep is the longest a run will simply wait in place. Beyond it, a
-// sleep suspends the run instead.
+// ShortSleep is the longest a thread will simply wait in place. Beyond it, a
+// sleep suspends the thread instead.
 //
 // The threshold exists because the two are not the same trade. Waiting in place
-// keeps the run's state in memory and its goroutine alive, which is cheap for a
-// second and absurd for a day; suspending writes the wake-up time down and ends
-// the attempt, which costs a replay when it resumes. A minute is where the
-// replay stops being the expensive half.
-const shortSleep = time.Minute
+// keeps the thread's state in memory and its goroutine alive, which is cheap
+// for a second and absurd for a day; suspending writes the wake-up time down
+// and ends the attempt, which costs a replay when it resumes. A minute is
+// where the replay stops being the expensive half. A variable so a process
+// that would rather be told about every sleep — a worker whose coordinator
+// schedules them — can lower it.
+var ShortSleep = time.Minute
 
 // Now returns the current time, recorded so that a replay sees the same instant.
 //
@@ -82,7 +84,7 @@ func (c Context) Sleep(d time.Duration) error {
 	switch {
 	case remaining <= 0:
 		return nil
-	case remaining < shortSleep:
+	case remaining < ShortSleep:
 		resume := t.park(ctx, WaitSleep)
 		if err := wait(ctx, remaining); err != nil {
 			return err

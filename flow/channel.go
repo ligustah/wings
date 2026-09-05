@@ -79,6 +79,16 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 // created it and how many it had created before. Exported for diagnostics.
 func (c *Channel[T]) Name() string { return c.name }
 
+// sharedID is the channel's name to other runs: the id it came with, for a
+// handle from another run, and otherwise the run's name and its own. Call
+// after bind, which is what sets c.run.
+func (c *Channel[T]) sharedID() string {
+	if c.id != "" {
+		return c.id
+	}
+	return c.run.channelID(c.name)
+}
+
 // channelHandle is how a channel appears in a call's input or output.
 type channelHandle struct {
 	Channel string `json:"channel"`
@@ -161,7 +171,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		return t.err()
 	}
 
-	if err := cs.awaitTaken(ctx, t, item); err != nil {
+	if err := cs.awaitTaken(ctx, t, c.sharedID(), item); err != nil {
 		return err
 	}
 	t.record(&protos.ChannelSendEvent{
@@ -214,7 +224,7 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return v, true, t.err()
 	}
 
-	item, err := cs.awaitAny(ctx, t)
+	item, err := cs.awaitAny(ctx, t, c.sharedID())
 	if err != nil {
 		return zero, false, err
 	}
@@ -453,7 +463,7 @@ func (cs *chanState) shut() {
 
 // awaitTaken blocks until a sent item has been received, or returns at once if
 // the channel had room for it. The thread is parked while it waits.
-func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, item *chanItem) error {
+func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, item *chanItem) error {
 	parked := false
 	resume := noResume
 	for {
@@ -466,7 +476,7 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, item *chanI
 		cs.mu.Unlock()
 
 		if !parked {
-			parked, resume = true, t.park(ctx, WaitSend)
+			parked, resume = true, t.parkOn(ctx, WaitSend, id)
 		}
 		select {
 		case <-wait:
@@ -478,7 +488,7 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, item *chanI
 
 // awaitAny blocks until something can be taken, and returns nil when the
 // channel is closed and drained. The thread is parked while it waits.
-func (cs *chanState) awaitAny(ctx context.Context, t *threadState) (*chanItem, error) {
+func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string) (*chanItem, error) {
 	parked := false
 	resume := noResume
 	for {
@@ -499,7 +509,7 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState) (*chanItem, e
 		cs.mu.Unlock()
 
 		if !parked {
-			parked, resume = true, t.park(ctx, WaitRecv)
+			parked, resume = true, t.parkOn(ctx, WaitRecv, id)
 		}
 		select {
 		case <-wait:

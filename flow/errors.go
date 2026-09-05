@@ -50,10 +50,12 @@ func (p *permanentError) Unwrap() error { return p.err }
 // difference between a run and a long function call, and it is what lets
 // a run that waits for tomorrow keep nothing alive today.
 //
-// What it does NOT do is return from [Run]. Run waits in place
+// What it does NOT do, by default, is return from [Run]. Run waits in place
 // until t and starts the next attempt itself, so the caller's goroutine is
-// held for the duration and the process has to be running when t arrives. A
-// scheduler that wakes runs on their own is not here yet.
+// held for the duration and the process has to be running when t arrives.
+// Under [Once] it does return, as an error [IsSuspended] recognises: that is
+// for a process running the thread on a scheduler's behalf, which wants to
+// let the thread go and be told when to run it again.
 func Suspend(until time.Time) error { return &suspendError{Until: until} }
 
 // IsSuspended reports whether err is a suspension, and until when.
