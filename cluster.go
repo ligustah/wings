@@ -1370,10 +1370,10 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		// would make the ordinary case pay for the special one.
 		origin: flow.OriginFrom(ctx),
 	}
-	// A call made by a job is a run named for that job. Where it goes on the
-	// worker follows from what it is, not from a parameter.
-	job.Nested = isJobRun(p.origin.Run)
-	p.job = job
+	// The job is the thread the origin names, and the worker runs it as
+	// that. Where it goes on the worker follows from what it is, not from a
+	// parameter: a thread whose parent is itself a job on a worker is nested.
+	job.Run, job.Thread = p.origin.Run, p.origin.Thread
 
 	key := p.origin.Key()
 
@@ -1382,6 +1382,8 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		c.mu.Unlock()
 		return nil, errors.New("wings: cluster is stopped")
 	}
+	job.Nested = c.parentJobLocked(p.origin) != nil
+	p.job = job
 	// A workflow attempt that replays a call its predecessor had not finished
 	// rejoins that job instead of dispatching a second one. Two copies of an
 	// hour of work would be a waste on their own; worse, the copy starts from

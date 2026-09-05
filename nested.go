@@ -29,24 +29,78 @@ import (
 // this: it runs on the worker, on the calling thread, recorded and replayed
 // like any call.
 //
-// The origin is what makes a move safe. The run is named for the JOB, not
-// the attempt, so a retry that replays a fork presents the same run and
-// thread, and the coordinator recognises the thread it is already running —
-// or already answered, since answers are kept until the job settles — rather
-// than dispatching it again.
+// The origin is what makes a move safe. A job is a thread of a run — the
+// run the workflow is, and the thread its fork named — and a retry that
+// replays a fork presents the same run and thread, so the coordinator
+// recognises the thread it is already running — or already answered, since
+// answers are kept until the job settles — rather than dispatching it again.
+// Which job a thread's parent is follows from the thread's name, since a
+// thread is named under its parent.
 //
 // On the worker, threads arrive on a queue of their own and run without a
 // place in the batch. The job queue is taken in batches of the worker's
 // concurrency, and a batch is not over until every job in it is; a thread
 // queued behind the batch that is waiting for it would wait forever.
 
-// jobRunName is the run a job executes as. Stable across attempts, because it
-// is what the job's calls are recorded against.
+// jobRunName is the run a bare call executes as on the worker: one made on
+// [Cluster.Bind], which belongs to no run of its own. Stable across attempts,
+// because it is what the threads the job forks are recorded against.
 func jobRunName(job string) string { return "job:" + job }
 
-// isJobRun reports whether a run name is a job's, and jobOfRun says which.
+// isJobRun reports whether a run name is one made up for a bare call's job,
+// and jobOfRun says which job.
 func isJobRun(run string) bool   { return strings.HasPrefix(run, "job:") }
 func jobOfRun(run string) string { return strings.TrimPrefix(run, "job:") }
+
+// runOf is the run a job's thread belongs to, on the coordinator and the
+// worker alike: the run it was forked from, or the one made up for a bare
+// call.
+func runOf(job jobEnvelope) string {
+	if job.Run != "" {
+		return job.Run
+	}
+	return jobRunName(job.ID)
+}
+
+// threadOf is the thread a job runs as: the one it was forked as, or main
+// for a bare call, which is a run of its own.
+func threadOf(job jobEnvelope) string {
+	if job.Thread != "" {
+		return job.Thread
+	}
+	return "main"
+}
+
+// parentThread is the thread that forked one, by its name: a thread is
+// named "<parent>.<n>". main has none.
+func parentThread(thread string) (string, bool) {
+	i := strings.LastIndexByte(thread, '.')
+	if i < 0 {
+		return "", false
+	}
+	return thread[:i], true
+}
+
+// parentJobLocked is the job running the thread that forked the one an
+// origin names, or nil when that thread is not a job — the workflow's own
+// main, or nothing at all. Call with mu held.
+//
+// A bare call's job is the main thread of a run made up for it, and is not
+// indexed by any origin; its children find it by the run's name instead.
+func (c *Cluster) parentJobLocked(o flow.Origin) *pendingJob {
+	if o.Zero() {
+		return nil
+	}
+	parent, ok := parentThread(o.Thread)
+	if !ok {
+		return nil
+	}
+	if parent == "main" && isJobRun(o.Run) {
+		return c.pending[jobOfRun(o.Run)]
+	}
+	return c.byOrigin[flow.Origin{Run: o.Run, Thread: parent}.Key()]
+}
+
 func callKey(thread string, step uint64) string {
 	return thread + "#" + strconv.FormatUint(step, 10)
 }
@@ -59,8 +113,12 @@ type forkedCall struct {
 }
 
 // followPoll is how often a history follower looks up from its read to see
-// whether the attempt it follows is still the one running.
-const followPoll = 5 * time.Second
+// whether the attempt it follows is still the one running; followLook is
+// how often it looks for the history's copy before the copy exists.
+const (
+	followPoll = 5 * time.Second
+	followLook = 50 * time.Millisecond
+)
 
 // --- coordinator ---
 
@@ -118,10 +176,17 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 		if st == nil {
 			// Not there yet: the attempt has recorded nothing worth a stream,
 			// or the copy has not caught up. Either way the answer is to look
-			// again, not to give up.
+			// again, not to give up — and soon, since a fork is the first
+			// thing many attempts record and the job is silent while it
+			// waits for the answer: a bound on silence shorter than the
+			// look would move the job for asking.
 			ok, err := client.StreamExists(c.ctx, name)
-			if err != nil || !ok {
+			if err != nil {
 				wait(time.Second)
+				continue
+			}
+			if !ok {
+				wait(followLook)
 				continue
 			}
 			if st, err = eventStream[*protos.Event](client, name); err != nil {
@@ -200,7 +265,7 @@ func (c *Cluster) dispatchNested(p *pendingJob, attempt int, thread string, step
 		case <-ctx.Done():
 		}
 	}()
-	origin := flow.Origin{Run: jobRunName(p.job.ID), Thread: thread, Step: step, Attempt: uint64(attempt)}
+	origin := flow.Origin{Run: runOf(p.job), Thread: thread, Step: step, Attempt: uint64(attempt)}
 	child, err := c.submit(flow.WithOrigin(ctx, origin), call.fn, call.input)
 	var res resultEnvelope
 	if err == nil {
@@ -243,15 +308,12 @@ func (c *Cluster) keepAnswerLocked(p *pendingJob, key string, res resultEnvelope
 }
 
 // noteSettledLocked is called for every job that settles, with mu held: one
-// that is a call made by another job has its answer kept against that job
-// here, at the moment it stops being outstanding, so a retry of the parent
-// that asks in the same instant finds the answer rather than a gap.
+// that is a thread forked by another job has its result kept against that
+// job here, at the moment it stops being outstanding, so a retry of the
+// parent that asks in the same instant finds the answer rather than a gap.
 func (c *Cluster) noteSettledLocked(child *pendingJob, res resultEnvelope) {
-	if !isJobRun(child.origin.Run) {
-		return
-	}
-	parent, ok := c.pending[jobOfRun(child.origin.Run)]
-	if !ok {
+	parent := c.parentJobLocked(child.origin)
+	if parent == nil {
 		return
 	}
 	c.keepAnswerLocked(parent, callKey(child.origin.Thread, child.origin.Step), res)

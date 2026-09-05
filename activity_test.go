@@ -463,3 +463,42 @@ func TestAWorkflowsDirectCallRunsOnTheCoordinator(t *testing.T) {
 			counts["ForkEvent"], counts["JoinEvent"], counts)
 	}
 }
+
+// THE POINT: a job is a thread of the run that forked it, wherever the fork
+// was made. A thread forked by a workflow is named under the workflow's
+// main; a thread forked by that thread, on a worker, is named under it —
+// and the record says so in those terms, not in terms of jobs.
+func TestAJobIsAThreadOfItsRun(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1})
+	name := "test-lineage-" + strconv.FormatUint(runSeq.Add(1), 36)
+
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		_, err := ctx.Go(callsWhere, 0).Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	threads := map[string]string{} // thread → function
+	awaitJournal(t, c, func(es []journalEntry) bool {
+		for _, e := range es {
+			if e.Kind == journalSubmitted && e.Run == name {
+				threads[e.Thread] = e.Func
+			}
+		}
+		return len(threads) >= 2
+	})
+	if threads["main.0"] != "test.callsWhere" {
+		t.Errorf("the workflow's fork was submitted as thread %q running %q, want main.0 running test.callsWhere",
+			"main.0", threads["main.0"])
+	}
+	if threads["main.0.0"] != "test.whereAmI" {
+		t.Errorf("the worker's fork was submitted as %v, want main.0.0 running test.whereAmI", threads)
+	}
+	for th, fn := range threads {
+		if th != "main.0" && th != "main.0.0" {
+			t.Errorf("unexpected thread %q running %q in run %s", th, fn, name)
+		}
+	}
+}

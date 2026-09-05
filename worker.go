@@ -487,18 +487,21 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		}
 	}()
 
-	// As a run, not a bare call. The function's body is a run's main thread,
-	// so it may fork, use a channel, read the clock, sleep and call other
-	// functions, and a retry replays all of that from the history rather than
-	// doing it again — the history being the coordinator's copy of the last
-	// attempt's, put on this worker under this attempt's name before the job
-	// arrived. One attempt per dispatch: whether to try again, and where, is
-	// the coordinator's decision, and the error is its input.
+	// As the thread it is, not a bare call. The function's body is a thread
+	// of the run that forked it, so it may fork, use a channel, read the
+	// clock, sleep and call other functions, and a retry replays all of
+	// that from the history rather than doing it again — the history being
+	// the coordinator's copy of the last attempt's, put on this worker under
+	// this attempt's name before the job arrived. One attempt per dispatch:
+	// whether to try again, and where, is the coordinator's decision, and
+	// the error is its input.
 	//
-	// Named for the JOB, not the attempt: the name is what the calls this run
-	// makes are recorded under, and a retry that replays one must present it
-	// as the same call, or the coordinator dispatches it twice.
-	payload, err := flow.RunCall(ctx, jobRunName(job.ID), job.Func, job.Payload,
+	// Under the thread's own name in its own run: that is what the threads
+	// this one forks are named under, and a retry that replays a fork must
+	// present it as the same thread, or the coordinator dispatches it twice.
+	// A bare call, which belongs to no run, is the main thread of a run made
+	// up for the job.
+	payload, err := flow.RunThread(ctx, runOf(job), threadOf(job), job.Func, job.Payload,
 		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
 		flow.WithPlacer(placer), flow.WithChannelHost(nodeChannels{n: n, job: state}), flow.Once())
 	// Whatever the attempt wrote is committed before its answer leaves: a

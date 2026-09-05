@@ -65,6 +65,12 @@ type jobEnvelope struct {
 	ID      string `json:"id"`
 	Func    string `json:"fn"`
 	Payload []byte `json:"payload,omitempty"`
+	// Run and Thread say which thread of which run this job is, when it is
+	// one: the worker runs it as that thread, from that thread's history,
+	// and the threads it forks are named under it. Empty for a bare call
+	// made on [Cluster.Bind], which belongs to no run.
+	Run    string `json:"run,omitempty"`
+	Thread string `json:"thread,omitempty"`
 	// Attempt counts prior dispatches of this job, starting at 0. Carried so a
 	// work function that cares can tell a retry from a first run, and so logs
 	// on the worker say which it was.
@@ -83,8 +89,8 @@ type jobEnvelope struct {
 	// oldest attempt first. A retry reads them with [Priors] to pick up where
 	// one of them stopped instead of starting over.
 	Priors []Recording `json:"priors,omitempty"`
-	// Nested says this job is a call made BY another job, and goes on the
-	// worker's nested queue rather than its job queue. See serveNested.
+	// Nested says this job is a thread forked BY another job, and goes on
+	// the worker's nested queue rather than its job queue. See serveNested.
 	Nested bool `json:"nested,omitempty"`
 }
 
