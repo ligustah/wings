@@ -86,6 +86,20 @@ type Machine interface {
 	Close(ctx context.Context) error
 }
 
+// PreemptionURLEnv names an environment variable a [Machine] may add to the
+// worker's environment in [Machine.Start]: a URL that answers "TRUE" once the
+// cloud has decided to take the machine back.
+//
+// Clouds that reclaim machines usually say so a little ahead of time — Google
+// gives thirty seconds, on its metadata server — and a worker that hears it
+// uses them: it tells the coordinator at once, so its jobs are moved now
+// rather than when the connection is found dead, and stops taking new ones.
+// The worker polls the URL and treats a request that blocks until the answer
+// changes as the cloud's favour, not a requirement. It sends its worker id in
+// an X-Wings-Worker header and a Metadata-Flavor: Google header, which the
+// metadata server requires and everything else ignores.
+const PreemptionURLEnv = "WINGS_PREEMPTION_URL"
+
 // Prober is a Machine that can say whether it still exists.
 //
 // Optional, and worth implementing for any cloud that can answer. A worker

@@ -2,6 +2,10 @@ package wings
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -284,6 +288,92 @@ func TestTheMirrorRemembersWhereItGotTo(t *testing.T) {
 // without crediting them back left it permanently in flight, so it was never
 // reaped and, on a cloud target, its machine billed on until the cluster
 // stopped. Which is precisely the case reaping exists for.
+// THE POINT: a cloud that takes a machine back usually says so a little
+// ahead. A worker that hears it tells the coordinator at once, so what it
+// owed is moved in the time the cloud gave rather than when the connection is
+// found dead, and it stops taking new work. Here the cloud is a fake metadata
+// server, and the notice is given to one worker of two.
+func TestAWorkerToldItIsBeingTakenBackHandsItsWorkOver(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	var (
+		mu     sync.Mutex
+		victim string // the worker being taken back, once chosen
+	)
+	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Header.Get("Metadata-Flavor") != "Google" {
+			http.Error(w, "missing Metadata-Flavor header", http.StatusForbidden)
+			return
+		}
+		if victim != "" && r.Header.Get("X-Wings-Worker") == victim {
+			io.WriteString(w, "TRUE")
+			return
+		}
+		io.WriteString(w, "FALSE")
+	}))
+	defer metadata.Close()
+	// Inherited by the child processes this test's workers are.
+	t.Setenv(PreemptionURLEnv, metadata.URL)
+
+	c := start(t, Config{Target: LocalProcess(), Workers: 2, Concurrency: 1,
+		ReconnectTimeout: 2 * time.Minute})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := slow(c.Bind(t.Context()), 4*time.Second)
+		done <- err
+	}()
+	var on *workerConn
+	waitFor(t, "the job to start on a worker", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, p := range c.pending {
+			if !p.started.IsZero() {
+				on = p.worker
+			}
+		}
+		return on != nil
+	})
+
+	// The cloud decides.
+	mu.Lock()
+	victim = on.id
+	mu.Unlock()
+
+	// The job is moved and finishes elsewhere, without the reconnect window
+	// having been waited out.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the job on the worker being taken back: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the job never finished; the notice was not acted on")
+	}
+	// And the worker leaves service, as a dead one would.
+	waitFor(t, "the worker to be released", func() bool { return c.Workers() == 1 })
+	// And the record says why. The release that follows writes its own line
+	// too, as it does for any dead worker; the notice is the one that matters.
+	awaitJournal(t, c, func(es []journalEntry) bool {
+		for _, e := range es {
+			if e.Kind == journalWorkerGone && e.Worker == on.id && e.Err == "preempted" {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range readJournal(t, c) {
+		if e.Kind == journalWorkerGone && e.Worker == on.id && e.Err == "preempted" {
+			return
+		}
+	}
+	t.Fatal("the record never says the worker was preempted")
+}
+
 func TestAWorkerThatDiesMidJobIsReaped(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")

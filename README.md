@@ -258,10 +258,12 @@ instance metadata; nothing wings creates outlives the cluster.
 
 **Spot instances** (`-gcp.spot`) are the cheap option and a real one: a
 preempted worker is a lost worker, its jobs are moved and the scaler replaces
-the machine. A preempted instance deletes itself rather than stopping, and the
-coordinator asks the cloud whether a worker that stopped answering still
-exists, so a preemption costs seconds rather than the whole reconnect window.
-Idempotent work is the price.
+the machine. Google announces a preemption thirty seconds ahead, and the worker
+uses them: it tells the coordinator, which moves its jobs then and there, and
+stops taking new ones. A preempted instance deletes itself rather than
+stopping, and for a worker that simply stops answering the coordinator asks the
+cloud whether it still exists, so a preemption costs seconds rather than the
+whole reconnect window either way. Idempotent work is the price.
 
 The worker goes up **straight from memory** — it is decompressed once and each
 machine's upload reads from that one copy, so nothing is written to the

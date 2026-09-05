@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ligustah/durable_streams/broker/embed"
@@ -45,6 +48,10 @@ type workerNode struct {
 	// away cannot stop the one that replaced it on this same worker.
 	runMu   sync.Mutex
 	running map[string]context.CancelCauseFunc
+	// leaving is set once the machine is being taken back. Nothing new is run
+	// after it: a job taken off the queue is answered with an error instead,
+	// and the coordinator, told, has already moved it elsewhere.
+	leaving atomic.Bool
 	// stopped names attempts the coordinator stopped BEFORE they started here:
 	// a job moved for waiting too long on this queue is still on this queue,
 	// and would otherwise run in full when its turn came. Cleared when the
@@ -217,6 +224,63 @@ func (n *workerNode) tailControl(ctx context.Context) {
 	}
 }
 
+// watchPreemption polls the URL the machine gave for the cloud's decision to
+// take it back, and acts on it once.
+//
+// See [PreemptionURLEnv]. A request that blocks until the answer changes is
+// used as such; one that answers at once is asked again after a moment. An
+// error is not a preemption — a metadata server that is briefly unreachable
+// is not a machine that is going away — so it is retried, a little later.
+func (n *workerNode) watchPreemption(ctx context.Context, url string) {
+	client := &http.Client{Timeout: 2 * time.Minute}
+	for ctx.Err() == nil {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			n.log.Warn("wings: preemption URL is unusable", "url", url, "err", err)
+			return
+		}
+		req.Header.Set("Metadata-Flavor", "Google")
+		req.Header.Set("X-Wings-Worker", n.id)
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			n.log.Debug("wings: could not ask about preemption", "err", err)
+			sleepCtx(ctx, 5*time.Second)
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		if strings.EqualFold(strings.TrimSpace(string(body)), "TRUE") {
+			n.leave()
+			return
+		}
+		sleepCtx(ctx, 2*time.Second)
+	}
+}
+
+// leave is what a worker does with the notice: tells the coordinator, so its
+// jobs are moved now; refuses new ones; and ends the attempts running here,
+// whose answers are no longer wanted anywhere.
+func (n *workerNode) leave() {
+	n.log.Warn("wings: this machine is being taken back; handing its work over")
+	n.leaving.Store(true)
+	if _, err := n.beats.Append(context.Background(), []beatEnvelope{{Leaving: true}}); err != nil {
+		n.log.Error("wings: could not tell the coordinator this worker is leaving", "err", err)
+	}
+	n.runMu.Lock()
+	cancels := make([]context.CancelCauseFunc, 0, len(n.running))
+	for _, cancel := range n.running {
+		cancels = append(cancels, cancel)
+	}
+	n.runMu.Unlock()
+	cause := errors.New("wings: this worker's machine is being taken back")
+	for _, cancel := range cancels {
+		cancel(cause)
+	}
+}
+
 // attemptKey names one attempt of one job, for running.
 func attemptKey(job string, attempt int) string { return job + "/" + strconv.Itoa(attempt) }
 
@@ -298,12 +362,29 @@ func (n *workerNode) process(ctx context.Context, batch []jobEnvelope) ([]result
 		}()
 	}
 	wg.Wait()
+	// The one other thing that fails a batch: the machine is being taken
+	// back. The coordinator was told and is moving these jobs, and a result
+	// from here — an error saying the attempt was cut short — could reach it
+	// BEFORE the move and be delivered as the job's answer. Failing the batch
+	// aborts the transaction, so nothing from this batch is ever committed,
+	// and the loop ends: this worker takes no more.
+	if n.leaving.Load() {
+		return nil, errLeaving
+	}
 	return out, nil
 }
+
+// errLeaving ends a worker's loop once its machine is being taken back.
+var errLeaving = errors.New("wings: this worker's machine is being taken back")
 
 func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnvelope) {
 	res.ID = job.ID
 	res.Attempt = job.Attempt
+
+	if n.leaving.Load() {
+		res.Error = "wings: this worker's machine is being taken back; the job was not started"
+		return res
+	}
 
 	h, ok := lookup(job.Func)
 	if !ok {
@@ -490,10 +571,24 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// A machine that will be told when it is being taken back, and where.
+	if url := os.Getenv(PreemptionURLEnv); url != "" {
+		go n.watchPreemption(ctx, url)
+	}
+
 	// The parent reads this to learn the port, so it must be the first thing on
 	// stdout and must be flushed before anything blocks.
 	fmt.Fprintln(os.Stdout, readyPrefix+b.addr())
 
 	n.log.Info("wings: worker serving", "addr", b.addr(), "concurrency", n.concurrency)
-	return n.run(ctx)
+	err = n.run(ctx)
+	if n.leaving.Load() {
+		// The loop ended because the machine is being taken back. The broker
+		// stays up until it is: the coordinator is still copying what the
+		// jobs here wrote, and those seconds are what the notice is for.
+		n.log.Info("wings: no longer taking work; serving what was written here until the machine goes")
+		<-ctx.Done()
+		return nil
+	}
+	return err
 }

@@ -93,6 +93,11 @@ type stepRecord struct {
 // belongs to.
 type beatEnvelope struct {
 	Job string `json:"job"`
+	// Leaving says the WORKER is about to go — its machine is being taken
+	// back — and names no job. The coordinator treats it as the worker's
+	// death, announced early: everything outstanding on it is moved now, in
+	// the time the cloud gave, rather than when the connection is found dead.
+	Leaving bool `json:"leaving,omitempty"`
 	// Attempt is which dispatch of the job this report is from. A job that was
 	// moved has an attempt still running where it was left, and that one may
 	// wake up and report: without this the coordinator could not tell its

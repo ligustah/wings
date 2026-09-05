@@ -1523,8 +1523,19 @@ func (c *Cluster) tailBeats(w *workerConn) {
 			continue
 		}
 		for _, r := range recs {
-			c.onBeat(r.Record)
 			from = r.Offset + 1
+			if r.Record.Leaving {
+				// The one verdict this loop does reach: not a guess about a
+				// silent worker, but the worker itself saying its machine is
+				// being taken back. Same path as a death, so what it owed is
+				// moved and the machine released.
+				c.log.Warn("wings: worker is leaving; its machine is being taken back", "worker", w.id)
+				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "preempted"})
+				w.dead.Store(true)
+				c.redispatchFrom(w)
+				return
+			}
+			c.onBeat(r.Record)
 		}
 	}
 }

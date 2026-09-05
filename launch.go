@@ -55,7 +55,7 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
-			if err := node.run(w.ctx); err != nil && w.ctx.Err() == nil {
+			if err := node.run(w.ctx); err != nil && w.ctx.Err() == nil && !node.leaving.Load() {
 				c.log.Error("wings: in-process worker stopped", "worker", id, "err", err)
 			}
 		}()

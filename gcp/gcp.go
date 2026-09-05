@@ -491,8 +491,23 @@ func (m *gcpMachine) Upload(ctx context.Context, src io.Reader, size int64, remo
 }
 
 func (m *gcpMachine) Start(ctx context.Context, cmd string, env map[string]string) error {
+	if m.cfg.Preemptible {
+		// The metadata server says, thirty seconds ahead, that this instance
+		// is being taken back; wait_for_change makes the request block until
+		// it does. The worker hands its work over in that time.
+		withNotice := make(map[string]string, len(env)+1)
+		for k, v := range env {
+			withNotice[k] = v
+		}
+		withNotice[wings.PreemptionURLEnv] = preemptionURL
+		env = withNotice
+	}
 	return m.ssh.Start(ctx, cmd, env, "/tmp/wings-worker.log")
 }
+
+// preemptionURL is where a Compute Engine instance learns it is about to be
+// preempted.
+const preemptionURL = "http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true"
 
 func (m *gcpMachine) Forward(ctx context.Context, remotePort int) (string, error) {
 	return m.ssh.Forward(ctx, remotePort)
