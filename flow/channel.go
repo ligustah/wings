@@ -187,7 +187,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 	// value queued: queued again, for a receiver of this attempt, and given
 	// up on again.
 	if ierr, ok := t.interrupted("send"); ok {
-		if _, err := cs.put(ctx, t.qualified(), seq, data, false); err != nil {
+		if _, err := cs.put(ctx, t.qualified(), seq, data, true); err != nil {
 			return err
 		}
 		return ierr
@@ -214,9 +214,14 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		}
 		return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 	}
-	// A replayed send is not announced to other runs again: they have it,
-	// and the identity would only be dropped as a copy.
-	item, err := cs.put(ctx, t.qualified(), seq, data, ev == nil)
+	// A replayed send is announced to other runs AGAIN. Nearly always they
+	// have it, and the host drops the copy by its identity; but the record
+	// of a send is made where the sender is, and the copy of it that other
+	// runs see is carried separately, so an attempt that ended between the
+	// two — the machine died, or the attempt was moved on — has a history
+	// that says it sent what nobody ever received. The replay is what
+	// puts that right, and only if it announces.
+	item, err := cs.put(ctx, t.qualified(), seq, data, true)
 	if err != nil {
 		return err
 	}
@@ -344,6 +349,10 @@ func (c *Channel[T]) Close(ctx Context) error {
 		if !ev.GetClosed() || ev.GetChannel() != c.name {
 			return continuityf("thread %q previously sent %s#%d at this point, but is now closing %s",
 				t.id, ev.GetChannel(), ev.GetSeq(), c.name)
+		}
+		// Announced again, for the reason a replayed send is.
+		if err := cs.announceClose(ctx); err != nil {
+			return err
 		}
 		cs.shut()
 		return t.err()
