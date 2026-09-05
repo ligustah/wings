@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -529,49 +530,79 @@ func (c *Cluster) priorsOf(ctx context.Context, w *workerConn, job string) ([]Re
 // at the destination, and deleting a stream does not roll it back. So: decline
 // it, so no pass starts it again; forget the copy, so none is running; then
 // delete, source first.
-func (c *Cluster) dropOutputsOf(job string, keep int) {
+//
+// writers is which worker ran each attempt, the kept one included. An attempt's
+// output is on the worker that ran it and nowhere else, so that is the one
+// worker asked to delete it; the fleet used to be asked in full, an
+// exists-and-delete round trip per worker per stream, and on a fleet of fifty
+// that was a hundred calls to remove one stream from one machine. A worker no
+// longer in the fleet is skipped: its storage went with it, or is going.
+func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerConn) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return
 	}
 	ctx := context.WithoutCancel(c.ctx)
+	// The coordinator's own catalog, one call on the embedded engine. What it
+	// finds is the fact: a stale stream is one the coordinator kept a copy of.
 	names, err := client.ListStreams(ctx)
 	if err != nil {
 		c.log.Warn("wings: could not look for abandoned output", "job", job, "err", err)
 		return
 	}
-	var stale []string
+	var stale []outputName
 	for _, name := range names {
 		o, ok := parseOutput(name)
 		if !ok || o.Job != streamPart(job) || o.Attempt == keep {
 			continue
 		}
-		stale = append(stale, name)
+		stale = append(stale, o)
 	}
 	if len(stale) == 0 {
 		return
 	}
+	staleNames := make([]string, len(stale))
+	for i, o := range stale {
+		staleNames[i] = o.String()
+	}
 
-	c.markDropped(stale)
+	c.markDropped(staleNames)
 	// Only until they are gone: after the source is deleted there is nothing
 	// left to offer, so the decision has nothing to decide and holding it would
 	// grow a map for the life of the cluster.
-	defer c.unmarkDropped(stale)
+	defer c.unmarkDropped(staleNames)
 
 	fleet := c.fleet()
-	for _, name := range stale {
-		for _, w := range fleet {
-			if w.client == client {
-				continue // one engine: the worker's copy IS the coordinator's
-			}
+	// reachable is a worker whose storage can still be asked to delete: still in
+	// the fleet, and not the coordinator's own engine, where the worker's copy
+	// IS the coordinator's and is deleted with it below.
+	reachable := func(w *workerConn) bool {
+		return w != nil && w.client != client && slices.Contains(fleet, w)
+	}
+	for _, o := range stale {
+		name := o.String()
+		if w := writers[o.Attempt]; reachable(w) {
 			if c.outputs != nil {
 				c.outputs.Forget(w.id, name)
 			}
-			// Whichever worker wrote it. Deleting one that was never here is a
-			// cheap no-op, and cheaper than asking every worker which it was.
 			if err := dropStream(ctx, w.client, name); err != nil {
 				c.log.Warn("wings: could not discard abandoned output on a worker",
 					"worker", w.id, "stream", name, "err", err)
+			}
+		}
+		// A recording was also put, as a prior, on the worker of every attempt
+		// after the one that wrote it — that is how a retry reads it — and those
+		// copies are the retry's business only until it settles.
+		if o.Prefix == recordingPrefix {
+			prior := o.in(priorPrefix).String()
+			for attempt, w := range writers {
+				if attempt <= o.Attempt || !reachable(w) {
+					continue
+				}
+				if err := dropStream(ctx, w.client, prior); err != nil {
+					c.log.Warn("wings: could not discard a prior on a worker",
+						"worker", w.id, "stream", prior, "err", err)
+				}
 			}
 		}
 		if err := dropStream(ctx, client, name); err != nil {

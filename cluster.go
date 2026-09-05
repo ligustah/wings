@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -187,6 +188,13 @@ func (w *workerConn) hasExited() bool {
 type pendingJob struct {
 	job    jobEnvelope
 	worker *workerConn
+	// ran is which worker each attempt was sent to, by attempt number. What an
+	// abandoned attempt wrote is on the worker that ran it and nowhere else, so
+	// this is the one worker to delete it from when the job settles — rather
+	// than asking every worker in the fleet whether it holds each stream.
+	//
+	// Guarded by Cluster.mu.
+	ran map[int]*workerConn
 
 	// done closes once, when the job has an outcome, and res is that outcome.
 	//
@@ -762,12 +770,13 @@ func (c *Cluster) forget(p *pendingJob) {
 	// seeing it clear here means the add lands first.
 	if p.job.Attempt > 0 && !c.closed {
 		job, keep := p.job.ID, p.job.Attempt
+		writers := maps.Clone(p.ran)
 		// On the cluster's wait group, so Stop does not close the storage this
 		// is deleting through while it is still deleting.
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			c.dropOutputsOf(job, keep)
+			c.dropOutputsOf(job, keep, writers)
 		}()
 	}
 	if key := p.origin.Key(); key != "" {
@@ -894,6 +903,10 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	job.Steps = p.steps
 	p.job = job
 	p.worker = w
+	if p.ran == nil {
+		p.ran = map[int]*workerConn{}
+	}
+	p.ran[job.Attempt] = w
 	p.since = time.Now()
 	p.started = time.Time{}
 	p.beat = time.Time{}
@@ -1147,6 +1160,7 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		return nil, errors.New("wings: no live workers")
 	}
 	p.worker = w
+	p.ran = map[int]*workerConn{job.Attempt: w}
 	p.since = time.Now()
 	p.waiters = 1
 	c.pending[job.ID] = p

@@ -326,7 +326,8 @@ func TestARetryOnAnotherMachineIsGivenItsPredecessorsRecording(t *testing.T) {
 }
 
 // abandoned is every copy of what a job's first attempt recorded, anywhere in
-// the cluster — the coordinator's and each worker's alike.
+// the cluster — the coordinator's, the writer's, and the prior put on the
+// worker that ran the retry alike.
 func abandoned(t *testing.T, c *Cluster) []string {
 	t.Helper()
 
@@ -342,7 +343,7 @@ func abandoned(t *testing.T, c *Cluster) []string {
 			continue // a worker on its way out is not a leak
 		}
 		for _, n := range names {
-			if o, ok := parseOutput(n); ok && o.Prefix == recordingPrefix && o.Attempt == 0 {
+			if o, ok := parseOutput(n); ok && o.Attempt == 0 && (o.Prefix == recordingPrefix || o.Prefix == priorPrefix) {
 				out = append(out, who+":"+n)
 			}
 		}
