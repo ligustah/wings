@@ -12,8 +12,8 @@
 //	var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) { … })
 //
 //	// A workflow is run as a flow once the cluster is up.
-//	var Frames = flow.DefineWorkflow("frames", func(ctx flow.Context) error {
-//		imgs, err := ctx.Map(Render, frames)
+//	var Frames = flow.DefineWorkflow("frames", func(ctx flow.Context, job Job) error {
+//		imgs, err := ctx.Map(Render, job.Frames)
 //		…
 //	})
 //
@@ -119,8 +119,9 @@ Flags:
   -v                print the go build commands
 
 Your package must declare, at package scope:
-  var X = flow.DefineWorkflow("name", func(ctx flow.Context) error { … })
-                                          (at least one; with several, the binary takes -workflow)
+  var X = flow.DefineWorkflow("name", func(ctx flow.Context, in Input) error { … })
+                                          (at least one; with several, the binary takes -workflow;
+                                          the input comes from -input as JSON, or is flow.None)
   func Provisioner() wings.Provisioner    (optional; overrides -provider)
 
 Example:
@@ -203,7 +204,7 @@ func build(args []string) error {
 	}
 	if !api.definesWorkflow {
 		return fmt.Errorf("package %s defines no workflow.\n"+
-			"Add, at package scope:\n\n\tvar Main = flow.DefineWorkflow(\"main\", func(ctx flow.Context) error { … })\n",
+			"Add, at package scope:\n\n\tvar Main = flow.DefineWorkflow(\"main\", func(ctx flow.Context, in Input) error { … })\n",
 			coordinate.ImportPath)
 	}
 

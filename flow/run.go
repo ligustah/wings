@@ -83,6 +83,7 @@
 package flow
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -126,6 +127,23 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 		return err
 	}
 
+	// A run's input is fixed by its first attempt. Later attempts replay a
+	// history that was produced from it, so giving them anything else would
+	// be a different run wearing this one's name — checked before the
+	// finished short-cut below, because a finished run handed different input
+	// is that same mistake, and answering it with silence would hide it.
+	input := ro.input
+	if recorded, ok := recordedInput(history); ok {
+		if input != nil && !bytes.Equal(input, recorded) {
+			return fmt.Errorf("flow: run %s was started with different input; "+
+				"a run's input is fixed by its first attempt, so leave it off to resume or use a new name", name)
+		}
+		input = recorded
+	} else if input == nil && ro.inputType != nil {
+		return fmt.Errorf("flow: run %s takes a %s as input and none was given; it looks like %s",
+			name, ro.inputType, exampleInput(ro.inputType))
+	}
+
 	// A finished run is finished. Re-running it would repeat every effect its
 	// calls had, which is the opposite of what a durable run is for.
 	if done, result, ok := finished(history); ok {
@@ -141,7 +159,7 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 		return err
 	}
 
-	r := &runner{name: name, body: body, opts: ro, sink: sink}
+	r := &runner{name: name, body: body, opts: ro, sink: sink, input: input}
 
 	attempt := lastAttempt(history)
 	for {
@@ -185,6 +203,10 @@ type runner struct {
 	body func(ctx Context) error
 	opts runOptions
 	sink Sink
+
+	// input is what the body is given, in recorded form; nil for a body that
+	// takes nothing.
+	input []byte
 }
 
 // attempt runs the body once over the history it is given.
@@ -208,15 +230,19 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 	// Recorded on the run's own bookkeeping rather than main's cursor: a start
 	// marker is about the attempt, not about what the body did, and putting it
 	// in main's sequence would shift every replay position by one.
-	appendMarker(run, &protos.RunStartEvent{
+	start := &protos.RunStartEvent{
 		Attempt:      attempt,
 		Reason:       reason,
 		WorkflowName: r.name,
 		InstanceId:   r.name,
 		Version:      uint64(r.opts.version),
-	})
+	}
+	if r.input != nil {
+		start.Input = &protos.Data{Serialized: r.input}
+	}
+	appendMarker(run, start)
 
-	err := r.body(Context{withThread(ctx, main)})
+	err := r.body(Context{withThread(withInput(ctx, r.input), main)})
 
 	if perr := run.err(); perr != nil {
 		// Persistence failed somewhere in there. Not retryable in any useful
@@ -467,6 +493,29 @@ func finished(history []*protos.Event) (protos.WorkflowStatus, *protos.Result, b
 		return end.GetStatus(), end.GetResult(), false
 	}
 	return protos.WorkflowStatus_WORKFLOW_STATUS_UNKNOWN, nil, false
+}
+
+// recordedInput is the input the run's first attempt was given, if the
+// history has one.
+func recordedInput(history []*protos.Event) ([]byte, bool) {
+	for _, ev := range history {
+		if start := ev.GetRunStart(); start != nil {
+			return start.GetInput().GetSerialized(), start.GetInput() != nil
+		}
+	}
+	return nil, false
+}
+
+type inputKey struct{}
+
+// withInput puts the run's input where the body can find it.
+func withInput(ctx context.Context, input []byte) context.Context {
+	return context.WithValue(ctx, inputKey{}, input)
+}
+
+func inputFrom(ctx context.Context) []byte {
+	b, _ := ctx.Value(inputKey{}).([]byte)
+	return b
 }
 
 func lastAttempt(history []*protos.Event) uint64 {

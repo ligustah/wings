@@ -82,6 +82,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
 		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
+		input       = flag.String("input", "", "the workflow's input as JSON, or @file to read it from a file; leave off to resume a run already in -dir")
 
 		// Autoscaling. Off unless -max-workers is set, and expressed only in
 		// jobs and durations — nothing here names a target, so the same numbers
@@ -99,6 +100,11 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	flag.Parse()
 
 	w, err := chooseWorkflow(*workflow, flow.Workflows())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wings: %v\n", err)
+		os.Exit(2)
+	}
+	payload, err := readInput(*input, w)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wings: %v\n", err)
 		os.Exit(2)
@@ -169,11 +175,11 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	// stopped. That is the whole reason a function is callable rather than
 	// something you pass to a method: the context already knows where work
 	// goes, and what has already been done.
-	runErr := c.RunWorkflow(ctx, w)
+	runErr := c.runWorkflow(ctx, w.Name, payload)
 	stopErr := c.Stop(context.Background())
 
 	if runErr != nil {
-		log.Error("wings: workflow", "name", w.Name(), "err", runErr)
+		log.Error("wings: workflow", "name", w.Name, "err", runErr)
 		if stopErr != nil {
 			log.Error("wings: stop", "err", stopErr)
 		}
@@ -191,31 +197,54 @@ func CoordinatorMain(opts CoordinatorOptions) {
 // have to say so. With several, the name is required and a missing or unknown
 // one is answered with the list, since the list is the only thing the caller
 // needs to fix the command line.
-func chooseWorkflow(name string, defined []flow.Workflow) (flow.Workflow, error) {
+func chooseWorkflow(name string, defined []flow.WorkflowInfo) (flow.WorkflowInfo, error) {
 	if len(defined) == 0 {
-		return flow.Workflow{}, errors.New("no workflow is defined in this program; " +
+		return flow.WorkflowInfo{}, errors.New("no workflow is defined in this program; " +
 			"declare one at package scope with flow.DefineWorkflow")
 	}
 	if name == "" {
 		if len(defined) == 1 {
 			return defined[0], nil
 		}
-		return flow.Workflow{}, fmt.Errorf("this program defines %d workflows; pick one with -workflow: %s",
+		return flow.WorkflowInfo{}, fmt.Errorf("this program defines %d workflows; pick one with -workflow: %s",
 			len(defined), workflowNames(defined))
 	}
 	for _, w := range defined {
-		if w.Name() == name {
+		if w.Name == name {
 			return w, nil
 		}
 	}
-	return flow.Workflow{}, fmt.Errorf("no workflow %q is defined in this program; it defines: %s",
+	return flow.WorkflowInfo{}, fmt.Errorf("no workflow %q is defined in this program; it defines: %s",
 		name, workflowNames(defined))
 }
 
-func workflowNames(ws []flow.Workflow) string {
+func workflowNames(ws []flow.WorkflowInfo) string {
 	names := make([]string, len(ws))
 	for i, w := range ws {
-		names[i] = w.Name()
+		names[i] = w.Name
 	}
 	return strings.Join(names, ", ")
+}
+
+// readInput turns the -input flag into the workflow's input as JSON: the
+// text itself, or the contents of a file named with a leading @. Empty is nil,
+// which flow reads as "none given" — fine for a workflow that takes none, and
+// for resuming a run whose input is already recorded; what a fresh run of a
+// workflow that takes input makes of it is flow's error to give, with the
+// shape it wants.
+func readInput(flagValue string, w flow.WorkflowInfo) ([]byte, error) {
+	if flagValue == "" {
+		return nil, nil
+	}
+	if w.Input == nil {
+		return nil, fmt.Errorf("workflow %s takes no input, and -input was given", w.Name)
+	}
+	if path, ok := strings.CutPrefix(flagValue, "@"); ok {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read -input file: %w", err)
+		}
+		return b, nil
+	}
+	return []byte(flagValue), nil
 }

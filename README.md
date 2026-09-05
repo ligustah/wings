@@ -7,8 +7,8 @@ var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error
     return render(f)
 })
 
-var Main = flow.DefineWorkflow("render", func(ctx flow.Context) error {
-    images, err := ctx.Map(Render, frames)   // runs wherever the workers are
+var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
+    images, err := ctx.Map(Render, job.Frames)   // runs wherever the workers are
     ...
 })
 ```
@@ -94,12 +94,12 @@ var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error
 
 // A workflow is run as a flow once the cluster is up. A coordinator restarted
 // over the same -dir replays what it already did rather than doing it again.
-var Main = flow.DefineWorkflow("render", func(ctx flow.Context) error {
-    images, err := ctx.Map(Render, frames)
+var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
+    images, err := ctx.Map(Render, job.Frames)
     if err != nil {
         return err
     }
-    return write(images)
+    return write(images, job.Out)
 })
 ```
 
@@ -111,6 +111,19 @@ A package that defines one workflow is a binary that runs it. Define several
 and the binary takes `-workflow <name>`; leave it off and it lists them. Each
 runs under its own name in `-dir`, so two workflows over one directory keep
 separate histories.
+
+The workflow's input is a typed value, given on the command line as JSON:
+
+```sh
+./myapp -target local -input '{"frames":["a.blend","b.blend"],"out":"./frames"}'
+./myapp -target local -input @job.json
+```
+
+Start a fresh run without it and the binary shows the shape it wants. A
+workflow that takes nothing declares `flow.None`. The input is part of the
+run's history: a coordinator restarted over the same `-dir` is given what the
+first start recorded, and one restarted with a different `-input` is refused
+rather than quietly replaying one input's history against another.
 
 Flags you register in that package are parsed too — `CoordinatorMain` calls
 `flag.Parse()` on the default set, so your own flags sit beside `-target` and

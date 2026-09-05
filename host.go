@@ -28,17 +28,28 @@ func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Conte
 	return flow.Run(withCluster(ctx, c), name, body, all...)
 }
 
-// RunWorkflow runs a defined workflow on this cluster, the way [CoordinatorMain]
-// runs the one it was asked for: under the workflow's own name, so a
-// coordinator started again over the same Dir resumes it.
+// RunWorkflow runs a defined workflow on in, on this cluster, the way
+// [CoordinatorMain] runs the one it was asked for: under the workflow's own
+// name, so a coordinator started again over the same Dir resumes it — with
+// the input the first start recorded, whatever is passed here.
 //
 // See [Cluster.Run] for what a run on a cluster is and what opts may say.
-func (c *Cluster) RunWorkflow(ctx context.Context, w flow.Workflow, opts ...flow.RunOption) error {
+func (c *Cluster) RunWorkflow[In any](ctx context.Context, w flow.Workflow[In], in In, opts ...flow.RunOption) error {
 	all, err := c.runOptions(opts)
 	if err != nil {
 		return err
 	}
-	return w.Run(withCluster(ctx, c), all...)
+	return w.Run(withCluster(ctx, c), in, all...)
+}
+
+// runWorkflow is RunWorkflow for a coordinator, which has the workflow as a
+// name and the input as JSON off the command line, or nil to resume.
+func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) error {
+	all, err := c.runOptions(nil)
+	if err != nil {
+		return err
+	}
+	return flow.RunWorkflow(withCluster(ctx, c), name, input, all...)
 }
 
 // runOptions is opts with this cluster's store and executor appended, so

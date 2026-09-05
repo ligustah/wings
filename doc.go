@@ -14,8 +14,8 @@
 //	})
 //
 //	// A workflow is run as a flow once the cluster is up.
-//	var Main = flow.DefineWorkflow("render", func(ctx flow.Context) error {
-//		images, err := ctx.Map(Render, frames)
+//	var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
+//		images, err := ctx.Map(Render, job.Frames)
 //		...
 //	})
 //

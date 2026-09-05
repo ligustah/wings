@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"reflect"
 	"time"
 )
 
@@ -14,6 +15,16 @@ type runOptions struct {
 	initialDelay time.Duration
 	maxDelay     time.Duration
 	permanent    []error
+
+	// input is what the run's body is given, in recorded form, or nil when
+	// none was given; inputType is what the body expects, or nil when it
+	// expects nothing. Set by a [Workflow], not by callers.
+	input     []byte
+	inputType reflect.Type
+}
+
+func inputOption(payload []byte, t reflect.Type) RunOption {
+	return func(o *runOptions) { o.input, o.inputType = payload, t }
 }
 
 func newRunOptions(fns []RunOption) runOptions {

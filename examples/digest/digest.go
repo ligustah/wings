@@ -6,9 +6,9 @@
 //
 //	go run github.com/ligustah/wings/cmd/wings build -pkg ./examples/digest -o digest
 //
-//	./digest -target inprocess -jobs 32
-//	./digest -target local -workers 4
-//	./digest -target remote -workers 4 -gcp.project my-project -gcp.zone europe-west1-b
+//	./digest -target inprocess -input '{"jobs":32}'
+//	./digest -target local -workers 4 -input '{"jobs":32}'
+//	./digest -target remote -workers 4 -input @params.json -gcp.project my-project -gcp.zone europe-west1-b
 //
 // Note what is NOT in this file: no cloud, no SDK, no Target, no provisioner.
 // Where the work runs is chosen entirely on the command line, and this package
@@ -16,9 +16,9 @@
 package digest
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -27,13 +27,15 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// Flags registered here are parsed too: wings.CoordinatorMain calls
-// flag.Parse() on the default flag set, so a package can add its own without
-// wings knowing about them.
-var (
-	jobs   = flag.Int("jobs", 32, "number of jobs to run")
-	rounds = flag.Int("rounds", 2_000_000, "hash rounds per job")
-)
+// Params is the workflow's input. It arrives as JSON from -input, and is part
+// of the run: a coordinator restarted over the same -dir is given what the
+// first start recorded, not whatever is on the new command line.
+type Params struct {
+	// Jobs is how many seeds to digest. Default 32.
+	Jobs int `json:"jobs"`
+	// Rounds is how many times each seed is hashed. Default 2,000,000.
+	Rounds int `json:"rounds"`
+}
 
 // Work is one unit of input.
 type Work struct {
@@ -75,10 +77,11 @@ var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, erro
 // already did rather than doing it again. It is the only workflow defined, so
 // the binary runs it without being told; a program that defines several takes
 // -workflow.
-var Main = flow.DefineWorkflow("digest", func(ctx flow.Context) error {
-	work := make([]Work, *jobs)
+var Main = flow.DefineWorkflow("digest", func(ctx flow.Context, in Params) error {
+	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
+	work := make([]Work, jobs)
 	for i := range work {
-		work[i] = Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: *rounds}
+		work[i] = Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: rounds}
 	}
 
 	start := time.Now()
