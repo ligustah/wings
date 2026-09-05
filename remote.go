@@ -198,25 +198,41 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 		return nil, nil
 	}
 
-	var conns []*workerConn
+	// All at once, as deployAll does: each is a tunnel and a dial, and a dial
+	// to a worker that is not answering is the whole of its timeout. One
+	// machine at a time made a restart with a few of those a wait of minutes.
+	conns := make([]*workerConn, len(found))
 	release := context.WithoutCancel(ctx)
-	for _, m := range found {
-		w, err := c.reconnect(ctx, m)
-		if err != nil {
-			c.log.Warn("wings: could not resume a recovered machine, destroying it",
-				"lease", m.ID(), "err", err)
-			_ = m.Close(release)
-			_ = c.machines.write(release, machineRecord{
-				Kind: machineReleased, Lease: m.ID(), Err: err.Error(),
-			})
-			continue
+	var wg sync.WaitGroup
+	for i, m := range found {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w, err := c.reconnect(ctx, m)
+			if err != nil {
+				c.log.Warn("wings: could not resume a recovered machine, destroying it",
+					"lease", m.ID(), "err", err)
+				_ = m.Close(release)
+				_ = c.machines.write(release, machineRecord{
+					Kind: machineReleased, Lease: m.ID(), Err: err.Error(),
+				})
+				return
+			}
+			conns[i] = w
+		}()
+	}
+	wg.Wait()
+
+	var out []*workerConn
+	for _, w := range conns {
+		if w != nil {
+			out = append(out, w)
 		}
-		conns = append(conns, w)
 	}
-	if len(conns) > 0 {
-		c.log.Info("wings: resumed machines from a previous run", "workers", len(conns))
+	if len(out) > 0 {
+		c.log.Info("wings: resumed machines from a previous run", "workers", len(out))
 	}
-	return conns, nil
+	return out, nil
 }
 
 // reconnect opens a tunnel to a recovered machine and picks its worker back up.
@@ -225,6 +241,16 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 // running, because a worker is launched detached precisely so it outlives the
 // session that started it. All that is missing is the way back in.
 func (c *Cluster) reconnect(ctx context.Context, m Machine) (*workerConn, error) {
+	// The worker kept the id it was started with, and its streams are named
+	// after it — so recovering the name is what recovers the queue. Asked
+	// FIRST: a machine with an intent but no recorded worker never finished
+	// starting one, and there is nothing on it to dial. It used to get a
+	// tunnel and the full dial timeout before being destroyed anyway.
+	id, err := c.workerIDFor(ctx, m.ID())
+	if err != nil {
+		return nil, err
+	}
+
 	local, err := m.Forward(ctx, defaultRemotePort)
 	if err != nil {
 		return nil, fmt.Errorf("wings: tunnel to %s: %w", m.ID(), err)
@@ -233,14 +259,6 @@ func (c *Cluster) reconnect(ctx context.Context, m Machine) (*workerConn, error)
 	backend, err := dialUntilReady(ctx, local, m.ID())
 	if err != nil {
 		return nil, fmt.Errorf("wings: worker on %s did not answer: %w", m.ID(), err)
-	}
-
-	// The worker kept the id it was started with, and its streams are named
-	// after it — so recovering the name is what recovers the queue.
-	id, err := c.workerIDFor(ctx, m.ID())
-	if err != nil {
-		_ = backend.Close()
-		return nil, err
 	}
 
 	w, err := c.connectBackend(id, backend)
