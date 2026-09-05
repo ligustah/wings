@@ -254,6 +254,7 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 		threads: threadsOf(history),
 		sink:    r.sink,
 		exec:    r.opts.executor,
+		host:    r.opts.host,
 	}
 	main := &threadState{id: mainThread, run: run}
 	// Whatever a thread of this attempt does after it returns is this attempt's

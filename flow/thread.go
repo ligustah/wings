@@ -25,6 +25,11 @@ type runState struct {
 	name    string
 	attempt uint64
 	exec    Executor
+	// host carries channels to and from other runs; nil for a run that
+	// shares none. linkCtx bounds the links, and ends with the attempt.
+	host     ChannelHost
+	linkCtx  context.Context
+	linkStop context.CancelFunc
 
 	mu       sync.Mutex
 	threads  map[string][]*protos.Event
@@ -44,8 +49,9 @@ type runState struct {
 // alone; only the durable record is closed.
 func (r *runState) finish() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.over = true
+	r.mu.Unlock()
+	r.closeLinks()
 }
 
 // declareChannel registers a channel's runtime the first time it is created.
@@ -107,6 +113,11 @@ func (t *threadState) newChannelName() string {
 	t.channels++
 	return name
 }
+
+// qualified is this thread's name to other runs: the run's name and its own.
+// It is the sender of everything the thread puts on a channel, so a value
+// from a thread of another run cannot be mistaken for one from here.
+func (t *threadState) qualified() string { return t.run.name + "/" + t.id }
 
 // nextSend returns this thread's sequence number for its next send on a
 // channel.

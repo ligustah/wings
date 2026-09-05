@@ -9,6 +9,7 @@ import (
 type runOptions struct {
 	store    Store
 	executor Executor
+	host     ChannelHost
 
 	version      int
 	maxAttempts  int

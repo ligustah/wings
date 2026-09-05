@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -35,6 +36,11 @@ type Channel[T any] struct {
 	name  string
 	run   *runState
 	codec dswire.Codec[T]
+
+	// id is set on a handle that arrived from another run, and mu guards
+	// binding it to this one on first use.
+	id string
+	mu sync.Mutex
 }
 
 // NewChannel returns an unbuffered channel: a send completes when a receive
@@ -73,6 +79,48 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 // created it and how many it had created before. Exported for diagnostics.
 func (c *Channel[T]) Name() string { return c.name }
 
+// channelHandle is how a channel appears in a call's input or output.
+type channelHandle struct {
+	Channel string `json:"channel"`
+}
+
+// MarshalJSON is what lets a channel leave its run: in a call's input, in a
+// value sent on another channel, in a result. Marshalling SHARES it — the
+// run's host is told, and what was sent so far goes with it — which needs
+// the run to have a [ChannelHost]. See [WithChannelHost].
+func (c *Channel[T]) MarshalJSON() ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := c.id
+	if c.run != nil {
+		var err error
+		if id, err = c.run.export(context.Background(), c.name); err != nil {
+			return nil, err
+		}
+	}
+	if id == "" {
+		return nil, errors.New("flow: this channel was created outside a Run and cannot be shared")
+	}
+	return json.Marshal(channelHandle{Channel: id})
+}
+
+// UnmarshalJSON receives a channel another run shared. It is bound to this
+// run on first use, which needs this run to have a [ChannelHost] too.
+func (c *Channel[T]) UnmarshalJSON(b []byte) error {
+	var h channelHandle
+	if err := json.Unmarshal(b, &h); err != nil {
+		return err
+	}
+	if h.Channel == "" {
+		return errors.New("flow: a shared channel needs an id")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.id, c.run, c.name = h.Channel, nil, h.Channel
+	c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
+	return nil
+}
+
 // Send puts a value on the channel.
 //
 // It blocks until the value is taken, or until the buffer has room. A send that
@@ -91,12 +139,17 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 	}
 
 	seq := t.nextSend(c.name)
-	item := cs.put(t.id, seq, data)
 
 	// Consumed before waiting, not after. The event says the send completed,
 	// and a replay that waited first would be waiting for a receive that has
 	// already been replayed away.
 	ev, err := t.expect[*protos.ChannelSendEvent]()
+	if err != nil {
+		return err
+	}
+	// A replayed send is not announced to other runs again: they have it,
+	// and the identity would only be dropped as a copy.
+	item, err := cs.put(ctx, t.qualified(), seq, data, ev == nil)
 	if err != nil {
 		return err
 	}
@@ -210,6 +263,9 @@ func (c *Channel[T]) Close(ctx Context) error {
 		cs.shut()
 		return t.run.err()
 	}
+	if err := cs.announceClose(ctx); err != nil {
+		return err
+	}
 	cs.shut()
 	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Closed: true})
 	return t.run.err()
@@ -217,13 +273,28 @@ func (c *Channel[T]) Close(ctx Context) error {
 
 // bind resolves the calling thread and this channel's shared state.
 func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
-	if c.run == nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.run == nil && c.id == "" {
 		return nil, nil, errors.New("flow: this channel was created outside a Run; " +
 			"create it inside the run's body, with the context it was given")
 	}
 	t := threadFrom(ctx)
 	if t == nil {
 		return nil, nil, fmt.Errorf("flow: channel %s was used outside a run's thread", c.name)
+	}
+	if c.run == nil {
+		// A handle from another run, used here for the first time: reach
+		// the channel through the host and keep it under its id.
+		cs, err := t.run.attach(ctx, c.id)
+		if err != nil {
+			return nil, nil, err
+		}
+		c.run, c.name = t.run, c.id
+		if c.codec == nil {
+			c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
+		}
+		return t, cs, nil
 	}
 	if t.run != c.run {
 		return nil, nil, fmt.Errorf("flow: channel %s belongs to another run", c.name)
@@ -260,6 +331,10 @@ type chanState struct {
 	items   []*chanItem
 	closed  bool
 	changed chan struct{}
+	// link is set once the channel is shared with other runs. From then on a
+	// send is a queue put — complete when the host has it — and what other
+	// runs send arrives through pump.
+	link ChannelLink
 }
 
 func newChanState(capacity int) *chanState {
@@ -272,30 +347,67 @@ func (cs *chanState) broadcast() {
 	cs.changed = make(chan struct{})
 }
 
-// put queues a value and reports the item it queued.
-func (cs *chanState) put(from string, seq uint64, data []byte) *chanItem {
+// put queues a value and reports the item it queued. On a shared channel a
+// new item is announced to the host first, when announce says so.
+func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []byte, announce bool) (*chanItem, error) {
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
 	// An item already queued under this identity was sent by a previous attempt
-	// of the same thread and is being sent again by the replay of it. Reuse it,
-	// or a receive naming that identity would find two.
-	for _, it := range cs.items {
-		if it.from == from && it.seq == seq {
-			return it
+	// of the same thread and is being sent again by the replay of it — or
+	// came back from the host as the copy of one sent here. Reuse it, or a
+	// receive naming that identity would find two.
+	if it := cs.find(from, seq); it != nil {
+		cs.mu.Unlock()
+		return it, nil
+	}
+	link := cs.link
+	cs.mu.Unlock()
+
+	if link != nil && announce {
+		if err := link.Send(ctx, ChannelItem{From: from, Seq: seq, Data: data}); err != nil {
+			return nil, fmt.Errorf("flow: send on a shared channel: %w", err)
 		}
 	}
 
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if it := cs.find(from, seq); it != nil {
+		return it, nil
+	}
 	pending := 0
 	for _, it := range cs.items {
 		if !it.taken && !it.buffered {
 			pending++
 		}
 	}
-	item := &chanItem{from: from, seq: seq, data: data, buffered: pending < cs.capacity}
+	// Shared: a queue, so the send is complete. Local: only if there is room.
+	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.link != nil || pending < cs.capacity}
 	cs.items = append(cs.items, item)
 	cs.broadcast()
-	return item
+	return item, nil
+}
+
+// find returns the queued item with an identity, or nil. Call with mu held.
+func (cs *chanState) find(from string, seq uint64) *chanItem {
+	for _, it := range cs.items {
+		if it.from == from && it.seq == seq {
+			return it
+		}
+	}
+	return nil
+}
+
+// announceClose tells the host the channel is closed, if it is shared.
+func (cs *chanState) announceClose(ctx context.Context) error {
+	cs.mu.Lock()
+	link := cs.link
+	cs.mu.Unlock()
+	if link == nil {
+		return nil
+	}
+	if err := link.Send(ctx, ChannelItem{Closed: true}); err != nil {
+		return fmt.Errorf("flow: close a shared channel: %w", err)
+	}
+	return nil
 }
 
 func (cs *chanState) shut() {
