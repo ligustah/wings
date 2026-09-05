@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
@@ -346,7 +345,3 @@ func (r Recording) Discard(ctx context.Context) error {
 	}
 	return dropStream(ctx, client, r.ID)
 }
-
-// recordWait bounds how long a reader waits for events still in flight behind
-// the result that named them.
-const recordWait = 2 * time.Minute

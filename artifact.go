@@ -106,7 +106,7 @@ func Create(ctx context.Context, name string) (*Output, error) {
 //
 // Writes are buffered and sent in chunks, so a job that produces a hundred
 // megabytes never holds a hundred megabytes: what is in memory at any moment is
-// one chunk.
+// one chunk, however large the slice handed to Write.
 type Output struct {
 	stream  *dsclient.Stream[fileChunk]
 	name    string
@@ -121,6 +121,10 @@ type Output struct {
 }
 
 // Write buffers p, sending whole chunks as they fill.
+//
+// A slice at least a chunk long is sent straight from the caller's memory
+// rather than copied into the buffer first, so a single large Write costs one
+// chunk of buffer and not a second copy of the whole thing.
 func (o *Output) Write(p []byte) (int, error) {
 	if o.closed {
 		return 0, fmt.Errorf("wings: artifact %q is closed", o.name)
@@ -128,15 +132,28 @@ func (o *Output) Write(p []byte) (int, error) {
 	if o.err != nil {
 		return 0, o.err
 	}
-	o.buf = append(o.buf, p...)
-	o.size += int64(len(p))
-	for len(o.buf) >= artifactChunk {
-		if err := o.send(o.buf[:artifactChunk]); err != nil {
-			return 0, err
+	n := 0
+	for len(p) > 0 {
+		if len(o.buf) == 0 && len(p) >= artifactChunk {
+			if err := o.send(p[:artifactChunk]); err != nil {
+				return n, err
+			}
+			p, n = p[artifactChunk:], n+artifactChunk
+			o.size += artifactChunk
+			continue
 		}
-		o.buf = o.buf[:copy(o.buf, o.buf[artifactChunk:])]
+		take := min(artifactChunk-len(o.buf), len(p))
+		o.buf = append(o.buf, p[:take]...)
+		p, n = p[take:], n+take
+		o.size += int64(take)
+		if len(o.buf) == artifactChunk {
+			if err := o.send(o.buf); err != nil {
+				return n, err
+			}
+			o.buf = o.buf[:0]
+		}
 	}
-	return len(p), nil
+	return n, nil
 }
 
 // Close sends what is left.
@@ -162,7 +179,8 @@ func (o *Output) Close() error {
 
 func (o *Output) send(data []byte) error {
 	// The stream stores what it is given verbatim, so the slice must not be the
-	// buffer we are about to shift.
+	// buffer about to be reused, nor the caller's, which Write's contract lets
+	// them overwrite the moment it returns. One chunk's worth, and the only copy.
 	chunk := append(fileChunk(nil), data...)
 	if _, err := o.stream.Append(context.Background(), []fileChunk{chunk}); err != nil {
 		o.err = fmt.Errorf("wings: write artifact %q: %w", o.name, err)
@@ -228,11 +246,17 @@ type artifactReader struct {
 
 	from int64
 	read int
-	rest []byte
+	// queue is what has been read and not yet handed out, and pos is how far
+	// into the first of them the reader has got. A position rather than a
+	// buffer that is shifted on every Read: a caller reading a quarter-megabyte
+	// chunk a kilobyte at a time would otherwise move the rest of it two
+	// hundred and fifty times.
+	queue []fileChunk
+	pos   int
 }
 
 func (r *artifactReader) Read(p []byte) (int, error) {
-	for len(r.rest) == 0 {
+	for len(r.queue) == 0 {
 		if r.read >= r.want {
 			return 0, io.EOF
 		}
@@ -254,13 +278,20 @@ func (r *artifactReader) Read(p []byte) (int, error) {
 			return 0, io.ErrUnexpectedEOF
 		}
 		for _, rec := range recs {
-			r.rest = append(r.rest, rec.Record...)
 			r.from = rec.Offset + 1
 			r.read++
+			if len(rec.Record) > 0 {
+				r.queue = append(r.queue, rec.Record)
+			}
 		}
 	}
-	n := copy(p, r.rest)
-	r.rest = r.rest[:copy(r.rest, r.rest[n:])]
+	n := copy(p, r.queue[0][r.pos:])
+	r.pos += n
+	if r.pos == len(r.queue[0]) {
+		r.queue[0] = nil
+		r.queue = r.queue[1:]
+		r.pos = 0
+	}
 	return n, nil
 }
 
