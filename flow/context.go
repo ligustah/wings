@@ -20,9 +20,35 @@ import (
 // It is a value, cheap to copy, and everything it knows lives in the
 // context.Context it wraps, so a context derived from one with the standard
 // library — context.WithTimeout, say — loses nothing; [From] wraps it back.
+//
+// The zero Context is usable and carries nothing: it behaves as
+// [context.Background] and every method of this package on it says, in its
+// error, that there is no run, call or executor here. It never panics.
 type Context struct {
 	context.Context
 }
+
+// base is the wrapped context, or Background for the zero Context, so that a
+// Context that was never given anything reports an error instead of a nil
+// dereference.
+func (c Context) base() context.Context {
+	if c.Context == nil {
+		return context.Background()
+	}
+	return c.Context
+}
+
+// Deadline is [context.Context.Deadline].
+func (c Context) Deadline() (time.Time, bool) { return c.base().Deadline() }
+
+// Done is [context.Context.Done].
+func (c Context) Done() <-chan struct{} { return c.base().Done() }
+
+// Err is [context.Context.Err].
+func (c Context) Err() error { return c.base().Err() }
+
+// Value is [context.Context.Value].
+func (c Context) Value(key any) any { return c.base().Value(key) }
 
 // From gives a Context over any context.
 //
@@ -43,19 +69,19 @@ func From(ctx context.Context) Context {
 
 // WithCancel is [context.WithCancel], keeping the type.
 func (c Context) WithCancel() (Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(c.Context)
+	ctx, cancel := context.WithCancel(c.base())
 	return Context{ctx}, cancel
 }
 
 // WithTimeout is [context.WithTimeout], keeping the type.
 func (c Context) WithTimeout(d time.Duration) (Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(c.Context, d)
+	ctx, cancel := context.WithTimeout(c.base(), d)
 	return Context{ctx}, cancel
 }
 
 // WithValue is [context.WithValue], keeping the type.
 func (c Context) WithValue(key, val any) Context {
-	return Context{context.WithValue(c.Context, key, val)}
+	return Context{context.WithValue(c.base(), key, val)}
 }
 
 // Go starts f on its own thread and returns immediately.
