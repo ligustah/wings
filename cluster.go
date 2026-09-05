@@ -575,7 +575,9 @@ func (c *Cluster) connectBackend(id string, backend dswire.Backend) (*workerConn
 // sharedClient is the cluster's own embedded durable-streams instance, created
 // on first use and torn down by [Cluster.Stop].
 //
-// Only the in-process target reaches for it, and it is what makes that target
+// Every target uses it: the journal, the machine record and the copies of
+// what jobs write all live here, whatever a worker is. The in-process target
+// goes further and runs its workers on it too, which is what makes that target
 // honest: coordinator and workers are the same process, so there is nothing to
 // serve over a socket and nothing to dial — they open the same streams on the
 // same engine. Above this line the coordinator sees a *dsclient.Client either

@@ -20,3 +20,4 @@
 .claude/settings.local.json
 .idea/
 .vscode/
+firebase-debug.log

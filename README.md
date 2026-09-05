@@ -8,7 +8,7 @@ var Render = wings.Define("render", func(ctx context.Context, f Frame) (Image, e
 })
 
 func Coordinate(ctx context.Context, c *wings.Cluster) error {
-    images, err := c.Map(ctx, Render, frames)   // runs wherever the workers are
+    images, err := wings.Map(ctx, Render, frames)   // runs wherever the workers are
     ...
 }
 ```
@@ -94,7 +94,7 @@ var Render = wings.Define("render", func(ctx context.Context, f Frame) (Image, e
 
 // Coordinate is called once, with a cluster that is already up.
 func Coordinate(ctx context.Context, c *wings.Cluster) error {
-    images, err := c.Map(ctx, Render, frames)
+    images, err := wings.Map(ctx, Render, frames)
     if err != nil {
         return err
     }

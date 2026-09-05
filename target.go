@@ -124,5 +124,5 @@ func LocalProcess() Target { return Target{kind: targetLocalProcess} }
 
 // Remote provisions machines through p and deploys this binary to each.
 //
-//	wings.Remote(wings.GCP(wings.GCPConfig{Project: "p", Zone: "europe-west1-b"}))
+//	wings.Remote(gcp.New(gcp.Config{Project: "p", Zone: "europe-west1-b"}))
 func Remote(p Provisioner) Target { return Target{kind: targetRemote, prov: p} }
