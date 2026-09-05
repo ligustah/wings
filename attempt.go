@@ -207,19 +207,24 @@ func (a *attemptOutputs) finish(ctx context.Context) error {
 // carries on from there under its own name.
 type historyStore struct {
 	a *attemptOutputs
+	// name is the stream, chosen by the attempt rather than by the run: the
+	// run is named for the job and every attempt of it is the same run, but
+	// each attempt writes its own stream.
+	name string
 }
 
-func (h *historyStore) stream(ctx context.Context, run string) (*dsclient.Stream[*protos.Event], error) {
-	st, err := h.a.node.client.OpenStream[*protos.Event](run, dsclient.WithCodec[*protos.Event](
+func (h *historyStore) stream(ctx context.Context) (*dsclient.Stream[*protos.Event], error) {
+	st, err := h.a.node.client.OpenStream[*protos.Event](h.name, dsclient.WithCodec[*protos.Event](
 		dswire.ReflectCodec[*protos.Event]{New: func() *protos.Event { return &protos.Event{} }},
 	))
 	if err != nil {
-		return nil, fmt.Errorf("wings: open history %s: %w", run, err)
+		return nil, fmt.Errorf("wings: open history %s: %w", h.name, err)
 	}
 	return st, nil
 }
 
-func (h *historyStore) Events(ctx context.Context, run string) ([]*protos.Event, error) {
+func (h *historyStore) Events(ctx context.Context, _ string) ([]*protos.Event, error) {
+	run := h.name
 	ok, err := h.a.node.client.StreamExists(ctx, run)
 	if err != nil {
 		return nil, fmt.Errorf("wings: look for history %s: %w", run, err)
@@ -227,7 +232,7 @@ func (h *historyStore) Events(ctx context.Context, run string) ([]*protos.Event,
 	if !ok {
 		return nil, nil
 	}
-	st, err := h.stream(ctx, run)
+	st, err := h.stream(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -248,8 +253,8 @@ func (h *historyStore) Events(ctx context.Context, run string) ([]*protos.Event,
 	}
 }
 
-func (h *historyStore) Sink(ctx context.Context, run string) (flow.Sink, error) {
-	return &historySink{h: h, run: run}, nil
+func (h *historyStore) Sink(ctx context.Context, _ string) (flow.Sink, error) {
+	return &historySink{h: h}, nil
 }
 
 // historySink appends a run's events inside the attempt's transaction.
@@ -261,8 +266,7 @@ func (h *historyStore) Sink(ctx context.Context, run string) (flow.Sink, error) 
 // would charge the common case for the rare one. The markers are held until
 // something worth keeping comes, and dropped if nothing does.
 type historySink struct {
-	h   *historyStore
-	run string
+	h *historyStore
 
 	mu     sync.Mutex
 	stream *dsclient.Stream[*protos.Event]
@@ -280,10 +284,10 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 		}
 		// Not the attempt's context: a stream half-made when a deadline
 		// expires is the next attempt's problem.
-		if err := ensureStream(context.WithoutCancel(ctx), s.h.a.node.client, s.run); err != nil {
+		if err := ensureStream(context.WithoutCancel(ctx), s.h.a.node.client, s.h.name); err != nil {
 			return err
 		}
-		st, err := s.h.stream(ctx, s.run)
+		st, err := s.h.stream(ctx)
 		if err != nil {
 			return err
 		}

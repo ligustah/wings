@@ -441,9 +441,18 @@ and by age as a net under a function that reports nothing for a long time. What
 the coordinator is told about progress is therefore never ahead of what it can
 copy, and what a retry is handed is consistent across all of them: the history
 that says which recordings were made and the recordings themselves were
-committed together. Nested calls still execute on the worker that runs the
-function; dispatching them back to the cluster, and channels that cross machines,
-are the next step on top of this.
+committed together.
+
+A call a work function makes is **the cluster's to place**, like any other.
+There is no request message: the coordinator keeps a copy of every attempt's
+history, reads the calls out of it, runs each where the load is lowest and
+sends the answer back on the worker's control stream. Making a call is
+therefore a commit point on the worker. The run is named for the job, not the
+attempt, so a retry that replays a call presents the same one, and the
+coordinator hands back the answer it kept — or lets the retry rejoin the call
+still in flight — rather than running it twice. A job waiting on a call it made
+is not moved for silence, however long the call takes; its total timeout still
+runs. Channels that cross machines are the next step on top of this.
 
 ## Recordings
 

@@ -398,10 +398,11 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// sits just past the call event, so the call's own position is one back —
 	// and that is the number a reader of an executor's record can find in the
 	// history.
+	step := t.at() - 1
 	out, callErr := t.run.exec.Invoke(WithOrigin(ctx, Origin{
 		Run:     t.run.name,
 		Thread:  t.id,
-		Step:    t.at() - 1,
+		Step:    step,
 		Attempt: t.run.attempt,
 	}), name, payload)
 
@@ -417,7 +418,10 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// Recorded either way. A failed call is a fact about the run, and one that
 	// a retry must not repeat blindly — the error is what the next attempt
 	// replays.
-	t.record(&protos.ReturnEvent{Result: packResult(out, callErr)})
+	// Named for its call, so a reader of the history that dispatches calls
+	// for the run — an executor following it from outside — can tell an
+	// answered call from one still open without pairing events by order.
+	t.record(&protos.ReturnEvent{Result: packResult(out, callErr), CallSerial: step})
 	if callErr != nil {
 		return nil, &callError{name: name, err: callErr}
 	}

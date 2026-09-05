@@ -42,6 +42,13 @@ type workerNode struct {
 	out     *dsclient.Stream[resultEnvelope]
 	beats   *dsclient.Stream[beatEnvelope]
 	control *dsclient.Stream[controlEnvelope]
+	nested  *dsclient.Stream[jobEnvelope]
+
+	// answers are the outcomes of calls made by attempts running here, by
+	// attempt and then by the call's position. See nested.go. Guarded by
+	// runMu, with running, since an answer is only kept for an attempt that
+	// is.
+	answers map[string]map[string]*answerBox
 
 	// running is how to stop each attempt in flight here, keyed by job and
 	// attempt. A cancellation names both, so one for an attempt already moved
@@ -92,7 +99,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 // already there. StreamExists is node-local, which is the right question for
 // both an embedded engine and a single-node broker.
 func (n *workerNode) declareStreams(ctx context.Context) error {
-	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id), controlStreamFor(n.id)} {
+	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id), controlStreamFor(n.id), nestedStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
 		if err != nil {
 			return fmt.Errorf("wings: check stream %s: %w", name, err)
@@ -116,6 +123,9 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 	}
 	if n.control, err = n.client.OpenStream[controlEnvelope](controlStreamFor(n.id)); err != nil {
 		return fmt.Errorf("wings: open %s: %w", controlStreamFor(n.id), err)
+	}
+	if n.nested, err = n.client.OpenStream[jobEnvelope](nestedStreamFor(n.id)); err != nil {
+		return fmt.Errorf("wings: open %s: %w", nestedStreamFor(n.id), err)
 	}
 	return nil
 }
@@ -203,6 +213,7 @@ func (n *workerNode) run(ctx context.Context) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	go n.tailControl(ctx)
+	go n.serveNested(ctx)
 	return n.client.Run(ctx, "wings-worker-"+n.id, dsclient.Processor[jobEnvelope, resultEnvelope]{
 		In:      n.jobs,
 		Out:     n.out,
@@ -248,6 +259,10 @@ func (n *workerNode) tailControl(ctx context.Context) {
 		}
 		for _, r := range recs {
 			from = r.Offset + 1
+			if r.Record.Answer != nil {
+				n.answer(r.Record)
+				continue
+			}
 			n.stopAttempt(r.Record)
 		}
 	}
@@ -333,6 +348,7 @@ func (n *workerNode) startAttempt(ctx context.Context, job jobEnvelope) (context
 	return ctx, func() {
 		n.runMu.Lock()
 		delete(n.running, key)
+		delete(n.answers, key)
 		n.runMu.Unlock()
 		cancel(nil)
 	}
@@ -445,10 +461,13 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// And the wings half: which job this is and the worker it is on, so what
 	// it writes goes on this worker's streams, and what its earlier attempts
 	// wrote can be read back.
-	ctx = withJob(ctx, &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs})
-	// A function this job calls runs here, on this worker: it is where work
-	// runs, and a worker is not a place work dispatches from.
-	ctx = flow.Bind(ctx, flow.Local())
+	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs}
+	ctx = withJob(ctx, state)
+	// A function this job calls is the cluster's to run, like any other: the
+	// call is read out of this job's history by the coordinator and its
+	// answer comes back on the control stream. See nested.go.
+	exec := nestedExecutor{n: n, job: state}
+	ctx = flow.Bind(ctx, exec)
 	// Now, not when the job was appended: the coordinator's clocks on this job
 	// run from here, so time it spent waiting behind others on this worker is
 	// not counted against the work. Best-effort like every beat — a lost one
@@ -476,8 +495,13 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// attempt's, put on this worker under this attempt's name before the job
 	// arrived. One attempt per dispatch: whether to try again, and where, is
 	// the coordinator's decision, and the error is its input.
-	payload, err := flow.RunCall(ctx, historyName(job.ID, job.Attempt), job.Func, job.Payload,
-		flow.WithStore(&historyStore{a: outputs}), flow.WithExecutor(flow.Local()), flow.Once())
+	//
+	// Named for the JOB, not the attempt: the name is what the calls this run
+	// makes are recorded under, and a retry that replays one must present it
+	// as the same call, or the coordinator dispatches it twice.
+	payload, err := flow.RunCall(ctx, jobRunName(job.ID), job.Func, job.Payload,
+		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
+		flow.WithExecutor(exec), flow.Once())
 	// Whatever the attempt wrote is committed before its answer leaves: a
 	// result whose recordings could still be lost would be a handle to
 	// nothing. A commit that fails is the attempt failing.

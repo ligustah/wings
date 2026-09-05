@@ -3,6 +3,7 @@ package wings
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -134,8 +135,8 @@ var forksThenStalls = flow.Define("test.forksThenStalls", func(ctx flow.Context,
 // name, and the retry's nested call is answered from it.
 //
 // In process the counters say so directly. Across processes they cannot, so
-// the nested call leaves a recording named for the attempt that ran it, and
-// the retry's absence of one is the proof.
+// the nested call leaves a recording under the job it ran as, and one
+// recording in the whole cluster is the proof.
 func TestAMovedWorkFunctionReplaysItsHistory(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -171,14 +172,21 @@ func TestAMovedWorkFunctionReplaysItsHistory(t *testing.T) {
 					t.Fatalf("the nested call ran %d times across the move, want 1: the retry must replay it from the history", n)
 				}
 			}
-			// The retry (attempt 1) must not have run the nested call, so it
-			// left no recording of its own; the abandoned attempt's is gone
-			// with the job's settling, so neither exists.
-			retry := outputName{Prefix: recordingPrefix, Job: got.Job, Attempt: 1, Name: "nested"}.String()
-			if ok, err := c.shared.StreamExists(t.Context(), retry); err != nil {
+			// The nested call is a job of its own, and every execution of it
+			// leaves a recording under its job. One recording means it ran once:
+			// the retry was answered from the history rather than calling again.
+			names, err := c.shared.ListStreams(t.Context())
+			if err != nil {
 				t.Fatal(err)
-			} else if ok {
-				t.Fatalf("the retry ran the nested call again: %s exists", retry)
+			}
+			var recordings []string
+			for _, name := range names {
+				if o, ok := parseOutput(name); ok && o.Prefix == recordingPrefix && o.Name == "nested" {
+					recordings = append(recordings, name)
+				}
+			}
+			if len(recordings) != 1 {
+				t.Fatalf("the nested call left %d recordings, want 1: %v", len(recordings), recordings)
 			}
 		})
 	}
@@ -284,5 +292,87 @@ func TestWhatAJobWritesIsVisibleAtItsCommitPoints(t *testing.T) {
 	}
 	if len(events) != 5 || !r.rec.Complete || r.rec.Events != 5 {
 		t.Fatalf("replayed %v, handle %+v; want 5 events and a complete log", events, r.rec)
+	}
+}
+
+type placement struct {
+	Parent string `json:"parent"`
+	Child  string `json:"child"`
+}
+
+// whereAmI answers with the worker it ran on.
+var whereAmI = flow.Define("test.whereAmI", func(ctx flow.Context, _ int) (string, error) {
+	return jobFrom(ctx).node.id, nil
+})
+
+// callsWhere makes one call and reports where both ran.
+var callsWhere = flow.Define("test.callsWhere", func(ctx flow.Context, _ int) (placement, error) {
+	child, err := ctx.Go(whereAmI, 0).Await(ctx)
+	if err != nil {
+		return placement{}, err
+	}
+	return placement{Parent: jobFrom(ctx).node.id, Child: child}, nil
+})
+
+// THE POINT: a call a work function makes is the cluster's to place. With a
+// second worker idle it goes there; with one worker whose only slot the caller
+// holds, it still runs — a call is not queued behind the job waiting for it.
+func TestACallFromAJobIsPlacedByTheCluster(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		target  Target
+		workers int
+	}{
+		{"inprocess/two", InProcess(), 2},
+		{"inprocess/one", InProcess(), 1},
+		{"local/two", LocalProcess(), 2},
+		{"local/one", LocalProcess(), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.workers == 0 || (strings.HasPrefix(tc.name, "local") && testing.Short()) {
+				t.Skip("spawns child processes")
+			}
+			c := start(t, Config{Target: tc.target, Workers: tc.workers, Concurrency: 1})
+			got, err := callsWhere(c.Bind(t.Context()), 0)
+			if err != nil {
+				t.Fatalf("callsWhere: %v", err)
+			}
+			if got.Parent == "" || got.Child == "" {
+				t.Fatalf("got %+v", got)
+			}
+			if tc.workers == 2 && got.Child == got.Parent {
+				t.Fatalf("the call ran on %s, the same worker as its caller, while another was idle", got.Child)
+			}
+			if tc.workers == 1 && got.Child != got.Parent {
+				t.Fatalf("the call ran on %s; there is only %s", got.Child, got.Parent)
+			}
+		})
+	}
+}
+
+var patient struct{ attempts atomic.Int32 }
+
+// waitsOnASlowCall must heartbeat every 200ms, and instead waits 700ms on a
+// call it made.
+var waitsOnASlowCall = flow.Define("test.waitsOnASlowCall", func(ctx flow.Context, _ int) (string, error) {
+	patient.attempts.Add(1)
+	return ctx.Go(slow, 700*time.Millisecond).Await(ctx)
+}, flow.WithHeartbeatTimeout(200*time.Millisecond))
+
+// THE POINT: a job waiting on a call it made is quiet for as long as the call
+// takes, and the coordinator — which is running the call — does not mistake
+// that for a stuck job and move it.
+func TestAJobWaitingOnItsCallIsNotMovedForSilence(t *testing.T) {
+	patient.attempts.Store(0)
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1})
+	got, err := waitsOnASlowCall(c.Bind(t.Context()), 0)
+	if err != nil {
+		t.Fatalf("waitsOnASlowCall: %v", err)
+	}
+	if got != "finished" {
+		t.Fatalf("got %q", got)
+	}
+	if n := patient.attempts.Load(); n != 1 {
+		t.Fatalf("the job ran %d times; waiting on its own call must not count as silence", n)
 	}
 }

@@ -49,7 +49,11 @@
 // On the worker a call runs as a flow run of its own — see [flow.RunCall] —
 // so a work function may fork, use channels, sleep and call other functions,
 // and a retry replays what its predecessor already did. Everything an attempt
-// writes is committed as one transaction at its heartbeats, steps and return.
+// writes is committed as one transaction at its heartbeats, steps, calls and
+// return. A call a work function makes goes back to the cluster to be placed:
+// the coordinator reads it out of its copy of the run's history and answers
+// it on the worker's control stream, so a function that fans out fans out
+// across the fleet, and a worker never waits on itself.
 //
 // # Using this package directly
 //

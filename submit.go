@@ -71,6 +71,7 @@ func (c *Cluster) submitter(w *workerConn) {
 
 	batch := make([]submission, 0, submitBatch)
 	jobs := make([]jobEnvelope, 0, submitBatch)
+	nested := make([]jobEnvelope, 0, submitBatch)
 	for {
 		var first submission
 		select {
@@ -93,11 +94,25 @@ func (c *Cluster) submitter(w *workerConn) {
 			break
 		}
 
-		jobs = jobs[:0]
+		// Two queues, one batcher: what a job called goes on the nested queue,
+		// which the worker reads without waiting for a slot on the other.
+		jobs, nested := jobs[:0], nested[:0]
 		for _, s := range batch {
-			jobs = append(jobs, s.job)
+			if s.job.Nested {
+				nested = append(nested, s.job)
+			} else {
+				jobs = append(jobs, s.job)
+			}
 		}
-		_, err := w.jobs.Append(w.ctx, jobs)
+		var err error
+		if len(jobs) > 0 {
+			_, err = w.jobs.Append(w.ctx, jobs)
+		}
+		if len(nested) > 0 {
+			if _, nerr := w.nested.Append(w.ctx, nested); nerr != nil && err == nil {
+				err = nerr
+			}
+		}
 		w.appends.Add(1)
 		for _, s := range batch {
 			s.done <- err

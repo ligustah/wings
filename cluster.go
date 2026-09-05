@@ -115,6 +115,9 @@ type workerConn struct {
 	// control is the coordinator's word to this worker about a job already
 	// on it: stop this one, nobody wants the answer.
 	control *dsclient.Stream[controlEnvelope]
+	// nested is the queue of calls made by jobs, which the worker takes off
+	// without regard to how full its job queue is. See nested.go.
+	nested *dsclient.Stream[jobEnvelope]
 
 	// beats is progress reported by jobs still running here. Read on its own
 	// goroutine rather than with results, because it says something about a
@@ -238,6 +241,18 @@ type pendingJob struct {
 	// bounds are those declared on the function. Read once at submit so the
 	// watchdog does not go through the registry per job per tick.
 	bounds flow.Bounds
+
+	// The calls this job makes, when it is a run that makes them. See
+	// nested.go. followed says which attempts' histories are being read for
+	// calls; children counts the calls dispatched and not yet answered; and
+	// answers keeps every answer by the call's position, so an attempt that
+	// replays a call already answered is handed the answer again rather than
+	// having the work done twice.
+	//
+	// All guarded by Cluster.mu.
+	followed map[int]bool
+	children int
+	answers  map[string]resultEnvelope
 	// since is when the current attempt was dispatched, started when the
 	// worker reported beginning it, and beat when it last reported progress.
 	//
@@ -286,7 +301,10 @@ func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	if p.bounds.Timeout > 0 && now.Sub(p.started) > p.bounds.Timeout {
 		tooSlow = true
 	}
-	if p.bounds.Heartbeat > 0 {
+	// A job waiting on a call it made is quiet for as long as the call takes,
+	// and is not stuck: the coordinator itself is running what it is waiting
+	// for. Its total bound still runs.
+	if p.bounds.Heartbeat > 0 && p.children == 0 {
 		last := p.beat
 		if last.IsZero() {
 			last = p.started
@@ -480,7 +498,7 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 	}
 	names := []string{mirrorStreamFor(w.id)}
 	if w.client == client {
-		names = append(names, jobStreamFor(w.id), resultStreamFor(w.id), beatStreamFor(w.id), controlStreamFor(w.id))
+		names = append(names, jobStreamFor(w.id), resultStreamFor(w.id), beatStreamFor(w.id), controlStreamFor(w.id), nestedStreamFor(w.id))
 	}
 	for _, name := range names {
 		if err := dropStream(ctx, client, name); err != nil {
@@ -601,6 +619,9 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	}
 	if w.control, err = client.OpenStream[controlEnvelope](controlStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", controlStreamFor(id), id, err)
+	}
+	if w.nested, err = client.OpenStream[jobEnvelope](nestedStreamFor(id)); err != nil {
+		return nil, fmt.Errorf("wings: open %s on worker %s: %w", nestedStreamFor(id), id, err)
 	}
 	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
 		return nil, err
@@ -885,6 +906,7 @@ func (c *Cluster) deliver(res resultEnvelope) {
 		return
 	}
 	if ok {
+		c.noteSettledLocked(p, res)
 		c.forget(p)
 		c.release(p.worker)
 	}
@@ -1165,6 +1187,9 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 	if p.started.IsZero() {
 		p.started = now
 	}
+	// The attempt is running, so its history is being written: follow it for
+	// the calls it makes. Once per attempt, from whichever beat comes first.
+	c.followHistory(p, b.Attempt)
 	if b.Started {
 		// The one report that is not progress. Leaving beat alone keeps the
 		// heartbeat clock honest: it runs from started until the job actually
@@ -1249,6 +1274,7 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	c.mu.Lock()
 	cur, ok := c.pending[p.job.ID]
 	if ok && cur == p {
+		c.noteSettledLocked(p, resultEnvelope{ID: p.job.ID, Error: err.Error()})
 		c.forget(p)
 	}
 	w, attempt := p.worker, p.job.Attempt
@@ -1337,6 +1363,10 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		// would make the ordinary case pay for the special one.
 		origin: flow.OriginFrom(ctx),
 	}
+	// A call made by a job is a run named for that job. Where it goes on the
+	// worker follows from what it is, not from a parameter.
+	job.Nested = isJobRun(p.origin.Run)
+	p.job = job
 
 	key := p.origin.Key()
 

@@ -25,6 +25,9 @@ const (
 	// that queue only as slots free, and the message that matters most is
 	// about the job holding the slot.
 	controlStreamPrefix = "wings.control."
+	// nestedStreamPrefix is the queue of calls made BY jobs, one per worker.
+	// Apart from the job queue on purpose: see the worker's serveNested.
+	nestedStreamPrefix = "wings.nested."
 
 	// consumerGroup is the offset key a worker commits its progress under. It
 	// need not be more specific: a worker consumes only its own job stream.
@@ -35,6 +38,7 @@ func jobStreamFor(workerID string) string     { return jobStreamPrefix + workerI
 func resultStreamFor(workerID string) string  { return resultStreamPrefix + workerID }
 func beatStreamFor(workerID string) string    { return beatStreamPrefix + workerID }
 func controlStreamFor(workerID string) string { return controlStreamPrefix + workerID }
+func nestedStreamFor(workerID string) string  { return nestedStreamPrefix + workerID }
 
 // controlEnvelope tells a worker to stop one attempt of one job.
 //
@@ -46,6 +50,11 @@ type controlEnvelope struct {
 	Job     string `json:"job"`
 	Attempt int    `json:"attempt,omitempty"`
 	Why     string `json:"why,omitempty"`
+	// Answer, when set, makes this the other thing the coordinator says to a
+	// worker about a job already on it: a call that job made has an outcome.
+	// Same stream, because both are about an attempt in flight here and both
+	// must get past the queue.
+	Answer *answerEnvelope `json:"answer,omitempty"`
 }
 
 // jobEnvelope is one unit of work on the wire.
@@ -74,6 +83,19 @@ type jobEnvelope struct {
 	// oldest attempt first. A retry reads them with [Priors] to pick up where
 	// one of them stopped instead of starting over.
 	Priors []Recording `json:"priors,omitempty"`
+	// Nested says this job is a call made BY another job, and goes on the
+	// worker's nested queue rather than its job queue. See serveNested.
+	Nested bool `json:"nested,omitempty"`
+}
+
+// answerEnvelope is the outcome of a call a job made, sent back to the worker
+// running it. Thread and Step name the call the way the job's own history
+// does, which is how the worker knows which wait to end.
+type answerEnvelope struct {
+	Thread  string `json:"thread"`
+	Step    uint64 `json:"step"`
+	Payload []byte `json:"payload,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // beatEnvelope is one report that a job is still running, and how far it has

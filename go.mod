@@ -24,7 +24,7 @@ require (
 	github.com/ligustah/durable_streams/broker/client v0.52.0
 	github.com/ligustah/durable_streams/broker/protos v0.37.0
 	github.com/ligustah/durable_streams/dsclient v0.49.0
-	github.com/ligustah/durable_streams/dswire v0.29.0
+	github.com/ligustah/durable_streams/dswire v0.29.1
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.83.2
