@@ -3,6 +3,7 @@ package flow_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -181,5 +182,68 @@ func TestAReplayToAForkPassesAWaitGivenUpOn(t *testing.T) {
 	}
 	if !replayed {
 		t.Fatalf("the lineages placed were %v; the second thread was to be reached by replay", p.lineages)
+	}
+}
+
+// THE POINT: a send on a channel that is already closed is refused, with an
+// error rather than a panic, and refused again on replay; what a send under
+// way offered is drained by the receiver that comes, closed or not.
+func TestASendOnAClosedChannelIsRefused(t *testing.T) {
+	store := flow.NewMemStore()
+	name := flow.NewName()
+	attempts := 0
+	var seen []error
+	body := func(ctx flow.Context) error {
+		seen = seen[:0]
+		ch := ctx.NewChannel[int]()
+		if err := ch.Close(ctx); err != nil {
+			return err
+		}
+		seen = append(seen, ch.Send(ctx, 2))
+		attempts++
+		if attempts == 1 {
+			return errors.New("fail once, to be retried")
+		}
+		return nil
+	}
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store), flow.Once()); err == nil {
+		t.Fatal("the first attempt was meant to fail")
+	}
+	if !errors.Is(seen[0], flow.ErrChannelClosed) {
+		t.Fatalf("the send after the close returned %v", seen[0])
+	}
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store), flow.Once()); err != nil {
+		t.Fatalf("second attempt: %v", err)
+	}
+	if !errors.Is(seen[0], flow.ErrChannelClosed) {
+		t.Fatalf("the replayed send after the close returned %v", seen[0])
+	}
+}
+
+// THE POINT: a send under way when the channel closes is not refused: what
+// it offered is drained by the receiver that comes, which finds the channel
+// closed only after.
+func TestASendUnderWayAtTheCloseIsDrained(t *testing.T) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
+			return 1, ch.Send(ctx, 1)
+		})
+		time.Sleep(50 * time.Millisecond)
+		if err := ch.Close(ctx); err != nil {
+			return err
+		}
+		v, more, err := ch.Recv(ctx)
+		if err != nil || !more || v != 1 {
+			return fmt.Errorf("the receive got %d, %v, %v; want the value the sender offered", v, more, err)
+		}
+		if _, more, err := ch.Recv(ctx); err != nil || more {
+			return fmt.Errorf("the second receive got %v, %v; want the channel closed", more, err)
+		}
+		_, err = sender.Await(ctx)
+		return err
+	}, flow.WithStore(flow.NewMemStore()), flow.Once())
+	if err != nil {
+		t.Fatal(err)
 	}
 }

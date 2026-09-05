@@ -152,12 +152,24 @@ func (c *Channel[T]) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// ErrChannelClosed is what [Channel.Send] returns on a channel that was
+// closed before the send: nothing was sent. A send under way when the
+// channel closes is not refused — what it offered is there to be drained,
+// like anything else queued — and a receiver drains a closed channel before
+// finding it closed.
+var ErrChannelClosed = errors.New("flow: send on a closed channel")
+
 // Send puts a value on the channel.
 //
 // It blocks until the value is taken, or until the buffer has room. A send that
 // completed on a previous attempt returns as soon as the value is queued: it is
 // already known to have got through, and making a replay wait again for
 // something that already happened is how a resumed run deadlocks.
+//
+// On a channel already closed it sends nothing and returns
+// [ErrChannelClosed] — rather than panicking, as a Go send would, since a
+// closed channel is a fact of the run's state that a thread elsewhere may
+// have made — and returns it again on replay.
 func (c *Channel[T]) Send(ctx Context, v T) error {
 	t, cs, err := c.bind(ctx)
 	if err != nil {
@@ -192,6 +204,15 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 			return continuityf("thread %q previously sent %s#%d at this point, but is now sending %s#%d",
 				t.id, ev.GetChannel(), ev.GetSeq(), c.name, seq)
 		}
+		if ev.GetRefused() {
+			return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
+		}
+	} else if cs.isClosed() {
+		t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Refused: true})
+		if err := t.err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 	}
 	// A replayed send is not announced to other runs again: they have it,
 	// and the identity would only be dropped as a copy.
@@ -522,6 +543,12 @@ func (cs *chanState) announceClose(ctx context.Context) error {
 		return fmt.Errorf("flow: close a shared channel: %w", err)
 	}
 	return nil
+}
+
+func (cs *chanState) isClosed() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.closed
 }
 
 func (cs *chanState) shut() {

@@ -164,6 +164,11 @@ message ChannelSendEvent {
   // every respect that matters here: it is a thing one thread does that another
   // observes, and it has to be ordered against the sends around it.
   bool closed = 4;
+
+  // Set when the send found the channel already closed and was refused:
+  // nothing was sent, and the sender was told so. Recorded, since the next
+  // attempt must be told the same.
+  bool refused = 5;
 }
 
 message ChannelRecvEvent {

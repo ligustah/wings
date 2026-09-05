@@ -953,7 +953,11 @@ type ChannelSendEvent struct {
 	// Set when this closed the channel rather than sending. A close is a send in
 	// every respect that matters here: it is a thing one thread does that another
 	// observes, and it has to be ordered against the sends around it.
-	Closed        bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	Closed bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	// Set when the send found the channel already closed and was refused:
+	// nothing was sent, and the sender was told so. Recorded, since the next
+	// attempt must be told the same.
+	Refused       bool `protobuf:"varint,5,opt,name=refused,proto3" json:"refused,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1012,6 +1016,13 @@ func (x *ChannelSendEvent) GetValue() *Data {
 func (x *ChannelSendEvent) GetClosed() bool {
 	if x != nil {
 		return x.Closed
+	}
+	return false
+}
+
+func (x *ChannelSendEvent) GetRefused() bool {
+	if x != nil {
+		return x.Refused
 	}
 	return false
 }
@@ -1305,12 +1316,13 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\vReturnEvent\x12-\n" +
 	"\x06result\x18\x01 \x01(\v2\x15.wings.flow.v1.ResultR\x06result\x12\x1f\n" +
 	"\vcall_serial\x18\x02 \x01(\x04R\n" +
-	"callSerial\"\x81\x01\n" +
+	"callSerial\"\x9b\x01\n" +
 	"\x10ChannelSendEvent\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\tR\achannel\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12)\n" +
 	"\x05value\x18\x03 \x01(\v2\x13.wings.flow.v1.DataR\x05value\x12\x16\n" +
-	"\x06closed\x18\x04 \x01(\bR\x06closed\"\xb0\x01\n" +
+	"\x06closed\x18\x04 \x01(\bR\x06closed\x12\x18\n" +
+	"\arefused\x18\x05 \x01(\bR\arefused\"\xb0\x01\n" +
 	"\x10ChannelRecvEvent\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\tR\achannel\x12$\n" +
 	"\x0efrom_thread_id\x18\x02 \x01(\tR\ffromThreadId\x12\x19\n" +
