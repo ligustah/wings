@@ -364,8 +364,19 @@ func TestAWorkerToldItIsBeingTakenBackHandsItsWorkOver(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the job never finished; the notice was not acted on")
 	}
-	// And the worker leaves service, as a dead one would.
-	waitFor(t, "the worker to be released", func() bool { return c.Workers() == 1 })
+	// And the worker leaves service, as a dead one would. Its replacement
+	// arrives right behind it, so the count is no measure; that this one is
+	// gone is.
+	waitFor(t, "the worker to be released", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, w := range c.workers {
+			if w == on {
+				return false
+			}
+		}
+		return true
+	})
 	// And the record says why. The release that follows writes its own line
 	// too, as it does for any dead worker; the notice is the one that matters.
 	awaitJournal(t, c, func(es []journalEntry) bool {

@@ -1018,13 +1018,16 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 		}
 		p.worker = nil
 		p.since, p.started, p.beat = time.Time{}, time.Time{}, time.Time{}
+		// Copied under the lock: the worker this waits for may arrive and
+		// place it before the lines below run, and placing rewrites p.job.
+		job := p.job
 		c.mu.Unlock()
 		c.log.Warn("wings: no live worker for a job; holding it until one arrives",
-			"job", p.job.ID, "fn", p.job.Func, "why", why)
+			"job", job.ID, "fn", job.Func, "why", why)
 		c.journal.record(journalEntry{
-			Kind: journalHeld, Job: p.job.ID, Func: p.job.Func, Attempt: left, Err: why,
+			Kind: journalHeld, Job: job.ID, Func: job.Func, Attempt: left, Err: why,
 		}.from(p.origin))
-		c.stopOn(from, p.job.ID, left, why)
+		c.stopOn(from, job.ID, left, why)
 		return
 	}
 	if from != nil {
