@@ -106,6 +106,29 @@ func (c Config) withDefaults() Config {
 
 type gcpProvisioner struct {
 	cfg Config
+
+	// One Compute API client for the life of the provisioner, made on first
+	// use. Provision and Reattach each used to make their own and hand it to
+	// the machines they returned, and nothing closed it once they had: a
+	// provisioner that scaled up ten times held ten clients' worth of
+	// connections. A provisioner lives as long as its cluster, and so does
+	// this.
+	once      sync.Once
+	client    *compute.InstancesClient
+	clientErr error
+}
+
+// instances is the Compute API client, made once.
+func (p *gcpProvisioner) instances(ctx context.Context) (*compute.InstancesClient, error) {
+	p.once.Do(func() {
+		// Detached from the first caller's context: the client outlives the
+		// call that happened to make it.
+		p.client, p.clientErr = compute.NewInstancesRESTClient(context.WithoutCancel(ctx), p.cfg.ClientOptions...)
+		if p.clientErr != nil {
+			p.clientErr = fmt.Errorf("wings: compute client: %w", p.clientErr)
+		}
+	})
+	return p.client, p.clientErr
 }
 
 // Provision creates n instances in parallel and returns once each accepts SSH.
@@ -123,9 +146,9 @@ func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wing
 		return nil, err
 	}
 
-	client, err := compute.NewInstancesRESTClient(ctx, p.cfg.ClientOptions...)
+	client, err := p.instances(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("wings: compute client: %w", err)
+		return nil, err
 	}
 
 	machines := make([]wings.Machine, len(leases))
@@ -158,7 +181,6 @@ func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wing
 				_ = m.Close(context.WithoutCancel(ctx))
 			}
 		}
-		_ = client.Close()
 		return nil, failed
 	}
 	return machines, nil
@@ -197,9 +219,9 @@ func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings
 		return nil, err
 	}
 
-	client, err := compute.NewInstancesRESTClient(ctx, p.cfg.ClientOptions...)
+	client, err := p.instances(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("wings: compute client: %w", err)
+		return nil, err
 	}
 
 	found := make([]wings.Machine, len(leases))
@@ -225,9 +247,6 @@ func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings
 		if m != nil {
 			out = append(out, m)
 		}
-	}
-	if len(out) == 0 {
-		_ = client.Close()
 	}
 	return out, nil
 }
@@ -258,8 +277,8 @@ func (p *gcpProvisioner) reattachOne(
 		return nil, fmt.Errorf("instance has no external IP")
 	}
 
-	// created is false: we did not make this one, but we are taking
-	// responsibility for it, and Close must still delete it.
+	// created is TRUE although this run did not make it: we are taking
+	// responsibility for it, and Close must delete it like any other.
 	m := &gcpMachine{name: name, lease: lease, ip: ip, cfg: p.cfg, client: client, log: log, created: true}
 
 	// The fingerprint is GCE's optimistic-concurrency token: a write carrying a
