@@ -16,6 +16,11 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
+// attemptWorkloadPrefix begins an attempt's transactional id: the job's
+// stream part and the attempt number follow. The coordinator's puller
+// reads it back to tell whose transaction it is offered.
+const attemptWorkloadPrefix = "wings.job."
+
 // One attempt of one job, on the worker running it, writes several streams:
 // the history of the run it executes as, the recordings it opens, the files
 // it produces. They are written under ONE transactional producer, and they
@@ -87,7 +92,7 @@ func newAttemptOutputs(n *workerNode, job jobEnvelope) *attemptOutputs {
 // job moved while its old attempt is still alive does not fence it: the old
 // one's open transaction is abandoned and reaped, and never becomes visible.
 func (a *attemptOutputs) producerID() string {
-	return "wings.job." + streamPart(a.job) + "." + strconv.Itoa(a.attempt)
+	return attemptWorkloadPrefix + streamPart(a.job) + "." + strconv.Itoa(a.attempt)
 }
 
 // begin opens a transaction if none is open. Called with mu held.

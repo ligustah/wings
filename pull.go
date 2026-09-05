@@ -3,6 +3,8 @@ package wings
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	streams "github.com/ligustah/durable_streams"
@@ -65,6 +67,7 @@ func (c *Cluster) pull(w *workerConn) {
 			// its own, and a job moved is a new attempt under a new id, so
 			// no writer is ever superseded by another under the same name.
 			Epoch:  func(string) (uint16, error) { return 1, nil },
+			Only:   c.pullWanted,
 			Stream: c.pulledStream,
 		})
 		if w.ctx.Err() != nil || errors.Is(err, context.Canceled) {
@@ -88,6 +91,40 @@ func (c *Cluster) pull(w *workerConn) {
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// pullWanted says whether a worker's transaction is one the coordinator
+// still wants: an attempt's, while the job is outstanding on that attempt.
+// What an attempt the job has moved on from committed late is not — the
+// move took what was home, and the next attempt runs from that — and nor
+// is what a settled job's attempt committed after the result. Declined
+// here rather than by the stream map, because the coordinator discards
+// such an attempt's streams on the worker, and a transaction whose records
+// are gone cannot be copied whole; the engine stops the whole loop over
+// one it wants and cannot copy, and rightly, but one nobody wants is not
+// a hole.
+func (c *Cluster) pullWanted(workload string) bool {
+	rest, ok := strings.CutPrefix(workload, attemptWorkloadPrefix)
+	if !ok {
+		return true
+	}
+	i := strings.LastIndexByte(rest, '.')
+	if i < 0 {
+		return true
+	}
+	attempt, err := strconv.Atoi(rest[i+1:])
+	if err != nil {
+		return true
+	}
+	part := rest[:i]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, p := range c.pending {
+		if streamPart(id) == part {
+			return p.job.Attempt <= attempt
+		}
+	}
+	return false
 }
 
 // pulledStream says where a record of a worker's transaction goes here: the

@@ -63,3 +63,30 @@ func TestWhatAJobCommitsComesHomeAsTransactions(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// THE POINT: the puller is offered every transaction a worker committed,
+// and declines the ones nobody wants — an attempt the job has moved on
+// from, a job that has settled — rather than stopping over one it cannot
+// copy whole: the coordinator discards such attempts' streams on the
+// worker, and their late transactions are exactly the ones with records
+// missing.
+func TestThePullerDeclinesWhatNoAttemptWants(t *testing.T) {
+	c := &Cluster{pending: map[string]*pendingJob{}}
+	c.pending["ep-1"] = &pendingJob{job: jobEnvelope{ID: "ep-1", Attempt: 2}}
+	for _, tc := range []struct {
+		workload string
+		want     bool
+	}{
+		{"wings.job.ep-1.2", true},          // the attempt the job is on
+		{"wings.job.ep-1.3", true},          // one the coordinator has yet to hear of
+		{"wings.job.ep-1.1", false},         // an attempt the job moved on from
+		{"wings.job.ep-1.0", false},         // ditto
+		{"wings.job.ep-2.0", false},         // a job that settled
+		{"wings.lineage.some.stream", true}, // not an attempt's at all
+		{"wings.job.odd", true},             // not the shape expected; the engine's to judge
+	} {
+		if got := c.pullWanted(tc.workload); got != tc.want {
+			t.Errorf("pullWanted(%q) = %v, want %v", tc.workload, got, tc.want)
+		}
+	}
+}
