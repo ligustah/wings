@@ -203,3 +203,181 @@ func TestARestartedCoordinatorRejoinsAThreadOfRunCode(t *testing.T) {
 		})
 	}
 }
+
+var spawnsSeveralSlowChildren = flow.DefineWorkflow("test.spawnsSeveralSlowChildren", func(ctx flow.Context, takes time.Duration) error {
+	var futs []*flow.Future[string]
+	for i := range 3 {
+		d := takes + time.Duration(i)*100*time.Millisecond
+		futs = append(futs, ctx.Spawn(func(ctx flow.Context) (string, error) { return slowChild(ctx, d) }))
+	}
+	several = nil
+	for _, f := range futs {
+		v, err := f.Await(ctx)
+		if err != nil {
+			return err
+		}
+		several = append(several, v)
+	}
+	return nil
+})
+
+var several []string
+
+// THE POINT: a restart with several threads of run code outstanding takes
+// every one of them back, and the replay rejoins each in turn.
+func TestARestartedCoordinatorRejoinsSeveralThreadsOfRunCode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	cloud := newFakeCloud(t)
+	dir := t.TempDir()
+
+	first := startRemote(t, dir, cloud, 1)
+	firstCtx, stopFirst := context.WithCancel(t.Context())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- first.RunWorkflow(firstCtx, spawnsSeveralSlowChildren, 4*time.Second) }()
+	awaitJournal(t, first, func(es []journalEntry) bool { return countKind(es, journalSubmitted) >= 3 })
+	abandon(t, first)
+	stopFirst()
+	<-firstDone
+
+	second := startRemote(t, dir, cloud, 1)
+	defer func() {
+		if err := second.Stop(context.Background()); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+	if err := second.RunWorkflow(t.Context(), spawnsSeveralSlowChildren, 4*time.Second); err != nil {
+		t.Fatalf("RunWorkflow after the restart: %v", err)
+	}
+	if len(several) != 3 || several[0] != "finished" || several[1] != "finished" || several[2] != "finished" {
+		t.Fatalf("got %v, want three results", several)
+	}
+	entries := awaitJournal(t, second, func(es []journalEntry) bool { return countKind(es, journalCompleted) >= 3 })
+	var submitted, recovered, attached int
+	for _, e := range entries {
+		if e.Run != spawnsSeveralSlowChildren.Name() {
+			continue
+		}
+		switch e.Kind {
+		case journalSubmitted:
+			submitted++
+		case journalRecovered:
+			recovered++
+		case journalAttached:
+			attached++
+		}
+	}
+	if submitted != 3 || recovered != 3 || attached != 3 {
+		t.Fatalf("journal: %d submitted, %d recovered, %d attached; want 3 of each", submitted, recovered, attached)
+	}
+}
+
+type report struct {
+	Seen *flow.Channel[sighting] `json:"seen"`
+}
+
+// parentOfSpawn is a work function that forks a thread of run code and waits
+// for it: the parent's worker is killed while the child runs.
+var parentOfSpawn = flow.Define("test.parentOfSpawn", func(ctx flow.Context, in report) (int, error) {
+	if err := in.Seen.Send(ctx, sighting{Worker: where(ctx)}); err != nil {
+		return 0, err
+	}
+	child := ctx.Spawn(func(ctx flow.Context) (int, error) {
+		r, err := ctx.Effect(func() (int, error) { return rand.IntN(1<<30) + 1, nil })
+		if err != nil {
+			return 0, err
+		}
+		if err := ctx.Heartbeat(1); err != nil {
+			return 0, err
+		}
+		if err := in.Seen.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
+			return 0, err
+		}
+		time.Sleep(3 * time.Second)
+		return r, nil
+	})
+	return child.Await(ctx)
+})
+
+var parentMoves = flow.DefineWorkflow("test.parentMoves", func(ctx flow.Context, _ int) error {
+	seen := ctx.NewBufferedChannel[sighting](4)
+	fut := ctx.Go(parentOfSpawn, report{Seen: seen})
+	for range 2 {
+		s, _, err := seen.Recv(ctx)
+		if err != nil {
+			return err
+		}
+		sightings <- s
+	}
+	v, err := fut.Await(ctx)
+	if err != nil {
+		return err
+	}
+	sightings <- sighting{Worker: "result", Value: v}
+	return nil
+})
+
+// THE POINT: a work function that forked a thread of run code and is waiting
+// on it is moved when its worker dies, and its retry — replaying the fork —
+// rejoins the thread, which was dispatched once and, if it was on the same
+// worker, moved once.
+func TestAJobMovedWhileItsSpawnRunsRejoinsIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 2, Concurrency: 2, ReconnectTimeout: time.Second})
+	for len(sightings) > 0 {
+		<-sightings
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.RunWorkflow(ctx, parentMoves, 0) }()
+
+	next := func(what string) sighting {
+		select {
+		case s := <-sightings:
+			return s
+		case err := <-done:
+			t.Fatalf("the workflow ended before %s: %v", what, err)
+		case <-time.After(40 * time.Second):
+			t.Fatalf("no %s", what)
+		}
+		return sighting{}
+	}
+	parent := next("the parent's report")
+	child := next("the child's report")
+	if parent.Worker == "" || child.Worker == "" || child.Value == 0 {
+		t.Fatalf("parent %+v, child %+v", parent, child)
+	}
+	killed := false
+	for _, w := range c.fleet() {
+		if w.id == parent.Worker && w.proc != nil {
+			if err := w.proc.Kill(); err != nil {
+				t.Fatalf("kill: %v", err)
+			}
+			killed = true
+		}
+	}
+	if !killed {
+		t.Fatalf("no local worker process is called %s", parent.Worker)
+	}
+	result := next("the parent's result")
+	if err := <-done; err != nil {
+		t.Fatalf("RunWorkflow: %v", err)
+	}
+	if result.Value != child.Value {
+		t.Fatalf("the parent's retry got %d from its thread, which reported %d", result.Value, child.Value)
+	}
+	entries := awaitJournal(t, c, func(es []journalEntry) bool { return countKind(es, journalCompleted) >= 2 })
+	childSubmits := 0
+	for _, e := range entries {
+		if e.Run == parentMoves.Name() && e.Thread == "main.0.0" && e.Kind == journalSubmitted {
+			childSubmits++
+		}
+	}
+	if childSubmits != 1 {
+		t.Fatalf("the thread was submitted %d times, want once: the parent's retry rejoins it", childSubmits)
+	}
+}
