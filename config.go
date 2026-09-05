@@ -90,7 +90,9 @@ type Config struct {
 	// in-process worker with Concurrency goroutines is the same machine either
 	// way — and to 2 otherwise.
 	//
-	// Ignored when Scaling is enabled, which decides the count instead.
+	// It is a size to KEEP, not a number to launch once: a worker that dies or
+	// is preempted is replaced. It is the same thing as Scaling with Min and
+	// Max both set to it, and is ignored when Scaling is set.
 	Workers int
 
 	// Scaling makes the worker count follow the queue. The zero value is off.

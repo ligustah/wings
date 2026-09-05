@@ -79,13 +79,17 @@ func TestWorkSurvivesAWorkerBeingKilled(t *testing.T) {
 	}
 }
 
-// A cluster with no live workers must refuse rather than block forever.
-func TestCallWithNoLiveWorkersFails(t *testing.T) {
+// THE POINT: a fixed worker count is a size to keep. A cluster whose only
+// worker died used to refuse every call from then on; now the worker is
+// replaced, and a call that lands in the gap waits for the replacement rather
+// than failing. The caller's context is the bound on that wait.
+func TestACallWithNoLiveWorkerWaitsForTheReplacement(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")
 	}
 
-	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1})
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1,
+		Scaling: Scaling{Min: 1, Max: 1, Interval: 100 * time.Millisecond}})
 
 	w := firstWorker(t, c)
 	if err := w.proc.Kill(); err != nil {
@@ -100,11 +104,17 @@ func TestCallWithNoLiveWorkersFails(t *testing.T) {
 		t.Fatal("the tail never noticed the worker had died")
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
 	defer cancel()
-
-	if _, err := double(c.Bind(ctx), 1); err == nil {
-		t.Fatal("want an error when no worker is live, got nil")
+	got, err := double(c.Bind(ctx), 21)
+	if err != nil {
+		t.Fatalf("a call made while the only worker was being replaced: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("got %d, want 42", got)
+	}
+	if c.Workers() != 1 {
+		t.Fatalf("the fleet is %d workers after the replacement, want 1", c.Workers())
 	}
 }
 

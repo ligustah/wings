@@ -198,6 +198,12 @@ func (w *workerConn) hasExited() bool {
 type pendingJob struct {
 	job    jobEnvelope
 	worker *workerConn
+	// placed says the job has been put on some worker at least once. A job
+	// that could not be — every worker was gone — is held, with no worker,
+	// until one arrives, and placing it then is not a retry: it never ran.
+	//
+	// Guarded by Cluster.mu.
+	placed bool
 	// ran is which worker each attempt was sent to, by attempt number. What an
 	// abandoned attempt wrote is on the worker that ran it and nowhere else, so
 	// this is the one worker to delete it from when the job settles — rather
@@ -312,6 +318,13 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	if err := cfg.Scaling.validate(); err != nil {
 		return nil, err
 	}
+	// A plain worker count IS a policy: that many, kept at that many. One
+	// loop maintains the fleet whichever way it was asked for, so a fixed
+	// fleet that loses a machine to a preemption gets it back rather than
+	// running short until Stop.
+	if !cfg.Scaling.enabled() {
+		cfg.Scaling = fixedFleet(cfg.workers())
+	}
 	// Normalised once, here, so nothing downstream has to ask whether a field
 	// was set — the scaling loop reads its policy as given.
 	cfg.Scaling = cfg.Scaling.withDefaults(cfg.Concurrency)
@@ -418,13 +431,13 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	c.wg.Add(1)
 	go c.watchdog()
 
-	if cfg.Scaling.enabled() {
-		c.wg.Add(1)
-		go c.autoscale()
+	c.wg.Add(1)
+	go c.autoscale()
+	if cfg.Scaling.fixed() {
+		log.Info("wings: cluster ready", "workers", len(workers), "target", cfg.Target.kind)
+	} else {
 		log.Info("wings: cluster ready", "workers", len(workers), "target", cfg.Target.kind,
 			"autoscale", fmt.Sprintf("%d..%d", cfg.Scaling.Min, cfg.Scaling.Max))
-	} else {
-		log.Info("wings: cluster ready", "workers", len(workers), "target", cfg.Target.kind)
 	}
 	return c, nil
 }
@@ -521,6 +534,29 @@ func (c *Cluster) adopt(w *workerConn) {
 	// its own eventually, and eventually is a long time to be writing output
 	// nothing is keeping.
 	c.pokeOutputs()
+
+	c.placeHeld()
+}
+
+// placeHeld sends the jobs that were waiting for a worker to the fleet as it
+// is now. Called when a worker arrives, which is the only time the answer to
+// "is there anywhere to send this" changes from no to yes.
+func (c *Cluster) placeHeld() {
+	var held []*pendingJob
+	c.mu.Lock()
+	for _, p := range c.pending {
+		if p.worker == nil {
+			held = append(held, p)
+		}
+	}
+	c.mu.Unlock()
+	if len(held) == 0 {
+		return
+	}
+	c.log.Info("wings: a worker arrived; placing the jobs that were waiting for one", "jobs", len(held))
+	for _, p := range held {
+		c.moveJob(p, "a worker arrived")
+	}
 }
 
 // launch brings up n workers for the configured target.
@@ -834,7 +870,7 @@ func (c *Cluster) deliver(res resultEnvelope) {
 	}
 	c.journal.record(journalEntry{
 		Kind: journalCompleted, Job: res.ID, Func: p.job.Func,
-		Worker: p.worker.id, Attempt: p.job.Attempt, Err: res.Error,
+		Worker: workerID(p.worker), Attempt: p.job.Attempt, Err: res.Error,
 	}.from(p.origin))
 	p.settle(res)
 }
@@ -959,7 +995,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	// lands on would be moved forever while the caller waited on a cluster that
 	// merely looked busy.
 	from, left := p.worker, p.job.Attempt
-	if p.job.Attempt+1 >= c.cfg.attempts() {
+	if p.placed && p.job.Attempt+1 >= c.cfg.attempts() {
 		if from != nil {
 			c.release(from)
 			p.worker = nil
@@ -972,20 +1008,35 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	}
 	w := c.pickBut(from)
 	if w == nil {
+		// Nowhere to send it, for now. The fleet is kept at its size, so a
+		// replacement is on its way, and this job waits for it — held with
+		// no worker, its clocks stopped, until adopt places it. It used to
+		// be failed on the spot, which made every preemption of the last
+		// machine a failed run.
 		if from != nil {
 			c.release(from)
-			p.worker = nil
 		}
+		p.worker = nil
+		p.since, p.started, p.beat = time.Time{}, time.Time{}, time.Time{}
 		c.mu.Unlock()
+		c.log.Warn("wings: no live worker for a job; holding it until one arrives",
+			"job", p.job.ID, "fn", p.job.Func, "why", why)
+		c.journal.record(journalEntry{
+			Kind: journalHeld, Job: p.job.ID, Func: p.job.Func, Attempt: left, Err: why,
+		}.from(p.origin))
 		c.stopOn(from, p.job.ID, left, why)
-		c.failPending(p, fmt.Errorf("wings: %s and no live worker remains", why))
 		return
 	}
 	if from != nil {
 		c.release(from)
 	}
 	job := p.job
-	job.Attempt++
+	// A held job being placed for the first time is not on its second
+	// attempt: nothing ran.
+	if p.placed {
+		job.Attempt++
+	}
+	p.placed = true
 	job.Checkpoint = p.checkpoint
 	job.Steps = p.steps
 	p.job = job
@@ -1277,10 +1328,27 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	}
 	w := c.pick()
 	if w == nil {
+		// No worker right now — every machine gone at once, or the fleet
+		// still being replaced. The fleet is kept at its size, so one is
+		// coming; the job is held until adopt places it, and the caller's
+		// own context bounds the wait. Refusing here made a call that landed
+		// in the gap between a preemption and its replacement fail outright.
+		p.waiters = 1
+		p.ran = map[int]*workerConn{}
+		c.pending[job.ID] = p
+		if key != "" {
+			c.byOrigin[key] = p
+		}
 		c.mu.Unlock()
-		return nil, errors.New("wings: no live workers")
+		c.log.Warn("wings: no live worker for a new job; holding it until one arrives",
+			"job", job.ID, "fn", job.Func)
+		c.journal.record(journalEntry{
+			Kind: journalHeld, Job: job.ID, Func: job.Func, Err: "no live worker",
+		}.from(p.origin))
+		return p, nil
 	}
 	p.worker = w
+	p.placed = true
 	p.ran = map[int]*workerConn{job.Attempt: w}
 	p.since = time.Now()
 	p.waiters = 1

@@ -16,7 +16,11 @@ import (
 // process, or a cloud VM, and a policy tuned locally means the same thing in
 // production.
 //
-// The zero value is off, and [Config.Workers] governs instead.
+// The zero value means a fixed fleet of [Config.Workers], which is this same
+// policy with Min and Max equal: there is no separate code for a fixed count.
+// What that buys is that a fixed fleet is MAINTAINED rather than launched
+// once — a worker that dies or is preempted is replaced on the next tick,
+// where it used to be simply gone.
 type Scaling struct {
 	// Min is the floor, held even when there is no work at all. Below 1 there
 	// would be nothing to send the first job to, so 0 is read as 1.
@@ -57,6 +61,13 @@ type Scaling struct {
 }
 
 func (s Scaling) enabled() bool { return s.Max > 0 }
+
+// fixed reports whether the fleet holds one size, which is what a plain
+// Config.Workers becomes.
+func (s Scaling) fixed() bool { return s.Min == s.Max }
+
+// fixedFleet is the policy a plain worker count means: n workers, kept at n.
+func fixedFleet(n int) Scaling { return Scaling{Min: n, Max: n} }
 
 func (s Scaling) validate() error {
 	if !s.enabled() {

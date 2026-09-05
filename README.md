@@ -120,6 +120,13 @@ numbers add goroutines, child processes or VMs depending on nothing but
 `-target`. Which means a policy you tuned locally means the same thing in
 production.
 
+A plain `-workers N` is the same policy with the floor and the ceiling both at
+N: there is one loop that keeps the fleet at its size, however the size was
+asked for. So a fixed fleet is *maintained*, not launched once — a worker that
+dies or is preempted is replaced on the next tick, and a job with nowhere to go
+in the meantime waits for the replacement rather than failing. The caller's own
+context bounds that wait.
+
 Scaling down never drops work: a worker is retired only while idle, and idle is
 decided under the same lock that assigns jobs, so nothing can be sent to a worker
 already on its way out. Failing to provision is not fatal — the cluster keeps

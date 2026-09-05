@@ -581,6 +581,79 @@ func TestAPreemptedMachineIsGivenUpOnAtOnce(t *testing.T) {
 	}
 }
 
+// THE POINT: Workers is a size to keep. A preempted machine used to leave the
+// fleet one short until Stop, and preempting the last one failed every job
+// outstanding on the spot. Now the machine is replaced, and jobs with nowhere
+// to go wait for it: here the ONLY machine is taken back mid-job, and both
+// the job it was running and a call made in the gap finish on its successor.
+func TestEveryMachinePreemptedIsNotTheEndOfTheRun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+
+	cloud := newFakeCloud(t)
+	c, err := Start(t.Context(), Config{
+		Target:           Remote(cloud.provisioner()),
+		Dir:              t.TempDir(),
+		Workers:          1,
+		Concurrency:      1,
+		ReconnectTimeout: 2 * time.Minute,
+		Scaling:          Scaling{Min: 1, Max: 1, Interval: 200 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Stop(context.Background())
+	ctx := c.Bind(t.Context())
+
+	running := make(chan error, 1)
+	go func() {
+		_, err := slow(ctx, 3*time.Second)
+		running <- err
+	}()
+	var victim *workerConn
+	waitFor(t, "the job to be dispatched", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, p := range c.pending {
+			victim = p.worker
+		}
+		return victim != nil
+	})
+	cloud.mu.Lock()
+	m := cloud.live[victim.lease]
+	cloud.mu.Unlock()
+	m.preempt()
+
+	// A second call, made while there is nobody to run it.
+	waitFor(t, "the coordinator to notice", func() bool { return victim.dead.Load() })
+	inTheGap := make(chan error, 1)
+	go func() {
+		got, err := double(ctx, 21)
+		if err == nil && got != 42 {
+			err = fmt.Errorf("got %d, want 42", got)
+		}
+		inTheGap <- err
+	}()
+
+	for name, ch := range map[string]chan error{"the job that was running": running, "the call made in the gap": inTheGap} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatalf("%s never finished; the machine was not replaced, or the job did not wait for it", name)
+		}
+	}
+	if got := c.Workers(); got != 1 {
+		t.Fatalf("the fleet is %d after the replacement, want 1", got)
+	}
+	if got := cloud.leases(); len(got) != 1 {
+		t.Fatalf("the cloud holds %d machines, want the one replacement", len(got))
+	}
+}
+
 // A machine destroyed on purpose must be struck from the record. It used to be
 // closed without the record being told, so its lease stayed open and every
 // future start went hunting for a machine that had been deliberately

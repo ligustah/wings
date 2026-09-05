@@ -27,6 +27,7 @@ const (
 	journalSubmitted    = "submitted"   // a job was accepted and sent to a worker
 	journalAttached     = "attached"    // a workflow retry rejoined a job already running
 	journalRedispatch   = "redispatch"  // a lost worker's job was sent somewhere else
+	journalHeld         = "held"        // no worker was live; the job waits for one
 	journalCompleted    = "completed"   // a result came back
 	journalFailed       = "failed"      // the coordinator gave up on the job
 	journalWorkerUp     = "worker-up"   // a worker entered service
