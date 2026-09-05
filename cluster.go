@@ -146,6 +146,12 @@ type workerConn struct {
 	// streams, and holds the offset to resume reading from.
 	mirror *mirror
 
+	// submits is the way onto this worker's queue. See submit.go: jobs that
+	// arrive together go in one append, and appends counts how many there
+	// were.
+	submits chan submission
+	appends atomic.Int64
+
 	// ctx bounds every goroutine belonging to THIS worker -- its result tail,
 	// and in process its run loop too -- and stop ends them. wg is how close
 	// waits for them.
@@ -466,6 +472,14 @@ func (c *Cluster) adopt(w *workerConn) {
 		c.tailBeats(w)
 	}()
 
+	c.wg.Add(1)
+	w.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer w.wg.Done()
+		c.submitter(w)
+	}()
+
 	// A machine the mirror has not been told about yet. It will find this one on
 	// its own eventually, and eventually is a long time to be writing output
 	// nothing is keeping.
@@ -497,7 +511,8 @@ func (c *Cluster) workerID(prefix string) string {
 // The one function every target funnels through, and the reason a remote worker
 // needs no code of its own here.
 func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*workerConn, error) {
-	w := &workerConn{id: id, client: client, ownsClient: owns}
+	w := &workerConn{id: id, client: client, ownsClient: owns,
+		submits: make(chan submission, submitBatch)}
 	w.ctx, w.stop = context.WithCancel(c.ctx)
 
 	var err error
@@ -952,7 +967,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 				"job", job.ID, "worker", w.id, "err", err)
 			job.Priors = nil
 		}
-		if _, err := w.jobs.Append(c.ctx, []jobEnvelope{job}); err != nil {
+		if err := c.send(c.ctx, w, job); err != nil {
 			c.mu.Lock()
 			c.release(w)
 			c.mu.Unlock()
@@ -1170,7 +1185,7 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	c.charge(w)
 	c.mu.Unlock()
 
-	if _, err := w.jobs.Append(ctx, []jobEnvelope{job}); err != nil {
+	if err := c.send(ctx, w, job); err != nil {
 		c.mu.Lock()
 		c.forget(p)
 		c.release(w)

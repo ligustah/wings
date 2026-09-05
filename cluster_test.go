@@ -239,6 +239,34 @@ func TestUnknownFunctionIsReported(t *testing.T) {
 	}
 }
 
+// THE POINT: a Map dispatches every input at once, and each used to be an
+// append of its own to the worker's queue — a round trip per job, through the
+// engine or over the network. Submissions that arrive while one append is in
+// flight now go together in the next.
+func TestJobsThatArriveTogetherGoInOneAppend(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 4})
+
+	in := make([]int, 400)
+	want := make([]int, len(in))
+	for i := range in {
+		in[i], want[i] = i, i*2
+	}
+	got, err := Map(c.Bind(t.Context()), double, in)
+	if err != nil {
+		t.Fatalf("Map: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatal("batched submissions came back wrong")
+	}
+
+	w := c.fleet()[0]
+	if n := w.appends.Load(); n >= int64(len(in)) {
+		t.Fatalf("%d jobs took %d appends; nothing arriving together was sent together", len(in), n)
+	} else {
+		t.Logf("%d jobs went in %d appends", len(in), n)
+	}
+}
+
 func TestMapEmptyInput(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
