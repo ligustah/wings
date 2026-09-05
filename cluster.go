@@ -1007,7 +1007,16 @@ func (c *Cluster) redispatchFrom(dead *workerConn) {
 // only once nothing is outstanding on it, so a dead worker whose jobs were
 // moved away without this was never reaped, and its machine billed on until the
 // cluster stopped — which is precisely the case reaping exists for.
-func (c *Cluster) moveJob(p *pendingJob, why string) {
+func (c *Cluster) moveJob(p *pendingJob, why string) { c.move(p, why, true) }
+
+// move is moveJob, with a say in whether the move counts against the job.
+//
+// A move on suspicion — a worker lost, a job gone quiet — is an attempt that
+// may have run, and counted so that a job which kills every worker it lands
+// on is eventually given up on. A move for balance is of a job that has not
+// started, from a queue it was merely waiting on, and counting that would
+// have a job fail for having been moved to where it could run sooner.
+func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	c.mu.Lock()
 	if cur, still := c.pending[p.job.ID]; !still || cur != p {
 		c.mu.Unlock()
@@ -1017,7 +1026,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	// lands on would be moved forever while the caller waited on a cluster that
 	// merely looked busy.
 	from, left := p.worker, p.job.Attempt
-	if p.placed && p.job.Attempt+1 >= c.cfg.attempts() {
+	if counted && p.placed && p.job.Attempt+1 >= c.cfg.attempts() {
 		if from != nil {
 			c.release(from)
 			p.worker = nil
@@ -1181,6 +1190,7 @@ func (c *Cluster) watchdog() {
 			return
 		case now := <-t.C:
 			c.sweep(now)
+			c.rebalance(now)
 			c.reapDead()
 		}
 	}

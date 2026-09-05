@@ -66,6 +66,12 @@
 // worker should carry, how long an idle one may linger — so the same numbers add
 // goroutines, child processes or cloud VMs depending on nothing but the target.
 //
+// A job is placed on the least loaded worker when it is submitted, and queued
+// work is evened out afterwards: a worker that arrives later, or frees up
+// sooner, is given jobs still waiting unstarted on another's queue. Without
+// that, a fleet grown or repaired mid-run would have done nothing for the work
+// already queued.
+//
 // # Delivery semantics
 //
 // Delivery is AT-LEAST-ONCE. Each worker owns the queue of work assigned to it,

@@ -132,6 +132,14 @@ dies or is preempted is replaced on the next tick, and a job with nowhere to go
 in the meantime waits for the replacement rather than failing. The caller's own
 context bounds that wait.
 
+A worker that arrives is also *given something to do*. A job is placed on the
+least loaded worker when it is submitted, so without more a replacement — or a
+scale-up — would find every queued job already addressed to somebody else and
+sit idle while the survivor worked through a queue built for two. So once a
+tick the watchdog moves jobs still waiting unstarted on one worker's queue to
+a worker with clearly less to do, until the two are within a job of each
+other. Such a move does not count against the job's attempts: nothing ran.
+
 Scaling down never drops work: a worker is retired only while idle, and idle is
 decided under the same lock that assigns jobs, so nothing can be sent to a worker
 already on its way out. Failing to provision is not fatal — the cluster keeps

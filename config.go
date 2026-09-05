@@ -66,6 +66,16 @@ const (
 	// verdict can be, which is why it is well under any timeout worth setting.
 	watchdogInterval = time.Second
 
+	// rebalanceAfter is how long a job may wait unstarted on one worker's queue
+	// while another worker has less to do, before it is moved there. One tick:
+	// long enough that a job appended a moment ago, which every worker takes a
+	// moment to notice, is not mistaken for one stuck behind a queue.
+	rebalanceAfter = watchdogInterval
+
+	// rebalanceStep bounds the moves one sweep makes, so a sweep over a large
+	// backlog stays short and the next tick sees the effect of this one.
+	rebalanceStep = 64
+
 	// defaultRemotePort is the loopback port a remote worker's broker binds.
 	// Fixed rather than negotiated because a freshly provisioned machine has
 	// nothing else on it, and the coordinator reaches it through a tunnel it

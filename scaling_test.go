@@ -1,10 +1,134 @@
 package wings
 
 import (
+	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/ligustah/durable_streams/dswire"
+
+	"github.com/ligustah/wings/flow"
 )
+
+// whereRun waits and then says which worker it ran on.
+var whereRun = flow.Define("test.where", func(ctx context.Context, d time.Duration) (string, error) {
+	select {
+	case <-time.After(d):
+		return jobFrom(ctx).node.id, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+})
+
+// THE POINT: a job is given its worker when it is submitted, so a worker that
+// arrives after that — a scale-up, or the replacement for a preempted machine —
+// would otherwise find nothing addressed to it and sit idle while the first
+// worker worked through a queue built for one. Seen for real: a replacement
+// VM that ran zero of the thirty jobs its predecessor had left.
+func TestQueuedWorkMovesToAWorkerThatArrivesLater(t *testing.T) {
+	c := start(t, Config{
+		Target:      InProcess(),
+		Concurrency: 1,
+		Scaling: Scaling{
+			Min:           1,
+			Max:           2,
+			JobsPerWorker: 4,
+			Interval:      50 * time.Millisecond,
+			IdleTimeout:   time.Hour,
+		},
+	})
+
+	// Twelve jobs of 400ms: nearly five seconds for one worker, all of it
+	// queued on the only worker there is at submit.
+	in := make([]time.Duration, 12)
+	for i := range in {
+		in[i] = 400 * time.Millisecond
+	}
+	done := make(chan []string, 1)
+	go func() {
+		got, err := mapOn(t.Context(), c, whereRun, in)
+		if err != nil {
+			t.Errorf("Map: %v", err)
+		}
+		done <- got
+	}()
+
+	if !eventually(t, 20*time.Second, func() bool { return c.Workers() > 1 }) {
+		t.Fatalf("the cluster never scaled up; still %d worker(s)", c.Workers())
+	}
+
+	var got []string
+	select {
+	case got = <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Map never finished")
+	}
+	if len(got) != len(in) {
+		t.Fatalf("got %d results, want %d", len(got), len(in))
+	}
+
+	ran := map[string]int{}
+	for _, w := range got {
+		ran[w]++
+	}
+	if len(ran) < 2 {
+		t.Fatalf("every job ran on %v; the worker that arrived later was given nothing", ran)
+	}
+
+	// And the record says what happened to the moved ones, and that the move
+	// was for balance rather than on suspicion.
+	moved := 0
+	for _, e := range readJournal(t, c) {
+		if e.Kind == journalRedispatch && strings.Contains(e.Err, "rebalanced") {
+			moved++
+		}
+	}
+	if moved == 0 {
+		t.Error("the journal records no rebalance, yet both workers ran jobs")
+	}
+}
+
+// submitSlow puts one bare slow job on the cluster and returns its handle.
+func submitSlow(t *testing.T, c *Cluster, d time.Duration) *pendingJob {
+	t.Helper()
+	payload, err := dswire.EncodeRecord(dswire.ReflectCodec[time.Duration]{}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := c.submit(c.Bind(t.Context()), "test.slow", payload)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	return p
+}
+
+// A move for balance is not an attempt the job used up: nothing ran on the
+// worker it left. A job moved as many times as the attempt limit must not fail.
+func TestRebalancingDoesNotSpendAttempts(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1, MaxAttempts: 2})
+
+	// One job the worker is busy with, one queued behind it and never begun.
+	first := submitSlow(t, c, 800*time.Millisecond)
+	queued := submitSlow(t, c, 10*time.Millisecond)
+
+	// Moved twice, for balance, which with MaxAttempts of 2 would have failed
+	// the job had the moves counted. There is only one worker, so the move
+	// lands it back where it was, which is fine for the arithmetic under test.
+	for range 2 {
+		c.move(queued, "rebalanced: test", false)
+	}
+
+	if res, err := c.await(t.Context(), queued); err != nil {
+		t.Fatalf("await: %v", err)
+	} else if res.Error != "" {
+		t.Fatalf("a job moved for balance failed: %s", res.Error)
+	}
+	if _, err := c.await(t.Context(), first); err != nil {
+		t.Fatalf("await first: %v", err)
+	}
+}
 
 func TestScalingWantClampsToBounds(t *testing.T) {
 	s := Scaling{Min: 2, Max: 6, JobsPerWorker: 4}.withDefaults(0)
