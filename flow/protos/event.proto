@@ -48,6 +48,7 @@ message Event {
     RunEndEvent run_end = 27;
     ChannelSendEvent channel_send = 28;
     ChannelRecvEvent channel_recv = 29;
+    EffectEvent effect = 30;
   }
 }
 
@@ -77,6 +78,13 @@ message SleepEvent {
 message GetTimeEvent {
   // The time at which the event was emitted
   google.protobuf.Timestamp time = 1;
+}
+
+message EffectEvent {
+  // What the function passed to Context.Effect returned: its value, or its
+  // error. Recorded so a replay hands back the same outcome instead of
+  // running the function again.
+  Result result = 1;
 }
 
 message ReturnEvent {

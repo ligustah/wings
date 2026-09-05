@@ -34,7 +34,8 @@
 //
 //   - use [Context.Now], not time.Now
 //   - use [Context.Sleep], not time.Sleep
-//   - do not read a random number, an environment variable, or a clock
+//   - wrap anything else that answers differently each time — a random
+//     number, a hostname, an environment variable — in [Context.Effect]
 //   - do not let map iteration order change what it does
 //   - use [Context.Map], [Context.Go] or [Context.Spawn] to do things at
 //     once, never a bare goroutine

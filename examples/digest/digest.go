@@ -59,7 +59,12 @@ type Result struct {
 // the workflow. Nothing here mentions wings: a work function is a flow function,
 // and wings is one place it can be sent to run.
 var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, error) {
-	host, _ := os.Hostname()
+	// The host is an answer from outside the run, different on every machine,
+	// so it is asked for as an effect: recorded once, replayed on a retry.
+	host, err := ctx.Effect(os.Hostname)
+	if err != nil {
+		return Result{}, err
+	}
 
 	sum := sha256.Sum256([]byte(in.Seed))
 	for range in.Rounds {

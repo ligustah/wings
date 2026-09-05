@@ -428,7 +428,7 @@ On the worker, a call does not execute as a bare function: it runs as a **flow
 run of its own**, with its history on the worker's storage. So a work function
 may do everything a workflow body may — fork with `ctx.Go` and `ctx.Spawn`, use
 a channel between its threads, `ctx.Map` over other functions, read `ctx.Now`,
-`ctx.Sleep` — and a retry **replays** all of it from the history instead of
+`ctx.Sleep`, wrap an outside answer in `ctx.Effect` — and a retry **replays** all of it from the history instead of
 doing it again. A nested call it made before it was moved is answered from the
 record; the one it was in the middle of is made again. The same determinism
 rules apply as to any run body, and a function that uses none of those
