@@ -138,6 +138,14 @@ var DigestBatch = flow.Define("digestBatch", func(ctx flow.Context, in Batch) (i
 // results as they arrive from wherever they were computed. The channel
 // crosses machines: the workflow reads it on the coordinator, the batches
 // write it on their workers.
+//
+// The batches leave the coordinator two ways, to show both. The even ones
+// are threads that run a function, sent to a worker by the function's name.
+// The odd ones are threads of RUN CODE — closures — which no worker can be
+// handed; they are sent as a lineage instead, and the worker replays this
+// workflow from its history to the fork that made the closure, then runs
+// it. The closure calls DigestBatch directly, which runs where the closure
+// does. Either way the batch's own calls fan out across the fleet.
 var Fanout = flow.DefineWorkflow("fanout", func(ctx flow.Context, in Params) error {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	const batches = 4
@@ -149,7 +157,14 @@ var Fanout = flow.DefineWorkflow("fanout", func(ctx flow.Context, in Params) err
 		for i := b; i < jobs; i += batches {
 			work = append(work, Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: rounds})
 		}
-		futures = append(futures, ctx.Go(DigestBatch, Batch{Work: work, Results: results}))
+		batch := Batch{Work: work, Results: results}
+		if b%2 == 0 {
+			futures = append(futures, ctx.Go(DigestBatch, batch))
+		} else {
+			futures = append(futures, ctx.Spawn(func(ctx flow.Context) (int, error) {
+				return DigestBatch(ctx, batch)
+			}))
+		}
 	}
 
 	start := time.Now()
