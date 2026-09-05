@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -264,6 +265,59 @@ func TestJobsThatArriveTogetherGoInOneAppend(t *testing.T) {
 		t.Fatalf("%d jobs took %d appends; nothing arriving together was sent together", len(in), n)
 	} else {
 		t.Logf("%d jobs went in %d appends", len(in), n)
+	}
+}
+
+// THE POINT: a worker's streams are named after it, and a name is never
+// reused, so a worker that has gone used to leave its mirror — and in process
+// its queue, results and beats; as a child process its whole broker directory
+// — on a persistent Dir forever, with every autoscale cycle minting more.
+func TestAWorkerThatIsGoneLeavesNothingBehind(t *testing.T) {
+	for _, target := range []Target{InProcess(), LocalProcess()} {
+		t.Run(fmt.Sprint(target.kind), func(t *testing.T) {
+			if target.kind == targetLocalProcess && testing.Short() {
+				t.Skip("spawns child processes")
+			}
+			dir := t.TempDir()
+			c, err := Start(t.Context(), Config{Target: target, Workers: 2, Dir: dir})
+			if err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if _, err := Map(c.Bind(t.Context()), double, []int{1, 2, 3, 4}); err != nil {
+				t.Fatalf("Map: %v", err)
+			}
+			var ids []string
+			for _, w := range c.fleet() {
+				ids = append(ids, w.id)
+			}
+			if err := c.Stop(context.Background()); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+
+			// Look with a fresh coordinator over the same Dir: what it can see
+			// is what was left.
+			again, err := Start(t.Context(), Config{Target: InProcess(), Dir: dir})
+			if err != nil {
+				t.Fatalf("Start again: %v", err)
+			}
+			defer again.Stop(context.Background())
+			names, err := again.shared.ListStreams(t.Context())
+			if err != nil {
+				t.Fatalf("ListStreams: %v", err)
+			}
+			for _, name := range names {
+				for _, id := range ids {
+					if strings.Contains(name, id) {
+						t.Errorf("stream %s belongs to worker %s, which is gone", name, id)
+					}
+				}
+			}
+			for _, id := range ids {
+				if _, err := os.Stat(filepath.Join(dir, id)); err == nil {
+					t.Errorf("worker %s left its directory behind", id)
+				}
+			}
+		})
 	}
 }
 

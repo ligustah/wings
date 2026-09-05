@@ -126,6 +126,7 @@ type workerConn struct {
 
 	node    *workerNode // in-process only; shares the cluster engine, owns nothing
 	proc    *os.Process // local-process only
+	dir     string      // local-process only: the child's broker directory
 	machine Machine     // remote only
 
 	// lease is the machine's identity in the coordinator's own record. Empty
@@ -439,12 +440,45 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 // costs one API call; one that is never looked for bills forever.
 func (c *Cluster) releaseWorker(ctx context.Context, w *workerConn) error {
 	err := w.close(ctx)
+	c.dropWorkerStreams(ctx, w)
 	if w.lease == "" {
 		return err
 	}
 	return errors.Join(err, c.machines.write(ctx, machineRecord{
 		Kind: machineReleased, Lease: w.lease, Worker: w.id,
 	}))
+}
+
+// dropWorkerStreams removes what a worker that is not coming back left on the
+// coordinator's storage.
+//
+// A worker's streams are named after it, and a name is never reused, so on a
+// persistent Dir every worker that was ever retired, reaped or stopped left its
+// mirror behind — and an in-process worker its queue, results and beats too,
+// since those are on the shared engine — and every autoscale cycle minted more.
+// A local worker's broker directory is the same leak on disk.
+//
+// Best effort: a copy that could not be removed is a leak, not a worker that
+// failed to stop, and the caller is releasing a machine.
+func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	names := []string{mirrorStreamFor(w.id)}
+	if w.client == client {
+		names = append(names, jobStreamFor(w.id), resultStreamFor(w.id), beatStreamFor(w.id))
+	}
+	for _, name := range names {
+		if err := dropStream(ctx, client, name); err != nil {
+			c.log.Warn("wings: could not remove a gone worker's stream", "worker", w.id, "stream", name, "err", err)
+		}
+	}
+	if w.dir != "" {
+		if err := os.RemoveAll(w.dir); err != nil {
+			c.log.Warn("wings: could not remove a gone worker's directory", "worker", w.id, "dir", w.dir, "err", err)
+		}
+	}
 }
 
 // adopt puts a freshly launched worker into service and starts tailing it.

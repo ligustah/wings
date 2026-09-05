@@ -123,6 +123,7 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 		return nil, err
 	}
 	w.proc = cmd.Process
+	w.dir = dir
 	w.exited = make(chan struct{})
 	// One owner for Wait, so the tail can ask whether this worker is gone
 	// without racing anyone for the answer.
