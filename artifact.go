@@ -99,7 +99,7 @@ func Create(ctx context.Context, name string) (*Output, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wings: open %s: %w", id, err)
 	}
-	return &Output{stream: stream, name: name, id: id, attempt: st.attempt}, nil
+	return &Output{ctx: ctx, stream: stream, name: name, id: id, attempt: st.attempt}, nil
 }
 
 // Output is where a job writes a file. It is an [io.WriteCloser].
@@ -108,6 +108,11 @@ func Create(ctx context.Context, name string) (*Output, error) {
 // megabytes never holds a hundred megabytes: what is in memory at any moment is
 // one chunk, however large the slice handed to Write.
 type Output struct {
+	// ctx is the job's. Its bytes go out under the job's own deadline, so a job
+	// that has been cancelled or timed out cannot go on writing a file nobody
+	// will collect, and a broker that stops answering fails the write rather
+	// than holding the job past every bound it was given.
+	ctx     context.Context
 	stream  *dsclient.Stream[fileChunk]
 	name    string
 	id      string
@@ -182,7 +187,16 @@ func (o *Output) send(data []byte) error {
 	// buffer about to be reused, nor the caller's, which Write's contract lets
 	// them overwrite the moment it returns. One chunk's worth, and the only copy.
 	chunk := append(fileChunk(nil), data...)
-	if _, err := o.stream.Append(context.Background(), []fileChunk{chunk}); err != nil {
+	// Asked outright rather than left to the append: a worker's own storage is
+	// an engine in its process, not a socket, and an engine does not look at a
+	// context on its way to disk. The job's deadline is still the job's.
+	if err := o.ctx.Err(); err != nil {
+		o.err = fmt.Errorf("wings: write artifact %q: %w", o.name, err)
+		return o.err
+	}
+	ctx, cancel := context.WithTimeout(o.ctx, outputAppend)
+	defer cancel()
+	if _, err := o.stream.Append(ctx, []fileChunk{chunk}); err != nil {
 		o.err = fmt.Errorf("wings: write artifact %q: %w", o.name, err)
 		return o.err
 	}

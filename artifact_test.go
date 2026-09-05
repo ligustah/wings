@@ -3,8 +3,10 @@ package wings
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
+	"time"
 )
 
 // render writes bytes rather than events, which is the other, entirely separate
@@ -202,6 +204,58 @@ func TestOneWriteLargerThanAChunkArrivesWholeAndInOrder(t *testing.T) {
 	}
 	if !bytes.Equal(got.Bytes(), pattern(size)) {
 		t.Fatalf("the bytes came back different from the ones written (%d of %d)", got.Len(), size)
+	}
+}
+
+// writeForever ignores its context, as a work function that only ever talks to
+// an io.Writer would, and writes until the writer refuses.
+var writeForever = Define("test.write-forever", func(ctx context.Context, _ int) (int, error) {
+	out, err := Create(ctx, "endless")
+	if err != nil {
+		return 0, err
+	}
+	line := bytes.Repeat([]byte("x"), 64<<10)
+	for {
+		if _, err := out.Write(line); err != nil {
+			return 0, err
+		}
+		time.Sleep(10 * time.Millisecond) // a producer, not a tight loop
+	}
+}, WithTimeout(300*time.Millisecond))
+
+// THE POINT: a job's output used to go out on a background context, so a job
+// that had blown its deadline but only ever checked the writer's error kept
+// writing, forever. The caller still got its error — the coordinator fails a
+// call that blows its bound — but the worker's slot was gone for good, and
+// the next job sent there waited behind a job that would never end. The
+// deadline the caller was promised is the writer's deadline too.
+func TestAJobPastItsDeadlineCannotKeepWriting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1})
+	ctx := c.Bind(t.Context())
+
+	if _, err := writeForever(ctx, 0); err == nil {
+		t.Fatal("a job that writes forever returned no error")
+	}
+
+	// The one slot on the one worker must be free again.
+	done := make(chan error, 1)
+	go func() {
+		got, err := double(ctx, 21)
+		if err == nil && got != 42 {
+			err = fmt.Errorf("got %d, want 42", got)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the job after it: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the worker is still busy 20s after a 300ms deadline; the job past it is still writing")
 	}
 }
 

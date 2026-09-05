@@ -98,6 +98,7 @@ func Record[E any](ctx context.Context, name string) (*Recorder[E], error) {
 		return nil, err
 	}
 	return &Recorder[E]{
+		ctx:     ctx,
 		stream:  stream,
 		name:    name,
 		id:      id,
@@ -124,6 +125,10 @@ func eventStream[E any](client *dsclient.Client, name string) (*dsclient.Stream[
 
 // Recorder is a job's event log. Safe for one goroutine at a time.
 type Recorder[E any] struct {
+	// ctx is the job's, so its events go out under the job's own deadline: a
+	// job that has timed out cannot go on recording, and a broker that stops
+	// answering fails the flush rather than holding the job forever.
+	ctx     context.Context
 	stream  *dsclient.Stream[E]
 	name    string
 	id      string
@@ -163,7 +168,15 @@ func (r *Recorder[E]) Flush() error {
 	if len(r.batch) == 0 {
 		return r.err
 	}
-	if _, err := r.stream.Append(context.Background(), r.batch); err != nil {
+	// Asked outright, as Output does: the worker's own storage is an engine in
+	// its process, and an engine does not look at a context on its way to disk.
+	if err := r.ctx.Err(); err != nil {
+		r.err = fmt.Errorf("wings: record %d events to %s: %w", len(r.batch), r.name, err)
+		return r.err
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, outputAppend)
+	defer cancel()
+	if _, err := r.stream.Append(ctx, r.batch); err != nil {
 		r.err = fmt.Errorf("wings: record %d events to %s: %w", len(r.batch), r.name, err)
 		return r.err
 	}

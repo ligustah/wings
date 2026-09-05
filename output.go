@@ -65,6 +65,13 @@ const (
 	// outputWait bounds how long a reader waits for output still on its way —
 	// the handle travels in the result, and what it names travels behind it.
 	outputWait = 2 * time.Minute
+
+	// outputAppend bounds one append of a job's output to its worker's own
+	// storage, which is on the same machine and should take milliseconds. It is
+	// a net under a broker that has stopped answering: without one, a job
+	// writing a file could hang there past the deadline it was given, and the
+	// deadline is what a caller was promised.
+	outputAppend = 30 * time.Second
 )
 
 // The three families of stream a job's output lives in. All three are built and
