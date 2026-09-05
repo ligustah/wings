@@ -438,22 +438,9 @@ func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnve
 	if err != nil {
 		return err
 	}
-	names, err := client.ListStreams(ctx)
-	if err != nil {
-		return fmt.Errorf("wings: look for the history of job %s: %w", job.ID, err)
-	}
-	source, last := "", -1
-	for _, name := range names {
-		o, ok := parseOutput(name)
-		if !ok || o.Prefix != historyPrefix || o.Job != streamPart(job.ID) || o.Attempt >= job.Attempt {
-			continue
-		}
-		if o.Attempt > last {
-			source, last = name, o.Attempt
-		}
-	}
-	if source == "" {
-		return nil
+	source, err := c.lastHistory(ctx, job.ID, job.Attempt)
+	if err != nil || source == "" {
+		return err
 	}
 	dest := historyName(job.ID, job.Attempt)
 	return w.client.RunMirror(ctx, "wings.hydrate."+dest, dsclient.MirrorSpec{
@@ -464,6 +451,31 @@ func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnve
 		StopWhenCaughtUp: true,
 		Batch:            recordBatch,
 	})
+}
+
+// lastHistory is the coordinator's copy of a job's last history from an
+// attempt before the one given — any attempt, when before is negative — or
+// "" when there is none.
+func (c *Cluster) lastHistory(ctx context.Context, job string, before int) (string, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return "", err
+	}
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		return "", fmt.Errorf("wings: look for the history of job %s: %w", job, err)
+	}
+	source, last := "", -1
+	for _, name := range names {
+		o, ok := parseOutput(name)
+		if !ok || o.Prefix != historyPrefix || o.Job != streamPart(job) || (before >= 0 && o.Attempt >= before) {
+			continue
+		}
+		if o.Attempt > last {
+			source, last = name, o.Attempt
+		}
+	}
+	return source, nil
 }
 
 // drainOutputs waits for the coordinator's copies of what a worker holds to be

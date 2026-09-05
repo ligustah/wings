@@ -255,6 +255,7 @@ func (p *pendingJob) complete(job jobEnvelope) (place bool) {
 		return false
 	}
 	p.job.Func, p.job.Payload, p.job.Nested = job.Func, job.Payload, job.Nested
+	p.job.Root, p.job.Lineage = job.Root, job.Lineage
 	p.incomplete = false
 	return p.worker == nil && p.yield == nil && !p.finished()
 }

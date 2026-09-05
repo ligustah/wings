@@ -105,23 +105,32 @@ func (w Workflow[In]) run(ctx context.Context, payload []byte, opts []RunOption)
 	all := make([]RunOption, 0, len(w.opts)+len(opts)+1)
 	all = append(all, w.opts...)
 	all = append(all, opts...)
-	all = append(all, inputOption(payload, w.inputType()))
+	all = append(all, inputOption(payload, w.inputType()), rootOption(Root{Workflow: w.name}))
 
-	return Run(ctx, w.name, func(ctx Context) error {
-		var in In
-		recorded := inputFrom(ctx)
-		if recorded == nil {
-			// Nothing was given and Run let that pass, so In is None.
-			return w.body(ctx, in)
-		}
-		in, err := dswire.DecodeRecord(w.codec, recorded)
-		if err != nil {
-			// The recorded input does not decode as In any more: the workflow
-			// changed shape under a run in flight. No retry can fix that.
-			return Permanent(fmt.Errorf("flow: decode the recorded input of workflow %q: %w", w.name, err))
-		}
+	return Run(ctx, w.name, w.call, all...)
+}
+
+// call runs the body on the input the run recorded.
+func (w Workflow[In]) call(ctx Context) error {
+	var in In
+	recorded := inputFrom(ctx)
+	if recorded == nil {
+		// Nothing was given and Run let that pass, so In is None.
 		return w.body(ctx, in)
-	}, all...)
+	}
+	in, err := dswire.DecodeRecord(w.codec, recorded)
+	if err != nil {
+		// The recorded input does not decode as In any more: the workflow
+		// changed shape under a run in flight. No retry can fix that.
+		return Permanent(fmt.Errorf("flow: decode the recorded input of workflow %q: %w", w.name, err))
+	}
+	return w.body(ctx, in)
+}
+
+// threadBody is the workflow as the body of its main thread, for a process
+// replaying it from history. See lineage.go.
+func (w Workflow[In]) threadBody() func(ctx Context) ([]byte, error) {
+	return func(ctx Context) ([]byte, error) { return nil, w.call(ctx) }
 }
 
 // runJSON is run for a hosting program, which has the input as text.
@@ -153,6 +162,7 @@ type workflowHandler interface {
 	Name() string
 	inputType() reflect.Type
 	runJSON(ctx context.Context, input []byte, opts []RunOption) error
+	threadBody() func(ctx Context) ([]byte, error)
 }
 
 var (

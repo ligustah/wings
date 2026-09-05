@@ -11,9 +11,10 @@ import (
 // A thread forked with [Context.Go] or [Context.Map] runs one defined
 // function on one input, and Fn and Input say which: a placer can send that
 // anywhere the function is defined. A thread forked with [Context.Spawn] runs
-// a body of the run's own code, which only the process holding that code can
-// run; Fn is empty for one of those, and the body is handed to the placer
-// alongside.
+// a body of the run's own code; Fn is empty for one of those, and the body
+// is handed to the placer alongside, for running it here — and Root and
+// Lineage say how a process that holds the code reaches the same body by
+// replay, for running it elsewhere; see [RunLineage].
 type Thread struct {
 	// Run is the run the thread belongs to.
 	Run string
@@ -28,6 +29,13 @@ type Thread struct {
 	// Empty for a thread that runs a body of run code.
 	Fn    string
 	Input []byte
+	// Root and Lineage are how another process reaches a thread of run
+	// code: Root is a thread it can start by name, and Lineage the path of
+	// thread ids from that root to this thread, both ends included. See
+	// [RunLineage]. Set on every thread; a placer that ships one that runs
+	// a function has no need of them.
+	Root    Root
+	Lineage []string
 }
 
 // Key identifies the thread across attempts of its run, for a placer that
@@ -41,8 +49,8 @@ func (th Thread) Key() string { return th.Run + "/" + th.ID }
 // joins it. A placer runs one somewhere and returns what it produced. The one
 // in this package, [InProcess], runs it on a goroutine of the calling
 // process, sharing the run's channels; a cluster's sends a thread that runs a
-// function to a machine that has it, and keeps a thread that runs run code at
-// home.
+// function to a machine that has it, and a thread that runs run code to one
+// that can replay its way to the code.
 //
 // ctx is the parent thread's, carrying the run; a placer that runs the
 // thread in this process hands it on, and one that runs it elsewhere uses it
@@ -60,8 +68,8 @@ type Placer interface {
 
 // InProcess runs every forked thread on a goroutine of the calling process.
 // It is the placer a [Run] uses when given no other, and the one a placer
-// that cannot ship a thread — because it runs run code, not a function —
-// falls back to.
+// that cannot ship a thread — run code with no lineage another process could
+// start from — falls back to.
 //
 // A thread placed here is retried on its own, under the run's retry options,
 // before its failure is reported: the thread is the unit of durability, and

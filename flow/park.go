@@ -54,7 +54,7 @@ func (t *threadState) park(ctx context.Context, on string) func(ctx context.Cont
 // parkOn is park for a wait on a channel, which names it and the receive or
 // send waited on.
 func (t *threadState) parkOn(ctx context.Context, on, channel string, seq uint64) func(ctx context.Context) error {
-	if t.run.parker == nil {
+	if t.run.parker == nil || t.readonly {
 		return noResume
 	}
 	resume := t.run.parker.Park(ctx, Wait{Run: t.run.name, Thread: t.id, On: on, Channel: channel, Seq: seq})

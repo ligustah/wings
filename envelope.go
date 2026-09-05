@@ -71,6 +71,13 @@ type jobEnvelope struct {
 	// made on [Cluster.Bind], which belongs to no run.
 	Run    string `json:"run,omitempty"`
 	Thread string `json:"thread,omitempty"`
+	// Root and Lineage make the job a thread of RUN CODE — one forked with
+	// [flow.Context.Spawn] — rather than a function: Func is empty, and the
+	// worker reaches the thread's body by replaying its ancestors from Root
+	// down, as [flow.RunLineage] does. The ancestors' histories are put on
+	// the worker with the job. See lineage.go.
+	Root    flow.Root `json:"root,omitempty"`
+	Lineage []string  `json:"lineage,omitempty"`
 	// Attempt counts prior dispatches of this job, starting at 0. Carried so a
 	// work function that cares can tell a retry from a first run, and so logs
 	// on the worker say which it was.

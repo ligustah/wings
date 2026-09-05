@@ -32,6 +32,9 @@ import (
 // an error: there is no attempt to report on.
 func (c Context) Heartbeat[T any](progress T) error {
 	ctx := c
+	if t := threadFrom(ctx); t != nil && t.readonly {
+		return nil // a replay reports nothing
+	}
 	st := progressFrom(ctx)
 	if st == nil {
 		return errors.New("flow: Heartbeat was called outside a running function; " +
@@ -64,6 +67,9 @@ func (c Context) Checkpoint[T any]() (T, bool, error) {
 	st := progressFrom(c)
 	if st == nil || len(st.resume.Checkpoint) == 0 {
 		return zero, false, nil
+	}
+	if t := threadFrom(c); t != nil && t.readonly {
+		return zero, false, nil // the checkpoint is the live thread's, not a replay's
 	}
 	v, err := dswire.DecodeRecord(dswire.ReflectCodec[T]{New: allocator[T]()}, st.resume.Checkpoint)
 	if err != nil {
@@ -114,6 +120,12 @@ func (c Context) Step[T any](name string, body func(ctx Context) (T, error)) (T,
 
 	if name == "" {
 		return zero, errors.New("flow: Step requires a name")
+	}
+	if t := threadFrom(ctx); t != nil && t.readonly {
+		// A step is kept with the call, not in the thread's history, so a
+		// replay has nothing to replay it from and must not run it.
+		return zero, fmt.Errorf("flow: step %q cannot be replayed: a thread of run code forked after a "+
+			"Step cannot be run elsewhere", name)
 	}
 	st := progressFrom(ctx)
 	if st == nil {

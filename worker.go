@@ -524,10 +524,22 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// present it as the same thread, or the coordinator dispatches it twice.
 	// A bare call, which belongs to no run, is the main thread of a run made
 	// up for the job.
-	payload, err := flow.RunThread(ctx, runOf(job), threadOf(job), job.Func, job.Payload,
+	//
+	// A thread of run code is reached by replaying its ancestors, whose
+	// histories the coordinator put on this worker with the job, in the
+	// same stream. See lineage.go.
+	runOpts := []flow.RunOption{
 		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
 		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
-		flow.Once())
+		flow.Once(),
+	}
+	var payload []byte
+	var err error
+	if len(job.Lineage) > 0 {
+		payload, err = flow.RunLineage(ctx, runOf(job), job.Root, job.Lineage, runOpts...)
+	} else {
+		payload, err = flow.RunThread(ctx, runOf(job), threadOf(job), job.Func, job.Payload, runOpts...)
+	}
 	// Whatever the attempt wrote is committed before its answer leaves: a
 	// result whose recordings could still be lost would be a handle to
 	// nothing. A commit that fails is the attempt failing.

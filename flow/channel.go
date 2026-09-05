@@ -69,6 +69,19 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	}
 	name := t.newChannelName()
 	t.run.declareChannel(name, capacity)
+	if t.run.fragment {
+		// The rest of the run is elsewhere, and any thread of it may use
+		// this. Linked, and nothing announced: there is nothing on it yet,
+		// and if this is a replay the live run announced then.
+		if _, err := t.run.export(ctx, name, true); err != nil {
+			// Reported on first use rather than here, where there is no
+			// error to return: a channel that cannot be shared is one this
+			// process cannot use.
+			t.run.mu.Lock()
+			delete(t.run.channels, name)
+			t.run.mu.Unlock()
+		}
+	}
 	return &Channel[T]{
 		name:  name,
 		run:   t.run,

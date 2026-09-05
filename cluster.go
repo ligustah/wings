@@ -1249,6 +1249,13 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 			c.log.Warn("wings: could not give a retry its predecessor's history",
 				"job", job.ID, "worker", w.id, "err", err)
 		}
+		if err := c.hydrateLineage(c.ctx, w, job); err != nil {
+			// Not the same trade: a thread of run code without its ancestors
+			// cannot be reached at all. The attempt fails on the worker, and
+			// the next is tried elsewhere.
+			c.log.Warn("wings: could not give a thread of run code its ancestors' histories",
+				"job", job.ID, "worker", w.id, "err", err)
+		}
 		if err := c.send(c.ctx, w, job); err != nil {
 			c.mu.Lock()
 			c.release(w)
@@ -1468,15 +1475,18 @@ func (c *Cluster) pickBut(avoid *workerConn) *workerConn {
 
 // submit places one job and returns a handle to its outcome.
 func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*pendingJob, error) {
-	job := jobEnvelope{
-		ID:      c.epoch + "-" + strconv.FormatUint(c.nextID.Add(1), 36),
-		Func:    fnName,
-		Payload: payload,
-	}
+	return c.submitJob(ctx, jobEnvelope{Func: fnName, Payload: payload})
+}
+
+// submitJob is submit for a job already described: a function on its input,
+// or a thread of run code by its lineage. Everything but what the job does
+// is filled in here.
+func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, error) {
+	job.ID = c.epoch + "-" + strconv.FormatUint(c.nextID.Add(1), 36)
 	p := &pendingJob{
 		job:    job,
 		done:   make(chan struct{}),
-		bounds: boundsOf(fnName),
+		bounds: boundsOf(job.Func),
 		// Read off the context rather than passed in: only a workflow sets it,
 		// and threading a parameter nobody else supplies through every caller
 		// would make the ordinary case pay for the special one.
@@ -1551,7 +1561,13 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	c.charge(w)
 	c.mu.Unlock()
 
-	if err := c.send(ctx, w, job); err != nil {
+	// A thread of run code is reached through its ancestors, whose
+	// histories the worker must have before the job: see lineage.go.
+	err := c.hydrateLineage(ctx, w, job)
+	if err == nil {
+		err = c.send(ctx, w, job)
+	}
+	if err != nil {
 		c.mu.Lock()
 		c.forget(p)
 		c.release(w)

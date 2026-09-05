@@ -45,6 +45,7 @@ func spawn[Out any](ctx Context, who, fn string, input []byte, codec dswire.Code
 	}
 
 	th := Thread{Run: parent.run.name, ID: parent.nextChild(), Parent: parent.id, Fn: fn, Input: input}
+	th.Root, th.Lineage = parent.run.opts.root, lineageOf(parent.run.opts.rootID, th.ID)
 	fut.parent, fut.thread = parent, th
 	if err := parent.recordFork(th); err != nil {
 		fut.err = err
@@ -54,7 +55,11 @@ func spawn[Out any](ctx Context, who, fn string, input []byte, codec dswire.Code
 
 	// Joined on a previous attempt: the thread is over and its result is in
 	// the parent's history, where Await will find it. Nothing to run.
-	if parent.joined(th.ID) {
+	joined := parent.joined(th.ID)
+	if parent.run.forked != nil {
+		parent.run.forked(th, joined)
+	}
+	if joined {
 		close(fut.done)
 		return fut
 	}

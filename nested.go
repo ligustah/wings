@@ -106,10 +106,18 @@ func callKey(thread string, step uint64) string {
 }
 
 // forkedCall is one thread a job forked and has not joined: the function it
-// runs and the input.
+// runs and the input, or — for a thread of run code — the lineage that
+// reaches it, from the job's own root.
 type forkedCall struct {
-	fn    string
-	input []byte
+	fn      string
+	input   []byte
+	root    flow.Root
+	lineage []string
+}
+
+// job is the thread as a job to send.
+func (f forkedCall) job() jobEnvelope {
+	return jobEnvelope{Func: f.fn, Payload: f.input, Root: f.root, Lineage: f.lineage}
 }
 
 // followPoll is how often a history follower looks up from its read to see
@@ -212,11 +220,14 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 			ev := r.Record
 			switch e := protos.UnpackEventPayload(ev).(type) {
 			case *protos.ForkEvent:
-				// A thread of run code has no function a worker could be
-				// handed; it runs where its parent is, and is not ours.
-				if e.GetFunction() != "" {
-					open[callKey(e.GetThreadId(), 0)] = forkedCall{fn: e.GetFunction(), input: e.GetInput().GetSerialized()}
+				call := forkedCall{fn: e.GetFunction(), input: e.GetInput().GetSerialized()}
+				if call.fn == "" {
+					// Run code: reached by the job's own lineage, one thread
+					// longer. See lineage.go.
+					root, lineage := lineageOfJob(p.job)
+					call.root, call.lineage = root, append(lineage, e.GetThreadId())
 				}
+				open[callKey(e.GetThreadId(), 0)] = call
 			case *protos.JoinEvent:
 				delete(open, callKey(e.GetThreadId(), 0))
 			}
@@ -266,7 +277,7 @@ func (c *Cluster) dispatchNested(p *pendingJob, attempt int, thread string, step
 		}
 	}()
 	origin := flow.Origin{Run: runOf(p.job), Thread: thread, Step: step, Attempt: uint64(attempt)}
-	child, err := c.submit(flow.WithOrigin(ctx, origin), call.fn, call.input)
+	child, err := c.submitJob(flow.WithOrigin(ctx, origin), call.job())
 	var res resultEnvelope
 	if err == nil {
 		res, err = c.await(ctx, child)
@@ -396,7 +407,9 @@ func (n *workerNode) answer(c controlEnvelope) {
 
 // nestedPlacer is the [flow.Placer] a job's run forks its threads through:
 // commit, so the fork is in the history the coordinator reads, and wait for
-// the result. A thread of run code cannot travel and runs here.
+// the result. A thread of run code goes the same way, by its lineage — the
+// coordinator works that out from the job's — after every channel of the run
+// is shared, since the thread may use any of them.
 type nestedPlacer struct {
 	n   *workerNode
 	job *jobState
@@ -404,8 +417,20 @@ type nestedPlacer struct {
 
 func (e nestedPlacer) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
 	if th.Fn == "" {
+		if err := flow.Share(ctx); err != nil {
+			return nil, err
+		}
+	}
+	out, err := e.place(ctx, th)
+	if err != nil && th.Fn == "" && unknownRoot(err) {
+		// No worker holds the code, and this one does: the coordinator's
+		// answer says so, and the thread runs here after all.
 		return flow.InProcess().Place(ctx, th, body)
 	}
+	return out, err
+}
+
+func (e nestedPlacer) place(ctx context.Context, th flow.Thread) ([]byte, error) {
 	attempt := attemptKey(e.job.id, e.job.attempt)
 	e.n.runMu.Lock()
 	box := e.n.boxLocked(attempt, callKey(th.ID, 0))

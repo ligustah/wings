@@ -210,7 +210,11 @@ func execute(ctx context.Context, run, thread, fn string, input []byte, body fun
 		return nil, errors.New("flow: Run requires a Store; pass flow.WithStore(flow.NewStore(...)) " +
 			"or flow.WithStore(flow.NewMemStore())")
 	}
-	r := &threadRunner{name: run, id: thread, fn: fn, input: input, body: body, opts: ro}
+	ro.rootID = thread
+	if !ro.root.known() && fn != "" {
+		ro.root = Root{Function: fn, Input: input}
+	}
+	r := &threadRunner{name: run, id: thread, fn: fn, input: input, body: body, opts: ro, top: true}
 	if thread == mainThread {
 		r.input = ro.input
 		r.inputType = ro.inputType
@@ -236,6 +240,13 @@ type threadRunner struct {
 	// takes nothing. inputType is what it expects, when that is known.
 	input     []byte
 	inputType reflect.Type
+
+	// top says this is the thread the process was asked to run, which is
+	// the one [Once] is about: the threads it forks in-process are its own
+	// to retry. readonly says the thread is replayed and nothing more; see
+	// lineage.go.
+	top      bool
+	readonly bool
 }
 
 // execute runs the thread to completion: attempt after attempt over its
@@ -268,6 +279,9 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	// its calls had, which is the opposite of what a durable run is for. What
 	// it produced is on record, and is the answer.
 	if done, result, ok := finished(history); ok {
+		if r.readonly {
+			return nil, fmt.Errorf("flow: %s has already finished; there is nothing left to fork", r.describe())
+		}
 		out, err := unpackResult(result)
 		if done == protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED {
 			return out, nil
@@ -275,9 +289,11 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("flow: %s already failed permanently: %w", r.describe(), err)
 	}
 
-	sink, err := store.Sink(ctx, r.name, r.id)
-	if err != nil {
-		return nil, err
+	var sink Sink
+	if !r.readonly {
+		if sink, err = store.Sink(ctx, r.name, r.id); err != nil {
+			return nil, err
+		}
 	}
 
 	attempt := lastAttempt(history)
@@ -285,6 +301,14 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 		attempt++
 
 		out, status, runErr := r.attempt(ctx, history, attempt, sink)
+
+		if r.readonly {
+			// One pass over the history is all a replay is.
+			if status == protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED {
+				return out, nil
+			}
+			return nil, runErr
+		}
 
 		switch status {
 		case protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED:
@@ -294,7 +318,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 			return nil, runErr
 
 		case protos.WorkflowStatus_WORKFLOW_STATUS_SUSPENDED:
-			if r.opts.once && r.run == nil {
+			if r.opts.once && r.top {
 				// Somebody else decides when to try again, and the
 				// suspension says when; see IsSuspended.
 				return nil, runErr
@@ -305,7 +329,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 			}
 
 		default: // backoff
-			if r.opts.once && r.run == nil {
+			if r.opts.once && r.top {
 				// Somebody else decides about retries, and wants the error as
 				// the body gave it. Only for the thread this process was
 				// asked to run: the threads it forks in-process are its
@@ -353,11 +377,12 @@ func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, att
 		defer cancel()
 	}
 	t := &threadState{
-		id:      r.id,
-		attempt: attempt,
-		run:     run,
-		events:  replayable(history),
-		sink:    sink,
+		id:       r.id,
+		attempt:  attempt,
+		run:      run,
+		events:   replayable(history),
+		sink:     sink,
+		readonly: r.readonly,
 	}
 
 	reason := protos.StartReason_START_REASON_INIT

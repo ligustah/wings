@@ -38,6 +38,17 @@ type runState struct {
 	linkCtx  context.Context
 	linkStop context.CancelFunc
 
+	// fragment says this process holds only some of the run's threads, the
+	// rest being elsewhere: every channel is shared as it is made. See
+	// lineage.go.
+	fragment bool
+	// forked, when set, is told of every fork the run's threads make, on
+	// the forking thread and before the placer is: a placer that must know
+	// a fork is coming before it arrives. joined says the fork is already
+	// over in the parent's history and will not reach the placer. See
+	// lineage.go.
+	forked func(th Thread, joined bool)
+
 	mu       sync.Mutex
 	channels map[string]*chanState
 	over     bool // this attempt has returned
@@ -108,6 +119,10 @@ type threadState struct {
 	id      string
 	attempt uint64
 	run     *runState
+	// readonly says the thread is being replayed and nothing more: it
+	// records nothing, parks nowhere, reports nothing, and stops where its
+	// history ends. See lineage.go.
+	readonly bool
 
 	// events is this thread's history, minus the attempt markers, with what
 	// this attempt records appended as it goes. Guarded by run.mu, because
@@ -233,6 +248,9 @@ func (t *threadState) expect[E protos.Events]() (E, error) {
 
 	ev := t.peek()
 	if ev == nil {
+		if t.readonly {
+			return zero, errExhausted
+		}
 		return zero, nil
 	}
 

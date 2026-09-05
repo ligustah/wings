@@ -94,11 +94,16 @@ func (c *Cluster) Bind(ctx context.Context) flow.Context {
 type clusterExecutor struct{ c *Cluster }
 
 func (e clusterExecutor) Invoke(ctx context.Context, name string, payload []byte) ([]byte, error) {
-	p, err := e.c.submit(ctx, name, payload)
+	return e.c.runJob(ctx, jobEnvelope{Func: name, Payload: payload})
+}
+
+// runJob sends one job to a worker and returns what came back.
+func (c *Cluster) runJob(ctx context.Context, job jobEnvelope) ([]byte, error) {
+	p, err := c.submitJob(ctx, job)
 	if err != nil {
 		return nil, err
 	}
-	res, err := e.c.await(ctx, p)
+	res, err := c.await(ctx, p)
 	if err != nil {
 		return nil, err
 	}
@@ -110,17 +115,32 @@ func (e clusterExecutor) Invoke(ctx context.Context, name string, payload []byte
 	return res.Payload, nil
 }
 
-// clusterPlacer is the cluster as a [flow.Placer]: a thread that runs a
-// function is a job sent to a worker, and the join is what came back. A
-// thread of run code has no function a worker could be handed, and runs
-// here.
+// clusterPlacer is the cluster as a [flow.Placer]: a thread is a job sent
+// to a worker, and the join is what came back. One that runs a function is
+// sent as the function on its input; one that runs run code is sent as its
+// lineage, for the worker to replay its way to — see lineage.go — and stays
+// home only when it has no lineage a worker could start from, or the worker
+// turns out not to hold the code.
 type clusterPlacer struct{ c *Cluster }
 
 func (p clusterPlacer) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
-	if th.Fn == "" {
+	ctx = flow.WithOrigin(ctx, threadOrigin(th))
+	if th.Fn != "" {
+		return p.c.runJob(ctx, jobEnvelope{Func: th.Fn, Payload: th.Input})
+	}
+	if !rootKnown(th.Root) {
 		return flow.InProcess().Place(ctx, th, body)
 	}
-	return clusterExecutor{p.c}.Invoke(flow.WithOrigin(ctx, threadOrigin(th)), th.Fn, th.Input)
+	// Every channel of the run, whether or not the thread was handed one:
+	// it is the run's code, and may use any of them.
+	if err := flow.Share(ctx); err != nil {
+		return nil, err
+	}
+	out, err := p.c.runJob(ctx, jobEnvelope{Root: th.Root, Lineage: th.Lineage})
+	if err != nil && unknownRoot(err) {
+		return flow.InProcess().Place(ctx, th, body)
+	}
+	return out, err
 }
 
 // threadOrigin is the origin a thread's job carries: the thread itself, at

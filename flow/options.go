@@ -25,7 +25,15 @@ type runOptions struct {
 	// expects nothing. Set by a [Workflow], not by callers.
 	input     []byte
 	inputType reflect.Type
+
+	// root is how another process could start the thread this process was
+	// asked to run, and rootID that thread's id: what a thread of run code
+	// forked here carries as its lineage. See lineage.go.
+	root   Root
+	rootID string
 }
+
+func rootOption(r Root) RunOption { return func(o *runOptions) { o.root = r } }
 
 func inputOption(payload []byte, t reflect.Type) RunOption {
 	return func(o *runOptions) { o.input, o.inputType = payload, t }

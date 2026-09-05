@@ -483,8 +483,17 @@ a retry that replays a fork presents the same thread, and the coordinator
 hands back the result it kept — or lets the retry rejoin the thread still in
 flight — rather than running it twice. A job waiting on a thread it forked is
 not moved for silence, however long the thread takes; its total timeout still
-runs. A thread of run code — `ctx.Spawn` — has no function a worker could be
-handed, and runs where its parent is.
+runs. A thread of run code — `ctx.Spawn` — is sent as its **lineage**: the
+path of threads from one a worker can start by name (a workflow, or a
+function on its input) down to the thread itself, with their histories. The
+worker replays each ancestor from its history to the fork of the next, which
+hands it the closure, and runs the last for real, sharing the run's channels
+with the threads that stayed home. What an ancestor computes between the
+events of its history it computes again, so the code before a `Spawn` should
+be the replayable kind; a `Spawn` after a `Step` cannot be sent, since steps
+are kept with the call and not in the history. A thread of a bare `Run` —
+one with a body and no name — has no root a worker could start from, and
+stays where its parent is.
 
 A wait that lasts is **unloaded**. A thread parked for a minute — on a join, a
 receive, a send — has its attempt ended where it stands, history committed,
