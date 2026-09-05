@@ -157,13 +157,24 @@ type progressOf struct {
 	n       *workerNode
 	job     string
 	attempt int
+	outputs *attemptOutputs
 }
 
+// A report of progress is a commit point. What the attempt has written is
+// committed BEFORE the coordinator is told how far it got, so a checkpoint
+// never claims more than a retry can be handed: a lost beat costs a resume
+// from slightly earlier, and a failed commit sends no beat at all.
 func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
+	if err := p.outputs.commit(ctx); err != nil {
+		return err
+	}
 	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
 }
 
 func (p progressOf) Step(ctx context.Context, step flow.StepRecord) error {
+	if err := p.outputs.commit(ctx); err != nil {
+		return err
+	}
 	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Step: &step})
 }
 
@@ -427,13 +438,14 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// timeout: calling Heartbeat is always allowed, and it is the checkpoint
 	// that makes a redispatch cheap whether or not anything is watching the
 	// clock.
-	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt}, flow.Resume{
+	outputs := newAttemptOutputs(n, job)
+	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, outputs}, flow.Resume{
 		Attempt: job.Attempt, Checkpoint: job.Checkpoint, Steps: job.Steps,
 	})
 	// And the wings half: which job this is and the worker it is on, so what
 	// it writes goes on this worker's streams, and what its earlier attempts
 	// wrote can be read back.
-	ctx = withJob(ctx, &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n})
+	ctx = withJob(ctx, &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs})
 	// A function this job calls runs here, on this worker: it is where work
 	// runs, and a worker is not a place work dispatches from.
 	ctx = flow.Bind(ctx, flow.Local())
@@ -457,7 +469,21 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		}
 	}()
 
-	payload, err := flow.Execute(ctx, job.Func, job.Payload)
+	// As a run, not a bare call. The function's body is a run's main thread,
+	// so it may fork, use a channel, read the clock, sleep and call other
+	// functions, and a retry replays all of that from the history rather than
+	// doing it again — the history being the coordinator's copy of the last
+	// attempt's, put on this worker under this attempt's name before the job
+	// arrived. One attempt per dispatch: whether to try again, and where, is
+	// the coordinator's decision, and the error is its input.
+	payload, err := flow.RunCall(ctx, historyName(job.ID, job.Attempt), job.Func, job.Payload,
+		flow.WithStore(&historyStore{a: outputs}), flow.WithExecutor(flow.Local()), flow.Once())
+	// Whatever the attempt wrote is committed before its answer leaves: a
+	// result whose recordings could still be lost would be a handle to
+	// nothing. A commit that fails is the attempt failing.
+	if cerr := outputs.finish(ctx); cerr != nil && err == nil {
+		err = cerr
+	}
 	if err != nil {
 		res.Error = err.Error()
 		// Say what actually happened. A work function that gives up on its

@@ -15,6 +15,7 @@ type runOptions struct {
 	initialDelay time.Duration
 	maxDelay     time.Duration
 	permanent    []error
+	once         bool
 
 	// input is what the run's body is given, in recorded form, or nil when
 	// none was given; inputType is what the body expects, or nil when it
@@ -66,6 +67,15 @@ func Version(v int) RunOption { return func(o *runOptions) { o.version = v } }
 
 // MaxAttempts caps how many times a failing run is retried. Default 10.
 func MaxAttempts(n int) RunOption { return func(o *runOptions) { o.maxAttempts = n } }
+
+// Once gives the run a single attempt and returns the body's error as it
+// was, unwrapped and without backoff.
+//
+// For a process that runs a run on somebody else's behalf — an executor's
+// worker, say — where whether and where to try again is decided elsewhere,
+// and the error is that decision's input rather than this run's verdict.
+// A continuity or permanent failure is still reported as such.
+func Once() RunOption { return func(o *runOptions) { o.once = true; o.maxAttempts = 1 } }
 
 // Backoff sets the delay before the first retry and the ceiling it doubles
 // towards. Defaults are 1s and 1m.

@@ -99,7 +99,7 @@ func Create(ctx context.Context, name string) (*Output, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wings: open %s: %w", id, err)
 	}
-	return &Output{ctx: ctx, stream: stream, name: name, id: id, attempt: j.attempt}, nil
+	return &Output{ctx: ctx, stream: stream, outputs: j.outputs, name: name, id: id, attempt: j.attempt}, nil
 }
 
 // Output is where a job writes a file. It is an [io.WriteCloser].
@@ -114,6 +114,7 @@ type Output struct {
 	// than holding the job past every bound it was given.
 	ctx     context.Context
 	stream  *dsclient.Stream[fileChunk]
+	outputs *attemptOutputs
 	name    string
 	id      string
 	attempt int
@@ -196,7 +197,7 @@ func (o *Output) send(data []byte) error {
 	}
 	ctx, cancel := context.WithTimeout(o.ctx, outputAppend)
 	defer cancel()
-	if _, err := o.stream.Append(ctx, []fileChunk{chunk}); err != nil {
+	if err := o.outputs.append(ctx, o.stream, []fileChunk{chunk}); err != nil {
 		o.err = fmt.Errorf("wings: write artifact %q: %w", o.name, err)
 		return o.err
 	}

@@ -46,6 +46,11 @@
 // a worker process never runs a workflow, and a function defined inside one
 // would not exist in the process meant to run it.
 //
+// On the worker a call runs as a flow run of its own — see [flow.RunCall] —
+// so a work function may fork, use channels, sleep and call other functions,
+// and a retry replays what its predecessor already did. Everything an attempt
+// writes is committed as one transaction at its heartbeats, steps and return.
+//
 // # Using this package directly
 //
 // [Start] and [Cluster] are usable without the build tool. In a process wings

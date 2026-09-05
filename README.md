@@ -422,6 +422,29 @@ copy would have thrown away is kept. The coordinator recognises it by the run,
 thread and position the call sits at, which replay puts in the same place every
 attempt.
 
+### A work function is a run
+
+On the worker, a call does not execute as a bare function: it runs as a **flow
+run of its own**, with its history on the worker's storage. So a work function
+may do everything a workflow body may — fork with `ctx.Go` and `ctx.Spawn`, use
+a channel between its threads, `ctx.Map` over other functions, read `ctx.Now`,
+`ctx.Sleep` — and a retry **replays** all of it from the history instead of
+doing it again. A nested call it made before it was moved is answered from the
+record; the one it was in the middle of is made again. The same determinism
+rules apply as to any run body, and a function that uses none of those
+primitives records nothing and behaves exactly as before.
+
+Everything an attempt writes on its worker — that history, its recordings, its
+files — goes into **one transaction**, committed at the points that mean
+something: before every heartbeat and step report, when the function returns,
+and by age as a net under a function that reports nothing for a long time. What
+the coordinator is told about progress is therefore never ahead of what it can
+copy, and what a retry is handed is consistent across all of them: the history
+that says which recordings were made and the recordings themselves were
+committed together. Nested calls still execute on the worker that runs the
+function; dispatching them back to the cluster, and channels that cross machines,
+are the next step on top of this.
+
 ## Recordings
 
 A long job's progress is usually a **sequence of events** — a simulation's ticks,
@@ -447,8 +470,9 @@ for ev, err := range wings.Replay[Event](ctx, played.Replay) {
 ```
 
 **One event is one record.** They go onto a durable stream of their own on the
-worker, are copied onto the coordinator's own storage as they arrive, and come
-back out one at a time in the order they went in. Neither end ever holds the log:
+worker, become visible at the job's commit points — every heartbeat, every step,
+its return — are copied onto the coordinator's own storage as they are
+committed, and come back out one at a time in the order they went in. Neither end ever holds the log:
 a reader takes as many as it wants and pays for no more, and breaking out of the
 range stops the reading.
 

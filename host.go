@@ -125,6 +125,8 @@ type jobState struct {
 	attempt int
 	priors  []Recording
 	node    *workerNode
+	// outputs is the transaction everything this attempt writes goes in.
+	outputs *attemptOutputs
 }
 
 type jobKey struct{}

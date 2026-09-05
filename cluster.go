@@ -1128,6 +1128,12 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 				"job", job.ID, "worker", w.id, "err", err)
 			job.Priors = nil
 		}
+		if err := c.hydrateHistory(c.ctx, w, job); err != nil {
+			// The same trade: a retry without its history starts the function
+			// from the top, which is at-least-once doing what it says.
+			c.log.Warn("wings: could not give a retry its predecessor's history",
+				"job", job.ID, "worker", w.id, "err", err)
+		}
 		if err := c.send(c.ctx, w, job); err != nil {
 			c.mu.Lock()
 			c.release(w)

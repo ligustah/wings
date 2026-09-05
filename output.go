@@ -119,7 +119,7 @@ func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 // A plain split is enough because every part goes through streamPart, which
 // leaves a dot in none of them.
 func parseOutput(stream string) (outputName, bool) {
-	for _, prefix := range []string{recordingPrefix, artifactPrefix, priorPrefix} {
+	for _, prefix := range []string{recordingPrefix, artifactPrefix, historyPrefix, priorPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {
 			continue
@@ -417,6 +417,50 @@ func (c *Cluster) hydrate(ctx context.Context, w *workerConn, priors []Recording
 	})
 }
 
+// hydrateHistory puts the coordinator's copy of a job's last history onto the
+// worker about to run its next attempt, under THAT attempt's name.
+//
+// A retry replays its predecessor's history and carries on, and what it then
+// records is the whole history — the replayed part and its own — under its own
+// name, so the attempt after it needs only the one stream. The copy is a
+// one-shot mirror like hydrate's; with one engine it is a copy within it,
+// which the mirror does as readily.
+//
+// The last attempt's, not the longest: the recordings a retry is told to
+// prefer are the last attempt's too, and the two were committed together.
+func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnvelope) error {
+	client, err := c.sharedClient()
+	if err != nil {
+		return err
+	}
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		return fmt.Errorf("wings: look for the history of job %s: %w", job.ID, err)
+	}
+	source, last := "", -1
+	for _, name := range names {
+		o, ok := parseOutput(name)
+		if !ok || o.Prefix != historyPrefix || o.Job != streamPart(job.ID) || o.Attempt >= job.Attempt {
+			continue
+		}
+		if o.Attempt > last {
+			source, last = name, o.Attempt
+		}
+	}
+	if source == "" {
+		return nil
+	}
+	dest := historyName(job.ID, job.Attempt)
+	return w.client.RunMirror(ctx, "wings.hydrate."+dest, dsclient.MirrorSpec{
+		From:             client,
+		Source:           source,
+		Dest:             dest,
+		Create:           true,
+		StopWhenCaughtUp: true,
+		Batch:            recordBatch,
+	})
+}
+
 // drainOutputs waits for the coordinator's copies of what a worker holds to be
 // as complete as the worker's own.
 //
@@ -547,7 +591,13 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 	var stale []outputName
 	for _, name := range names {
 		o, ok := parseOutput(name)
-		if !ok || o.Job != streamPart(job) || o.Attempt == keep {
+		if !ok || o.Job != streamPart(job) {
+			continue
+		}
+		// The kept attempt's recordings and files are what the caller's
+		// handles name. Its history is not: a history is for the attempt
+		// after this one, and there is none.
+		if o.Attempt == keep && o.Prefix != historyPrefix {
 			continue
 		}
 		stale = append(stale, o)

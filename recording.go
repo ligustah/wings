@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
+	"sync"
 
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
@@ -98,13 +99,18 @@ func Record[E any](ctx context.Context, name string) (*Recorder[E], error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Recorder[E]{
+	r := &Recorder[E]{
 		ctx:     ctx,
 		stream:  stream,
+		outputs: j.outputs,
 		name:    name,
 		id:      id,
 		attempt: j.attempt,
-	}, nil
+	}
+	// A commit point pushes out what this holds first, so the boundary never
+	// falls in the middle of what the function considers recorded.
+	r.unregister = j.outputs.register(r.Flush)
+	return r, nil
 }
 
 // eventStream opens a recording's storage with a codec that can allocate.
@@ -138,17 +144,23 @@ func allocator[E any]() func() E {
 	}
 }
 
-// Recorder is a job's event log. Safe for one goroutine at a time.
+// Recorder is a job's event log. Safe to use from several goroutines, though
+// the order of events is then theirs to decide.
 type Recorder[E any] struct {
 	// ctx is the job's, so its events go out under the job's own deadline: a
 	// job that has timed out cannot go on recording, and a broker that stops
 	// answering fails the flush rather than holding the job forever.
 	ctx     context.Context
 	stream  *dsclient.Stream[E]
+	outputs *attemptOutputs
 	name    string
 	id      string
 	attempt int
 
+	// unregister takes this recorder off the attempt's commit-time flush.
+	unregister func()
+
+	mu     sync.Mutex
 	batch  []E
 	count  int64
 	closed bool
@@ -161,6 +173,8 @@ type Recorder[E any] struct {
 // to call in the inner loop of whatever produces them. Each one is still its own
 // record; the batching is a round trip, not a container.
 func (r *Recorder[E]) Record(e E) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return fmt.Errorf("wings: recording %q is closed", r.name)
 	}
@@ -171,15 +185,23 @@ func (r *Recorder[E]) Record(e E) error {
 	if len(r.batch) < recordBatch {
 		return nil
 	}
-	return r.Flush()
+	return r.flush()
 }
 
 // Flush sends what has been recorded but not yet gone out.
 //
-// Rarely needed: [Recorder.Close] flushes, and so does a full batch. It is here
-// for a job that wants what it has recorded to be readable NOW — a slow producer
-// whose progress somebody is watching.
+// Sent, not yet visible: what a job writes becomes readable — here and on the
+// coordinator — at the attempt's next commit point, which is its next
+// heartbeat or step, or its return. It is here for a job that wants what it
+// has recorded on its way NOW, and for the commit point itself, which calls
+// it.
 func (r *Recorder[E]) Flush() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.flush()
+}
+
+func (r *Recorder[E]) flush() error {
 	if len(r.batch) == 0 {
 		return r.err
 	}
@@ -191,7 +213,7 @@ func (r *Recorder[E]) Flush() error {
 	}
 	ctx, cancel := context.WithTimeout(r.ctx, outputAppend)
 	defer cancel()
-	if _, err := r.stream.Append(ctx, r.batch); err != nil {
+	if err := r.outputs.append(ctx, r.stream, r.batch); err != nil {
 		r.err = fmt.Errorf("wings: record %d events to %s: %w", len(r.batch), r.name, err)
 		return r.err
 	}
@@ -205,13 +227,16 @@ func (r *Recorder[E]) Flush() error {
 // Safe to call twice: the second call returns what the first did, so a deferred
 // Close beside an explicit one is not a second log.
 func (r *Recorder[E]) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return r.err
 	}
-	if err := r.Flush(); err != nil {
+	if err := r.flush(); err != nil {
 		return err
 	}
 	r.closed = true
+	r.unregister()
 	return nil
 }
 
@@ -221,6 +246,8 @@ func (r *Recorder[E]) Close() error {
 // wants to say how far it has got can hand one out mid-run, and what it names is
 // everything flushed so far.
 func (r *Recorder[E]) Recording() Recording {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return Recording{
 		Name:     r.name,
 		ID:       r.id,

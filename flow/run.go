@@ -109,22 +109,51 @@ import (
 // runs out of attempts. A run that suspends is waited for. Both of those are
 // why this can take a long time and why ctx matters.
 func Run(ctx context.Context, name string, body func(ctx Context) error, opts ...RunOption) error {
-	ro := newRunOptions(opts)
-
-	if name == "" {
-		return errors.New("flow: Run requires a name; use flow.NewName for an arbitrary one")
-	}
 	if body == nil {
 		return errors.New("flow: Run requires a body")
 	}
+	_, err := execute(ctx, name, func(ctx Context) ([]byte, error) { return nil, body(ctx) }, opts)
+	return err
+}
+
+// RunCall executes the function defined under fn, on payload, as a durable
+// run named name, and returns its encoded output.
+//
+// This is [Execute] made durable: the function's body runs as the run's main
+// thread, so everything a run's body may do — fork, use a channel, read the
+// clock, sleep, call other functions — it may do too, and is replayed on the
+// next attempt rather than repeated. The output is recorded with the run's
+// end, so entering a run that already completed returns what it produced
+// without running anything.
+//
+// For executors. A process that has been handed a call and has storage of its
+// own runs it through here, and what it gets is a call that survives being
+// moved: the history is what has to travel, and it is a stream.
+func RunCall(ctx context.Context, name, fn string, payload []byte, opts ...RunOption) ([]byte, error) {
+	if fn == "" {
+		return nil, errors.New("flow: RunCall requires a function name")
+	}
+	return execute(ctx, name, func(ctx Context) ([]byte, error) {
+		return Execute(ctx, fn, payload)
+	}, opts)
+}
+
+// execute is Run and RunCall: a body whose output, if any, is kept with the
+// run's end.
+func execute(ctx context.Context, name string, body func(ctx Context) ([]byte, error), opts []RunOption) ([]byte, error) {
+	ro := newRunOptions(opts)
+
+	if name == "" {
+		return nil, errors.New("flow: Run requires a name; use flow.NewName for an arbitrary one")
+	}
 	if ro.store == nil {
-		return errors.New("flow: Run requires a Store; pass flow.WithStore(flow.NewStore(...)) " +
+		return nil, errors.New("flow: Run requires a Store; pass flow.WithStore(flow.NewStore(...)) " +
 			"or flow.WithStore(flow.NewMemStore())")
 	}
 
 	history, err := ro.store.Events(ctx, name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// A run's input is fixed by its first attempt. Later attempts replay a
@@ -135,28 +164,29 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 	input := ro.input
 	if recorded, ok := recordedInput(history); ok {
 		if input != nil && !bytes.Equal(input, recorded) {
-			return fmt.Errorf("flow: run %s was started with different input; "+
+			return nil, fmt.Errorf("flow: run %s was started with different input; "+
 				"a run's input is fixed by its first attempt, so leave it off to resume or use a new name", name)
 		}
 		input = recorded
 	} else if input == nil && ro.inputType != nil {
-		return fmt.Errorf("flow: run %s takes a %s as input and none was given; it looks like %s",
+		return nil, fmt.Errorf("flow: run %s takes a %s as input and none was given; it looks like %s",
 			name, ro.inputType, exampleInput(ro.inputType))
 	}
 
 	// A finished run is finished. Re-running it would repeat every effect its
-	// calls had, which is the opposite of what a durable run is for.
+	// calls had, which is the opposite of what a durable run is for. What it
+	// produced is on record, and is the answer.
 	if done, result, ok := finished(history); ok {
+		out, err := unpackResult(result)
 		if done == protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED {
-			return nil
+			return out, nil
 		}
-		_, err := unpackResult(result)
-		return fmt.Errorf("flow: run %s already failed permanently: %w", name, err)
+		return nil, fmt.Errorf("flow: run %s already failed permanently: %w", name, err)
 	}
 
 	sink, err := ro.store.Sink(ctx, name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	r := &runner{name: name, body: body, opts: ro, sink: sink, input: input}
@@ -165,34 +195,39 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 	for {
 		attempt++
 
-		status, runErr := r.attempt(ctx, history, attempt)
+		out, status, runErr := r.attempt(ctx, history, attempt)
 
 		switch status {
 		case protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED:
-			return nil
+			return out, nil
 
 		case protos.WorkflowStatus_WORKFLOW_STATUS_FAILED:
-			return runErr
+			return nil, runErr
 
 		case protos.WorkflowStatus_WORKFLOW_STATUS_SUSPENDED:
 			_, until := IsSuspended(runErr)
 			if err := wait(ctx, time.Until(until)); err != nil {
-				return err
+				return nil, err
 			}
 
 		default: // backoff
+			if ro.once {
+				// Somebody else decides about retries, and wants the error as
+				// the body gave it.
+				return nil, runErr
+			}
 			if attempt >= uint64(ro.maxAttempts) {
-				return fmt.Errorf("flow: run %s failed after %d attempts: %w", name, attempt, runErr)
+				return nil, fmt.Errorf("flow: run %s failed after %d attempts: %w", name, attempt, runErr)
 			}
 			if err := wait(ctx, r.backoff(attempt)); err != nil {
-				return err
+				return nil, err
 			}
 		}
 
 		// The next attempt replays everything recorded so far, including what
 		// this one managed to do before it stopped.
 		if history, err = ro.store.Events(ctx, name); err != nil {
-			return err
+			return nil, err
 		}
 	}
 }
@@ -200,7 +235,7 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 // runner is one Run in progress: its body, its options and its sink.
 type runner struct {
 	name string
-	body func(ctx Context) error
+	body func(ctx Context) ([]byte, error)
 	opts runOptions
 	sink Sink
 
@@ -209,8 +244,9 @@ type runner struct {
 	input []byte
 }
 
-// attempt runs the body once over the history it is given.
-func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt uint64) (protos.WorkflowStatus, error) {
+// attempt runs the body once over the history it is given, and returns what
+// it produced along with what became of it.
+func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt uint64) ([]byte, protos.WorkflowStatus, error) {
 	run := &runState{
 		name:    r.name,
 		attempt: attempt,
@@ -242,7 +278,7 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 	}
 	appendMarker(run, start)
 
-	err := r.body(Context{withThread(withInput(ctx, r.input), main)})
+	out, err := r.body(Context{withThread(withInput(ctx, r.input), main)})
 
 	if perr := run.err(); perr != nil {
 		// Persistence failed somewhere in there. Not retryable in any useful
@@ -251,19 +287,19 @@ func (r *runner) attempt(ctx context.Context, history []*protos.Event, attempt u
 			Status: protos.WorkflowStatus_WORKFLOW_STATUS_FAILED,
 			Result: packResult(nil, perr),
 		})
-		return protos.WorkflowStatus_WORKFLOW_STATUS_FAILED, perr
+		return nil, protos.WorkflowStatus_WORKFLOW_STATUS_FAILED, perr
 	}
 
 	status := r.classify(err)
 
-	end := &protos.RunEndEvent{Status: status, Result: packResult(nil, err)}
+	end := &protos.RunEndEvent{Status: status, Result: packResult(out, err)}
 	if status == protos.WorkflowStatus_WORKFLOW_STATUS_SUSPENDED {
 		if _, until := IsSuspended(err); !until.IsZero() {
 			end.ScheduledFor = timestamppb.New(until)
 		}
 	}
 	appendMarker(run, end)
-	return status, err
+	return out, status, err
 }
 
 // classify decides what an error the body returned means for the next
