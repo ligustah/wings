@@ -433,14 +433,16 @@ thread's name, which replay gives it again on every attempt.
 A flow run is made of **threads**: the body is the main thread, and every
 `ctx.Go`, `ctx.Map` and `ctx.Spawn` forks another. Each thread has a history
 of its own, on a stream of its own. The fork in the parent's history says what
-the thread is to do — the function and its input — and the join says what it
-produced; a replay of the parent that finds the join never runs the thread
-again, and one that finds only the fork starts the thread, which replays *its*
-history and carries on. That is the whole reason a thread is what the cluster
-hands to a machine: its stream is all that has to travel.
+the thread is to do — the function and its input, or that it is a closure of
+the run's own code — and the join says what it produced; a replay of the
+parent that finds the join never runs the thread again, and one that finds
+only the fork starts the thread, which replays *its* history and carries on.
+That is the whole reason a thread is what the cluster hands to a machine: its
+stream is all that has to travel — or, for a closure, its stream and its
+ancestors', which is how a worker holding the same code reaches the closure.
 
-So what goes to a worker is a thread that runs a function, and it runs there
-as a **flow run of its own**, with its history on the worker's storage. A work
+So what goes to a worker is a thread, and it runs there as a **flow run of
+its own**, with its history on the worker's storage. A work
 function may do everything a workflow body may — fork with `ctx.Go` and
 `ctx.Spawn`, use a channel between its threads, `ctx.Map` over other
 functions, read `ctx.Now`, `ctx.Sleep`, wrap an outside answer in
@@ -509,7 +511,9 @@ waiting for. A worker keeps nothing of a thread that is waiting for tomorrow.
 
 A `flow.Channel` **travels in a call's input** like any other value. The
 workflow creates one and hands it to a function; the function sends into it or
-receives from it; two functions on two workers can share one the same way. On
+receives from it; two functions on two workers can share one the same way. A
+thread of run code sent to a worker may use any channel of the run, so every
+channel is shared when one leaves. On
 the wire a shared channel is a durable stream relayed through the coordinator:
 every run that uses it has an outbox — on a worker, copied home like a
 recording — and the coordinator merges the outboxes into one canonical stream

@@ -120,10 +120,19 @@ func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
 // body may call functions, sleep, use a [Channel], fork further threads —
 // anything the run's own body may do. It is what makes channels worth having,
 // since a channel between threads needs threads that do more than one thing.
-// What it cannot do is leave the process: the fork records no function a
-// placer could run elsewhere, only that a thread of run code was started,
-// so the thread runs where its parent is. Its result must be encodable, as
-// a function's output must, since the join records it.
+// Its result must be encodable, as a function's output must, since the join
+// records it.
+//
+// The fork records no function a placer could run elsewhere, only that a
+// thread of run code was started; what a placer can send instead is the way
+// to the code — the thread's lineage, see [Thread] and [RunLineage] — for a
+// process holding the same code to replay its way to the closure. That
+// process computes again whatever the parent computed between the events of
+// its history up to the fork, so keep that the replayable kind, and know
+// that a Spawn after a [Context.Step] cannot leave: steps are kept with the
+// call, not in the history. A thread of a run started under [Run] with a
+// bare body has no lineage another process could start, and runs where its
+// parent is.
 //
 //	ch := ctx.NewChannel[int]()
 //	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {

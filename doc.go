@@ -48,11 +48,15 @@
 //
 // What goes to a worker is a THREAD: one forked with flow.Context.Go or
 // flow.Context.Map, which runs one function on one input, and is what the
-// parent's history recorded at the fork. A function called directly runs on
-// the calling thread, where the call is made. On the worker the thread runs
-// as a flow run of its own — see [flow.RunThread] — so a work function may
-// fork, use channels, sleep and call other functions, and a retry replays
-// what its predecessor already did. Everything an attempt writes is committed
+// parent's history recorded at the fork; or one forked with
+// flow.Context.Spawn, which runs a closure of the workflow's own code, sent
+// as its LINEAGE — the path of threads from the workflow down to it — for
+// the worker to replay its way to the closure, see [flow.RunLineage]. A
+// function called directly runs on the calling thread, where the call is
+// made. On the worker the thread runs as a flow run of its own — see
+// [flow.RunThread] — so a work function may fork, use channels, sleep and
+// call other functions, and a retry replays what its predecessor already
+// did. Everything an attempt writes is committed
 // as one transaction at its heartbeats, steps, forks and return. A thread a
 // work function forks goes back to the cluster to be placed: the coordinator
 // reads the fork out of its copy of the run's history and answers it on the
