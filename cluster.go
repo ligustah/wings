@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1682,7 +1683,10 @@ func (c *Cluster) Stop(ctx context.Context) error {
 		return nil
 	}
 	c.closed = true
-	workers := c.workers
+	// A copy, not the slice: a worker that dies from here on is deleted
+	// from c.workers in place, which clears the slot it left at the end of
+	// the array this would otherwise still be reading.
+	workers := slices.Clone(c.workers)
 	c.mu.Unlock()
 
 	c.journal.record(journalEntry{Kind: journalClusterStop})
