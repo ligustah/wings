@@ -374,10 +374,21 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 			}},
 		}},
 		Metadata: &computepb.Metadata{
-			Items: []*computepb.Items{{
-				Key:   proto.String("ssh-keys"),
-				Value: proto.String(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
-			}},
+			Items: []*computepb.Items{
+				{
+					Key:   proto.String("ssh-keys"),
+					Value: proto.String(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
+				},
+				// The key above is installed by the guest agent from
+				// metadata, and OS Login — which a project may enforce by
+				// default — ignores metadata keys entirely. Said explicitly
+				// on the instance, so the run does not depend on a project
+				// setting nobody remembers.
+				{
+					Key:   proto.String("enable-oslogin"),
+					Value: proto.String("FALSE"),
+				},
+			},
 		},
 		Labels: p.cfg.Labels,
 	}
