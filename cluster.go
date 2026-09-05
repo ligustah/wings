@@ -1417,10 +1417,19 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	c.cancel()
 	c.wg.Wait()
 
-	var errs []error
-	for _, w := range workers {
-		errs = append(errs, c.releaseWorker(ctx, w))
+	// All at once. Releasing a cloud machine is a delete the API takes most
+	// of a minute to confirm, and one after another made Stop on a fleet of
+	// sixteen a ten-minute wait — every one of them billing until its turn.
+	errs := make([]error, len(workers))
+	var releases sync.WaitGroup
+	for i, w := range workers {
+		releases.Add(1)
+		go func() {
+			defer releases.Done()
+			errs[i] = c.releaseWorker(ctx, w)
+		}()
 	}
+	releases.Wait()
 	// The journal writes through the shared instance, so it must be drained
 	// before that instance goes away — and it is drained last, so the entries
 	// for the workers just closed are in it.

@@ -307,8 +307,11 @@ func (c *Cluster) startOutputMirror() error {
 			return dsclient.MirrorTarget{Name: cand.Stream, Batch: batchFor(o.Prefix)}, nil
 		},
 		OnStreamError: func(cand dsclient.MirrorCandidate, err error) error {
-			c.log.Warn("wings: keeping worker output", "worker", cand.Source,
-				"stream", cand.Stream, "err", err)
+			// A copy cut short by the cluster stopping is not trouble.
+			if c.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+				c.log.Warn("wings: keeping worker output", "worker", cand.Source,
+					"stream", cand.Stream, "err", err)
+			}
 			return nil // one worker having trouble is not the fleet stopping
 		},
 		OnDiscoveryDegraded: func(source string, err error) {
