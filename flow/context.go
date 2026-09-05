@@ -70,12 +70,19 @@ func From(ctx context.Context) Context {
 }
 
 // WithCancel is [context.WithCancel], keeping the type.
+//
+// A wait cut short by a context the body derives — a join, a receive, a
+// send, a sleep — is on record as the body's giving up, and the next
+// attempt gives up at the same point with the same error, at once. What
+// the run's own context cuts short is not: that attempt is over, and the
+// next one waits again.
 func (c Context) WithCancel() (Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(c.base())
 	return Context{ctx}, cancel
 }
 
-// WithTimeout is [context.WithTimeout], keeping the type.
+// WithTimeout is [context.WithTimeout], keeping the type. See [Context.WithCancel]
+// for what a wait it cuts short leaves on record.
 func (c Context) WithTimeout(d time.Duration) (Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(c.base(), d)
 	return Context{ctx}, cancel

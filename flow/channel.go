@@ -171,16 +171,19 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 
 	seq := t.nextSend(c.name)
 
+	// Given up on last time, by the sender's own timeout or cancel, with the
+	// value queued: queued again, for a receiver of this attempt, and given
+	// up on again.
+	if ierr, ok := t.interrupted("send"); ok {
+		if _, err := cs.put(ctx, t.qualified(), seq, data, false); err != nil {
+			return err
+		}
+		return ierr
+	}
 	// Consumed before waiting, not after. The event says the send completed,
 	// and a replay that waited first would be waiting for a receive that has
 	// already been replayed away.
 	ev, err := t.expect[*protos.ChannelSendEvent]()
-	if err != nil {
-		return err
-	}
-	// A replayed send is not announced to other runs again: they have it,
-	// and the identity would only be dropped as a copy.
-	item, err := cs.put(ctx, t.qualified(), seq, data, ev == nil)
 	if err != nil {
 		return err
 	}
@@ -189,10 +192,21 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 			return continuityf("thread %q previously sent %s#%d at this point, but is now sending %s#%d",
 				t.id, ev.GetChannel(), ev.GetSeq(), c.name, seq)
 		}
+	}
+	// A replayed send is not announced to other runs again: they have it,
+	// and the identity would only be dropped as a copy.
+	item, err := cs.put(ctx, t.qualified(), seq, data, ev == nil)
+	if err != nil {
+		return err
+	}
+	if ev != nil {
 		return t.err()
 	}
 
 	if err := cs.awaitTaken(ctx, t, c.sharedID(), item); err != nil {
+		if ctx.Err() != nil {
+			err = t.interrupt("send", err)
+		}
 		return err
 	}
 	t.record(&protos.ChannelSendEvent{
@@ -221,6 +235,9 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	// replay.
 	recvSeq := t.nextRecv(c.name)
 
+	if err, ok := t.interrupted("recv"); ok {
+		return zero, false, err
+	}
 	ev, err := t.expect[*protos.ChannelRecvEvent]()
 	if err != nil {
 		return zero, false, err
@@ -252,6 +269,9 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 
 	item, err := cs.awaitAny(ctx, t, c.sharedID(), recvSeq)
 	if err != nil {
+		if ctx.Err() != nil {
+			err = t.interrupt("recv", err)
+		}
 		return zero, false, err
 	}
 	if item == nil {
@@ -292,6 +312,9 @@ func (c *Channel[T]) Close(ctx Context) error {
 	}
 
 	seq := t.nextSend(c.name)
+	if err, ok := t.interrupted("close"); ok {
+		return err
+	}
 	ev, err := t.expect[*protos.ChannelSendEvent]()
 	if err != nil {
 		return err
@@ -305,6 +328,9 @@ func (c *Channel[T]) Close(ctx Context) error {
 		return t.err()
 	}
 	if err := cs.announceClose(ctx); err != nil {
+		if ctx.Err() != nil {
+			err = t.interrupt("close", err)
+		}
 		return err
 	}
 	cs.shut()
@@ -534,6 +560,7 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 		select {
 		case <-wait:
 		case <-ctx.Done():
+			_ = resume(t.base())
 			return ctx.Err()
 		}
 	}
@@ -599,6 +626,7 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 		select {
 		case <-wait:
 		case <-ctx.Done():
+			_ = resume(t.base())
 			return nil, ctx.Err()
 		}
 	}

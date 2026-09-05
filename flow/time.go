@@ -79,6 +79,12 @@ func (c Context) Sleep(d time.Duration) error {
 		}
 	}
 
+	// Cut short last time, by the body's own timeout or cancel: cut short
+	// again, at once, whatever the clock says now.
+	if err, ok := t.interrupted("sleep"); ok {
+		return err
+	}
+
 	until := start.Add(d)
 	remaining := time.Until(until)
 	switch {
@@ -87,7 +93,8 @@ func (c Context) Sleep(d time.Duration) error {
 	case remaining < ShortSleep:
 		resume := t.park(ctx, WaitSleep)
 		if err := wait(ctx, remaining); err != nil {
-			return err
+			_ = resume(t.base())
+			return t.interrupt("sleep", err)
 		}
 		return resume(ctx)
 	default:

@@ -49,6 +49,7 @@ message Event {
     ChannelSendEvent channel_send = 28;
     ChannelRecvEvent channel_recv = 29;
     EffectEvent effect = 30;
+    WaitInterruptedEvent interrupted = 31;
   }
 }
 
@@ -95,6 +96,28 @@ message SleepEvent {
 message GetTimeEvent {
   // The time at which the event was emitted
   google.protobuf.Timestamp time = 1;
+}
+
+// WaitInterruptedEvent is a wait — a join, a receive, a send, a close, a
+// sleep — that a context the body made itself cut short: a timeout it set on
+// the wait, a cancel it called. The body went on from there with the
+// context's error, and the next attempt has to go on the same way, at once,
+// rather than wait again for what the body already gave up on — or find
+// that this time the wait would have completed, and diverge. A wait the
+// thread's OWN context cut short is not recorded: the attempt is over.
+message WaitInterruptedEvent {
+  // Which wait: "join", "recv", "send", "close" or "sleep", checked on
+  // replay like every other event's shape.
+  string wait = 1;
+
+  // Why: the context's error.
+  InterruptCause cause = 2;
+}
+
+enum InterruptCause {
+  INTERRUPT_CAUSE_UNKNOWN = 0;
+  INTERRUPT_CAUSE_CANCELED = 1;
+  INTERRUPT_CAUSE_DEADLINE_EXCEEDED = 2;
 }
 
 message EffectEvent {

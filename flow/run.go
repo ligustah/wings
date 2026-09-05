@@ -383,6 +383,7 @@ func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, att
 		events:   replayable(history),
 		sink:     sink,
 		readonly: r.readonly,
+		ctx:      ctx,
 	}
 
 	reason := protos.StartReason_START_REASON_INIT

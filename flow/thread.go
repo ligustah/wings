@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -123,6 +124,13 @@ type threadState struct {
 	// records nothing, parks nowhere, reports nothing, and stops where its
 	// history ends. See lineage.go.
 	readonly bool
+
+	// ctx is the attempt's own context: what the thread runs under. A wait
+	// that ends by a context derived from it while it is still live was
+	// cut short by the body's own doing, which is on record (see
+	// interrupt); one that ends because it is done was interrupted with
+	// the attempt, which is not.
+	ctx context.Context
 
 	// events is this thread's history, minus the attempt markers, with what
 	// this attempt records appended as it goes. Guarded by run.mu, because
@@ -318,6 +326,57 @@ func (t *threadState) persistLocked(ev *protos.Event) {
 	if err := t.sink.Append(context.Background(), ev); err != nil {
 		t.sinkErr = fmt.Errorf("flow: persist event: %w", err)
 	}
+}
+
+// base is the attempt's own context, for what must go on after a wait the
+// body's narrower context cut short — taking the thread's slot back, say —
+// and Background for a thread that was given none.
+func (t *threadState) base() context.Context {
+	if t.ctx != nil {
+		return t.ctx
+	}
+	return context.Background()
+}
+
+// interrupted reports the interruption a previous attempt recorded at this
+// point, if it recorded one: the wait named was cut short by the body's own
+// context, and returns the same error now, at once.
+func (t *threadState) interrupted(wait string) (error, bool) {
+	ev := t.peek()
+	in := ev.GetInterrupted()
+	if in == nil {
+		return nil, false
+	}
+	if in.GetWait() != wait {
+		return continuityf("at position %d of thread %q the history has an interrupted %s, but the run is now doing a %s",
+			t.serial, t.id, in.GetWait(), wait), true
+	}
+	t.run.mu.Lock()
+	t.serial++
+	t.run.mu.Unlock()
+	switch in.GetCause() {
+	case protos.InterruptCause_INTERRUPT_CAUSE_DEADLINE_EXCEEDED:
+		return context.DeadlineExceeded, true
+	default:
+		return context.Canceled, true
+	}
+}
+
+// interrupt is what a wait returns when its context ended: err, recorded as
+// the wait's outcome when the context was one the body made — a timeout or
+// cancel of its own — so that the next attempt goes on from here the same
+// way. An interruption by the thread's own context is not recorded: the
+// attempt is over, and the next one waits again, as the body would have.
+func (t *threadState) interrupt(wait string, err error) error {
+	if t.readonly || (t.ctx != nil && t.ctx.Err() != nil) {
+		return err
+	}
+	cause := protos.InterruptCause_INTERRUPT_CAUSE_CANCELED
+	if errors.Is(err, context.DeadlineExceeded) {
+		cause = protos.InterruptCause_INTERRUPT_CAUSE_DEADLINE_EXCEEDED
+	}
+	t.record(&protos.WaitInterruptedEvent{Wait: wait, Cause: cause})
+	return err
 }
 
 // err reports the first persistence failure of this thread, if any.

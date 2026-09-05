@@ -98,6 +98,12 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	}
 	f.awaited = true
 
+	// Given up on last time, by the caller's own timeout or cancel: given
+	// up on again, at once. The thread runs on regardless, as it did.
+	if err, ok := f.parent.interrupted("join"); ok {
+		return zero, err
+	}
+
 	select {
 	case <-f.done:
 	default:
@@ -106,18 +112,22 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 		select {
 		case <-f.done:
 		case <-ctx.Done():
-			return zero, ctx.Err()
+			// Going on without the thread, so going on as a running
+			// thread: the slot given up to wait is taken back first.
+			_ = resume(f.parent.base())
+			return zero, f.parent.interrupt("join", ctx.Err())
 		}
 		if err := resume(ctx); err != nil {
 			return zero, err
 		}
 	}
 
-	// Interrupted rather than finished: the thread was cut short by the
-	// caller's own context, or by whatever was running it stopping, and
-	// recording that as its result would have the next attempt replay a
-	// failure that never happened. The fork stays without a join, which is
-	// what makes that attempt run the thread again.
+	// Interrupted rather than finished: whatever was running the thread
+	// stopped, and recording that as its result would have the next attempt
+	// replay a failure that never happened. The fork stays without a join,
+	// which is what makes that attempt run the thread again. (A wait the
+	// caller's own context cut short returned above, and is on record as
+	// the caller's giving up, not as the thread's result.)
 	if f.err != nil && (ctx.Err() != nil || errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded)) {
 		return zero, f.err
 	}
