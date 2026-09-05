@@ -99,15 +99,25 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	registerProviderFlags(flag.CommandLine)
 	flag.Parse()
 
-	w, err := chooseWorkflow(*workflow, flow.Workflows())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "wings: %v\n", err)
-		os.Exit(2)
-	}
-	payload, err := readInput(*input, w)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "wings: %v\n", err)
-		os.Exit(2)
+	// Which workflow, and with what: a coordinator's question, settled
+	// before any machine is paid for. A worker is this same binary with the
+	// same flags and no workflow to run, so it must not be asked — with two
+	// defined and no -workflow it would refuse to start, and the coordinator
+	// would wait for a worker that had exited.
+	var (
+		w       flow.WorkflowInfo
+		payload []byte
+	)
+	if !isWorkerProcess() {
+		var err error
+		if w, err = chooseWorkflow(*workflow, flow.Workflows()); err != nil {
+			fmt.Fprintf(os.Stderr, "wings: %v\n", err)
+			os.Exit(2)
+		}
+		if payload, err = readInput(*input, w); err != nil {
+			fmt.Fprintf(os.Stderr, "wings: %v\n", err)
+			os.Exit(2)
+		}
 	}
 
 	level := slog.LevelInfo
