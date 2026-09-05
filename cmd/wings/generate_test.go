@@ -68,7 +68,6 @@ func TestCoordinatorMainWiresTheOptions(t *testing.T) {
 		"Worker:",
 		`WorkerOS:    "linux"`,
 		`WorkerArch:  "arm64"`,
-		"app.Coordinate",
 		"app.Provisioner()",
 	} {
 		if !strings.Contains(src, want) {
@@ -83,6 +82,11 @@ func TestCoordinatorMainWithoutProvisioner(t *testing.T) {
 	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil)
 	src := mustGenerate(t, b, err)
 
+	// With nothing in main to name it, the package must still be linked in,
+	// or the coordinator has no workflow to run.
+	if !strings.Contains(src, `_ "example.com/app"`) {
+		t.Errorf("the package must be imported for its DefineWorkflow calls:\n\n%s", src)
+	}
 	if strings.Contains(src, "app.Provisioner") {
 		t.Errorf("generated a call to Provisioner the package does not export:\n\n%s", src)
 	}
@@ -100,8 +104,19 @@ func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
 	if !strings.Contains(src, `_ "example.com/app/job"`) {
 		t.Errorf("the work package must be linked in for its Define calls:\n\n%s", src)
 	}
+	if !strings.Contains(src, `_ "example.com/app/coord"`) {
+		t.Errorf("the coordinator package must be linked in for its DefineWorkflow calls:\n\n%s", src)
+	}
+
+	// When main has to call its Provisioner, the same package is imported by
+	// name instead — once, not both ways.
+	b, err = coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, true, nil)
+	src = mustGenerate(t, b, err)
 	if !strings.Contains(src, `app "example.com/app/coord"`) {
-		t.Errorf("the coordinator package must be imported as app:\n\n%s", src)
+		t.Errorf("the coordinator package must be imported as app when its Provisioner is called:\n\n%s", src)
+	}
+	if n := strings.Count(src, `"example.com/app/coord"`); n != 1 {
+		t.Errorf("imported the coordinator package %d times, want 1:\n\n%s", n, src)
 	}
 }
 
@@ -129,7 +144,7 @@ func TestWorkerMainIsJustTheEntrypoint(t *testing.T) {
 	if strings.Contains(src, "go:embed") {
 		t.Errorf("the worker must not embed a worker:\n\n%s", src)
 	}
-	if strings.Contains(src, "Coordinate") {
-		t.Errorf("the worker must not reference the coordinator body:\n\n%s", src)
+	if strings.Contains(src, "CoordinatorMain") {
+		t.Errorf("the worker must not be a coordinator:\n\n%s", src)
 	}
 }

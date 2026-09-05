@@ -66,13 +66,23 @@ func workerMain(workPkg string) ([]byte, error) {
 //	func main() {
 //		wings.CoordinatorMain(wings.CoordinatorOptions{…})
 //	}
+//
+// The coordinator package is imported for its DefineWorkflow calls, and by
+// name only when it also exports a Provisioner the main has to call.
 func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner bool, providers []string) ([]byte, error) {
 	f := jen.NewFile("main")
 	f.HeaderComment(generatedBy)
 
 	// embed contributes nothing but the directive's machinery.
 	f.Anon("embed")
-	f.ImportAlias(coordPkg, "app")
+	if hasProvisioner {
+		f.ImportAlias(coordPkg, "app")
+	} else {
+		// Nothing in main names the package, so an aliased import would be
+		// dropped as unused — and with it the workflows. Import it for effect.
+		f.Comment("Linked in for its DefineWorkflow calls; the coordinator runs one of them.")
+		f.Anon(coordPkg)
+	}
 
 	if workPkg != coordPkg {
 		// Split build: the work package must still be linked in, because the
@@ -107,7 +117,6 @@ func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner b
 				jen.Id("Worker"):      jen.Id("wingsWorker"),
 				jen.Id("WorkerOS"):    jen.Lit(worker.os),
 				jen.Id("WorkerArch"):  jen.Lit(worker.arch),
-				jen.Id("Coordinate"):  jen.Qual(coordPkg, "Coordinate"),
 				jen.Id("Provisioner"): provisionerValue(coordPkg, hasProvisioner),
 			}),
 		),

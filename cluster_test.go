@@ -64,7 +64,7 @@ var slow = flow.Define("test.slow", func(ctx flow.Context, d time.Duration) (str
 // second run under a finished one's name would be that run, already done.
 var runSeq atomic.Uint64
 
-// mapOn fans f out over ins as a run on c, the way Coordinate would, and
+// mapOn fans f out over ins as a run on c, the way a workflow would, and
 // returns what Map returned. Map is only callable inside a run — it forks a
 // thread per input — so this is how a test gets a fan-out out of a cluster.
 func mapOn[In, Out any](ctx context.Context, c *Cluster, f flow.Func[In, Out], ins []In) ([]Out, error) {

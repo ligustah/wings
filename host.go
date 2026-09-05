@@ -9,8 +9,7 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// Run executes body as a durable run on this cluster, the way [CoordinatorMain]
-// runs your Coordinate.
+// Run executes body as a durable run on this cluster.
 //
 // Every function the body calls goes to a worker and is recorded in the run's
 // history, which lives on the cluster's own storage under Dir. Run the same
@@ -22,15 +21,37 @@ import (
 // opts are passed through to [flow.Run]; the store and the executor are this
 // cluster's and cannot be overridden.
 func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Context) error, opts ...flow.RunOption) error {
-	client, err := c.sharedClient()
+	all, err := c.runOptions(opts)
 	if err != nil {
 		return err
 	}
-	all := append(append([]flow.RunOption{}, opts...),
+	return flow.Run(withCluster(ctx, c), name, body, all...)
+}
+
+// RunWorkflow runs a defined workflow on this cluster, the way [CoordinatorMain]
+// runs the one it was asked for: under the workflow's own name, so a
+// coordinator started again over the same Dir resumes it.
+//
+// See [Cluster.Run] for what a run on a cluster is and what opts may say.
+func (c *Cluster) RunWorkflow(ctx context.Context, w flow.Workflow, opts ...flow.RunOption) error {
+	all, err := c.runOptions(opts)
+	if err != nil {
+		return err
+	}
+	return w.Run(withCluster(ctx, c), all...)
+}
+
+// runOptions is opts with this cluster's store and executor appended, so
+// that they win.
+func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]flow.RunOption{}, opts...),
 		flow.WithStore(flow.NewStore(client)),
 		flow.WithExecutor(clusterExecutor{c}),
-	)
-	return flow.Run(withCluster(ctx, c), name, body, all...)
+	), nil
 }
 
 // Bind returns a context on which defined functions are called on this
@@ -120,7 +141,7 @@ func streamsFor(ctx context.Context) (*dsclient.Client, error) {
 	c := clusterFrom(ctx)
 	if c == nil {
 		return nil, errors.New("wings: this context belongs to neither a cluster nor a running job; " +
-			"use the context Coordinate was given, or Cluster.Run or Cluster.Bind")
+			"use the context a workflow or a run was given, or Cluster.Run or Cluster.Bind")
 	}
 	client, err := c.sharedClient()
 	if err != nil {

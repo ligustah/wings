@@ -7,10 +7,10 @@ var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error
     return render(f)
 })
 
-func Coordinate(ctx flow.Context) error {
+var Main = flow.DefineWorkflow("render", func(ctx flow.Context) error {
     images, err := ctx.Map(Render, frames)   // runs wherever the workers are
     ...
-}
+})
 ```
 
 That is the whole API. The functions and the body are written against
@@ -66,7 +66,7 @@ source tree is not written to):
 | | contains | built for |
 |---|---|---|
 | **worker** | your work functions, the worker loop | the machines it will run on |
-| **coordinator** | your work functions, `Coordinate`, the providers, the embedded worker | the machine *you* run it on |
+| **coordinator** | your work functions, your workflows, the providers, the embedded worker | the machine *you* run it on |
 
 Because they are separate, **the coordinator is never cross-compiled** — only
 the worker is — and the worker does not link the cloud SDK that deploys it. That
@@ -87,25 +87,30 @@ package job
 import "github.com/ligustah/wings/flow"
 
 // Work functions are package-scope vars, so a worker process — which never runs
-// Coordinate — still has them registered.
+// a workflow — still has them registered.
 var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
 })
 
-// Coordinate is run as a flow once the cluster is up. A coordinator restarted
+// A workflow is run as a flow once the cluster is up. A coordinator restarted
 // over the same -dir replays what it already did rather than doing it again.
-func Coordinate(ctx flow.Context) error {
+var Main = flow.DefineWorkflow("render", func(ctx flow.Context) error {
     images, err := ctx.Map(Render, frames)
     if err != nil {
         return err
     }
     return write(images)
-}
+})
 ```
 
 That is the whole file. No cloud appears in it — and no cluster either. The
 cluster reaches the body through its context: every call a flow makes goes to
 the executor bound there, which for the coordinator is the cluster's workers.
+
+A package that defines one workflow is a binary that runs it. Define several
+and the binary takes `-workflow <name>`; leave it off and it lists them. Each
+runs under its own name in `-dir`, so two workflows over one directory keep
+separate histories.
 
 Flags you register in that package are parsed too — `CoordinatorMain` calls
 `flag.Parse()` on the default set, so your own flags sit beside `-target` and
@@ -198,7 +203,7 @@ during the run. Its value is that it outlives the process, so a coordinator that
 died has still left an account of what it had done.
 
 When the job was a call of a flow run — which on a coordinator every job is,
-since `Coordinate` itself is one — the entry says so: the run, the thread and
+since the workflow itself is one — the entry says so: the run, the thread and
 the position in that run's history. That is what makes the record answerable at
 the level anyone actually asks at: not "job 3f went to remote-2" but "the second
 call of order-77 went to remote-2 and never came back". Only the run knows which
@@ -258,11 +263,11 @@ drops a result for a job it never dispatched. The work a worker was still doing
 finishes and is written down, and nobody collects it.
 
 What does survive a coordinator restart is a **flow run** ([`flow`](flow)), and
-`Coordinate` is one: its history is kept under `-dir`, and a coordinator started
+a workflow is one: its history is kept under `-dir`, and a coordinator started
 again over the same directory replays what returned and dispatches again what
 had not. A call that was in flight when the coordinator died is therefore run
 twice, once by each coordinator, and the second copy is the one whose answer
-counts. Work functions are idempotent for exactly this reason. A `Coordinate`
+counts. Work functions are idempotent for exactly this reason. A workflow
 that already finished does nothing at all on a restart.
 
 ### Remote deployment

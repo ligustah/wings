@@ -13,11 +13,11 @@
 //		return render(f)
 //	})
 //
-//	// Coordinate is run as a flow once the cluster is up.
-//	func Coordinate(ctx flow.Context) error {
+//	// A workflow is run as a flow once the cluster is up.
+//	var Main = flow.DefineWorkflow("render", func(ctx flow.Context) error {
 //		images, err := ctx.Map(Render, frames)
 //		...
-//	}
+//	})
 //
 // Nothing in that file names a cluster. The body reaches it through its
 // context: [Cluster.Run] runs a flow whose calls are dispatched to the
@@ -39,11 +39,11 @@
 //
 // A wings program is compiled twice, into a coordinator and a worker. The
 // worker gets your work functions and nothing else — no provisioning, no
-// [Coordinate]. The coordinator gets everything, plus the worker embedded
+// workflow to run. The coordinator gets everything, plus the worker embedded
 // inside it, so it can deploy one without a Go toolchain or a source tree.
 //
 // Work functions must therefore be registered by flow.Define at PACKAGE SCOPE:
-// a worker process never runs Coordinate, and a function defined inside it
+// a worker process never runs a workflow, and a function defined inside one
 // would not exist in the process meant to run it.
 //
 // # Using this package directly
@@ -57,7 +57,7 @@
 // worker is this same binary, so package initialisers, flag parsing, and
 // whatever main does on its way to Start all run once per worker, on the
 // worker's machine. Work that belongs to the coordinator alone — opening the
-// output file, reading the job list — goes after Start, or in [Coordinate].
+// output file, reading the job list — goes after Start, or in the workflow.
 //
 // # How many workers
 //
@@ -168,5 +168,5 @@
 // job it never dispatched is dropped. A run is different: its history is the
 // durable thing, and a coordinator started again over the same Dir replays
 // what returned and dispatches again whatever had not — which is what makes
-// Coordinate, itself a run, survive the process that was running it.
+// a workflow, itself a run, survive the process that was running it.
 package wings

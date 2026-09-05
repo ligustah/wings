@@ -1,5 +1,5 @@
-// Package digest is a complete wings program: work functions, a coordinator
-// body, and an optional provisioner.
+// Package digest is a complete wings program: work functions, a workflow,
+// and an optional provisioner.
 //
 // It is a LIBRARY, not a main. `wings build` generates both mains — one for the
 // coordinator, one for the worker — and imports this package into each:
@@ -54,7 +54,7 @@ type Result struct {
 //
 // Defined at PACKAGE SCOPE, which is what puts it in the registry of every
 // process that links this package — including a worker, which never runs
-// Coordinate. Nothing here mentions wings: a work function is a flow function,
+// the workflow. Nothing here mentions wings: a work function is a flow function,
 // and wings is one place it can be sent to run.
 var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, error) {
 	host, _ := os.Hostname()
@@ -69,11 +69,13 @@ var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, erro
 	return Result{Seed: in.Seed, Digest: hex.EncodeToString(sum[:]), Host: host}, nil
 })
 
-// Coordinate is the coordinator body. wings runs it as a flow once the cluster
-// is up, and tears the cluster down when it returns. Because it is a flow, a
-// coordinator restarted over the same -dir replays what this already did
-// rather than doing it again.
-func Coordinate(ctx flow.Context) error {
+// Main is the workflow: what this program is about. wings runs it as a flow
+// once the cluster is up, and tears the cluster down when it returns. Because
+// it is a flow, a coordinator restarted over the same -dir replays what this
+// already did rather than doing it again. It is the only workflow defined, so
+// the binary runs it without being told; a program that defines several takes
+// -workflow.
+var Main = flow.DefineWorkflow("digest", func(ctx flow.Context) error {
 	work := make([]Work, *jobs)
 	for i := range work {
 		work[i] = Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: *rounds}
@@ -98,4 +100,4 @@ func Coordinate(ctx flow.Context) error {
 	fmt.Printf("\nfirst result: %s -> %s\n", results[0].Seed, results[0].Digest[:16])
 	fmt.Println(strings.Repeat("-", 40))
 	return nil
-}
+})

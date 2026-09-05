@@ -11,11 +11,11 @@
 //
 //	var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) { … })
 //
-//	// Coordinate is run as a flow once the cluster is up.
-//	func Coordinate(ctx flow.Context) error {
+//	// A workflow is run as a flow once the cluster is up.
+//	var Frames = flow.DefineWorkflow("frames", func(ctx flow.Context) error {
 //		imgs, err := ctx.Map(Render, frames)
 //		…
-//	}
+//	})
 //
 // That is all. WHERE the work runs is not in it: -providers links clouds into
 // the coordinator, and -target and -provider choose between them at run time.
@@ -54,8 +54,8 @@
 //
 // Both mains do import the package named by -pkg, so anything IT pulls in lands
 // in the worker too. Pass -coordinator-pkg to split them: -pkg holds the work
-// functions both halves need, -coordinator-pkg holds Coordinate and is linked
-// only into the coordinator.
+// functions both halves need, -coordinator-pkg holds the workflows and is
+// linked only into the coordinator.
 package main
 
 import (
@@ -105,7 +105,7 @@ Usage:
 
 Flags:
   -pkg              package holding your work functions; linked into BOTH halves (default ".")
-  -coordinator-pkg  package holding Coordinate; defaults to -pkg. Split it out to keep
+  -coordinator-pkg  package holding the workflows; defaults to -pkg. Split it out to keep
                     anything only the coordinator needs out of the worker.
   -coordinator      os/arch to run the coordinator on (default: this machine)
   -worker           os/arch to run workers on (default "linux/amd64")
@@ -118,9 +118,10 @@ Flags:
   -keep-debug       keep debug info; binaries are much larger
   -v                print the go build commands
 
-Your package must export:
-  func Coordinate(ctx flow.Context) error   (required)
-  func Provisioner() wings.Provisioner         (optional; overrides -provider)
+Your package must declare, at package scope:
+  var X = flow.DefineWorkflow("name", func(ctx flow.Context) error { … })
+                                          (at least one; with several, the binary takes -workflow)
+  func Provisioner() wings.Provisioner    (optional; overrides -provider)
 
 Example:
   wings build -pkg ./job -coordinator windows/amd64 -worker linux/amd64 -o myapp.exe
@@ -143,7 +144,7 @@ func parsePlatform(s, what string) (platform, error) {
 func build(args []string) error {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	pkg := fs.String("pkg", ".", "package holding your work functions")
-	coordPkg := fs.String("coordinator-pkg", "", "package holding Coordinate and Provisioner; defaults to -pkg")
+	coordPkg := fs.String("coordinator-pkg", "", "package holding the workflows and Provisioner; defaults to -pkg")
 	coordFlag := fs.String("coordinator", runtime.GOOS+"/"+runtime.GOARCH, "os/arch to run the coordinator on")
 	workerFlag := fs.String("worker", "linux/amd64", "os/arch to run workers on")
 	out := fs.String("o", "", "output path for the coordinator binary (required)")
@@ -192,9 +193,17 @@ func build(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !api.hasCoordinate {
-		return fmt.Errorf("package %s does not export Coordinate.\n"+
-			"Add:\n\n\tfunc Coordinate(ctx flow.Context) error { … }\n",
+	if !api.definesWorkflow && coordinate.Dir != work.Dir {
+		// A split build may keep the workflows with the work functions.
+		workAPI, err := inspectAPI(work.Dir)
+		if err != nil {
+			return err
+		}
+		api.definesWorkflow = workAPI.definesWorkflow
+	}
+	if !api.definesWorkflow {
+		return fmt.Errorf("package %s defines no workflow.\n"+
+			"Add, at package scope:\n\n\tvar Main = flow.DefineWorkflow(\"main\", func(ctx flow.Context) error { … })\n",
 			coordinate.ImportPath)
 	}
 
@@ -338,15 +347,17 @@ func describe(pkg string) (pkgInfo, error) {
 }
 
 type pkgAPI struct {
-	hasCoordinate  bool
-	hasProvisioner bool
+	definesWorkflow bool
+	hasProvisioner  bool
 }
 
-// inspectAPI looks for the two functions the generated main may call.
+// inspectAPI looks for the function the generated main may call, and for the
+// DefineWorkflow call that gives the coordinator something to run.
 //
-// Parsed rather than probed by compiling: a missing Coordinate should be one
-// clear sentence naming the function to add, not a compile error inside
-// generated code the user never wrote and cannot see.
+// Parsed rather than probed by compiling: a missing workflow should be one
+// clear sentence naming the call to add, not a compile error inside generated
+// code the user never wrote and cannot see — or worse, a binary that builds
+// and then refuses to start.
 func inspectAPI(dir string) (pkgAPI, error) {
 	var api pkgAPI
 	fset := token.NewFileSet()
@@ -359,15 +370,28 @@ func inspectAPI(dir string) (pkgAPI, error) {
 	for _, p := range pkgs {
 		for _, f := range p.Files {
 			for _, decl := range f.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Recv != nil {
-					continue
-				}
-				switch fn.Name.Name {
-				case "Coordinate":
-					api.hasCoordinate = true
-				case "Provisioner":
-					api.hasProvisioner = true
+				switch d := decl.(type) {
+				case *ast.FuncDecl:
+					if d.Recv == nil && d.Name.Name == "Provisioner" {
+						api.hasProvisioner = true
+					}
+				case *ast.GenDecl:
+					// Package-scope vars only: a workflow defined inside a
+					// function is not in the registry when the coordinator
+					// looks, and it is better to say so here.
+					ast.Inspect(d, func(n ast.Node) bool {
+						call, ok := n.(*ast.CallExpr)
+						if !ok {
+							return true
+						}
+						switch fn := call.Fun.(type) {
+						case *ast.SelectorExpr:
+							api.definesWorkflow = api.definesWorkflow || fn.Sel.Name == "DefineWorkflow"
+						case *ast.Ident:
+							api.definesWorkflow = api.definesWorkflow || fn.Name == "DefineWorkflow"
+						}
+						return true
+					})
 				}
 			}
 		}

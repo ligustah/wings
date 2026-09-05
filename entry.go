@@ -27,23 +27,21 @@ type CoordinatorOptions struct {
 	// program was built without one, and -target=remote is refused rather than
 	// failing later with something less obvious.
 	Provisioner Provisioner
-
-	// Coordinate is your code. It runs as a durable run on a cluster that is
-	// already up — see [Cluster.Run] — and the cluster is torn down when it
-	// returns.
-	Coordinate func(flow.Context) error
 }
 
-// coordinateRun is the name Coordinate's history is kept under in Dir. One
-// per directory: a directory is one run of one program, and a second start
-// in the same directory is that run resuming.
-const coordinateRun = "coordinate"
+// Your code is not in CoordinatorOptions: it is whatever the linked packages
+// declared with [flow.DefineWorkflow]. A program that defines one workflow
+// runs it; one that defines several is told which by -workflow. Either way it
+// runs as a durable run on a cluster that is already up — see
+// [Cluster.RunWorkflow] — under its own name in Dir, so a second start over
+// the same directory is that run resuming, and the cluster is torn down when
+// it returns.
 
 // WorkerMain is the entire worker binary.
 //
 // The generated worker main is this call and an import of your package, whose
 // flow.Define calls register the work. A worker needs nothing else: it never
-// provisions, never dispatches, and never runs your Coordinate.
+// provisions, never dispatches, and never runs a workflow.
 //
 // It does not return.
 func WorkerMain() {
@@ -66,15 +64,11 @@ func WorkerMain() {
 }
 
 // CoordinatorMain is the entire coordinator binary: it parses the standard
-// flags, brings a cluster up, runs your Coordinate, and takes the cluster down
-// again.
+// flags, brings a cluster up, runs the chosen workflow, and takes the cluster
+// down again.
 //
 // It does not return.
 func CoordinatorMain(opts CoordinatorOptions) {
-	if opts.Coordinate == nil {
-		fmt.Fprintln(os.Stderr, "wings: no Coordinate function was supplied")
-		os.Exit(2)
-	}
 	if len(opts.Worker) > 0 {
 		payload.Set(opts.Worker, opts.WorkerOS, opts.WorkerArch)
 	}
@@ -87,6 +81,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		dir         = flag.String("dir", "", "data directory; empty uses a temporary one that is removed on exit")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
+		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
 
 		// Autoscaling. Off unless -max-workers is set, and expressed only in
 		// jobs and durations — nothing here names a target, so the same numbers
@@ -102,6 +97,12 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	// selected is itself a parsed flag, so they all have to be declared first.
 	registerProviderFlags(flag.CommandLine)
 	flag.Parse()
+
+	w, err := chooseWorkflow(*workflow, flow.Workflows())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wings: %v\n", err)
+		os.Exit(2)
+	}
 
 	level := slog.LevelInfo
 	if *verbose {
@@ -162,17 +163,17 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		os.Exit(1)
 	}
 
-	// As a run, not a call: every function called inside Coordinate goes to
+	// As a run, not a call: every function called inside the workflow goes to
 	// this cluster's workers and into a history under Dir, so a coordinator
 	// started again in the same directory carries on from where the last one
 	// stopped. That is the whole reason a function is callable rather than
 	// something you pass to a method: the context already knows where work
 	// goes, and what has already been done.
-	runErr := c.Run(ctx, coordinateRun, opts.Coordinate)
+	runErr := c.RunWorkflow(ctx, w)
 	stopErr := c.Stop(context.Background())
 
 	if runErr != nil {
-		log.Error("wings: coordinate", "err", runErr)
+		log.Error("wings: workflow", "name", w.Name(), "err", runErr)
 		if stopErr != nil {
 			log.Error("wings: stop", "err", stopErr)
 		}
@@ -182,4 +183,39 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		log.Error("wings: stop", "err", stopErr)
 		os.Exit(1)
 	}
+}
+
+// chooseWorkflow picks which of the defined workflows this coordinator runs.
+//
+// With one defined, that one — a program that is about one thing should not
+// have to say so. With several, the name is required and a missing or unknown
+// one is answered with the list, since the list is the only thing the caller
+// needs to fix the command line.
+func chooseWorkflow(name string, defined []flow.Workflow) (flow.Workflow, error) {
+	if len(defined) == 0 {
+		return flow.Workflow{}, errors.New("no workflow is defined in this program; " +
+			"declare one at package scope with flow.DefineWorkflow")
+	}
+	if name == "" {
+		if len(defined) == 1 {
+			return defined[0], nil
+		}
+		return flow.Workflow{}, fmt.Errorf("this program defines %d workflows; pick one with -workflow: %s",
+			len(defined), workflowNames(defined))
+	}
+	for _, w := range defined {
+		if w.Name() == name {
+			return w, nil
+		}
+	}
+	return flow.Workflow{}, fmt.Errorf("no workflow %q is defined in this program; it defines: %s",
+		name, workflowNames(defined))
+}
+
+func workflowNames(ws []flow.Workflow) string {
+	names := make([]string, len(ws))
+	for i, w := range ws {
+		names[i] = w.Name()
+	}
+	return strings.Join(names, ", ")
 }
