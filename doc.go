@@ -44,6 +44,12 @@
 // lines after it are coordinator-only by construction. That is the one
 // surprising thing here, so it is stated rather than discovered.
 //
+// The other half of it: everything BEFORE Start runs in every worker too. A
+// worker is this same binary, so package initialisers, flag parsing, and
+// whatever main does on its way to Start all run once per worker, on the
+// worker's machine. Work that belongs to the coordinator alone — opening the
+// output file, reading the job list — goes after Start, or in [Coordinate].
+//
 // # How many workers
 //
 // Either a fixed count ([Config.Workers]) or a policy ([Config.Scaling]) that
