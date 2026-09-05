@@ -10,28 +10,27 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ligustah/wings"
 	"github.com/ligustah/wings/flow"
 )
 
-// calls counts how many times each work function actually ran. Replay is the
-// claim that a retry does NOT run what already succeeded, so counting is the
-// only way to check it.
+// calls counts how many times each function actually ran. Replay is the claim
+// that a retry does NOT run what already succeeded, so counting is the only
+// way to check it.
 var calls struct {
 	double atomic.Int64
 	slow   atomic.Int64
 }
 
-var double = wings.Define("flow.double", func(ctx context.Context, in int) (int, error) {
+var double = flow.Define("flow.double", func(ctx context.Context, in int) (int, error) {
 	calls.double.Add(1)
 	return in * 2, nil
 })
 
-var boom = wings.Define("flow.boom", func(ctx context.Context, in string) (string, error) {
+var boom = flow.Define("flow.boom", func(ctx context.Context, in string) (string, error) {
 	return "", errors.New("deliberate failure: " + in)
 })
 
-var slow = wings.Define("flow.slow", func(ctx context.Context, d time.Duration) (string, error) {
+var slow = flow.Define("flow.slow", func(ctx context.Context, d time.Duration) (string, error) {
 	calls.slow.Add(1)
 	select {
 	case <-time.After(d):
@@ -41,36 +40,35 @@ var slow = wings.Define("flow.slow", func(ctx context.Context, d time.Duration) 
 	}
 })
 
-func cluster(t *testing.T) context.Context {
-	t.Helper()
-
-	c, err := wings.Start(t.Context(), wings.Config{
-		Target: wings.InProcess(),
-		Dir:    t.TempDir(),
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := c.Stop(context.Background()); err != nil {
-			t.Errorf("Stop: %v", err)
-		}
-	})
-	return c.Bind(t.Context())
+// gated finishes when the test lets it, and counts how often it was started.
+var gate struct {
+	starts atomic.Int64
+	open   chan struct{}
 }
 
-func TestWorkflowRunsAndReturnsItsResult(t *testing.T) {
-	ctx := cluster(t)
+var gated = flow.Define("flow.gated", func(ctx context.Context, in int) (int, error) {
+	gate.starts.Add(1)
+	select {
+	case <-gate.open:
+		return in * 2, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+})
 
-	wf := flow.Define("t.simple", func(ctx context.Context, in int) (int, error) {
-		a, err := double(ctx, in)
+// quick is a retry policy that does not make a test wait.
+var quick = flow.Backoff(time.Millisecond, time.Millisecond)
+
+func TestARunExecutesItsBodyOnce(t *testing.T) {
+	var got int
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		a, err := double(ctx, 5)
 		if err != nil {
-			return 0, err
+			return err
 		}
-		return double(ctx, a)
-	})
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), 5, flow.WithStore(flow.NewMemStore()))
+		got, err = double(ctx, a)
+		return err
+	}, flow.WithStore(flow.NewMemStore()))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -79,31 +77,29 @@ func TestWorkflowRunsAndReturnsItsResult(t *testing.T) {
 	}
 }
 
-// THE POINT OF THE WHOLE PACKAGE: a workflow that fails after doing real work
-// must not do that work a second time.
+// THE POINT OF THE WHOLE PACKAGE: a run that fails after doing real work must
+// not do that work a second time.
 func TestRetryReplaysCompletedWorkInsteadOfRepeatingIt(t *testing.T) {
-	ctx := cluster(t)
-
 	before := calls.double.Load()
 	var attempts atomic.Int64
+	var got int
 
-	wf := flow.Define("t.replay", func(ctx context.Context, in int) (int, error) {
-		a, err := double(ctx, in)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		a, err := double(ctx, 3)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		b, err := double(ctx, a)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		// Fail the first two attempts AFTER the calls above have succeeded.
 		if attempts.Add(1) <= 2 {
-			return 0, errors.New("not yet")
+			return errors.New("not yet")
 		}
-		return b, nil
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), 3, flow.WithStore(flow.NewMemStore()))
+		got = b
+		return nil
+	}, flow.WithStore(flow.NewMemStore()), quick)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -111,24 +107,20 @@ func TestRetryReplaysCompletedWorkInsteadOfRepeatingIt(t *testing.T) {
 		t.Fatalf("got %d, want 12", got)
 	}
 	if n := attempts.Load(); n != 3 {
-		t.Fatalf("the workflow body ran %d times, want 3", n)
+		t.Fatalf("the body ran %d times, want 3", n)
 	}
 	// Three attempts, two calls each if nothing replayed. Two total is the claim.
 	if n := calls.double.Load() - before; n != 2 {
-		t.Fatalf("the work function ran %d times across 3 attempts; replay should have held it to 2", n)
+		t.Fatalf("the function ran %d times across 3 attempts; replay should have held it to 2", n)
 	}
 }
 
 func TestPermanentErrorIsNotRetried(t *testing.T) {
-	ctx := cluster(t)
-
 	var attempts atomic.Int64
-	wf := flow.Define("t.permanent", func(ctx context.Context, in int) (int, error) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		attempts.Add(1)
-		return 0, flow.Permanent(errors.New("malformed input"))
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	_, err := flow.Run(ctx, wf, flow.NewInstance(), 1, flow.WithStore(flow.NewMemStore()))
+		return flow.Permanent(errors.New("malformed input"))
+	}, flow.WithStore(flow.NewMemStore()), quick)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -141,17 +133,14 @@ func TestPermanentErrorIsNotRetried(t *testing.T) {
 }
 
 func TestDeclaredPermanentErrorIsNotRetried(t *testing.T) {
-	ctx := cluster(t)
-
 	sentinel := errors.New("no such account")
 	var attempts atomic.Int64
 
-	wf := flow.Define("t.declared", func(ctx context.Context, in int) (int, error) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		attempts.Add(1)
-		return 0, fmt.Errorf("looking up %d: %w", in, sentinel)
-	}, flow.PermanentErrors(sentinel), flow.Backoff(time.Millisecond, time.Millisecond))
-
-	if _, err := flow.Run(ctx, wf, flow.NewInstance(), 1, flow.WithStore(flow.NewMemStore())); err == nil {
+		return fmt.Errorf("looking up %d: %w", 1, sentinel)
+	}, flow.WithStore(flow.NewMemStore()), flow.PermanentErrors(sentinel), quick)
+	if err == nil {
 		t.Fatal("want an error")
 	}
 	if n := attempts.Load(); n != 1 {
@@ -160,15 +149,11 @@ func TestDeclaredPermanentErrorIsNotRetried(t *testing.T) {
 }
 
 func TestGivesUpAfterMaxAttempts(t *testing.T) {
-	ctx := cluster(t)
-
 	var attempts atomic.Int64
-	wf := flow.Define("t.giveup", func(ctx context.Context, in int) (int, error) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		attempts.Add(1)
-		return 0, errors.New("always fails")
-	}, flow.MaxAttempts(3), flow.Backoff(time.Millisecond, time.Millisecond))
-
-	_, err := flow.Run(ctx, wf, flow.NewInstance(), 1, flow.WithStore(flow.NewMemStore()))
+		return errors.New("always fails")
+	}, flow.WithStore(flow.NewMemStore()), flow.MaxAttempts(3), quick)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -180,49 +165,108 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 }
 
-// A failing work function is a normal outcome that the workflow can handle,
-// not something that kills the run.
-func TestWorkFunctionErrorReachesTheWorkflow(t *testing.T) {
-	ctx := cluster(t)
-
-	wf := flow.Define("t.handled", func(ctx context.Context, in string) (string, error) {
-		_, err := boom(ctx, in)
+// A failing function is a normal outcome that the body can handle, not
+// something that kills the run.
+func TestACallsFailureReachesTheBody(t *testing.T) {
+	var got string
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		_, err := boom(ctx, "x")
 		if err == nil {
-			return "", errors.New("expected the work function to fail")
+			return errors.New("expected the function to fail")
 		}
-		return "handled: " + err.Error(), nil
-	})
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), "x", flow.WithStore(flow.NewMemStore()))
+		if !flow.IsCallFailure(err) {
+			return fmt.Errorf("the body should be able to tell a call's failure apart: %v", err)
+		}
+		got = "handled: " + err.Error()
+		return nil
+	}, flow.WithStore(flow.NewMemStore()))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !strings.Contains(got, "deliberate failure: x") {
-		t.Fatalf("got %q; the work function's message should have reached the workflow", got)
+		t.Fatalf("got %q; the function's message should have reached the body", got)
 	}
 }
 
-// Map must work unchanged inside a workflow — that is the whole "same code"
-// claim — and it must survive a replay, which a bare goroutine fan-out would
-// not.
-func TestMapWorksInsideAWorkflowAndReplays(t *testing.T) {
-	ctx := cluster(t)
+// THE POINT: a call's failure is recorded, so a retry of the run replays it
+// and the body fails the same way. Retrying that used to be ten attempts and
+// minutes of backoff to reach the answer the first attempt had. A body that
+// lets a call's failure through is done.
+func TestARunThatFailsBecauseACallFailedIsNotRetried(t *testing.T) {
+	var attempts atomic.Int64
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		attempts.Add(1)
+		_, err := boom(ctx, "y")
+		return err
+	}, flow.WithStore(flow.NewMemStore()), quick)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "deliberate failure: y") {
+		t.Errorf("the call's own message should be the run's: %v", err)
+	}
+	if n := attempts.Load(); n != 1 {
+		t.Errorf("the body ran %d times; a call's recorded failure must not be retried", n)
+	}
+}
 
+// A call the caller interrupted has no answer yet, and must not be given one:
+// the interruption is nearly always a shutdown, and the restart that follows
+// would otherwise replay a failure that never happened.
+func TestAnInterruptedCallIsNotRecordedAsFailed(t *testing.T) {
+	store := flow.NewMemStore()
+	name := flow.NewName()
+	gate.open = make(chan struct{})
+	gate.starts.Store(0)
+
+	var got int
+	body := func(ctx context.Context) error {
+		var err error
+		got, err = gated(ctx, 21)
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		waitFor(t, func() bool { return gate.starts.Load() == 1 })
+		cancel()
+	}()
+	err := flow.Run(ctx, name, body, flow.WithStore(store))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want the cancellation", err)
+	}
+
+	// Resumed: the call is made again, and this time it is let through.
+	close(gate.open)
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store)); err != nil {
+		t.Fatalf("resumed Run: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("got %d, want 42", got)
+	}
+	if n := gate.starts.Load(); n != 2 {
+		t.Fatalf("the call was started %d times, want 2: once interrupted, once through", n)
+	}
+}
+
+// Map must work inside a run — it is the fan-out — and it must survive a
+// replay, which a bare goroutine fan-out would not.
+func TestMapReplays(t *testing.T) {
 	before := calls.double.Load()
 	var attempts atomic.Int64
+	var got []int
 
-	wf := flow.Define("t.map", func(ctx context.Context, in []int) ([]int, error) {
-		outs, err := wings.Map(ctx, double, in)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		outs, err := flow.Map(ctx, double, []int{1, 2, 3, 4})
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if attempts.Add(1) == 1 {
-			return nil, errors.New("fail once, after the fan-out")
+			return errors.New("fail once, after the fan-out")
 		}
-		return outs, nil
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), []int{1, 2, 3, 4}, flow.WithStore(flow.NewMemStore()))
+		got = outs
+		return nil
+	}, flow.WithStore(flow.NewMemStore()), quick)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -230,36 +274,56 @@ func TestMapWorksInsideAWorkflowAndReplays(t *testing.T) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 	if n := calls.double.Load() - before; n != 4 {
-		t.Fatalf("the work function ran %d times across 2 attempts; replay should have held it to 4", n)
+		t.Fatalf("the function ran %d times across 2 attempts; replay should have held it to 4", n)
+	}
+}
+
+// Map keeps every successful output and names each failure by its index.
+func TestMapReportsEachFailureInItsPlace(t *testing.T) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		outs, err := flow.Map(ctx, boom, []string{"a", "b"})
+		if err == nil {
+			return errors.New("want an error")
+		}
+		if len(outs) != 2 {
+			return fmt.Errorf("got %d outputs, want a place for each input", len(outs))
+		}
+		for _, want := range []string{"input 0", "input 1", "deliberate failure: a", "deliberate failure: b"} {
+			if !strings.Contains(err.Error(), want) {
+				return fmt.Errorf("the error should mention %q: %v", want, err)
+			}
+		}
+		return nil
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestFuturesRunConcurrentlyAndReplay(t *testing.T) {
-	ctx := cluster(t)
-
 	before := calls.slow.Load()
 	var attempts atomic.Int64
+	var got string
 
-	wf := flow.Define("t.futures", func(ctx context.Context, d time.Duration) (string, error) {
-		a := flow.Go(ctx, slow, d)
-		b := flow.Go(ctx, slow, d)
+	start := time.Now()
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		a := flow.Go(ctx, slow, 300*time.Millisecond)
+		b := flow.Go(ctx, slow, 300*time.Millisecond)
 
 		x, err := a.Await(ctx)
 		if err != nil {
-			return "", err
+			return err
 		}
 		y, err := b.Await(ctx)
 		if err != nil {
-			return "", err
+			return err
 		}
 		if attempts.Add(1) == 1 {
-			return "", errors.New("fail once, after both futures")
+			return errors.New("fail once, after both futures")
 		}
-		return x + "+" + y, nil
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	start := time.Now()
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), 300*time.Millisecond, flow.WithStore(flow.NewMemStore()))
+		got = x + "+" + y
+		return nil
+	}, flow.WithStore(flow.NewMemStore()), quick)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -269,7 +333,7 @@ func TestFuturesRunConcurrentlyAndReplay(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 	if n := calls.slow.Load() - before; n != 2 {
-		t.Fatalf("the work function ran %d times across 2 attempts; replay should have held it to 2", n)
+		t.Fatalf("the function ran %d times across 2 attempts; replay should have held it to 2", n)
 	}
 	// Two 300ms calls concurrently, then a replayed attempt that does neither.
 	if elapsed > 900*time.Millisecond {
@@ -280,21 +344,17 @@ func TestFuturesRunConcurrentlyAndReplay(t *testing.T) {
 // Awaiting twice would record a second join that the next attempt never
 // produces, so it is refused rather than quietly served from the cache.
 func TestAwaitingAFutureTwiceIsRefused(t *testing.T) {
-	ctx := cluster(t)
-
-	wf := flow.Define("t.double-await", func(ctx context.Context, in int) (int, error) {
-		f := flow.Go(ctx, double, in)
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		f := flow.Go(ctx, double, 3)
 		if _, err := f.Await(ctx); err != nil {
-			return 0, flow.Permanent(err)
+			return flow.Permanent(err)
 		}
-		_, err := f.Await(ctx)
-		if err == nil {
-			return 0, flow.Permanent(errors.New("second Await should have failed"))
+		if _, err := f.Await(ctx); err == nil {
+			return flow.Permanent(errors.New("second Await should have failed"))
 		}
-		return 1, nil
-	})
-
-	if _, err := flow.Run(ctx, wf, flow.NewInstance(), 3, flow.WithStore(flow.NewMemStore())); err != nil {
+		return nil
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 }
@@ -302,24 +362,21 @@ func TestAwaitingAFutureTwiceIsRefused(t *testing.T) {
 // Now must be stable across attempts, or every retry decides something
 // different from the run it is supposed to be continuing.
 func TestNowIsRecordedAndReplayed(t *testing.T) {
-	ctx := cluster(t)
-
 	var attempts atomic.Int64
 	var seen []time.Time
 
-	wf := flow.Define("t.now", func(ctx context.Context, in int) (int, error) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		now, err := flow.Now(ctx)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		seen = append(seen, now)
 		if attempts.Add(1) == 1 {
-			return 0, errors.New("fail once")
+			return errors.New("fail once")
 		}
-		return 1, nil
-	}, flow.Backoff(20*time.Millisecond, 20*time.Millisecond))
-
-	if _, err := flow.Run(ctx, wf, flow.NewInstance(), 0, flow.WithStore(flow.NewMemStore())); err != nil {
+		return nil
+	}, flow.WithStore(flow.NewMemStore()), flow.Backoff(20*time.Millisecond, 20*time.Millisecond))
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(seen) != 2 {
@@ -331,21 +388,19 @@ func TestNowIsRecordedAndReplayed(t *testing.T) {
 }
 
 func TestSleepIsNotServedTwice(t *testing.T) {
-	ctx := cluster(t)
-
 	var attempts atomic.Int64
-	wf := flow.Define("t.sleep", func(ctx context.Context, d time.Duration) (int, error) {
-		if err := flow.Sleep(ctx, d); err != nil {
-			return 0, err
-		}
-		if attempts.Add(1) == 1 {
-			return 0, errors.New("fail once, after the sleep")
-		}
-		return 1, nil
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
 
 	start := time.Now()
-	if _, err := flow.Run(ctx, wf, flow.NewInstance(), 400*time.Millisecond, flow.WithStore(flow.NewMemStore())); err != nil {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+		if err := flow.Sleep(ctx, 400*time.Millisecond); err != nil {
+			return err
+		}
+		if attempts.Add(1) == 1 {
+			return errors.New("fail once, after the sleep")
+		}
+		return nil
+	}, flow.WithStore(flow.NewMemStore()), quick)
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// One 400ms sleep, not two: the second attempt replays a sleep that is
@@ -355,70 +410,54 @@ func TestSleepIsNotServedTwice(t *testing.T) {
 	}
 }
 
-// A completed instance must not run again, whatever the caller does — its work
-// functions already had their effects.
-func TestACompletedInstanceReturnsItsStoredResult(t *testing.T) {
-	ctx := cluster(t)
-
+// A completed run must not run again, whatever the caller does — its calls
+// already had their effects.
+func TestACompletedRunDoesNotRunAgain(t *testing.T) {
 	store := flow.NewMemStore()
-	instance := flow.NewInstance()
+	name := flow.NewName()
 	var attempts atomic.Int64
 
-	wf := flow.Define("t.once", func(ctx context.Context, in int) (int, error) {
+	body := func(ctx context.Context) error {
 		attempts.Add(1)
-		return double(ctx, in)
-	})
-
-	first, err := flow.Run(ctx, wf, instance, 21, flow.WithStore(store))
-	if err != nil {
+		_, err := double(ctx, 21)
+		return err
+	}
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	second, err := flow.Run(ctx, wf, instance, 21, flow.WithStore(store))
-	if err != nil {
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store)); err != nil {
 		t.Fatalf("second Run: %v", err)
 	}
-
-	if first != 42 || second != 42 {
-		t.Fatalf("got %d then %d, want 42 both times", first, second)
-	}
 	if n := attempts.Load(); n != 1 {
-		t.Fatalf("the workflow body ran %d times; a completed instance must not run again", n)
+		t.Fatalf("the body ran %d times; a completed run must not run again", n)
 	}
 }
 
-// Editing a workflow while a run of it is in flight is the failure this
+// Editing a run's body while a run of it is in flight is the failure this
 // machinery is most likely to meet in practice, so it must be named clearly
 // rather than producing a wrong answer.
-func TestChangedWorkflowIsReportedAsAContinuityError(t *testing.T) {
-	ctx := cluster(t)
-
+func TestAChangedBodyIsReportedAsAContinuityError(t *testing.T) {
 	store := flow.NewMemStore()
-	instance := flow.NewInstance()
+	name := flow.NewName()
 
 	// First shape: one call, then a RETRYABLE failure — so the run gives up
 	// without reaching a terminal state and its history is left mid-flight,
 	// which is exactly the situation a redeploy creates.
-	v1 := flow.Define("t.changed", func(ctx context.Context, in int) (int, error) {
-		if _, err := double(ctx, in); err != nil {
-			return 0, err
+	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+		if _, err := double(ctx, 2); err != nil {
+			return err
 		}
-		return 0, errors.New("stop here")
-	}, flow.MaxAttempts(1), flow.Backoff(time.Millisecond, time.Millisecond))
-
-	if _, err := flow.Run(ctx, v1, instance, 2, flow.WithStore(store)); err == nil {
+		return errors.New("stop here")
+	}, flow.WithStore(store), flow.MaxAttempts(1), quick)
+	if err == nil {
 		t.Fatal("want the first run to fail")
 	}
 
-	// Second shape: sleeps where the first called. Same instance, so it replays
+	// Second shape: sleeps where the first called. Same name, so it replays
 	// into the history the first one left.
-	v2 := flow.Define("t.changed", func(ctx context.Context, in int) (int, error) {
-		if err := flow.Sleep(ctx, time.Millisecond); err != nil {
-			return 0, err
-		}
-		return 1, nil
-	}, flow.MaxAttempts(2), flow.Backoff(time.Millisecond, time.Millisecond))
-
-	_, err := flow.Run(ctx, v2, instance, 2, flow.WithStore(store))
+	err = flow.Run(t.Context(), name, func(ctx context.Context) error {
+		return flow.Sleep(ctx, time.Millisecond)
+	}, flow.WithStore(store), flow.MaxAttempts(2), quick)
 	if err == nil {
 		t.Fatal("want a continuity error")
 	}
@@ -433,54 +472,71 @@ func TestChangedWorkflowIsReportedAsAContinuityError(t *testing.T) {
 	}
 }
 
-func TestRunRefusesAnUnboundContext(t *testing.T) {
-	wf := flow.Define("t.unbound", func(ctx context.Context, in int) (int, error) { return in, nil })
-
-	_, err := flow.Run(t.Context(), wf, flow.NewInstance(), 1, flow.WithStore(flow.NewMemStore()))
+func TestRunRequiresAStore(t *testing.T) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error { return nil })
 	if err == nil {
-		t.Fatal("want an error for a context with no cluster")
-	}
-	if !strings.Contains(err.Error(), "not bound to a cluster") {
-		t.Errorf("the error should say what is missing: %v", err)
+		t.Fatal("want an error when no Store is given")
 	}
 }
 
-func TestRunRequiresAStore(t *testing.T) {
-	ctx := cluster(t)
-	wf := flow.Define("t.nostore", func(ctx context.Context, in int) (int, error) { return in, nil })
+// A call needs somewhere to go. Inside a run that is the run's executor;
+// outside one it has to be said, and a call with neither is refused rather
+// than quietly run in place.
+func TestACallOutsideARunNeedsAnExecutor(t *testing.T) {
+	if _, err := double(context.Background(), 1); err == nil {
+		t.Fatal("want an error for a call with nowhere to go")
+	} else if !strings.Contains(err.Error(), "not inside a Run") {
+		t.Fatalf("the error should say what is missing: %v", err)
+	}
 
-	if _, err := flow.Run(ctx, wf, flow.NewInstance(), 1); err == nil {
-		t.Fatal("want an error when no Store is given")
+	got, err := double(flow.Bind(context.Background(), flow.Local()), 21)
+	if err != nil {
+		t.Fatalf("a bare call on a bound context: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("got %d, want 42", got)
+	}
+}
+
+// A fan-out forks threads, and a thread belongs to a run; outside one there
+// is nothing to fork from.
+func TestAFanOutOutsideARunIsRefused(t *testing.T) {
+	ctx := flow.Bind(context.Background(), flow.Local())
+
+	if _, err := flow.Map(ctx, double, []int{1}); err == nil {
+		t.Fatal("want an error from Map outside a run")
+	} else if !strings.Contains(err.Error(), "outside a Run") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := flow.Go(ctx, double, 1).Await(ctx); err == nil {
+		t.Fatal("want an error from Go outside a run")
 	}
 }
 
 // A replayed fork must be RECOGNISED, not recorded again. Nothing about the
 // result goes wrong if it is — the cursor still advances one per operation
 // either way — but the history grows by a fork and a join per parallel call per
-// attempt, and it then claims the workflow forked more threads than it did.
-// A long-lived workflow that retries is exactly where that compounds.
+// attempt, and it then claims the run forked more threads than it did. A
+// long-lived run that retries is exactly where that compounds.
 func TestReplayDoesNotDuplicateForkAndJoinEvents(t *testing.T) {
-	ctx := cluster(t)
 	store := flow.NewMemStore()
-	instance := flow.NewInstance()
+	name := flow.NewName()
 
 	var attempts atomic.Int64
-	wf := flow.Define("t.forkdup", func(ctx context.Context, in []int) ([]int, error) {
-		outs, err := wings.Map(ctx, double, in)
-		if err != nil {
-			return nil, err
+	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+		if _, err := flow.Map(ctx, double, []int{1, 2, 3}); err != nil {
+			return err
 		}
 		if attempts.Add(1) < 3 {
-			return nil, errors.New("fail twice, after the fan-out")
+			return errors.New("fail twice, after the fan-out")
 		}
-		return outs, nil
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	if _, err := flow.Run(ctx, wf, instance, []int{1, 2, 3}, flow.WithStore(store)); err != nil {
+		return nil
+	}, flow.WithStore(store), quick)
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	events, err := store.Events(context.Background(), "t.forkdup", instance)
+	events, err := store.Events(context.Background(), name)
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}

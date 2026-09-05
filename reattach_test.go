@@ -295,7 +295,7 @@ func TestARestartedCoordinatorRecoversItsMachines(t *testing.T) {
 	dir := t.TempDir()
 
 	first := startRemote(t, dir, cloud, 2)
-	if got, err := Map(first.Bind(t.Context()), double, []int{1, 2, 3}); err != nil {
+	if got, err := mapOn(t.Context(), first, double, []int{1, 2, 3}); err != nil {
 		t.Fatalf("Map: %v", err)
 	} else if len(got) != 3 || got[0] != 2 {
 		t.Fatalf("got %v", got)
@@ -332,7 +332,7 @@ func TestARestartedCoordinatorRecoversItsMachines(t *testing.T) {
 	}
 
 	// And it must actually work afterwards.
-	got, err := Map(second.Bind(t.Context()), double, []int{4, 5})
+	got, err := mapOn(t.Context(), second, double, []int{4, 5})
 	if err != nil {
 		t.Fatalf("Map after restart: %v", err)
 	}
@@ -668,7 +668,7 @@ func TestARetiredMachinesLeaseIsClosed(t *testing.T) {
 	dir := t.TempDir()
 
 	c := startRemote(t, dir, cloud, 2)
-	if _, err := Map(c.Bind(t.Context()), double, []int{1, 2}); err != nil {
+	if _, err := mapOn(t.Context(), c, double, []int{1, 2}); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 

@@ -21,7 +21,7 @@ import (
 	"github.com/ligustah/durable_streams/dsclient"
 	"google.golang.org/grpc"
 
-	"github.com/ligustah/wings/internal/invoke"
+	"github.com/ligustah/wings/flow"
 )
 
 // workerNode is the loop that drains one worker's job stream.
@@ -148,6 +148,23 @@ func (n *workerNode) declareOutput(ctx context.Context, stream, name string) (*d
 		return nil, err
 	}
 	return n.client, nil
+}
+
+// progressOf is one running attempt's [flow.Progress]: its heartbeats and
+// finished steps go on this worker's beat stream, tagged with the job and
+// attempt they are about.
+type progressOf struct {
+	n       *workerNode
+	job     string
+	attempt int
+}
+
+func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
+	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
+}
+
+func (p progressOf) Step(ctx context.Context, step flow.StepRecord) error {
+	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Step: &step})
 }
 
 // sendBeat publishes one progress report.
@@ -349,9 +366,7 @@ func (n *workerNode) process(ctx context.Context, batch []jobEnvelope) ([]result
 	sem := make(chan struct{}, n.concurrency)
 	var wg sync.WaitGroup
 	for i, job := range batch {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -360,7 +375,7 @@ func (n *workerNode) process(ctx context.Context, batch []jobEnvelope) ([]result
 			}
 			defer func() { <-sem }()
 			out[i] = n.runOne(ctx, job)
-		}()
+		})
 	}
 	wg.Wait()
 	// The one other thing that fails a batch: the machine is being taken
@@ -387,21 +402,14 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		return res
 	}
 
-	h, ok := lookup(job.Func)
-	if !ok {
-		// Nearly always a worker built from different source than the
-		// coordinator, so say what this binary does have.
-		res.Error = fmt.Sprintf("wings: no work function %q registered in this worker; it defines: %s",
-			job.Func, strings.Join(definedNames(), ", "))
-		return res
-	}
-
 	// The function's own bound wins over the cluster-wide default: one function
 	// is a millisecond of arithmetic and another an hour of transcoding, and
-	// the number that knows which is the one declared beside the code.
+	// the number that knows which is the one declared beside the code. A
+	// function this worker does not have is left to Execute to refuse, which
+	// names what it does have.
 	timeout := n.timeout
-	if d := h.options().timeout; d > 0 {
-		timeout = d
+	if bounds, ok := flow.BoundsOf(job.Func); ok && bounds.Timeout > 0 {
+		timeout = bounds.Timeout
 	}
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -419,10 +427,16 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// timeout: calling Heartbeat is always allowed, and it is the checkpoint
 	// that makes a redispatch cheap whether or not anything is watching the
 	// clock.
-	ctx = withBeat(ctx, &beatState{
-		job: job.ID, sink: n, in: job.Checkpoint, steps: job.Steps,
-		attempt: job.Attempt, priors: job.Priors,
+	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt}, flow.Resume{
+		Attempt: job.Attempt, Checkpoint: job.Checkpoint, Steps: job.Steps,
 	})
+	// And the wings half: which job this is and the worker it is on, so what
+	// it writes goes on this worker's streams, and what its earlier attempts
+	// wrote can be read back.
+	ctx = withJob(ctx, &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n})
+	// A function this job calls runs here, on this worker: it is where work
+	// runs, and a worker is not a place work dispatches from.
+	ctx = flow.Bind(ctx, flow.Local())
 	// Now, not when the job was appended: the coordinator's clocks on this job
 	// run from here, so time it spent waiting behind others on this worker is
 	// not counted against the work. Best-effort like every beat — a lost one
@@ -431,10 +445,6 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	if err := n.sendBeat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Started: true}); err != nil {
 		n.log.Warn("wings: could not report a job as started", "job", job.ID, "err", err)
 	}
-	// The worker's own broker, bound so a job can read what its previous
-	// attempts wrote. A worker is not a place work dispatches to and has no
-	// host; this is only storage, which is all Replay needs.
-	ctx = invoke.WithStreams(ctx, n.client)
 
 	// A panicking work function must cost one job, not the worker.
 	defer func() {
@@ -447,7 +457,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 		}
 	}()
 
-	payload, err := h.invoke(ctx, job.Payload)
+	payload, err := flow.Execute(ctx, job.Func, job.Payload)
 	if err != nil {
 		res.Error = err.Error()
 		// Say what actually happened. A work function that gives up on its

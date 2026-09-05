@@ -19,7 +19,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/ligustah/wings/internal/invoke"
+	"github.com/ligustah/wings/flow"
 )
 
 // Cluster is a set of running workers and the means to call work functions on
@@ -233,11 +233,11 @@ type pendingJob struct {
 	// origin is what larger piece of work this job is a step of, kept so a
 	// redispatch or a failure can be recorded against the same run as the
 	// submit — the caller's context is long gone by then.
-	origin invoke.Origin
+	origin flow.Origin
 
-	// opts are the bounds declared on the work function. Read once at submit
-	// so the watchdog does not go through the registry per job per tick.
-	opts defOptions
+	// bounds are those declared on the function. Read once at submit so the
+	// watchdog does not go through the registry per job per tick.
+	bounds flow.Bounds
 	// since is when the current attempt was dispatched, started when the
 	// worker reported beginning it, and beat when it last reported progress.
 	//
@@ -262,7 +262,7 @@ type pendingJob struct {
 	// and stops the log there: what ships to a retry is the contiguous prefix,
 	// because a log with a hole in it would have a retry skip work it never
 	// did.
-	steps []stepRecord
+	steps []flow.StepRecord
 }
 
 // overdue reports whether a job has run out of time, and why. Call with mu
@@ -278,20 +278,20 @@ type pendingJob struct {
 // attempts having never once run.
 func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	if p.started.IsZero() {
-		if p.opts.start > 0 && !p.since.IsZero() && now.Sub(p.since) > p.opts.start {
+		if p.bounds.Start > 0 && !p.since.IsZero() && now.Sub(p.since) > p.bounds.Start {
 			stuck = true
 		}
 		return stuck, false
 	}
-	if p.opts.timeout > 0 && now.Sub(p.started) > p.opts.timeout {
+	if p.bounds.Timeout > 0 && now.Sub(p.started) > p.bounds.Timeout {
 		tooSlow = true
 	}
-	if p.opts.beat > 0 {
+	if p.bounds.Heartbeat > 0 {
 		last := p.beat
 		if last.IsZero() {
 			last = p.started
 		}
-		if now.Sub(last) > p.opts.beat {
+		if now.Sub(last) > p.bounds.Heartbeat {
 			stuck = true
 		}
 	}
@@ -315,9 +315,6 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		os.Exit(0)
 	}
 
-	if len(registry) == 0 {
-		return nil, errors.New("wings: no work functions defined; call wings.Define in a package-scope var")
-	}
 	if err := cfg.Scaling.validate(); err != nil {
 		return nil, err
 	}
@@ -642,6 +639,13 @@ func (c *Cluster) connectBackend(id string, backend dswire.Backend) (*workerConn
 // serve over a socket and nothing to dial — they open the same streams on the
 // same engine. Above this line the coordinator sees a *dsclient.Client either
 // way, which is why one connect serves every target.
+// boundsOf is what a function declared about itself, or nothing for one this
+// binary does not define — the worker will refuse that job and say so.
+func boundsOf(name string) flow.Bounds {
+	b, _ := flow.BoundsOf(name)
+	return b
+}
+
 func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 	c.sharedOnce.Do(func() {
 		dir := filepath.Join(c.dir, "engine")
@@ -929,11 +933,9 @@ func (c *Cluster) forget(p *pendingJob) {
 		writers := maps.Clone(p.ran)
 		// On the cluster's wait group, so Stop does not close the storage this
 		// is deleting through while it is still deleting.
-		c.wg.Add(1)
-		go func() {
-			defer c.wg.Done()
+		c.wg.Go(func() {
 			c.dropOutputsOf(job, keep, writers)
-		}()
+		})
 	}
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
@@ -1100,9 +1102,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 	// is itself counted, so the count cannot be zero here — and left uncounted
 	// it would outlive Stop and finish its move against a journal and an
 	// engine that had already been closed.
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	c.wg.Go(func() {
 		// The attempt being left behind may well still be running — a worker
 		// that was merely slow finishes anyway — and its answer is not the
 		// answer. Stop it, so the slot it holds is not lost to an attempt
@@ -1139,7 +1139,7 @@ func (c *Cluster) moveJob(p *pendingJob, why string) {
 			c.mu.Unlock()
 			c.failPending(p, fmt.Errorf("wings: redispatch to worker %s: %w", w.id, err))
 		}
-	}()
+	})
 }
 
 // onBeat records that a job is still alive, and where it has got to.
@@ -1223,9 +1223,9 @@ func (c *Cluster) sweep(now time.Time) {
 			// only the lock guards. The two are different complaints: one is
 			// about a job that went quiet, the other about a worker that never
 			// began it.
-			why := fmt.Sprintf("no heartbeat for %s", p.opts.beat)
+			why := fmt.Sprintf("no heartbeat for %s", p.bounds.Heartbeat)
 			if p.started.IsZero() {
-				why = fmt.Sprintf("not started within %s", p.opts.start)
+				why = fmt.Sprintf("not started within %s", p.bounds.Start)
 			}
 			stuck = append(stuck, p)
 			whys = append(whys, why)
@@ -1235,8 +1235,8 @@ func (c *Cluster) sweep(now time.Time) {
 
 	for _, p := range slow {
 		c.log.Warn("wings: job exceeded its timeout", "job", p.job.ID, "fn", p.job.Func,
-			"timeout", p.opts.timeout)
-		c.failPending(p, fmt.Errorf("wings: %s exceeded its %s timeout", p.job.Func, p.opts.timeout))
+			"timeout", p.bounds.Timeout)
+		c.failPending(p, fmt.Errorf("wings: %s exceeded its %s timeout", p.job.Func, p.bounds.Timeout))
 	}
 	for i, p := range stuck {
 		c.log.Warn("wings: job is overdue, moving it", "job", p.job.ID,
@@ -1260,11 +1260,9 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	// enforces the same bound itself, but only the bound it knows. Off this
 	// goroutine, which is the watchdog's: every caller of this is counted in
 	// the group, so the count cannot be zero here.
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	c.wg.Go(func() {
 		c.stopOn(w, p.job.ID, attempt, err.Error())
-	}()
+	})
 	c.journal.record(journalEntry{
 		Kind: journalFailed, Job: p.job.ID, Func: p.job.Func,
 		Worker: workerID(p.worker), Attempt: p.job.Attempt, Err: err.Error(),
@@ -1331,13 +1329,13 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 		Payload: payload,
 	}
 	p := &pendingJob{
-		job:  job,
-		done: make(chan struct{}),
-		opts: optionsFor(fnName),
+		job:    job,
+		done:   make(chan struct{}),
+		bounds: boundsOf(fnName),
 		// Read off the context rather than passed in: only a workflow sets it,
 		// and threading a parameter nobody else supplies through every caller
 		// would make the ordinary case pay for the special one.
-		origin: invoke.OriginFrom(ctx),
+		origin: flow.OriginFrom(ctx),
 	}
 
 	key := p.origin.Key()
@@ -1435,11 +1433,9 @@ func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, err
 				// group, which closed says under this same lock.
 				if w := p.worker; w != nil && !c.closed {
 					job, attempt := p.job.ID, p.job.Attempt
-					c.wg.Add(1)
-					go func() {
-						defer c.wg.Done()
+					c.wg.Go(func() {
 						c.stopOn(w, job, attempt, "its caller gave up")
-					}()
+					})
 				}
 			}
 		}
@@ -1507,11 +1503,9 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	// scaler declines to run on a closing cluster.
 	var drains sync.WaitGroup
 	for _, w := range workers {
-		drains.Add(1)
-		go func() {
-			defer drains.Done()
+		drains.Go(func() {
 			c.drainOutputs(ctx, w, "")
-		}()
+		})
 	}
 	drains.Wait()
 
@@ -1528,11 +1522,9 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	errs := make([]error, len(workers))
 	var releases sync.WaitGroup
 	for i, w := range workers {
-		releases.Add(1)
-		go func() {
-			defer releases.Done()
+		releases.Go(func() {
 			errs[i] = c.releaseWorker(ctx, w)
-		}()
+		})
 	}
 	releases.Wait()
 	// The journal writes through the shared instance, so it must be drained

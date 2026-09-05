@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
-
-	"github.com/ligustah/wings/internal/invoke"
 )
 
 // Getting a job's streams off a worker and onto the coordinator, and back again
@@ -168,14 +166,6 @@ func batchFor(prefix string) int {
 	return recordBatch
 }
 
-// outputSink is a worker, from the point of view of something writing bulk
-// output. Implemented by workerNode.
-type outputSink interface {
-	// declareOutput stands a stream up on this worker and returns the client to
-	// write it through.
-	declareOutput(ctx context.Context, stream, name string) (*dsclient.Client, error)
-}
-
 // jobOutput resolves the job an output belongs to and stands its stream up.
 //
 // The one thing [Record] and [Create] both call, because both need a stream on
@@ -185,17 +175,13 @@ func jobOutput(ctx context.Context, prefix, name string) (*dsclient.Client, stri
 	if name == "" {
 		return nil, "", errors.New("wings: this needs a name")
 	}
-	st := beatFrom(ctx)
-	if st == nil {
+	j := jobFrom(ctx)
+	if j == nil {
 		return nil, "", errors.New("wings: this was called outside a work function; " +
 			"it belongs to a job, and there is no job here")
 	}
-	sink, ok := st.sink.(outputSink)
-	if !ok || sink == nil {
-		return nil, "", errors.New("wings: this worker cannot store bulk output")
-	}
-	stream := outputName{Prefix: prefix, Job: st.job, Attempt: st.attempt, Name: name}.String()
-	client, err := sink.declareOutput(ctx, stream, name)
+	stream := outputName{Prefix: prefix, Job: j.id, Attempt: j.attempt, Name: name}.String()
+	client, err := j.node.declareOutput(ctx, stream, name)
 	if err != nil {
 		return nil, "", err
 	}
@@ -334,13 +320,11 @@ func (c *Cluster) startOutputMirror() error {
 	}
 	c.outputs = h
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	c.wg.Go(func() {
 		if err := h.Run(c.ctx); err != nil && c.ctx.Err() == nil {
 			c.log.Error("wings: stopped keeping output", "err", err)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -672,41 +656,4 @@ func dropStream(ctx context.Context, client *dsclient.Client, name string) error
 		return fmt.Errorf("wings: discard %s: %w", name, err)
 	}
 	return nil
-}
-
-// streamsFor is somewhere to read and write, from a bound context.
-//
-// Two places supply it. On the coordinator it is the cluster's own instance,
-// through the host a bound context carries. On a worker it is that worker's own
-// broker, bound directly — a worker is not a place work dispatches to and has no
-// host, but it does have storage, and a job that wants to read what a previous
-// attempt of it wrote needs exactly that.
-func streamsFor(ctx context.Context) (*dsclient.Client, error) {
-	if c := invoke.StreamsFrom(ctx); c != nil {
-		return c, nil
-	}
-	h := invoke.From(ctx)
-	if h == nil {
-		return nil, errors.New("wings: this context is not bound to a cluster; " +
-			"use the context Coordinate was given, or Cluster.Bind")
-	}
-	client := h.Streams()
-	if client == nil {
-		return nil, errors.New("wings: this cluster has no durable streams")
-	}
-	return client, nil
-}
-
-// Attempt reports how many times this job has been dispatched before, starting
-// at zero.
-//
-// A work function that resumes rather than restarting wants to know, and until
-// now nothing exposed it: a retry looked exactly like a first run. Zero outside
-// a work function.
-func Attempt(ctx context.Context) int {
-	st := beatFrom(ctx)
-	if st == nil {
-		return 0
-	}
-	return st.attempt
 }

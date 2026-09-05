@@ -86,8 +86,8 @@ func (a Artifact) Zero() bool { return a.ID == "" }
 // feature with its own storage and its own lifetime, and the two have nothing to
 // do with each other.
 func Create(ctx context.Context, name string) (*Output, error) {
-	st := beatFrom(ctx)
-	if st == nil {
+	j := jobFrom(ctx)
+	if j == nil {
 		return nil, errors.New("wings: Create was called outside a work function; " +
 			"an artifact belongs to a job, and there is no job here")
 	}
@@ -99,7 +99,7 @@ func Create(ctx context.Context, name string) (*Output, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wings: open %s: %w", id, err)
 	}
-	return &Output{ctx: ctx, stream: stream, name: name, id: id, attempt: st.attempt}, nil
+	return &Output{ctx: ctx, stream: stream, name: name, id: id, attempt: j.attempt}, nil
 }
 
 // Output is where a job writes a file. It is an [io.WriteCloser].

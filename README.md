@@ -3,19 +3,21 @@
 Define a typed Go function. Call it across a cluster that did not exist a minute ago.
 
 ```go
-var Render = wings.Define("render", func(ctx context.Context, f Frame) (Image, error) {
+var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) {
     return render(f)
 })
 
-func Coordinate(ctx context.Context, c *wings.Cluster) error {
-    images, err := wings.Map(ctx, Render, frames)   // runs wherever the workers are
+func Coordinate(ctx context.Context) error {
+    images, err := flow.Map(ctx, Render, frames)   // runs wherever the workers are
     ...
 }
 ```
 
-That is the whole API. Where the work runs — goroutines here, child processes on
-this machine, or GCP VMs provisioned on demand — is a flag at run time, not a
-change to the code.
+That is the whole API. The functions and the body are written against
+[`flow`](flow), a durable-execution framework that knows nothing about
+clusters; wings is where a flow's calls go to run. Where that is — goroutines
+here, child processes on this machine, or GCP VMs provisioned on demand — is a
+flag at run time, not a change to the code.
 
 ```sh
 ./myapp -target inprocess          # goroutines in this process
@@ -83,18 +85,19 @@ package job
 import (
     "context"
 
-    "github.com/ligustah/wings"
+    "github.com/ligustah/wings/flow"
 )
 
 // Work functions are package-scope vars, so a worker process — which never runs
 // Coordinate — still has them registered.
-var Render = wings.Define("render", func(ctx context.Context, f Frame) (Image, error) {
+var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) {
     return render(f)
 })
 
-// Coordinate is called once, with a cluster that is already up.
-func Coordinate(ctx context.Context, c *wings.Cluster) error {
-    images, err := wings.Map(ctx, Render, frames)
+// Coordinate is run as a flow once the cluster is up. A coordinator restarted
+// over the same -dir replays what it already did rather than doing it again.
+func Coordinate(ctx context.Context) error {
+    images, err := flow.Map(ctx, Render, frames)
     if err != nil {
         return err
     }
@@ -102,7 +105,9 @@ func Coordinate(ctx context.Context, c *wings.Cluster) error {
 }
 ```
 
-That is the whole file. No cloud appears in it.
+That is the whole file. No cloud appears in it — and no cluster either. The
+cluster reaches the body through its context: every call a flow makes goes to
+the executor bound there, which for the coordinator is the cluster's workers.
 
 Flags you register in that package are parsed too — `CoordinatorMain` calls
 `flag.Parse()` on the default set, so your own flags sit beside `-target` and
@@ -186,13 +191,14 @@ worker was lost, every worker that entered or left service. Nothing reads it
 during the run. Its value is that it outlives the process, so a coordinator that
 died has still left an account of what it had done.
 
-When the job was a step of a workflow (the [`flow`](flow) package), the entry says so — the
-flow, the run, the thread and the position in that run's history. That is what
-makes the record answerable at the level anyone actually asks at: not "job 3f
-went to remote-2" but "the second activity of order-77 went to remote-2 and
-never came back". Only the workflow knows which run a call belongs to, so it
-stamps it on the dispatch and the coordinator writes it down. A bare call
-belongs to nothing larger and leaves those columns empty.
+When the job was a call of a flow run — which on a coordinator every job is,
+since `Coordinate` itself is one — the entry says so: the run, the thread and
+the position in that run's history. That is what makes the record answerable at
+the level anyone actually asks at: not "job 3f went to remote-2" but "the second
+call of order-77 went to remote-2 and never came back". Only the run knows which
+run a call belongs to, so it stamps it on the dispatch and the coordinator
+writes it down. A bare call made on `Cluster.Bind` belongs to nothing larger and
+leaves those columns empty.
 
 Writes go through a buffered channel drained by one goroutine and batched, so
 recording never becomes backpressure on the work. A full buffer drops entries
@@ -245,12 +251,13 @@ its own record and each worker's mirror only for the position to continue from �
 drops a result for a job it never dispatched. The work a worker was still doing
 finishes and is written down, and nobody collects it.
 
-What does survive a coordinator restart is a **workflow** ([`flow`](flow)). Its
-history is the durable thing: rerun with the same instance it replays what
-returned and dispatches again what had not. An activity that was in flight when
-the coordinator died is therefore run twice, once by each coordinator, and the
-second copy is the one whose answer counts. Work functions are idempotent for
-exactly this reason.
+What does survive a coordinator restart is a **flow run** ([`flow`](flow)), and
+`Coordinate` is one: its history is kept under `-dir`, and a coordinator started
+again over the same directory replays what returned and dispatches again what
+had not. A call that was in flight when the coordinator died is therefore run
+twice, once by each coordinator, and the second copy is the one whose answer
+counts. Work functions are idempotent for exactly this reason. A `Coordinate`
+that already finished does nothing at all on a restart.
 
 ### Remote deployment
 
@@ -304,9 +311,9 @@ is a millisecond of arithmetic and another an hour of transcoding, and a single
 cluster-wide number is either useless to one or fatal to the other.
 
 ```go
-var Transcode = wings.Define("transcode", transcode,
-    wings.WithTimeout(2*time.Hour),            // total: exceeding it FAILS
-    wings.WithHeartbeatTimeout(30*time.Second) // quiet: exceeding it MOVES
+var Transcode = flow.Define("transcode", transcode,
+    flow.WithTimeout(2*time.Hour),            // total: exceeding it FAILS
+    flow.WithHeartbeatTimeout(30*time.Second) // quiet: exceeding it MOVES
 )
 ```
 
@@ -322,13 +329,13 @@ because the job reports where it has got to as it goes:
 
 ```go
 func transcode(ctx context.Context, in Job) (Out, error) {
-    from, _, err := wings.Checkpoint[int](ctx)   // 0 on the first attempt
+    from, _, err := flow.Checkpoint[int](ctx)   // 0 on the first attempt
     if err != nil {
         return Out{}, err
     }
     for i := from; i < in.Frames; i++ {
         // ... one frame ...
-        wings.Heartbeat(ctx, i+1)
+        flow.Heartbeat(ctx, i+1)
     }
 }
 ```
@@ -351,18 +358,18 @@ moving a queued job only puts it at the back of another queue.
 
 ### Steps
 
-`wings.Step` is the same mechanism with the bookkeeping taken away. Name the
+`flow.Step` is the same mechanism with the bookkeeping taken away. Name the
 phases of a long job and a move replays the ones that finished:
 
 ```go
 func restore(ctx context.Context, in Backup) (Report, error) {
-    snap, err := wings.Step(ctx, "snapshot", func(ctx context.Context) (Snapshot, error) {
+    snap, err := flow.Step(ctx, "snapshot", func(ctx context.Context) (Snapshot, error) {
         return takeSnapshot(ctx, in.Source)      // twenty minutes
     })
     if err != nil {
         return Report{}, err
     }
-    return wings.Step(ctx, "restore", func(ctx context.Context) (Report, error) {
+    return flow.Step(ctx, "restore", func(ctx context.Context) (Report, error) {
         return restoreInto(ctx, snap, in.Target) // another forty
     })
 }
@@ -380,12 +387,12 @@ is one message to the coordinator, which accumulates them, so a step costs the
 same however many came before it — but it is a message all the same. Use steps
 for coarse phases and `Heartbeat` for a position inside a loop.
 
-### Inside a workflow
+### Inside a run
 
-A work function called from a workflow checkpoints exactly the same way — `Step`
-and `Heartbeat` do not know or care whether a workflow is involved. What a
-workflow adds is a second way to be interrupted: the workflow itself can fail
-and be retried while the call is still running. The retry **rejoins** the call
+A work function checkpoints the same way whatever called it — `Step` and
+`Heartbeat` do not know or care which run they are part of. What the run adds
+is a second way to be interrupted: the run itself can fail and be retried while
+the call is still running. The retry **rejoins** the call
 already in flight instead of dispatching a second copy, so the progress that
 copy would have thrown away is kept. The coordinator recognises it by the run,
 thread and position the call sits at, which replay puts in the same place every

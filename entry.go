@@ -27,15 +27,21 @@ type CoordinatorOptions struct {
 	// failing later with something less obvious.
 	Provisioner Provisioner
 
-	// Coordinate is your code. It is called once, with a cluster that is
-	// already up, and the cluster is torn down when it returns.
-	Coordinate func(context.Context, *Cluster) error
+	// Coordinate is your code. It runs as a durable run on a cluster that is
+	// already up — see [Cluster.Run] — and the cluster is torn down when it
+	// returns.
+	Coordinate func(context.Context) error
 }
+
+// coordinateRun is the name Coordinate's history is kept under in Dir. One
+// per directory: a directory is one run of one program, and a second start
+// in the same directory is that run resuming.
+const coordinateRun = "coordinate"
 
 // WorkerMain is the entire worker binary.
 //
 // The generated worker main is this call and an import of your package, whose
-// [Define] calls register the work. A worker needs nothing else: it never
+// flow.Define calls register the work. A worker needs nothing else: it never
 // provisions, never dispatches, and never runs your Coordinate.
 //
 // It does not return.
@@ -155,11 +161,13 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		os.Exit(1)
 	}
 
-	// Bound, so a work function called inside Coordinate dispatches to this
-	// cluster without being told about it. That is the whole reason a work
-	// function is callable rather than something you pass to a method: the
-	// context already knows where work goes.
-	runErr := opts.Coordinate(c.Bind(ctx), c)
+	// As a run, not a call: every function called inside Coordinate goes to
+	// this cluster's workers and into a history under Dir, so a coordinator
+	// started again in the same directory carries on from where the last one
+	// stopped. That is the whole reason a function is callable rather than
+	// something you pass to a method: the context already knows where work
+	// goes, and what has already been done.
+	runErr := c.Run(ctx, coordinateRun, opts.Coordinate)
 	stopErr := c.Stop(context.Background())
 
 	if runErr != nil {

@@ -1,21 +1,30 @@
-// Package wings distributes calls to a typed Go function across workers.
+// Package wings runs flows across workers.
 //
-// You define the work function once, and call it through a [Cluster]. Where it
-// actually runs — a goroutine in this process, a child process on this machine,
-// or a cloud VM that did not exist a minute ago — is a one-line choice at
-// startup and changes nothing about the code that defines or calls the work.
+// The work is written against package flow: functions declared with
+// flow.Define, and a body that calls them. wings is an executor for those
+// calls — a [Cluster] is where they go to run — and where that is — a
+// goroutine in this process, a child process on this machine, or a cloud VM
+// that did not exist a minute ago — is a one-line choice at startup that
+// changes nothing about the code that defines or calls the work.
 //
 //	package job
 //
-//	var Render = wings.Define("render", func(ctx context.Context, f Frame) (Image, error) {
+//	var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) {
 //		return render(f)
 //	})
 //
-//	// Coordinate is called once, with a cluster that is already up.
-//	func Coordinate(ctx context.Context, c *wings.Cluster) error {
-//		images, err := wings.Map(ctx, Render, frames)
+//	// Coordinate is run as a flow once the cluster is up.
+//	func Coordinate(ctx context.Context) error {
+//		images, err := flow.Map(ctx, Render, frames)
 //		...
 //	}
+//
+// Nothing in that file names a cluster. The body reaches it through its
+// context: [Cluster.Run] runs a flow whose calls are dispatched to the
+// cluster's workers and whose history is kept on the cluster's own storage, so
+// a coordinator started again over the same directory replays what it already
+// did. [Cluster.Bind] gives a context for calls outside any run, which are
+// dispatched the same way and recorded nowhere.
 //
 // You write a LIBRARY package, not a main. The `wings build` command generates
 // both mains — see that command's documentation — and the target is then a flag:
@@ -33,9 +42,9 @@
 // [Coordinate]. The coordinator gets everything, plus the worker embedded
 // inside it, so it can deploy one without a Go toolchain or a source tree.
 //
-// Work functions must therefore be registered by [Define] at PACKAGE SCOPE: a
-// worker process never runs Coordinate, and a function defined inside it would
-// not exist in the process meant to run it.
+// Work functions must therefore be registered by flow.Define at PACKAGE SCOPE:
+// a worker process never runs Coordinate, and a function defined inside it
+// would not exist in the process meant to run it.
 //
 // # Using this package directly
 //
@@ -68,19 +77,19 @@
 //
 // # Long jobs
 //
-// Two bounds, both declared beside the work with [WithTimeout] and
-// [WithHeartbeatTimeout], because "too slow" and "stuck" deserve different
+// Two bounds, both declared beside the work with flow.WithTimeout and
+// flow.WithHeartbeatTimeout, because "too slow" and "stuck" deserve different
 // answers. Exceeding a total bound FAILS the call: retrying would spend the
 // same time again to reach the same answer. Going quiet for longer than the
 // heartbeat bound MOVES it to another worker, on the suspicion that the machine
 // rather than the work is at fault.
 //
-// Moving is affordable because a job reports where it has got to. [Heartbeat]
-// records a position; [Checkpoint] reads back whatever the previous attempt
+// Moving is affordable because a job reports where it has got to. flow.Heartbeat
+// records a position; flow.Checkpoint reads back whatever the previous attempt
 // last recorded, so a retry resumes instead of starting over. Only the latest
 // survives — it is a position, not a log.
 //
-// [Step] is the same thing with the bookkeeping taken away: name the phases of a
+// flow.Step is the same thing with the bookkeeping taken away: name the phases of a
 // long job, and a job that moves replays the ones that finished and runs the
 // rest. What can never move is the running goroutine itself — its stack, its
 // locals, its open sockets — so the only thing that crosses a machine boundary
@@ -102,9 +111,8 @@
 //
 // This is durability for the job's OWN state, deliberately outside the durable
 // execution wings does for the job itself. wings stores the events and gives
-// them back, and never reads one. [Step] and [Heartbeat] are
-// the other thing: they are about resuming a job, not about describing what it
-// did.
+// them back, and never reads one. flow.Step and flow.Heartbeat are the other
+// thing: they are about resuming a job, not about describing what it did.
 //
 // # Artifacts
 //
@@ -130,10 +138,9 @@
 // The coordinator also keeps a durable record of its own decisions — which job
 // went to which node, what came back, which workers came and went — on that
 // same embedded engine. Broker-less by construction: nothing else reads it, and
-// its value is that it outlives the process that wrote it. A job dispatched
-// from inside a workflow is recorded with the flow, run and thread it is a step
-// of, so the record answers "which activity of which run went where" and not
-// merely "which job".
+// its value is that it outlives the process that wrote it. A job is recorded
+// with the run, thread and step it is a call of, so the record answers "which
+// call of which run went where" and not merely "which job".
 //
 // # Machines outlive the coordinator
 //
@@ -150,8 +157,10 @@
 // intact; one that cannot be resumed is destroyed rather than left running.
 // Recovered machines count towards the worker target.
 //
-// What is NOT recovered is a call. A caller's goroutine died with the process
-// that made it, and a result that reaches the new coordinator for a job it never
-// dispatched is dropped. A workflow (package flow) is the exception: its history
-// is the durable thing, and a rerun dispatches again whatever had not returned.
+// What is NOT recovered is a bare call. A caller's goroutine died with the
+// process that made it, and a result that reaches the new coordinator for a
+// job it never dispatched is dropped. A run is different: its history is the
+// durable thing, and a coordinator started again over the same Dir replays
+// what returned and dispatches again whatever had not — which is what makes
+// Coordinate, itself a run, survive the process that was running it.
 package wings

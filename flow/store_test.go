@@ -12,7 +12,6 @@ import (
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/dsclient"
 
-	"github.com/ligustah/wings"
 	"github.com/ligustah/wings/flow"
 )
 
@@ -22,8 +21,7 @@ import (
 // Closing is the caller's business rather than t.Cleanup's because a log
 // directory admits exactly one instance at a time — the durable-streams engine
 // takes an OS lock on it — so a test that reopens a directory must close the
-// first one first. That constraint is real and worth meeting head-on: it is the
-// same reason the coordinator keeps ONE engine rather than one per worker.
+// first one first.
 func streams(t *testing.T, dir string) (*dsclient.Client, func()) {
 	t.Helper()
 
@@ -43,13 +41,12 @@ func streams(t *testing.T, dir string) (*dsclient.Client, func()) {
 	return dsclient.Wrap(b.Client()), closeFn
 }
 
-// THE POINT: history on a durable stream, not in a map. A workflow's replay
-// must survive the store being closed and reopened, because surviving a process
-// is the only reason to write it down at all.
+// THE POINT: history on a durable stream, not in a map. A run's replay must
+// survive the store being closed and reopened, because surviving a process is
+// the only reason to write it down at all.
 func TestHistorySurvivesReopeningTheStore(t *testing.T) {
-	ctx := cluster(t)
 	dir := filepath.Join(t.TempDir(), "engine")
-	instance := flow.NewInstance()
+	name := flow.NewName()
 
 	before := calls.double.Load()
 
@@ -58,34 +55,32 @@ func TestHistorySurvivesReopeningTheStore(t *testing.T) {
 	func() {
 		client, closeStreams := streams(t, dir)
 		defer closeStreams()
-		store := flow.NewStore(client)
 
-		wf := flow.Define("t.durable", func(ctx context.Context, in int) (int, error) {
-			if _, err := double(ctx, in); err != nil {
-				return 0, err
+		err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+			if _, err := double(ctx, 21); err != nil {
+				return err
 			}
-			return 0, errors.New("stop after the call")
-		}, flow.MaxAttempts(1), flow.Backoff(time.Millisecond, time.Millisecond))
-
-		if _, err := flow.Run(ctx, wf, instance, 21, flow.WithStore(store)); err == nil {
+			return errors.New("stop after the call")
+		}, flow.WithStore(flow.NewStore(client)), flow.MaxAttempts(1), quick)
+		if err == nil {
 			t.Fatal("want the first run to fail")
 		}
 	}()
 
 	if n := calls.double.Load() - before; n != 1 {
-		t.Fatalf("the work function ran %d times in the first run, want 1", n)
+		t.Fatalf("the function ran %d times in the first run, want 1", n)
 	}
 
 	// A SECOND instance of the store over the same directory — the engine was
 	// closed and reopened in between, so anything remembered in memory is gone.
 	client, _ := streams(t, dir)
-	store := flow.NewStore(client)
 
-	wf := flow.Define("t.durable", func(ctx context.Context, in int) (int, error) {
-		return double(ctx, in)
-	})
-
-	got, err := flow.Run(ctx, wf, instance, 21, flow.WithStore(store))
+	var got int
+	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+		var err error
+		got, err = double(ctx, 21)
+		return err
+	}, flow.WithStore(flow.NewStore(client)))
 	if err != nil {
 		t.Fatalf("resumed Run: %v", err)
 	}
@@ -94,24 +89,24 @@ func TestHistorySurvivesReopeningTheStore(t *testing.T) {
 	}
 	// Still one: the second run replayed the call the first one recorded.
 	if n := calls.double.Load() - before; n != 1 {
-		t.Fatalf("the work function ran %d times in total; the reopened store should have replayed it", n)
+		t.Fatalf("the function ran %d times in total; the reopened store should have replayed it", n)
 	}
 }
 
 func TestStoredHistoryIsReadableAsEvents(t *testing.T) {
-	ctx := cluster(t)
 	client, _ := streams(t, filepath.Join(t.TempDir(), "engine"))
 	store := flow.NewStore(client)
-	instance := flow.NewInstance()
+	name := flow.NewName()
 
-	wf := flow.Define("t.readable", func(ctx context.Context, in int) (int, error) {
-		return double(ctx, in)
-	})
-	if _, err := flow.Run(ctx, wf, instance, 2, flow.WithStore(store)); err != nil {
+	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+		_, err := double(ctx, 2)
+		return err
+	}, flow.WithStore(store))
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	events, err := store.Events(context.Background(), "t.readable", instance)
+	events, err := store.Events(context.Background(), name)
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
@@ -139,24 +134,29 @@ func TestStoredHistoryIsReadableAsEvents(t *testing.T) {
 	}
 }
 
-// Two instances of the same workflow must not read each other's history, or a
-// replay would resume somebody else's run.
-func TestInstancesAreIsolated(t *testing.T) {
-	ctx := cluster(t)
+// Two runs must not read each other's history, or a replay would resume
+// somebody else's run.
+func TestRunsAreIsolated(t *testing.T) {
 	client, _ := streams(t, filepath.Join(t.TempDir(), "engine"))
 	store := flow.NewStore(client)
 
 	var ran atomic.Int64
-	wf := flow.Define("t.isolated", func(ctx context.Context, in int) (int, error) {
-		ran.Add(1)
-		return double(ctx, in)
-	})
+	run := func(name string, in int) (int, error) {
+		var out int
+		err := flow.Run(t.Context(), name, func(ctx context.Context) error {
+			ran.Add(1)
+			var err error
+			out, err = double(ctx, in)
+			return err
+		}, flow.WithStore(store))
+		return out, err
+	}
 
-	a, err := flow.Run(ctx, wf, "instance-a", 1, flow.WithStore(store))
+	a, err := run("run-a", 1)
 	if err != nil {
 		t.Fatalf("Run a: %v", err)
 	}
-	b, err := flow.Run(ctx, wf, "instance-b", 10, flow.WithStore(store))
+	b, err := run("run-b", 10)
 	if err != nil {
 		t.Fatalf("Run b: %v", err)
 	}
@@ -165,45 +165,37 @@ func TestInstancesAreIsolated(t *testing.T) {
 		t.Fatalf("got %d and %d, want 2 and 20", a, b)
 	}
 	if n := ran.Load(); n != 2 {
-		t.Fatalf("the workflow body ran %d times; each instance should have run once", n)
+		t.Fatalf("the body ran %d times; each run should have run once", n)
 	}
 }
 
-// The coordinator's own instance is the intended home for this, so it has to
-// work: a cluster's embedded engine, reached the way flow expects.
-func TestWorkflowOnTheClusterOwnStreams(t *testing.T) {
-	dir := t.TempDir()
+// A run that was left mid-flight and is started again later picks up where it
+// stopped, however long it was gone.
+func TestARunLeftMidFlightResumesLater(t *testing.T) {
+	client, _ := streams(t, filepath.Join(t.TempDir(), "engine"))
+	store := flow.NewStore(client)
+	name := flow.NewName()
 
-	c, err := wings.Start(t.Context(), wings.Config{Target: wings.InProcess(), Dir: dir})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer func() {
-		if err := c.Stop(context.Background()); err != nil {
-			t.Errorf("Stop: %v", err)
+	var attempts atomic.Int64
+	body := func(ctx context.Context) error {
+		if _, err := double(ctx, 1); err != nil {
+			return err
 		}
-	}()
-
-	ctx := c.Bind(t.Context())
-
-	// The cluster's OWN instance, not a second one. A log directory admits one
-	// engine at a time, so this is the difference between a workflow history
-	// that sits beside the coordinator's other records and one that needs a
-	// directory of its own.
-	store, err := flow.ClusterStore(ctx)
-	if err != nil {
-		t.Fatalf("ClusterStore: %v", err)
+		if attempts.Add(1) == 1 {
+			return errors.New("gone")
+		}
+		_, err := double(ctx, 2)
+		return err
 	}
-
-	wf := flow.Define("t.cluster", func(ctx context.Context, in []int) ([]int, error) {
-		return wings.Map(ctx, double, in)
-	})
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), []int{1, 2, 3}, flow.WithStore(store))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store), flow.MaxAttempts(1)); err == nil {
+		t.Fatal("want the first run to fail")
 	}
-	if len(got) != 3 || got[0] != 2 || got[1] != 4 || got[2] != 6 {
-		t.Fatalf("got %v, want [2 4 6]", got)
+	time.Sleep(10 * time.Millisecond)
+	before := calls.double.Load()
+	if err := flow.Run(t.Context(), name, body, flow.WithStore(store)); err != nil {
+		t.Fatalf("resumed Run: %v", err)
+	}
+	if n := calls.double.Load() - before; n != 1 {
+		t.Fatalf("the resumed run made %d calls, want only the one the first run had not reached", n)
 	}
 }

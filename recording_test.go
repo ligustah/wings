@@ -10,6 +10,8 @@ import (
 
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire/protos"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // Tick is a made-up simulation event, standing in for whatever a long job
@@ -21,7 +23,7 @@ type Tick struct {
 
 // simulate produces a long event log and returns only a handle to it. The point
 // of the whole feature: the log never travels as a value.
-var simulate = Define("test.simulate", func(ctx context.Context, steps int) (Recording, error) {
+var simulate = flow.Define("test.simulate", func(ctx context.Context, steps int) (Recording, error) {
 	rec, err := Record[Tick](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -177,11 +179,11 @@ var resume struct {
 //
 // That is the whole feature in one function: durable execution for the job, and
 // a log the job keeps for itself alongside it.
-var resumeSim = Define("test.resume", func(ctx context.Context, total int) (int, error) {
+var resumeSim = flow.Define("test.resume", func(ctx context.Context, total int) (int, error) {
 	// The dispatch count, not a counter of our own: a worker in another process
 	// has its own copy of every package variable, and both attempts would think
 	// they were the first.
-	attempt := Attempt(ctx)
+	attempt := flow.Attempt(ctx)
 
 	from := 0
 	priors := Priors(ctx)
@@ -230,7 +232,7 @@ var resumeSim = Define("test.resume", func(ctx context.Context, total int) (int,
 		if err := rec.Record(Tick{At: i, What: fmt.Sprintf("step %d", i)}); err != nil {
 			return 0, err
 		}
-		if err := Heartbeat(ctx, i+1); err != nil {
+		if err := flow.Heartbeat(ctx, i+1); err != nil {
 			return 0, err
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -239,7 +241,7 @@ var resumeSim = Define("test.resume", func(ctx context.Context, total int) (int,
 		return 0, err
 	}
 	return from, nil
-}, WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a job that is moved must be able to replay what the attempt before
 // it recorded. Without that the whole feature is half a feature — a simulation
@@ -404,7 +406,7 @@ type Beat struct {
 	What string `json:"what"`
 }
 
-var pulse = Define("test.pulse", func(ctx context.Context, steps int) (Recording, error) {
+var pulse = flow.Define("test.pulse", func(ctx context.Context, steps int) (Recording, error) {
 	rec, err := Record[*Beat](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -470,7 +472,7 @@ func (n *Note) UnmarshalBinary(b []byte) error {
 
 // emit records protobuf events, which is what a simulation's replay actually
 // is. A generated message type is a pointer, always.
-var emit = Define("test.emit", func(ctx context.Context, steps int) (Recording, error) {
+var emit = flow.Define("test.emit", func(ctx context.Context, steps int) (Recording, error) {
 	rec, err := Record[*protos.Data](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -487,7 +489,7 @@ var emit = Define("test.emit", func(ctx context.Context, steps int) (Recording, 
 })
 
 // scribble records a pointer event with its own binary marshalling.
-var scribble = Define("test.scribble", func(ctx context.Context, steps int) (Recording, error) {
+var scribble = flow.Define("test.scribble", func(ctx context.Context, steps int) (Recording, error) {
 	rec, err := Record[*Note](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -600,11 +602,9 @@ func TestARetiredMachineTakesNothingWithIt(t *testing.T) {
 	errs := make([]error, jobs)
 	var wg sync.WaitGroup
 	for i := range jobs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			recs[i], errs[i] = simulate(ctx, steps)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -653,7 +653,7 @@ var late struct {
 // completes the recording and returns a handle to it — which is the situation
 // the coordinator has to get right: two attempts of one job, both finishing,
 // only one of them the job.
-var lateSim = Define("test.late", func(ctx context.Context, steps int) (Recording, error) {
+var lateSim = flow.Define("test.late", func(ctx context.Context, steps int) (Recording, error) {
 	rec, err := Record[Tick](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -667,7 +667,7 @@ var lateSim = Define("test.late", func(ctx context.Context, steps int) (Recordin
 		return Recording{}, err
 	}
 
-	switch Attempt(ctx) {
+	switch flow.Attempt(ctx) {
 	case 0:
 		// Quiet: no beats, so the coordinator moves the job. But not gone.
 		select {
@@ -684,7 +684,7 @@ var lateSim = Define("test.late", func(ctx context.Context, steps int) (Recordin
 			case <-ctx.Done():
 				return Recording{}, ctx.Err()
 			case <-time.After(50 * time.Millisecond):
-				_ = Heartbeat(ctx, 0)
+				_ = flow.Heartbeat(ctx, 0)
 				continue
 			}
 			break
@@ -694,7 +694,7 @@ var lateSim = Define("test.late", func(ctx context.Context, steps int) (Recordin
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-}, WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a job that was moved because its worker went quiet may still
 // finish there. Its result carries no more authority than its beats do: the job

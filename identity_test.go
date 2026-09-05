@@ -35,7 +35,7 @@ func TestAFreshWorkerNeverReusesARecoveredWorkersName(t *testing.T) {
 	dir := t.TempDir()
 
 	first := startRemote(t, dir, cloud, 1)
-	if _, err := Map(first.Bind(t.Context()), double, []int{1, 2}); err != nil {
+	if _, err := mapOn(t.Context(), first, double, []int{1, 2}); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 	was := workerIDs(first)
@@ -72,7 +72,7 @@ func TestAFreshWorkerNeverReusesARecoveredWorkersName(t *testing.T) {
 
 	// And the cluster has to actually work, which is the symptom a name clash
 	// produces: jobs to the colliding worker are never answered.
-	got, err := Map(second.Bind(t.Context()), double, []int{1, 2, 3, 4, 5, 6, 7, 8})
+	got, err := mapOn(t.Context(), second, double, []int{1, 2, 3, 4, 5, 6, 7, 8})
 	if err != nil {
 		t.Fatalf("Map after restart: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestTheRecordCanTellTwoCoordinatorRunsApart(t *testing.T) {
 	dir := t.TempDir()
 
 	first := startIn(t, dir)
-	if _, err := Map(first.Bind(t.Context()), double, []int{1, 2, 3}); err != nil {
+	if _, err := mapOn(t.Context(), first, double, []int{1, 2, 3}); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 	awaitJournal(t, first, func(es []journalEntry) bool {
@@ -127,7 +127,7 @@ func TestTheRecordCanTellTwoCoordinatorRunsApart(t *testing.T) {
 	if second.epoch == firstEpoch {
 		t.Fatalf("both runs call themselves %q", firstEpoch)
 	}
-	if _, err := Map(second.Bind(t.Context()), double, []int{4, 5, 6}); err != nil {
+	if _, err := mapOn(t.Context(), second, double, []int{4, 5, 6}); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 

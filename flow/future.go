@@ -4,16 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	"github.com/ligustah/wings"
-	"github.com/ligustah/wings/internal/invoke"
 )
 
-// Future is a call that is running while the workflow does something else.
+// Future is a call that is running while the run does something else.
 //
-// Get one from [Go]. It is not a promise you can pass anywhere: it belongs to
-// the thread that created it and must be awaited by that thread, because the
-// order of the forks and joins is part of what makes the run replayable.
+// Get one from [Go] or [Spawn]. It is not a promise you can pass anywhere: it
+// belongs to the thread that created it and must be awaited by that thread,
+// because the order of the forks and joins is part of what makes the run
+// replayable.
 type Future[Out any] struct {
 	out  Out
 	err  error
@@ -24,7 +22,7 @@ type Future[Out any] struct {
 	parent  *threadState
 }
 
-// Go starts f on its own workflow thread and returns immediately.
+// Go starts f on its own thread and returns immediately.
 //
 //	a := flow.Go(ctx, Digest, left)
 //	b := flow.Go(ctx, Digest, right)
@@ -36,21 +34,20 @@ type Future[Out any] struct {
 // same code produces the same names in the same order on every attempt — which
 // a goroutine cannot promise, and which replay cannot do without.
 //
-// For a fan-out over a slice, prefer [wings.Map]: it forks the same way and
-// keeps the results in order.
-func Go[In, Out any](ctx context.Context, f wings.Func[In, Out], in In) *Future[Out] {
+// For a fan-out over a slice, prefer [Map]: it is this, once per input, with
+// the results kept in order.
+func Go[In, Out any](ctx context.Context, f Func[In, Out], in In) *Future[Out] {
 	return spawn(ctx, "Go", func(ctx context.Context) (Out, error) {
 		return f(ctx, in)
 	})
 }
 
-// Spawn runs body on a workflow thread of its own and returns immediately.
+// Spawn runs body on a thread of its own and returns immediately.
 //
-// This is [Go] for a piece of workflow code rather than a single work function:
-// body may call work functions, sleep, use a [Channel], fork further threads —
-// anything the workflow function itself may do. It is what makes channels worth
-// having, since a channel between threads needs threads that do more than one
-// thing.
+// This is [Go] for a piece of run code rather than a single function: body may
+// call functions, sleep, use a [Channel], fork further threads — anything the
+// run's own body may do. It is what makes channels worth having, since a
+// channel between threads needs threads that do more than one thing.
 //
 //	ch := flow.NewChannel[int](ctx)
 //	producer := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
@@ -82,7 +79,8 @@ func spawn[Out any](ctx context.Context, who string, body func(ctx context.Conte
 
 	parent := threadFrom(ctx)
 	if parent == nil {
-		fut.err = fmt.Errorf("flow: %s called outside a workflow", who)
+		fut.err = fmt.Errorf("flow: %s called outside a Run; a thread can only be forked from a run's body, "+
+			"with the context it was given", who)
 		close(fut.done)
 		return fut
 	}
@@ -139,6 +137,36 @@ func (f *Future[Out]) Await(ctx context.Context) (Out, error) {
 	return f.out, f.parent.run.err()
 }
 
-// Assert at compile time that a cluster host and the recording host agree on
-// the seam, since Go and Map both depend on them being interchangeable.
-var _ invoke.Host = host{}
+// Map runs f on every input and returns the results in the order the inputs
+// were given.
+//
+// It is [Go] once per input and then [Future.Await] on each in order, and
+// nothing more: every input is dispatched before any result is waited on, so
+// the work is in flight in parallel rather than merely submitted in a loop,
+// and the forks and joins land in the history in the same order every attempt.
+//
+// If some inputs fail, the successful outputs are still returned in their
+// places and the error joins every failure, each naming its index. Check the
+// error before trusting a position you did not verify.
+func Map[In, Out any](ctx context.Context, f Func[In, Out], ins []In) ([]Out, error) {
+	outs := make([]Out, len(ins))
+	if len(ins) == 0 {
+		return outs, nil
+	}
+
+	futures := make([]*Future[Out], len(ins))
+	for i, in := range ins {
+		futures[i] = Go(ctx, f, in)
+	}
+
+	var joined []error
+	for i, fut := range futures {
+		out, err := fut.Await(ctx)
+		if err != nil {
+			joined = append(joined, fmt.Errorf("flow: input %d: %w", i, err))
+			continue
+		}
+		outs[i] = out
+	}
+	return outs, errors.Join(joined...)
+}

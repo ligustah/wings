@@ -8,12 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ligustah/wings"
 	"github.com/ligustah/wings/flow"
 )
 
-// long is a work function that takes a while and counts how many times it was
-// actually started. Started, not finished: the question is whether a workflow
+// long is a function that takes a while and counts how many times it was
+// actually started. Started, not finished: the question is whether a run's
 // retry set a second copy of it going.
 var long struct {
 	starts  atomic.Int64
@@ -21,7 +20,7 @@ var long struct {
 	once    sync.Once
 }
 
-var longWork = wings.Define("rejoin.long", func(ctx context.Context, in int) (int, error) {
+var longWork = flow.Define("rejoin.long", func(ctx context.Context, in int) (int, error) {
 	long.starts.Add(1)
 	select {
 	case <-long.release:
@@ -31,62 +30,96 @@ var longWork = wings.Define("rejoin.long", func(ctx context.Context, in int) (in
 	return in * 2, nil
 })
 
-// THE POINT: a workflow that is retried while one of its activities is still
-// running must rejoin that activity, not start another. Two copies of an hour
-// of work would be waste on its own; worse, the copy starts from nothing while
-// the original is most of the way through, holding the checkpoint and the steps
-// that make it cheap to move. Nothing a long activity records about its own
-// progress survives being duplicated.
-func TestARetriedWorkflowRejoinsTheActivityStillRunning(t *testing.T) {
-	ctx := cluster(t)
+// rejoining is an executor that recognises a call still in flight by its
+// origin and hands the second asker the first one's answer — what a cluster
+// does with the jobs it has outstanding.
+type rejoining struct {
+	mu       sync.Mutex
+	inflight map[string]*pending
+}
 
+// pending is one call in flight: done closes when its answer is in.
+type pending struct {
+	done chan struct{}
+	out  []byte
+	err  error
+}
+
+func (r *rejoining) Invoke(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	key := flow.OriginFrom(ctx).Key()
+
+	r.mu.Lock()
+	if r.inflight == nil {
+		r.inflight = map[string]*pending{}
+	}
+	p, ok := r.inflight[key]
+	if !ok {
+		p = &pending{done: make(chan struct{})}
+		r.inflight[key] = p
+		go func() {
+			p.out, p.err = flow.Execute(context.WithoutCancel(ctx), name, payload)
+			close(p.done)
+		}()
+	}
+	r.mu.Unlock()
+
+	select {
+	case <-p.done:
+		return p.out, p.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// THE POINT: a run that is retried while one of its calls is still running
+// must rejoin that call, not start another. Two copies of an hour of work
+// would be waste on its own; worse, the copy starts from nothing while the
+// original is most of the way through, holding the checkpoint and the steps
+// that make it cheap to move. The run's part is to hand the executor the same
+// origin on the retry; the executor's is to recognise it.
+func TestARetriedRunRejoinsTheCallStillRunning(t *testing.T) {
 	long.release = make(chan struct{})
 	long.starts.Store(0)
 	t.Cleanup(func() { long.once.Do(func() { close(long.release) }) })
 
 	var attempts atomic.Int64
-	wf := flow.Define("t.rejoin", func(ctx context.Context, n int) (int, error) {
-		fut := flow.Go(ctx, longWork, n)
-
-		// The first attempt walks away while the activity is still going. Its
-		// call is recorded and its return is not, which is exactly the state a
-		// coordinator crash or a failing workflow leaves behind.
-		if attempts.Add(1) == 1 {
-			return 0, errors.New("abandoned while the activity ran")
-		}
-		return fut.Await(ctx)
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	done := make(chan struct{})
-	var (
-		got int
-		err error
-	)
+	var got int
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		got, err = flow.Run(ctx, wf, flow.NewInstance(), 21, flow.WithStore(flow.NewMemStore()))
+		done <- flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
+			fut := flow.Go(ctx, longWork, 21)
+
+			// The first attempt walks away while the call is still going. Its
+			// call is recorded and its return is not, which is exactly the
+			// state a crash or a failing body leaves behind.
+			if attempts.Add(1) == 1 {
+				return errors.New("abandoned while the call ran")
+			}
+			var err error
+			got, err = fut.Await(ctx)
+			return err
+		}, flow.WithStore(flow.NewMemStore()), flow.WithExecutor(&rejoining{}), quick)
 	}()
 
 	// Give the second attempt time to reach the call and rejoin, then let the
-	// one running activity finish.
+	// one running call finish.
 	waitFor(t, func() bool { return attempts.Load() >= 2 })
 	time.Sleep(300 * time.Millisecond)
 	long.once.Do(func() { close(long.release) })
 
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("the workflow never finished")
-	}
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatal("the run never finished")
 	}
 	if got != 42 {
 		t.Fatalf("got %d, want 42", got)
 	}
-
 	if n := long.starts.Load(); n != 1 {
-		t.Fatalf("the activity was started %d times; a retried workflow must rejoin the one already running, not add another", n)
+		t.Fatalf("the call was started %d times; a retried run must rejoin the one already running, not add another", n)
 	}
 }
 

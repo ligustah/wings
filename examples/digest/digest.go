@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ligustah/wings"
+	"github.com/ligustah/wings/flow"
 )
 
 // Flags registered here are parsed too: wings.CoordinatorMain calls
@@ -55,8 +55,9 @@ type Result struct {
 //
 // Defined at PACKAGE SCOPE, which is what puts it in the registry of every
 // process that links this package — including a worker, which never runs
-// Coordinate.
-var Digest = wings.Define("digest", func(ctx context.Context, in Work) (Result, error) {
+// Coordinate. Nothing here mentions wings: a work function is a flow function,
+// and wings is one place it can be sent to run.
+var Digest = flow.Define("digest", func(ctx context.Context, in Work) (Result, error) {
 	host, _ := os.Hostname()
 
 	sum := sha256.Sum256([]byte(in.Seed))
@@ -69,16 +70,18 @@ var Digest = wings.Define("digest", func(ctx context.Context, in Work) (Result, 
 	return Result{Seed: in.Seed, Digest: hex.EncodeToString(sum[:]), Host: host}, nil
 })
 
-// Coordinate is the coordinator body. wings calls it once with a cluster that
-// is already up, and tears the cluster down when it returns.
-func Coordinate(ctx context.Context, c *wings.Cluster) error {
+// Coordinate is the coordinator body. wings runs it as a flow once the cluster
+// is up, and tears the cluster down when it returns. Because it is a flow, a
+// coordinator restarted over the same -dir replays what this already did
+// rather than doing it again.
+func Coordinate(ctx context.Context) error {
 	work := make([]Work, *jobs)
 	for i := range work {
 		work[i] = Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: *rounds}
 	}
 
 	start := time.Now()
-	results, err := wings.Map(ctx, Digest, work)
+	results, err := flow.Map(ctx, Digest, work)
 	elapsed := time.Since(start)
 	if err != nil {
 		return err

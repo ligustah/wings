@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestWorkSurvivesAWorkerBeingKilled(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		got, err := Map(c.Bind(t.Context()), slow, in)
+		got, err := mapOn(t.Context(), c, slow, in)
 		done <- outcome{got, err}
 	}()
 
@@ -249,7 +250,7 @@ func TestResultsAreMirroredToTheCoordinator(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 1})
 
 	in := []int{1, 2, 3, 4, 5}
-	if _, err := Map(c.Bind(t.Context()), double, in); err != nil {
+	if _, err := mapOn(t.Context(), c, double, in); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 
@@ -304,7 +305,7 @@ func TestResultsAreMirroredToTheCoordinator(t *testing.T) {
 func TestTheMirrorRemembersWhereItGotTo(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 1})
 
-	if _, err := Map(c.Bind(t.Context()), double, []int{1, 2, 3}); err != nil {
+	if _, err := mapOn(t.Context(), c, double, []int{1, 2, 3}); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 
@@ -328,7 +329,7 @@ func TestTheMirrorRemembersWhereItGotTo(t *testing.T) {
 
 	// And it must not re-deliver: more work on the same worker keeps moving
 	// forward from there.
-	if _, err := Map(c.Bind(t.Context()), double, []int{7, 8}); err != nil {
+	if _, err := mapOn(t.Context(), c, double, []int{7, 8}); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 	if w.mirror.next <= live {
@@ -414,12 +415,7 @@ func TestAWorkerToldItIsBeingTakenBackHandsItsWorkOver(t *testing.T) {
 	waitFor(t, "the worker to be released", func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		for _, w := range c.workers {
-			if w == on {
-				return false
-			}
-		}
-		return true
+		return !slices.Contains(c.workers, on)
 	})
 	// And the record says why. The release that follows writes its own line
 	// too, as it does for any dead worker; the notice is the one that matters.
@@ -454,7 +450,7 @@ func TestAWorkerThatDiesMidJobIsReaped(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := Map(c.Bind(t.Context()), slow, in)
+		_, err := mapOn(t.Context(), c, slow, in)
 		done <- err
 	}()
 

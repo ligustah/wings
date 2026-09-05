@@ -1,5 +1,7 @@
 package wings
 
+import "github.com/ligustah/wings/flow"
+
 // Stream names. Each worker gets its own pair: the coordinator writes jobs to a
 // NAMED worker and reads that worker's results. Workers do not read each other's
 // anything — there is no stream in this package that two workers both touch.
@@ -59,30 +61,19 @@ type jobEnvelope struct {
 	// on the worker say which it was.
 	Attempt int `json:"attempt,omitempty"`
 	// Checkpoint is the last progress a previous attempt reported through
-	// [Heartbeat], and is what makes a retry cheap: the work resumes from it
-	// rather than starting over. Empty on a first attempt, and on a retry of
-	// something that never heartbeated.
+	// [flow.Heartbeat], and is what makes a retry cheap: the work resumes from
+	// it rather than starting over. Empty on a first attempt, and on a retry
+	// of something that never heartbeated.
 	Checkpoint []byte `json:"checkpoint,omitempty"`
-	// Steps are the [Step] calls a previous attempt completed, in order. A
-	// retry replays them from here instead of running them again.
-	Steps []stepRecord `json:"steps,omitempty"`
+	// Steps are the [flow.Step] calls a previous attempt completed, in order.
+	// A retry replays them from here instead of running them again. The index
+	// each carries is what lets one that went missing leave a detectable hole
+	// rather than a silently shifted list.
+	Steps []flow.StepRecord `json:"steps,omitempty"`
 	// Priors are the event logs earlier attempts of this job left behind,
 	// oldest attempt first. A retry reads them with [Priors] to pick up where
 	// one of them stopped instead of starting over.
 	Priors []Recording `json:"priors,omitempty"`
-}
-
-// stepRecord is one completed [Step]: where it sat in the job, what it was
-// called, and what it produced.
-//
-// The index is carried rather than implied by position because these arrive one
-// at a time over a best-effort channel, and one that goes missing must leave a
-// detectable hole rather than a silently shifted list — a step log off by one is
-// a retry that skips work it never did.
-type stepRecord struct {
-	Index int    `json:"i"`
-	Name  string `json:"name"`
-	Value []byte `json:"value,omitempty"`
 }
 
 // beatEnvelope is one report that a job is still running, and how far it has
@@ -111,10 +102,10 @@ type beatEnvelope struct {
 	// the work's fault. Any beat implies it, so a lost one costs nothing.
 	Started    bool   `json:"started,omitempty"`
 	Checkpoint []byte `json:"checkpoint,omitempty"`
-	// Step is one newly completed [Step], if this beat reports one. Sent one at
+	// Step is one newly completed flow.Step, if this beat reports one. Sent one at
 	// a time rather than as a growing log, so the cost of a step does not climb
 	// with how many came before it; the coordinator does the accumulating.
-	Step *stepRecord `json:"step,omitempty"`
+	Step *flow.StepRecord `json:"step,omitempty"`
 }
 
 // resultEnvelope is one outcome.

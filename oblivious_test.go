@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // THE POINT: a program that uses wings must not be able to tell where its work
@@ -93,7 +95,7 @@ func TestTargetsProduceIdenticalResults(t *testing.T) {
 	run := func(target Target, workers int) []int {
 		t.Helper()
 		c := start(t, Config{Target: target, Workers: workers, Concurrency: 3})
-		got, err := Map(c.Bind(t.Context()), double, in)
+		got, err := mapOn(t.Context(), c, double, in)
 		if err != nil {
 			t.Fatalf("Map: %v", err)
 		}
@@ -147,7 +149,7 @@ func TestWorkFunctionSeesTheSameContextShapeEverywhere(t *testing.T) {
 	}
 }
 
-var reportsDeadline = Define("test.deadline", func(ctx context.Context, _ int) (string, error) {
+var reportsDeadline = flow.Define("test.deadline", func(ctx context.Context, _ int) (string, error) {
 	if _, ok := ctx.Deadline(); ok {
 		return "has deadline", nil
 	}

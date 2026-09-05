@@ -7,7 +7,7 @@ import (
 
 	"github.com/ligustah/durable_streams/dsclient"
 
-	"github.com/ligustah/wings/internal/invoke"
+	"github.com/ligustah/wings/flow"
 )
 
 // readJournal reads the coordinator's record back off the stream it was written
@@ -72,7 +72,7 @@ func TestCoordinatorJournalsEveryJob(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Concurrency: 2})
 
 	in := []int{1, 2, 3, 4, 5, 6, 7, 8}
-	if _, err := Map(c.Bind(t.Context()), double, in); err != nil {
+	if _, err := mapOn(t.Context(), c, double, in); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 
@@ -178,10 +178,10 @@ func TestInProcessWorkersShareOneEngine(t *testing.T) {
 func TestTheJournalSaysWhichRunAJobBelongedTo(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	// What a workflow stamps on the context; here set directly so this tests
-	// the coordinator's half without dragging the workflow engine in.
-	origin := invoke.Origin{Flow: "checkout", Run: "order-77", Thread: "main.2", Step: 4}
-	ctx := invoke.WithOrigin(c.Bind(t.Context()), origin)
+	// What a run stamps on the context; here set directly so this tests the
+	// coordinator's half without dragging the run engine in.
+	origin := flow.Origin{Run: "order-77", Thread: "main.2", Step: 4}
+	ctx := flow.WithOrigin(c.Bind(t.Context()), origin)
 
 	if got, err := double(ctx, 21); err != nil {
 		t.Fatalf("double: %v", err)
@@ -202,10 +202,10 @@ func TestTheJournalSaysWhichRunAJobBelongedTo(t *testing.T) {
 				continue
 			}
 			found = true
-			if e.Flow != origin.Flow || e.Run != origin.Run || e.Thread != origin.Thread || e.Step != origin.Step {
-				t.Errorf("the %s entry records flow %q run %q thread %q step %d, want %q/%q/%q/%d",
-					kind, e.Flow, e.Run, e.Thread, e.Step,
-					origin.Flow, origin.Run, origin.Thread, origin.Step)
+			if e.Run != origin.Run || e.Thread != origin.Thread || e.Step != origin.Step {
+				t.Errorf("the %s entry records run %q thread %q step %d, want %q/%q/%d",
+					kind, e.Run, e.Thread, e.Step,
+					origin.Run, origin.Thread, origin.Step)
 			}
 			if e.Worker == "" {
 				t.Errorf("the %s entry names no worker, which is the other half of the answer", kind)
@@ -230,9 +230,9 @@ func TestABareCallLeavesTheRunColumnsEmpty(t *testing.T) {
 		return countKind(es, journalSubmitted) >= 1
 	})
 	for _, e := range entries {
-		if e.Flow != "" || e.Run != "" || e.Thread != "" {
-			t.Errorf("a %s entry for a bare call claims flow %q run %q thread %q",
-				e.Kind, e.Flow, e.Run, e.Thread)
+		if e.Run != "" || e.Thread != "" {
+			t.Errorf("a %s entry for a bare call claims run %q thread %q",
+				e.Kind, e.Run, e.Thread)
 		}
 	}
 }

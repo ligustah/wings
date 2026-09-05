@@ -8,15 +8,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// received records, per attempt, the order in which the workflow took values
-// off a channel. Determinism across a retry is the whole claim, and the order is
-// the only place it is visible.
+// received records, per attempt, the order in which the run took values off a
+// channel. Determinism across a retry is the whole claim, and the order is the
+// only place it is visible.
 var received struct {
 	mu   sync.Mutex
 	byGo [][]int
@@ -41,9 +40,9 @@ func orders() [][]int {
 }
 
 // countEvents tallies a run's history by payload kind.
-func countEvents(t *testing.T, store flow.Store, workflow, instance string) map[string]int {
+func countEvents(t *testing.T, store flow.Store, run string) map[string]int {
 	t.Helper()
-	evs, err := store.Events(context.Background(), workflow, instance)
+	evs, err := store.Events(context.Background(), run)
 	if err != nil {
 		t.Fatalf("Events: %v", err)
 	}
@@ -54,16 +53,15 @@ func countEvents(t *testing.T, store flow.Store, workflow, instance string) map[
 	return out
 }
 
-// A channel between workflow threads has to work like a Go channel first, or
-// none of the replay machinery underneath it matters.
+// A channel between threads has to work like a Go channel first, or none of
+// the replay machinery underneath it matters.
 func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
-	ctx := cluster(t)
-
-	wf := flow.Define("chan.pipeline", func(ctx context.Context, n int) (int, error) {
+	var got int
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		ch := flow.NewChannel[int](ctx)
 
 		producer := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
-			for i := 1; i <= n; i++ {
+			for i := 1; i <= 3; i++ {
 				v, err := double(ctx, i)
 				if err != nil {
 					return 0, err
@@ -79,7 +77,7 @@ func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 		for {
 			v, ok, err := ch.Recv(ctx)
 			if err != nil {
-				return 0, err
+				return err
 			}
 			if !ok {
 				break
@@ -87,12 +85,11 @@ func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 			total += v
 		}
 		if _, err := producer.Await(ctx); err != nil {
-			return 0, err
+			return err
 		}
-		return total, nil
-	})
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), 3, flow.WithStore(flow.NewMemStore()))
+		got = total
+		return nil
+	}, flow.WithStore(flow.NewMemStore()))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -102,16 +99,19 @@ func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 }
 
 // THE POINT: which of two concurrent senders arrives first is the operating
-// system's decision, not the workflow's — so a replay that took "whatever is
+// system's decision, not the run's — so a replay that took "whatever is
 // there" would take a different value than the run it is replaying, and every
-// decision the workflow made from that value would be wrong. The receive is
+// decision the run made from that value would be wrong. The receive is
 // recorded, and a replay waits for exactly the item it took last time.
 func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
-	ctx := cluster(t)
 	resetOrders()
+	const n = 4
 
 	var attempts atomic.Int64
-	wf := flow.Define("chan.order", func(ctx context.Context, n int) (int, error) {
+	var got int
+	name := flow.NewName()
+	store := flow.NewMemStore()
+	err := flow.Run(t.Context(), name, func(ctx context.Context) error {
 		ch := flow.NewChannel[int](ctx)
 
 		// Two producers racing. Each sends its own numbers as fast as it can,
@@ -132,30 +132,27 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 		for range 2 * n {
 			v, ok, err := ch.Recv(ctx)
 			if err != nil {
-				return 0, err
+				return err
 			}
 			if !ok {
-				return 0, errors.New("channel closed early")
+				return errors.New("channel closed early")
 			}
 			order = append(order, v)
 		}
 		for _, p := range producers {
 			if _, err := p.Await(ctx); err != nil {
-				return 0, err
+				return err
 			}
 		}
 		recordOrder(order)
 
 		// Fail the first two attempts, so the third replays both of them.
 		if attempts.Add(1) <= 2 {
-			return 0, errors.New("not yet")
+			return errors.New("not yet")
 		}
-		return len(order), nil
-	}, flow.Backoff(time.Millisecond, time.Millisecond))
-
-	instance := flow.NewInstance()
-	store := flow.NewMemStore()
-	got, err := flow.Run(ctx, wf, instance, 4, flow.WithStore(store))
+		got = len(order)
+		return nil
+	}, flow.WithStore(store), quick)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -165,7 +162,7 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 
 	seen := orders()
 	if len(seen) != 3 {
-		t.Fatalf("the workflow body ran %d times, want 3", len(seen))
+		t.Fatalf("the body ran %d times, want 3", len(seen))
 	}
 	for i, o := range seen[1:] {
 		if !slices.Equal(o, seen[0]) {
@@ -177,7 +174,7 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 	// And the history must not have grown a set of channel events per attempt.
 	// Eight values were sent and eight received, once, however many times the
 	// body ran.
-	counts := countEvents(t, store, "chan.order", instance)
+	counts := countEvents(t, store, name)
 	if counts["ChannelSendEvent"] != 8 {
 		t.Errorf("the history holds %d sends, want 8 — a replayed send must be consumed, not appended",
 			counts["ChannelSendEvent"])
@@ -190,14 +187,14 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 // A buffered channel accepts values with nobody waiting for them, which is the
 // only thing that distinguishes it from an unbuffered one.
 func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
-	ctx := cluster(t)
-
-	wf := flow.Define("chan.buffered", func(ctx context.Context, n int) (int, error) {
+	const n = 4
+	var got int
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		ch := flow.NewBufferedChannel[int](ctx, n)
 
 		// Fills the buffer and returns without anybody having received. On an
 		// unbuffered channel this thread would still be blocked on its first
-		// send when Await was called, and the workflow would deadlock.
+		// send when Await was called, and the run would deadlock.
 		filler := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
 			for i := range n {
 				if err := ch.Send(ctx, i); err != nil {
@@ -207,23 +204,20 @@ func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
 			return n, ch.Close(ctx)
 		})
 		if _, err := filler.Await(ctx); err != nil {
-			return 0, err
+			return err
 		}
 
-		count := 0
 		for {
 			_, ok, err := ch.Recv(ctx)
 			if err != nil {
-				return 0, err
+				return err
 			}
 			if !ok {
-				return count, nil
+				return nil
 			}
-			count++
+			got++
 		}
-	})
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), 4, flow.WithStore(flow.NewMemStore()))
+	}, flow.WithStore(flow.NewMemStore()))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -235,9 +229,8 @@ func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
 // Closing must not throw away what was already sent, exactly as with a Go
 // channel: receives drain first and only then report the channel closed.
 func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
-	ctx := cluster(t)
-
-	wf := flow.Define("chan.drain", func(ctx context.Context, _ int) (string, error) {
+	var got string
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		ch := flow.NewBufferedChannel[string](ctx, 2)
 
 		sender := flow.Spawn(ctx, func(ctx context.Context) (int, error) {
@@ -250,23 +243,22 @@ func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
 			return 0, ch.Close(ctx)
 		})
 		if _, err := sender.Await(ctx); err != nil {
-			return "", err
+			return err
 		}
 
-		var got []string
+		var parts []string
 		for {
 			v, ok, err := ch.Recv(ctx)
 			if err != nil {
-				return "", err
+				return err
 			}
 			if !ok {
-				return strings.Join(got, ""), nil
+				got = strings.Join(parts, "")
+				return nil
 			}
-			got = append(got, v)
+			parts = append(parts, v)
 		}
-	})
-
-	got, err := flow.Run(ctx, wf, flow.NewInstance(), 0, flow.WithStore(flow.NewMemStore()))
+	}, flow.WithStore(flow.NewMemStore()))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -275,14 +267,12 @@ func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
 	}
 }
 
-// A channel's identity has to come from the workflow, not from the caller: a
-// name somebody chose can be reused or built from something that varies between
+// A channel's identity has to come from the run, not from the caller: a name
+// somebody chose can be reused or built from something that varies between
 // attempts, and this one cannot.
 func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
-	ctx := cluster(t)
-
 	var names []string
-	wf := flow.Define("chan.names", func(ctx context.Context, _ int) (int, error) {
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx context.Context) error {
 		names = nil
 		names = append(names, flow.NewChannel[int](ctx).Name())
 		names = append(names, flow.NewChannel[int](ctx).Name())
@@ -292,10 +282,9 @@ func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
 			return 0, nil
 		})
 		_, err := child.Await(ctx)
-		return 0, err
-	})
-
-	if _, err := flow.Run(ctx, wf, flow.NewInstance(), 0, flow.WithStore(flow.NewMemStore())); err != nil {
+		return err
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	want := []string{"main.ch0", "main.ch1", "main.0.ch0"}
@@ -304,21 +293,21 @@ func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
 	}
 }
 
-// Outside a workflow there is no history to record a receive in, so a channel
+// Outside a run there is no history to record a receive in, so a channel
 // there is exactly the non-determinism the type exists to remove. It says so
 // rather than working by accident.
-func TestAChannelOutsideAWorkflowRefusesToBeUsed(t *testing.T) {
+func TestAChannelOutsideARunRefusesToBeUsed(t *testing.T) {
 	ch := flow.NewChannel[int](context.Background())
 
 	if err := ch.Send(context.Background(), 1); err == nil {
-		t.Fatal("want an error from a send outside a workflow")
-	} else if !strings.Contains(err.Error(), "outside a workflow") {
+		t.Fatal("want an error from a send outside a run")
+	} else if !strings.Contains(err.Error(), "outside a Run") {
 		t.Fatalf("got %v", err)
 	}
 	if _, _, err := ch.Recv(context.Background()); err == nil {
-		t.Fatal("want an error from a receive outside a workflow")
+		t.Fatal("want an error from a receive outside a run")
 	}
 	if err := ch.Close(context.Background()); err == nil {
-		t.Fatal("want an error from a close outside a workflow")
+		t.Fatal("want an error from a close outside a run")
 	}
 }

@@ -7,11 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ligustah/durable_streams/dswire"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // TestMain lets the test binary be its own worker.
@@ -31,23 +35,23 @@ type point struct {
 	X, Y int
 }
 
-var double = Define("test.double", func(ctx context.Context, in int) (int, error) {
+var double = flow.Define("test.double", func(ctx context.Context, in int) (int, error) {
 	return in * 2, nil
 })
 
-var sum = Define("test.sum", func(ctx context.Context, in point) (int, error) {
+var sum = flow.Define("test.sum", func(ctx context.Context, in point) (int, error) {
 	return in.X + in.Y, nil
 })
 
-var boom = Define("test.boom", func(ctx context.Context, in string) (string, error) {
+var boom = flow.Define("test.boom", func(ctx context.Context, in string) (string, error) {
 	return "", errors.New("deliberate failure: " + in)
 })
 
-var panics = Define("test.panics", func(ctx context.Context, in int) (int, error) {
+var panics = flow.Define("test.panics", func(ctx context.Context, in int) (int, error) {
 	panic("deliberate panic")
 })
 
-var slow = Define("test.slow", func(ctx context.Context, d time.Duration) (string, error) {
+var slow = flow.Define("test.slow", func(ctx context.Context, d time.Duration) (string, error) {
 	select {
 	case <-time.After(d):
 		return "finished", nil
@@ -55,6 +59,29 @@ var slow = Define("test.slow", func(ctx context.Context, d time.Duration) (strin
 		return "", ctx.Err()
 	}
 })
+
+// runSeq names each test run distinctly: a run's name is its history, and a
+// second run under a finished one's name would be that run, already done.
+var runSeq atomic.Uint64
+
+// mapOn fans f out over ins as a run on c, the way Coordinate would, and
+// returns what Map returned. Map is only callable inside a run — it forks a
+// thread per input — so this is how a test gets a fan-out out of a cluster.
+func mapOn[In, Out any](ctx context.Context, c *Cluster, f flow.Func[In, Out], ins []In) ([]Out, error) {
+	var (
+		outs   []Out
+		mapErr error
+	)
+	name := "test-map-" + strconv.FormatUint(runSeq.Add(1), 36)
+	err := c.Run(ctx, name, func(ctx context.Context) error {
+		outs, mapErr = flow.Map(ctx, f, ins)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return outs, mapErr
+}
 
 func start(t *testing.T, cfg Config) *Cluster {
 	t.Helper()
@@ -126,7 +153,7 @@ func TestMapPreservesOrder(t *testing.T) {
 		want[i] = i * 2
 	}
 
-	got, err := Map(c.Bind(t.Context()), double, in)
+	got, err := mapOn(t.Context(), c, double, in)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -201,7 +228,7 @@ func TestLocalProcessTargetMatchesInProcess(t *testing.T) {
 		want[i] = i * 2
 	}
 
-	got, err := Map(c.Bind(t.Context()), double, in)
+	got, err := mapOn(t.Context(), c, double, in)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -220,14 +247,13 @@ func TestLocalProcessTargetMatchesInProcess(t *testing.T) {
 func TestUnknownFunctionIsReported(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	// Built directly rather than through Define, because Define would register
+	// Sent by name rather than through a Func, because Define would register
 	// it — and then it would not be missing.
-	ghost := &def[int, int]{
-		name:     "test.not-registered",
-		inCodec:  dswire.ReflectCodec[int]{},
-		outCodec: dswire.ReflectCodec[int]{},
+	payload, err := dswire.EncodeRecord(dswire.ReflectCodec[int]{}, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, err := ghost.dispatch(c.Bind(t.Context()), 1)
+	_, err = clusterExecutor{c}.Invoke(c.Bind(t.Context()), "test.not-registered", payload)
 	if err == nil {
 		t.Fatal("want an error for an unregistered function")
 	}
@@ -252,7 +278,7 @@ func TestJobsThatArriveTogetherGoInOneAppend(t *testing.T) {
 	for i := range in {
 		in[i], want[i] = i, i*2
 	}
-	got, err := Map(c.Bind(t.Context()), double, in)
+	got, err := mapOn(t.Context(), c, double, in)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -283,7 +309,7 @@ func TestAWorkerThatIsGoneLeavesNothingBehind(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Start: %v", err)
 			}
-			if _, err := Map(c.Bind(t.Context()), double, []int{1, 2, 3, 4}); err != nil {
+			if _, err := mapOn(t.Context(), c, double, []int{1, 2, 3, 4}); err != nil {
 				t.Fatalf("Map: %v", err)
 			}
 			var ids []string
@@ -366,7 +392,7 @@ func TestGivingUpOnAJobStopsItOnTheWorker(t *testing.T) {
 func TestMapEmptyInput(t *testing.T) {
 	c := start(t, Config{Target: InProcess()})
 
-	got, err := Map(c.Bind(t.Context()), double, nil)
+	got, err := mapOn(t.Context(), c, double, nil)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
 	}
@@ -381,7 +407,7 @@ func TestDuplicateDefinePanics(t *testing.T) {
 			t.Fatal("want a panic on duplicate Define")
 		}
 	}()
-	_ = Define("test.double", func(ctx context.Context, in int) (int, error) { return in, nil })
+	_ = flow.Define("test.double", func(ctx context.Context, in int) (int, error) { return in, nil })
 }
 
 func TestStopIsIdempotent(t *testing.T) {
@@ -408,7 +434,7 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 
 	started := time.Now()
-	got, err := Map(c.Bind(t.Context()), slow, in)
+	got, err := mapOn(t.Context(), c, slow, in)
 	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatalf("Map: %v", err)
@@ -423,7 +449,7 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 }
 
-var huge = Define("test.huge", func(ctx context.Context, n int) (string, error) {
+var huge = flow.Define("test.huge", func(ctx context.Context, n int) (string, error) {
 	return strings.Repeat("x", n), nil
 })
 
@@ -484,7 +510,7 @@ func TestGivingUpOnAJobWithNoWorkerIsHarmless(t *testing.T) {
 
 func ExampleDefine() {
 	// Defined at package scope in real code, so a worker process has it too.
-	greet := Define("example.greet", func(ctx context.Context, name string) (string, error) {
+	greet := flow.Define("example.greet", func(ctx context.Context, name string) (string, error) {
 		return "hello, " + name, nil
 	})
 
@@ -494,7 +520,7 @@ func ExampleDefine() {
 	}
 	defer c.Stop(context.Background())
 
-	out, err := Map(c.Bind(context.Background()), greet, []string{"ada", "alan"})
+	out, err := mapOn(context.Background(), c, greet, []string{"ada", "alan"})
 	if err != nil {
 		panic(err)
 	}

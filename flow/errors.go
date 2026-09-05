@@ -8,7 +8,7 @@ import (
 
 // Permanent marks an error as one that must not be retried.
 //
-// The default is the opposite — an error a workflow returns is assumed to be
+// The default is the opposite — an error a run's body returns is assumed to be
 // worth another attempt — because the errors that dominate distributed work are
 // transient ones. Use this for the errors that are not: a malformed input, a
 // rejected credential, anything where the next attempt fails identically and
@@ -42,13 +42,13 @@ type permanentError struct{ err error }
 func (p *permanentError) Error() string { return "permanent error: " + p.err.Error() }
 func (p *permanentError) Unwrap() error { return p.err }
 
-// Suspend ends this attempt of the workflow until t.
+// Suspend ends this attempt of the run until t.
 //
 // The attempt ends and its events are durable, so nothing of it stays in
 // memory: no thread, no locals, no half-finished call. At t the next attempt
 // replays what already happened and carries on from here. That is the
-// difference between a workflow and a long function call, and it is what lets
-// a workflow that waits for tomorrow keep nothing alive today.
+// difference between a run and a long function call, and it is what lets
+// a run that waits for tomorrow keep nothing alive today.
 //
 // What it does NOT do is return from [Run]. Run waits in place
 // until t and starts the next attempt itself, so the caller's goroutine is
@@ -58,8 +58,7 @@ func Suspend(until time.Time) error { return &suspendError{Until: until} }
 
 // IsSuspended reports whether err is a suspension, and until when.
 func IsSuspended(err error) (bool, time.Time) {
-	var s *suspendError
-	if errors.As(err, &s) {
+	if s, ok := errors.AsType[*suspendError](err); ok {
 		return true, s.Until
 	}
 	return false, time.Time{}
@@ -69,20 +68,20 @@ type suspendError struct{ Until time.Time }
 
 func (s *suspendError) Error() string { return "suspended until " + s.Until.Format(time.RFC3339) }
 
-// continuityError means the workflow did something on this attempt that
+// continuityError means the run did something on this attempt that
 // contradicts what the log says it did on the last one.
 //
 // It is always fatal and never retried, because a retry replays the same log
 // against the same code and reaches the same contradiction. It nearly always
-// means the workflow function was edited while runs of it were in flight —
+// means the run's body was edited while runs of it were in flight —
 // which is a deployment problem, not a runtime one, and the error says so.
 type continuityError struct{ msg string }
 
 func (c *continuityError) Error() string {
-	return "workflow continuity error: " + c.msg + "\n" +
-		"(the workflow did something that does not match its recorded history; " +
+	return "continuity error: " + c.msg + "\n" +
+		"(the run did something that does not match its recorded history; " +
 		"this usually means the function changed while a run of it was in flight — " +
-		"change the workflow's name or version instead of editing one that is running)"
+		"change the run's name or version instead of editing one that is running)"
 }
 
 // IsContinuity reports whether err is a replay mismatch.

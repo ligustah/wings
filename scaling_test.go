@@ -153,7 +153,7 @@ func TestAutoscaleAddsWorkersUnderLoad(t *testing.T) {
 
 	done := make(chan []string, 1)
 	go func() {
-		got, err := Map(c.Bind(t.Context()), slow, in)
+		got, err := mapOn(t.Context(), c, slow, in)
 		if err != nil {
 			t.Errorf("Map: %v", err)
 		}
@@ -203,7 +203,7 @@ func TestAutoscaleRetiresIdleWorkers(t *testing.T) {
 	for i := range in {
 		in[i] = 150 * time.Millisecond
 	}
-	if _, err := Map(c.Bind(t.Context()), slow, in); err != nil {
+	if _, err := mapOn(t.Context(), c, slow, in); err != nil {
 		t.Fatalf("Map: %v", err)
 	}
 
@@ -244,7 +244,7 @@ func TestScaleDownNeverDropsWork(t *testing.T) {
 			in[i] = round*100 + i
 			want[i] = in[i] * 2
 		}
-		got, err := Map(c.Bind(t.Context()), double, in)
+		got, err := mapOn(t.Context(), c, double, in)
 		if err != nil {
 			t.Fatalf("round %d: Map: %v", round, err)
 		}
@@ -281,7 +281,7 @@ func TestAutoscaleWorksOnTheLocalTarget(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if _, err := Map(c.Bind(t.Context()), slow, in); err != nil {
+		if _, err := mapOn(t.Context(), c, slow, in); err != nil {
 			t.Errorf("Map: %v", err)
 		}
 	}()

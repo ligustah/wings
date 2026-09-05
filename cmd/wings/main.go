@@ -9,11 +9,11 @@
 //
 //	package job
 //
-//	var Render = wings.Define("render", func(ctx context.Context, f Frame) (Image, error) { … })
+//	var Render = flow.Define("render", func(ctx context.Context, f Frame) (Image, error) { … })
 //
-//	// Coordinate is called once, with a cluster that is already up.
-//	func Coordinate(ctx context.Context, c *wings.Cluster) error {
-//		imgs, err := wings.Map(ctx, Render, frames)
+//	// Coordinate is run as a flow once the cluster is up.
+//	func Coordinate(ctx context.Context) error {
+//		imgs, err := flow.Map(ctx, Render, frames)
 //		…
 //	}
 //
@@ -119,8 +119,8 @@ Flags:
   -v                print the go build commands
 
 Your package must export:
-  func Coordinate(ctx context.Context, c *wings.Cluster) error   (required)
-  func Provisioner() wings.Provisioner                           (optional; overrides -provider)
+  func Coordinate(ctx context.Context) error   (required)
+  func Provisioner() wings.Provisioner         (optional; overrides -provider)
 
 Example:
   wings build -pkg ./job -coordinator windows/amd64 -worker linux/amd64 -o myapp.exe
@@ -194,7 +194,7 @@ func build(args []string) error {
 	}
 	if !api.hasCoordinate {
 		return fmt.Errorf("package %s does not export Coordinate.\n"+
-			"Add:\n\n\tfunc Coordinate(ctx context.Context, c *wings.Cluster) error { … }\n",
+			"Add:\n\n\tfunc Coordinate(ctx context.Context) error { … }\n",
 			coordinate.ImportPath)
 	}
 
@@ -298,7 +298,7 @@ func build(args []string) error {
 // one of the providers wings ships; anything with a slash is somebody else's.
 func providerImports(list string) []string {
 	var out []string
-	for _, name := range strings.Split(list, ",") {
+	for name := range strings.SplitSeq(list, ",") {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue

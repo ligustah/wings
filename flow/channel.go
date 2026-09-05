@@ -11,9 +11,9 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// Channel carries typed values between the threads of one workflow.
+// Channel carries typed values between the threads of one run.
 //
-// It is what a Go channel is for, with one difference that matters: a workflow
+// It is what a Go channel is for, with one difference that matters: a run
 // can be replayed, and a Go channel cannot promise that the same value arrives
 // first twice. So a receive is RECORDED — which thread's which send it took —
 // and on a later attempt it waits for exactly that item rather than for
@@ -22,13 +22,13 @@ import (
 // recorded about a send is when it COMPLETED, which on an unbuffered channel is
 // somebody else's decision.
 //
-// Create one with [NewChannel] or [NewBufferedChannel], inside a workflow, at a
-// point every attempt reaches — the same rule as everything else in a workflow
-// function. Pass it to threads forked by [Go] or [github.com/ligustah/wings.Map]
+// Create one with [NewChannel] or [NewBufferedChannel], inside a Run, at a
+// point every attempt reaches — the same rule as everything else in a run's
+// body. Pass it to threads forked by [Go] or [Map]
 // the way you would pass a Go channel to a goroutine; it is safe to use from all
 // of them at once.
 //
-// Not usable outside a workflow. There is no history there to record a receive
+// Not usable outside a Run. There is no history there to record a receive
 // in, and a channel whose receives are not recorded is exactly the
 // non-determinism this type exists to remove.
 type Channel[T any] struct {
@@ -147,7 +147,7 @@ func (c *Channel[T]) Recv(ctx context.Context) (T, bool, error) {
 		}
 		// The one place replay differs from a live run: wait for THAT item,
 		// not for the first one going. Two sends racing produced one order last
-		// time and would produce another now, and the workflow already acted on
+		// time and would produce another now, and the run already acted on
 		// the first.
 		item, err := cs.awaitItem(ctx, ev.GetFromThreadId(), ev.GetFromSeq())
 		if err != nil {
@@ -218,15 +218,15 @@ func (c *Channel[T]) Close(ctx context.Context) error {
 // bind resolves the calling thread and this channel's shared state.
 func (c *Channel[T]) bind(ctx context.Context) (*threadState, *chanState, error) {
 	if c.run == nil {
-		return nil, nil, errors.New("flow: this channel was created outside a workflow; " +
-			"create it inside the workflow function, with the context it was given")
+		return nil, nil, errors.New("flow: this channel was created outside a Run; " +
+			"create it inside the run's body, with the context it was given")
 	}
 	t := threadFrom(ctx)
 	if t == nil {
-		return nil, nil, fmt.Errorf("flow: channel %s was used outside a workflow thread", c.name)
+		return nil, nil, fmt.Errorf("flow: channel %s was used outside a run's thread", c.name)
 	}
 	if t.run != c.run {
-		return nil, nil, fmt.Errorf("flow: channel %s belongs to another workflow run", c.name)
+		return nil, nil, fmt.Errorf("flow: channel %s belongs to another run", c.name)
 	}
 	cs := c.run.channel(c.name)
 	if cs == nil {

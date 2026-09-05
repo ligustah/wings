@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"reflect"
 
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
@@ -84,8 +85,8 @@ func (r Recording) Zero() bool { return r.ID == "" }
 // proto.Message, then binary or text marshalling, then JSON — and E must be the
 // same type on both sides.
 func Record[E any](ctx context.Context, name string) (*Recorder[E], error) {
-	st := beatFrom(ctx)
-	if st == nil {
+	j := jobFrom(ctx)
+	if j == nil {
 		return nil, errors.New("wings: Record was called outside a work function; " +
 			"a recording belongs to a job, and there is no job here")
 	}
@@ -102,7 +103,7 @@ func Record[E any](ctx context.Context, name string) (*Recorder[E], error) {
 		stream:  stream,
 		name:    name,
 		id:      id,
-		attempt: st.attempt,
+		attempt: j.attempt,
 	}, nil
 }
 
@@ -121,6 +122,20 @@ func eventStream[E any](client *dsclient.Client, name string) (*dsclient.Stream[
 		return nil, fmt.Errorf("wings: open %s: %w", name, err)
 	}
 	return s, nil
+}
+
+// allocator returns a factory for E when E is a pointer type, and nil
+// otherwise. dswire.ReflectCodec needs one to decode into a pointer — it has
+// no way to allocate the pointed-to value itself.
+func allocator[E any]() func() E {
+	var zero E
+	rt := reflect.TypeOf(&zero).Elem()
+	if rt.Kind() != reflect.Pointer {
+		return nil
+	}
+	return func() E {
+		return reflect.New(rt.Elem()).Interface().(E)
+	}
 }
 
 // Recorder is a job's event log. Safe for one goroutine at a time.
@@ -240,11 +255,11 @@ func (r *Recorder[E]) Recording() Recording {
 //
 // Empty on a first attempt, and outside a work function.
 func Priors(ctx context.Context) []Recording {
-	st := beatFrom(ctx)
-	if st == nil {
+	j := jobFrom(ctx)
+	if j == nil {
 		return nil
 	}
-	return st.priors
+	return j.priors
 }
 
 // Replay hands back the events of a log, in the order they were recorded.

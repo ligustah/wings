@@ -3,12 +3,13 @@ package wings
 import (
 	"context"
 	"errors"
-
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // resumable counts how much work each attempt actually did, which is the only
@@ -29,8 +30,8 @@ var wedge struct {
 // chunks processes items one at a time, heartbeating its position, and can be
 // told to go quiet part-way through. That combination is the whole feature: a
 // job that stops reporting is moved, and the move is cheap because it resumes.
-var chunks = Define("test.chunks", func(ctx context.Context, total int) (int, error) {
-	from, _, err := Checkpoint[int](ctx)
+var chunks = flow.Define("test.chunks", func(ctx context.Context, total int) (int, error) {
+	from, _, err := flow.Checkpoint[int](ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -49,7 +50,7 @@ var chunks = Define("test.chunks", func(ctx context.Context, total int) (int, er
 			return 0, errors.New("test.chunks: first attempt was abandoned")
 		}
 		did++
-		if err := Heartbeat(ctx, i+1); err != nil {
+		if err := flow.Heartbeat(ctx, i+1); err != nil {
 			return 0, err
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -59,12 +60,12 @@ var chunks = Define("test.chunks", func(ctx context.Context, total int) (int, er
 	resumable.done = append(resumable.done, did)
 	resumable.mu.Unlock()
 	return total, nil
-}, WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithHeartbeatTimeout(300*time.Millisecond))
 
-var forever = Define("test.forever", func(ctx context.Context, _ int) (int, error) {
+var forever = flow.Define("test.forever", func(ctx context.Context, _ int) (int, error) {
 	<-ctx.Done()
 	return 0, ctx.Err()
-}, WithTimeout(200*time.Millisecond))
+}, flow.WithTimeout(200*time.Millisecond))
 
 // THE POINT: a job that goes quiet is presumed stuck on its machine rather than
 // slow, and is moved — but moving it must not throw away what it had already
@@ -157,10 +158,10 @@ func TestAFunctionsOwnTimeoutWinsOverTheClusterDefault(t *testing.T) {
 // Heartbeat outside a work function has no job to report on, and says so rather
 // than quietly doing nothing.
 func TestHeartbeatOutsideAJobIsAnError(t *testing.T) {
-	if err := Heartbeat(context.Background(), 1); err == nil {
+	if err := flow.Heartbeat(context.Background(), 1); err == nil {
 		t.Fatal("want an error from a heartbeat with no job")
 	}
-	v, ok, err := Checkpoint[int](context.Background())
+	v, ok, err := flow.Checkpoint[int](context.Background())
 	if err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
@@ -171,14 +172,14 @@ func TestHeartbeatOutsideAJobIsAnError(t *testing.T) {
 
 // quick is a short job with short bounds. It runs in a fraction of either, so
 // the only way it can fail is by being charged for time it spent waiting.
-var quick = Define("test.quick", func(ctx context.Context, _ int) (string, error) {
+var quick = flow.Define("test.quick", func(ctx context.Context, _ int) (string, error) {
 	select {
 	case <-time.After(20 * time.Millisecond):
 		return "finished", nil
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-}, WithTimeout(300*time.Millisecond), WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithTimeout(300*time.Millisecond), flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a bound is on the work, not on the queue in front of it. One worker
 // with one slot is given a slow job, and then a quick one that waits behind it
@@ -222,8 +223,8 @@ func TestAQueuedJobIsNotChargedForItsWait(t *testing.T) {
 func TestBoundsRunFromWhenTheJobStarted(t *testing.T) {
 	t0 := time.Now()
 	p := &pendingJob{
-		opts:  defOptions{timeout: time.Minute, beat: 10 * time.Second},
-		since: t0,
+		bounds: flow.Bounds{Timeout: time.Minute, Heartbeat: 10 * time.Second},
+		since:  t0,
 	}
 
 	// Queued for an hour: neither bound has begun.
@@ -256,7 +257,7 @@ func TestBoundsRunFromWhenTheJobStarted(t *testing.T) {
 	}
 
 	// The start bound is the one thing that applies before the job runs.
-	q := &pendingJob{opts: defOptions{start: time.Minute}, since: t0}
+	q := &pendingJob{bounds: flow.Bounds{Start: time.Minute}, since: t0}
 	if stuck, _ := q.overdue(t0.Add(30 * time.Second)); stuck {
 		t.Fatal("a job queued for thirty seconds of a one-minute start bound is overdue")
 	}
