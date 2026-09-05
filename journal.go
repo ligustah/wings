@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
@@ -31,6 +32,19 @@ const (
 	journalWorkerUp     = "worker-up"   // a worker entered service
 	journalWorkerGone   = "worker-gone" // a worker left, one way or another
 	journalClusterStop  = "stop"        // Stop was called
+)
+
+const (
+	// journalBuffer is how many entries may be queued for the writer. Deep
+	// enough that an ordinary burst of submits never touches the bottom,
+	// shallow enough that a wedged writer cannot pin much memory.
+	journalBuffer = 4096
+
+	// journalWait is how long an entry that matters waits for room in a full
+	// queue before it is dropped. The writer drains thousands of entries a
+	// second, so this is many batches' worth; an entry still waiting after it
+	// is one the writer is not going to take.
+	journalWait = time.Second
 )
 
 // journalEntry is one line in that account.
@@ -72,28 +86,31 @@ func (e journalEntry) from(o invoke.Origin) journalEntry {
 // journal appends entries off the hot path.
 //
 // Recording must never become backpressure on the work itself, so writes go
-// through a buffered channel drained by one goroutine, and a full buffer DROPS
-// entries rather than blocking a submit. That is the right trade for a record
-// kept for diagnosis: an incomplete account of a run is bad, an account that
-// makes the run slower is worse. Drops are counted and reported, so a gap is
+// through a buffered channel drained by one goroutine. What happens when the
+// buffer is full depends on what the entry is. A completion is the flood — one
+// per job, and the one line that is also implied by the result reaching its
+// caller — and is dropped on the spot. Everything else is what a post-mortem
+// is read for: which job went where, what was moved, which worker was lost.
+// Those wait, briefly, for room; only an entry the writer will not take within
+// that wait is dropped. Drops are counted and reported either way, so a gap is
 // never silent.
 type journal struct {
 	stream *dsclient.Stream[journalEntry]
 	log    *slog.Logger
 	epoch  string
 
-	ch   chan journalEntry
+	ch chan journalEntry
+	// quit is closed by close, and is what a recorder checks rather than a
+	// closed ch: a send on a closed channel panics, select or no select, and an
+	// entry can arrive after close — a goroutine that was moving a job when
+	// Stop began finishes its move against a journal already drained. Those
+	// are counted, not written, and never a crash.
+	quit chan struct{}
 	done chan struct{}
+	once sync.Once
 
-	// mu serialises record against close. A send on a closed channel panics,
-	// select or no select, and an entry can arrive after close: a goroutine
-	// that was moving a job when Stop began finishes its move against a
-	// journal that has already been drained. Those are counted, not written,
-	// and never a crash.
-	mu      sync.Mutex
-	closed  bool
-	dropped int
-	late    int
+	dropped atomic.Int64
+	late    atomic.Int64
 }
 
 // openJournal declares the stream and starts the writer.
@@ -112,20 +129,25 @@ func openJournal(ctx context.Context, client *dsclient.Client, log *slog.Logger,
 		return nil, fmt.Errorf("wings: open %s: %w", journalStream, err)
 	}
 
-	j := &journal{
-		stream: s,
-		log:    log,
-		epoch:  epoch,
-		// Deep enough that an ordinary burst of submits never touches the
-		// bottom, shallow enough that a wedged writer cannot pin much memory.
-		ch:   make(chan journalEntry, 4096),
-		done: make(chan struct{}),
-	}
+	j := newJournal(s, log, epoch, journalBuffer)
 	go j.write()
 	return j, nil
 }
 
-// record queues one entry. Never blocks, and is safe after close.
+// newJournal is a journal with its queue, and no writer running yet.
+func newJournal(s *dsclient.Stream[journalEntry], log *slog.Logger, epoch string, buffer int) *journal {
+	return &journal{
+		stream: s,
+		log:    log,
+		epoch:  epoch,
+		ch:     make(chan journalEntry, buffer),
+		quit:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+}
+
+// record queues one entry. Safe after close, and never blocks for a
+// completion; anything else may wait up to journalWait for room.
 func (j *journal) record(e journalEntry) {
 	if j == nil {
 		return
@@ -133,19 +155,29 @@ func (j *journal) record(e journalEntry) {
 	e.At = time.Now()
 	e.Epoch = j.epoch
 
-	// The lock is held across the send so close cannot slip in between the
-	// check and it. The send does not block, so nothing waits on this lock
-	// for longer than one channel operation.
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if j.closed {
-		j.late++
+	select {
+	case <-j.quit:
+		j.late.Add(1)
 		return
+	default:
 	}
 	select {
 	case j.ch <- e:
+		return
 	default:
-		j.dropped++
+	}
+	if e.Kind == journalCompleted {
+		j.dropped.Add(1)
+		return
+	}
+	t := time.NewTimer(journalWait)
+	defer t.Stop()
+	select {
+	case j.ch <- e:
+	case <-t.C:
+		j.dropped.Add(1)
+	case <-j.quit:
+		j.late.Add(1)
 	}
 }
 
@@ -159,21 +191,21 @@ func (j *journal) write() {
 
 	batch := make([]journalEntry, 0, 256)
 	for {
-		e, ok := <-j.ch
-		if !ok {
-			j.flush(batch)
+		select {
+		case e := <-j.ch:
+			batch = append(batch[:0], e)
+		case <-j.quit:
+			// What is still queued was recorded before close and is written.
+			// An entry that lands in the queue after this drain was sent by a
+			// recorder that saw the queue open, and is the one kind of entry
+			// this cannot count; the window is a channel operation wide.
+			j.flush(j.drain(batch[:0]))
 			return
 		}
-		batch = append(batch[:0], e)
-
 		// Take everything else already waiting, up to the batch size.
 		for len(batch) < cap(batch) {
 			select {
-			case e, ok := <-j.ch:
-				if !ok {
-					j.flush(batch)
-					return
-				}
+			case e := <-j.ch:
 				batch = append(batch, e)
 				continue
 			default:
@@ -184,6 +216,18 @@ func (j *journal) write() {
 	}
 }
 
+// drain takes everything queued right now, without waiting.
+func (j *journal) drain(batch []journalEntry) []journalEntry {
+	for {
+		select {
+		case e := <-j.ch:
+			batch = append(batch, e)
+		default:
+			return batch
+		}
+	}
+}
+
 func (j *journal) flush(batch []journalEntry) {
 	if len(batch) == 0 {
 		return
@@ -191,39 +235,30 @@ func (j *journal) flush(batch []journalEntry) {
 	// Background, not the cluster context: this runs during shutdown too, and
 	// the record of the shutdown is exactly the part worth keeping.
 	if _, err := j.stream.Append(context.Background(), batch); err != nil {
-		j.mu.Lock()
-		j.dropped += len(batch)
-		j.mu.Unlock()
+		j.dropped.Add(int64(len(batch)))
 		if j.log != nil {
 			j.log.Warn("wings: journal append failed", "entries", len(batch), "err", err)
 		}
 	}
 }
 
-// close stops the writer once everything already queued is written.
+// close stops the writer once everything already queued is written. Safe to
+// call twice.
 func (j *journal) close() {
 	if j == nil {
 		return
 	}
-	j.mu.Lock()
-	if j.closed {
-		j.mu.Unlock()
-		return
-	}
-	j.closed = true
-	close(j.ch)
-	j.mu.Unlock()
-	<-j.done
+	j.once.Do(func() {
+		close(j.quit)
+		<-j.done
 
-	j.mu.Lock()
-	dropped, late := j.dropped, j.late
-	j.mu.Unlock()
-	if dropped > 0 && j.log != nil {
-		j.log.Warn("wings: journal entries dropped", "count", dropped,
-			"why", "the journal fell behind; the record of this run has gaps")
-	}
-	if late > 0 && j.log != nil {
-		j.log.Warn("wings: journal entries arrived after the journal closed", "count", late,
-			"why", "something was still moving or failing a job as the cluster stopped")
-	}
+		if dropped := j.dropped.Load(); dropped > 0 && j.log != nil {
+			j.log.Warn("wings: journal entries dropped", "count", dropped,
+				"why", "the journal fell behind; the record of this run has gaps")
+		}
+		if late := j.late.Load(); late > 0 && j.log != nil {
+			j.log.Warn("wings: journal entries arrived after the journal closed", "count", late,
+				"why", "something was still moving or failing a job as the cluster stopped")
+		}
+	})
 }

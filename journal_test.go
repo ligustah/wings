@@ -248,3 +248,72 @@ func TestRecordingAfterTheJournalClosedIsNotAPanic(t *testing.T) {
 	c.journal.record(journalEntry{Kind: journalFailed, Job: "late"})
 	c.journal.close() // and closing twice is not one either
 }
+
+// THE POINT: a full queue used to drop whatever came next, and under a large
+// Map what came next was as likely a lost worker or a redispatch as one more
+// completion. The completions are the flood and may go; the rest is what the
+// record exists for, and waits for room instead.
+func TestTheJournalDropsTheFloodAndKeepsTheRest(t *testing.T) {
+	c := start(t, Config{Target: InProcess()})
+
+	s, err := c.shared.OpenStream[journalEntry]("wings.test-journal")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := c.shared.CreateStream(t.Context(), "wings.test-journal", nil); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A queue of two, full, with no writer draining it yet.
+	j := newJournal(s, c.log, "e", 2)
+	j.ch <- journalEntry{Kind: journalCompleted, Job: "a"}
+	j.ch <- journalEntry{Kind: journalCompleted, Job: "b"}
+
+	// One more completion is dropped on the spot, not waited for.
+	began := time.Now()
+	j.record(journalEntry{Kind: journalCompleted, Job: "c"})
+	if waited := time.Since(began); waited > 200*time.Millisecond {
+		t.Fatalf("a completion against a full queue waited %s; the flood must never be backpressure", waited)
+	}
+	if got := j.dropped.Load(); got != 1 {
+		t.Fatalf("dropped %d entries, want the one completion", got)
+	}
+
+	// A lost worker waits.
+	landed := make(chan struct{})
+	go func() {
+		j.record(journalEntry{Kind: journalWorkerGone, Worker: "w"})
+		close(landed)
+	}()
+	select {
+	case <-landed:
+		t.Fatal("a worker-gone entry against a full queue returned at once; it was dropped rather than waited for")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// And once the writer runs, it is written.
+	go j.write()
+	select {
+	case <-landed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker-gone entry never found room once the writer was draining")
+	}
+	j.close()
+
+	recs, err := s.Read(t.Context(), 0, 16)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var gone bool
+	for _, r := range recs {
+		if r.Record.Kind == journalWorkerGone {
+			gone = true
+		}
+	}
+	if !gone {
+		t.Fatalf("the worker-gone entry is not in the record; got %d entries", len(recs))
+	}
+	if got := j.dropped.Load(); got != 1 {
+		t.Fatalf("dropped %d entries by the end, want still just the one completion", got)
+	}
+}
