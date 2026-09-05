@@ -3,7 +3,9 @@ package flow_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,5 +205,24 @@ func TestALineageWaitsForAnAncestorStillReplaying(t *testing.T) {
 	}
 	if slowly != 42 {
 		t.Fatalf("got %d, want 42", slowly)
+	}
+}
+
+var spawnsAPanic = flow.DefineWorkflow("test.spawnsAPanic", func(ctx flow.Context, base int) error {
+	_, err := ctx.Spawn(func(ctx flow.Context) (int, error) { panic(fmt.Sprintf("on purpose, %d", base)) }).Await(ctx)
+	if err == nil {
+		return errors.New("the panicking thread returned nothing")
+	}
+	return flow.Permanent(fmt.Errorf("the thread's result: %w", err))
+})
+
+// THE POINT: a thread of run code that panics where it was sent has the
+// panic as its result, as one run in-process would, rather than the process
+// that replayed its way to it reporting that the histories fall short.
+func TestAPanicInAThreadRunElsewhereIsItsResult(t *testing.T) {
+	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	err := spawnsAPanic.Run(t.Context(), 3, p.opts()...)
+	if err == nil || !strings.Contains(err.Error(), "the thread's result: flow: panic in forked work: on purpose, 3") {
+		t.Fatalf("the thread's result is %v, want its panic", err)
 	}
 }

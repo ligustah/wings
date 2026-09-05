@@ -322,10 +322,20 @@ func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Cont
 	defer p.landed(nil)
 
 	// The target, for real: on RunLineage's own context, since the ancestor
-	// that forked it is stopped once it is over.
+	// that forked it is stopped once it is over. A panic in it is its
+	// result, as it would be in a thread run in-process — caught here
+	// rather than by the ancestor's fork, which would take it for the
+	// ancestor's own and leave RunLineage with nothing to report.
 	r := &threadRunner{run: p.rs, name: th.Run, id: th.ID, fn: th.Fn, input: th.Input,
 		body: body, opts: p.rs.opts, top: true}
-	out, err := r.execute(p.ctx)
+	out, err := func() (out []byte, err error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				err = fmt.Errorf("flow: panic in forked work: %v", rec)
+			}
+		}()
+		return r.execute(p.ctx)
+	}()
 	p.mu.Lock()
 	if !p.reported {
 		p.reported = true
