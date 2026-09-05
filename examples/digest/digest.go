@@ -109,3 +109,72 @@ var Main = flow.DefineWorkflow("digest", func(ctx flow.Context, in Params) error
 	fmt.Println(strings.Repeat("-", 40))
 	return nil
 })
+
+// Batch is a work function that does its work by calling another: it digests
+// a batch of seeds through Digest — calls the cluster places like any other,
+// so a batch on one worker fans out across the fleet — and reports each
+// result on the channel it was handed as it comes, rather than all at once
+// when it returns.
+type Batch struct {
+	Work    []Work                `json:"work"`
+	Results *flow.Channel[Result] `json:"results"`
+}
+
+var DigestBatch = flow.Define("digestBatch", func(ctx flow.Context, in Batch) (int, error) {
+	results, err := ctx.Map(Digest, in.Work)
+	if err != nil {
+		return 0, err
+	}
+	for _, r := range results {
+		if err := in.Results.Send(ctx, r); err != nil {
+			return 0, err
+		}
+	}
+	return len(results), nil
+})
+
+// Fanout is a second workflow, chosen with -workflow fanout. It splits the
+// work into batches, hands each batch a channel to report on, and prints
+// results as they arrive from wherever they were computed. The channel
+// crosses machines: the workflow reads it on the coordinator, the batches
+// write it on their workers.
+var Fanout = flow.DefineWorkflow("fanout", func(ctx flow.Context, in Params) error {
+	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
+	const batches = 4
+	results := ctx.NewChannel[Result]()
+
+	var futures []*flow.Future[int]
+	for b := range batches {
+		var work []Work
+		for i := b; i < jobs; i += batches {
+			work = append(work, Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: rounds})
+		}
+		futures = append(futures, ctx.Go(DigestBatch, Batch{Work: work, Results: results}))
+	}
+
+	start := time.Now()
+	hosts := map[string]int{}
+	for range jobs {
+		r, ok, err := results.Recv(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("the results channel closed after %d of %d results", len(hosts), jobs)
+		}
+		hosts[r.Host]++
+		fmt.Printf("  %s on %s\n", r.Seed, r.Host)
+	}
+	for _, f := range futures {
+		if _, err := f.Await(ctx); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("\n%d results in %s, from %d batches\n", jobs, time.Since(start).Round(time.Millisecond), batches)
+	for host, n := range hosts {
+		fmt.Printf("  %-24s %d jobs\n", host, n)
+	}
+	fmt.Println(strings.Repeat("-", 40))
+	return nil
+})
