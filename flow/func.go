@@ -172,8 +172,17 @@ func describe[In, Out any](ctx Context, f Func[In, Out], in In) (*capture, error
 	return cap, cap.err
 }
 
-func (d *def[In, Out]) encodeInput(in In) ([]byte, error) {
-	payload, err := dswire.EncodeRecord(d.inCodec, in)
+// encodeInput encodes a call's input as the calling thread's, when there is
+// one: a channel in the input is shared on that thread's behalf.
+func (d *def[In, Out]) encodeInput(ctx context.Context, in In) ([]byte, error) {
+	encode := func() ([]byte, error) { return dswire.EncodeRecord(d.inCodec, in) }
+	var payload []byte
+	var err error
+	if t := threadFrom(ctx); t != nil {
+		payload, err = t.encode(encode)
+	} else {
+		payload, err = encode()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("flow: encode input for %q: %w", d.name, err)
 	}
@@ -187,11 +196,11 @@ func (d *def[In, Out]) dispatch(ctx Context, in In) (Out, error) {
 	if cap, ok := ctx.Value(captureKey{}).(*capture); ok && !cap.taken {
 		// Asked what this call would be, not to make it. See capture.
 		cap.taken, cap.name, cap.codec = true, d.name, d.outCodec
-		cap.payload, cap.err = d.encodeInput(in)
+		cap.payload, cap.err = d.encodeInput(ctx, in)
 		return zero, nil
 	}
 
-	payload, err := d.encodeInput(in)
+	payload, err := d.encodeInput(ctx, in)
 	if err != nil {
 		return zero, err
 	}
@@ -242,7 +251,13 @@ func (d *def[In, Out]) invoke(ctx context.Context, payload []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	b, err := dswire.EncodeRecord(d.outCodec, out)
+	encode := func() ([]byte, error) { return dswire.EncodeRecord(d.outCodec, out) }
+	var b []byte
+	if t := threadFrom(ctx); t != nil {
+		b, err = t.encode(encode)
+	} else {
+		b, err = encode()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("encode output for %q: %w", d.name, err)
 	}

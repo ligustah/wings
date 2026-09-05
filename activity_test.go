@@ -516,7 +516,7 @@ func TestAWaitingThreadGivesUpItsSlot(t *testing.T) {
 	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
 		ch := ctx.NewChannel[int]()
 		receiver := ctx.Go(sums, feed{Values: ch}) // takes the slot, then waits
-		v, err := ctx.Go(double, 21).Await(ctx)     // needs the slot
+		v, err := ctx.Go(double, 21).Await(ctx)    // needs the slot
 		if err != nil {
 			return err
 		}

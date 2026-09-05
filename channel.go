@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -15,17 +14,23 @@ import (
 
 // A channel shared between runs on different machines is a durable stream
 // relayed through the coordinator. See the flow package's ChannelHost for
-// the seam; this is what carries the bytes.
+// the seam; this is what carries the bytes, and the coordinator is the host
+// that decides who takes what.
 //
 // Every run that uses a shared channel has an OUTBOX for it: a stream of
-// what that run sent, named for the run and the channel like any other
-// output — wings.chanout.<job>.<attempt>.<channel> — so on a worker it is
-// written inside the attempt's transaction and copied home by the same
-// mirror as a recording. The coordinator's RELAY merges every outbox of a
-// channel into one canonical stream, wings.chan.<channel>, in arrival order,
-// dropping any item it has seen. A run receives by reading the canonical
-// stream: the coordinator its own, a worker a copy the coordinator PUSHES
-// onto it.
+// what that run sent and asked for, named for the run and the channel like
+// any other output — wings.chanout.<job>.<attempt>.<channel> — so on a
+// worker it is copied home by the same mirror as a recording. It is not
+// written inside the attempt's transaction, though, because it does not
+// need to be: a value or a want is named by its sender and sequence, and one
+// that reaches the coordinator without the history event that explains it
+// is sent again by the replay and dropped as a copy. What it needs instead
+// is to be SEEN AT ONCE, since a run on another machine is waiting on it.
+// The coordinator's RELAY merges every outbox of a channel into one
+// canonical stream, wings.chan.<channel>, in arrival order, by the rule in
+// flow.Arbiter: each value or want once, and a grant of each value to the
+// earliest want still open. A run receives by reading the canonical stream:
+// the coordinator its own, a worker a copy the coordinator PUSHES onto it.
 //
 // Nothing asks for the push. A worker that uses a channel creates its outbox
 // first, whether or not it ever sends, and the output mirror discovering that
@@ -33,10 +38,11 @@ import (
 // healthy connection; the listing interval is the fallback.
 //
 // The canonical stream is never dropped: a coordinator that restarts replays
-// its workflow, and the workflow's receives replay from it. A worker's outbox
-// goes with the attempt that wrote it, like its other outputs; what an
-// abandoned attempt committed to its outbox is merged as soon as the copy
-// arrives, well before the job settles and the outbox is dropped.
+// its workflow, and the workflow's receives replay from it, and it reads the
+// stream back to find what it had granted. A worker's outbox goes with the
+// attempt that wrote it, like its other outputs; what an abandoned attempt
+// wrote to its outbox is merged as soon as the copy arrives, well before the
+// job settles and the outbox is dropped.
 
 const (
 	// chanoutPrefix is a run's outbox for one shared channel. An output
@@ -62,40 +68,31 @@ func outboxFor(run string, attempt int, id string) string {
 	return outputName{Prefix: chanoutPrefix, Job: run, Attempt: attempt, Name: id}.String()
 }
 
-func itemKey(it flow.ChannelItem) string { return it.From + "#" + strconv.FormatUint(it.Seq, 10) }
-
 // --- relay, on the coordinator ---
 
 // relayChannel is the relay's state for one channel: the canonical stream
-// and what is already on it.
+// and the arbiter that says what goes on it.
 type relayChannel struct {
 	stream *dsclient.Stream[flow.ChannelItem]
 
-	mu     sync.Mutex
-	seen   map[string]bool
-	closed bool
+	mu      sync.Mutex
+	arbiter *flow.Arbiter
 }
 
-// merge appends an item to the canonical stream unless it is already there.
-func (rc *relayChannel) merge(ctx context.Context, it flow.ChannelItem) error {
+// merge puts a record from an outbox through the arbiter and appends what
+// it says — the record if it is new, and any grants — to the canonical
+// stream, returning what it appended. Nothing for a copy.
+func (rc *relayChannel) merge(ctx context.Context, it flow.ChannelItem) ([]flow.ChannelItem, error) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	if it.Closed {
-		if rc.closed {
-			return nil
-		}
-	} else if rc.seen[itemKey(it)] {
-		return nil
+	recs := rc.arbiter.Offer(it)
+	if len(recs) == 0 {
+		return nil, nil
 	}
-	if _, err := rc.stream.Append(ctx, []flow.ChannelItem{it}); err != nil {
-		return err
+	if _, err := rc.stream.Append(ctx, recs); err != nil {
+		return nil, err
 	}
-	if it.Closed {
-		rc.closed = true
-	} else {
-		rc.seen[itemKey(it)] = true
-	}
-	return nil
+	return recs, nil
 }
 
 // channelRelay is the coordinator's side of every shared channel.
@@ -179,7 +176,7 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 	if err != nil {
 		return nil, err
 	}
-	rc := &relayChannel{stream: st, seen: map[string]bool{}}
+	rc := &relayChannel{stream: st, arbiter: flow.NewArbiter()}
 	var from int64
 	for {
 		recs, err := st.Read(c.ctx, from, recordBatch)
@@ -191,11 +188,13 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 		}
 		for _, rec := range recs {
 			from = rec.Offset + 1
-			if rec.Record.Closed {
-				rc.closed = true
-			} else {
-				rc.seen[itemKey(rec.Record)] = true
-			}
+			rc.arbiter.Restore(rec.Record)
+		}
+	}
+	// What the predecessor admitted and did not live to grant.
+	if owed := rc.arbiter.Grants(); len(owed) > 0 {
+		if _, err := st.Append(c.ctx, owed); err != nil {
+			return nil, fmt.Errorf("wings: grant what was owed on %s: %w", canonical, err)
 		}
 	}
 
@@ -256,17 +255,20 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 				}
 				continue
 			}
+			var merged []flow.ChannelItem
 			for _, rec := range recs {
 				from = rec.Offset + 1
-				if err := rc.merge(c.ctx, rec.Record); err != nil {
+				appended, err := rc.merge(c.ctx, rec.Record)
+				if err != nil {
 					if c.ctx.Err() == nil {
 						c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
 					}
 					return
 				}
+				merged = append(merged, appended...)
 			}
-			if len(recs) > 0 {
-				c.wakeOnChannel(id)
+			if len(merged) > 0 {
+				c.wakeOnChannel(id, merged)
 			}
 		}
 	})
@@ -364,10 +366,12 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 	if err != nil {
 		return nil, err
 	}
-	a := h.job.outputs
+	// Outside the attempt's transaction, on purpose: see the top of the
+	// file. A record is on its way home the moment it is written.
 	return &channelLink{
 		send: func(ctx context.Context, it flow.ChannelItem) error {
-			return a.append(ctx, outbox, []flow.ChannelItem{it})
+			_, err := outbox.Append(ctx, []flow.ChannelItem{it})
+			return err
 		},
 		client: h.n.client,
 		in:     chanStreamFor(id),

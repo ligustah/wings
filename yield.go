@@ -73,7 +73,7 @@ func yieldOf(ctx context.Context, err error) *yieldEnvelope {
 		return &yieldEnvelope{Until: until}
 	}
 	if u, ok := errors.AsType[*unloadError](context.Cause(ctx)); ok && errors.Is(err, context.Canceled) {
-		return &yieldEnvelope{Wait: u.wait.On, Channel: u.wait.Channel}
+		return &yieldEnvelope{Wait: u.wait.On, Channel: u.wait.Channel, Seq: u.wait.Seq}
 	}
 	return nil
 }
@@ -119,21 +119,50 @@ func (c *Cluster) wake(p *pendingJob, why string) {
 	c.move(p, why, false)
 }
 
-// wakeOnChannel wakes every yielded job that was waiting on a channel that
-// has just had something arrive. A job woken for an item it was not waiting
-// for — a send waiting for room, say — replays to the same wait and parks
-// again, which costs a replay and nothing else.
+// yieldSettled reports whether a job's wait on a channel was over by the
+// time the yield arrived: the grant, or the close, reached the record while
+// the attempt was being unloaded, and so woke nobody. Such a job is woken at
+// once, or it would wait for news that has already come.
+func (c *Cluster) yieldSettled(p *pendingJob, y *yieldEnvelope) bool {
+	if y.Channel == "" || c.relay == nil {
+		return false
+	}
+	c.relay.mu.Lock()
+	rc := c.relay.channels[chanStreamFor(y.Channel)]
+	c.relay.mu.Unlock()
+	if rc == nil {
+		return false
+	}
+	thread := runOf(p.job) + "/" + threadOf(p.job)
+	return rc.arbiter.Settled(flow.ChannelItem{Want: y.Wait == flow.WaitRecv, From: thread, Seq: y.Seq})
+}
+
+// wakeOnChannel wakes the yielded jobs that what has just gone on a
+// channel's record is for. A receive is woken by the grant that names its
+// thread, or by the close; a send by any grant, since a value taken is room
+// made — and one woken for room that another sender took replays to the
+// same wait and parks again, which costs a replay and nothing else. A want
+// wakes nobody: the receive's own want, come round again, is not news.
 //
 // Matched by canonical stream: the relay knows a channel by the name its
 // outbox carried, which is the id made safe for a stream name, and the
 // yield carries the id itself.
-func (c *Cluster) wakeOnChannel(id string) {
+func (c *Cluster) wakeOnChannel(id string, recs []flow.ChannelItem) {
 	canonical := chanStreamFor(id)
 	var due []*pendingJob
 	c.mu.Lock()
 	for _, p := range c.pending {
-		if p.yield != nil && p.yield.Channel != "" && chanStreamFor(p.yield.Channel) == canonical {
-			due = append(due, p)
+		if p.yield == nil || p.yield.Channel == "" || chanStreamFor(p.yield.Channel) != canonical {
+			continue
+		}
+		thread := runOf(p.job) + "/" + threadOf(p.job)
+		for _, rec := range recs {
+			granted, closed := rec.To != "", rec.Closed
+			if p.yield.Wait == flow.WaitRecv && (closed || (granted && rec.To == thread)) ||
+				p.yield.Wait == flow.WaitSend && granted {
+				due = append(due, p)
+				break
+			}
 		}
 	}
 	c.mu.Unlock()

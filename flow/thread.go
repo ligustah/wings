@@ -41,6 +41,11 @@ type runState struct {
 	mu       sync.Mutex
 	channels map[string]*chanState
 	over     bool // this attempt has returned
+
+	// encMu serialises the run's encodes, and encoder is the thread whose
+	// encode is under way. See encoding.
+	encMu   sync.Mutex
+	encoder *threadState
 }
 
 func newRunState(name string, opts runOptions) *runState {
@@ -122,9 +127,11 @@ type threadState struct {
 
 	// channels names the next channel this thread creates, on the same
 	// principle as counter; sends counts this thread's sends per channel, so a
-	// receive on another thread can name exactly one of them.
+	// receive on another thread can name exactly one of them, and recvs its
+	// receives, so a host can name exactly one of those.
 	channels uint64
 	sends    map[string]uint64
+	recvs    map[string]uint64
 }
 
 // newChannelName mints the next channel name for this thread.
@@ -157,6 +164,26 @@ func (t *threadState) nextSend(channel string) uint64 {
 	seq := t.sends[channel]
 	t.sends[channel] = seq + 1
 	return seq
+}
+
+// nextRecv returns this thread's sequence number for its next receive on a
+// channel: what a want is named by, so that a receive asked for twice — the
+// attempt ended while it waited, and the replay is asking again — is one
+// want, and gets one value.
+func (t *threadState) nextRecv(channel string) uint64 {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	if t.recvs == nil {
+		t.recvs = map[string]uint64{}
+	}
+	seq := t.recvs[channel]
+	t.recvs[channel] = seq + 1
+	return seq
+}
+
+// encode runs encode as this thread's. See runState.encoding.
+func (t *threadState) encode(encode func() ([]byte, error)) ([]byte, error) {
+	return t.run.encoding(t, encode)
 }
 
 type ctxKey struct{}

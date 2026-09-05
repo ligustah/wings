@@ -8,8 +8,12 @@ type Wait struct {
 	// On is what the thread waits on: one of the Wait constants.
 	On string
 	// Channel names the channel, for a wait on one: the run's name and the
-	// channel's, as [ChannelHost] knows it.
+	// channel's, as [ChannelHost] knows it. Seq is the thread's number for
+	// the receive or send it waits on — the name of its want, or of its
+	// value, on the channel's record — so that whoever holds the thread can
+	// see whether the wait has been answered.
 	Channel string
+	Seq     uint64
 }
 
 // What a thread can wait on.
@@ -44,15 +48,16 @@ func WithParker(p Parker) RunOption { return func(o *runOptions) { o.parker = p 
 // park tells the run's parker this thread is about to wait, and returns what
 // to call when it is done. Never nil.
 func (t *threadState) park(ctx context.Context, on string) func(ctx context.Context) error {
-	return t.parkOn(ctx, on, "")
+	return t.parkOn(ctx, on, "", 0)
 }
 
-// parkOn is park for a wait on a channel, which names it.
-func (t *threadState) parkOn(ctx context.Context, on, channel string) func(ctx context.Context) error {
+// parkOn is park for a wait on a channel, which names it and the receive or
+// send waited on.
+func (t *threadState) parkOn(ctx context.Context, on, channel string, seq uint64) func(ctx context.Context) error {
 	if t.run.parker == nil {
 		return noResume
 	}
-	resume := t.run.parker.Park(ctx, Wait{Run: t.run.name, Thread: t.id, On: on, Channel: channel})
+	resume := t.run.parker.Park(ctx, Wait{Run: t.run.name, Thread: t.id, On: on, Channel: channel, Seq: seq})
 	if resume == nil {
 		return noResume
 	}

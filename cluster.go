@@ -936,6 +936,9 @@ func (c *Cluster) deliver(res resultEnvelope) {
 			Kind: journalYielded, Job: p.job.ID, Func: p.job.Func,
 			Attempt: p.job.Attempt, Err: res.Yield.describe(),
 		}.from(p.origin))
+		if c.yieldSettled(p, res.Yield) {
+			c.wake(p, "what it was waiting for had already arrived")
+		}
 		return
 	}
 	var wake *pendingJob

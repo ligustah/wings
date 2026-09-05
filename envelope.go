@@ -172,4 +172,5 @@ type yieldEnvelope struct {
 	Until   time.Time `json:"until,omitempty"`
 	Wait    string    `json:"wait,omitempty"`
 	Channel string    `json:"channel,omitempty"`
+	Seq     uint64    `json:"seq,omitempty"`
 }

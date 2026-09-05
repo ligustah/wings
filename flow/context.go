@@ -152,7 +152,7 @@ func (c Context) Spawn[Out any](body func(ctx Context) (Out, error)) *Future[Out
 		if err != nil {
 			return nil, err
 		}
-		b, err := dswire.EncodeRecord(codec, out)
+		b, err := threadFrom(ctx).encode(func() ([]byte, error) { return dswire.EncodeRecord(codec, out) })
 		if err != nil {
 			return nil, fmt.Errorf("flow: encode the result of a spawned thread: %w", err)
 		}

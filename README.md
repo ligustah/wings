@@ -497,19 +497,21 @@ A `flow.Channel` **travels in a call's input** like any other value. The
 workflow creates one and hands it to a function; the function sends into it or
 receives from it; two functions on two workers can share one the same way. On
 the wire a shared channel is a durable stream relayed through the coordinator:
-every run that uses it has an outbox — on a worker, written inside the
-attempt's transaction and copied home like a recording — and the coordinator
-merges the outboxes into one canonical stream and pushes it to every worker
-using the channel. A worker subscribes by creating its outbox, which the output
-mirror discovers; nothing asks.
+every run that uses it has an outbox — on a worker, copied home like a
+recording — and the coordinator merges the outboxes into one canonical stream
+and pushes it to every worker using the channel. A worker subscribes by
+creating its outbox, which the output mirror discovers; nothing asks.
 
-Two things differ from a channel between threads. A shared channel is a
-**queue, not a rendezvous**: `Send` completes once the value is durable,
-whatever capacity the channel was created with. And **every run that receives
-sees every value** — threads within one run still compete, but two runs each
-get the whole sequence. Receives replay exactly as they do between threads: a
-moved function is handed the same values in the same order from the channel's
-record, on a worker that never saw the sender.
+It behaves as a channel between threads does. **Each value goes to one
+receiver**, wherever that receiver runs: a receive is a request the coordinator
+answers by granting it a value, values in the order they arrived to requests in
+the order they arrived, and two functions receiving from one channel split what
+is sent between them. **Capacity holds across machines**: a send with no room
+waits for a receive somewhere to make some. Receives replay exactly as they do
+between threads: a moved function is handed the same values in the same order
+from the channel's record, on a worker that never saw the sender, and a receive
+abandoned mid-wait asks again under the same name and gets the grant already
+made for it.
 
 ## Recordings
 

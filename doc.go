@@ -59,8 +59,8 @@
 // worker's control stream, so a function that fans out fans out across the
 // fleet, and a worker never waits on itself. A flow.Channel handed to a
 // function in its input crosses machines too: a shared channel is a durable
-// stream relayed through the coordinator, a queue whose every value reaches
-// every run receiving from it.
+// stream relayed through the coordinator, which gives each value to one
+// receiver, wherever that receiver runs, and keeps the channel's capacity.
 //
 // # Using this package directly
 //

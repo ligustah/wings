@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
@@ -325,5 +326,41 @@ func TestAChannelOutsideARunRefusesToBeUsed(t *testing.T) {
 	}
 	if err := ch.Close(ctx); err == nil {
 		t.Fatal("want an error from a close outside a run")
+	}
+}
+
+// A buffered channel holds as many values as its capacity says and no more:
+// the send after that waits for a receive, like a send on an unbuffered one.
+func TestABufferedChannelHoldsOnlyItsCapacity(t *testing.T) {
+	var secondSent, firstTaken time.Time
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewBufferedChannel[int](1)
+		filler := ctx.Spawn(func(ctx flow.Context) (int, error) {
+			if err := ch.Send(ctx, 1); err != nil { // the one place
+				return 0, err
+			}
+			if err := ch.Send(ctx, 2); err != nil { // waits for the place to free
+				return 0, err
+			}
+			secondSent = time.Now()
+			return 2, nil
+		})
+		time.Sleep(50 * time.Millisecond)
+		if _, _, err := ch.Recv(ctx); err != nil {
+			return err
+		}
+		firstTaken = time.Now()
+		if _, _, err := ch.Recv(ctx); err != nil {
+			return err
+		}
+		_, err := filler.Await(ctx)
+		return err
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if secondSent.Before(firstTaken) {
+		t.Fatalf("the second send completed at %s, before the first receive at %s",
+			secondSent.Format(time.StampMicro), firstTaken.Format(time.StampMicro))
 	}
 }

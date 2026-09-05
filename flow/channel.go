@@ -37,10 +37,11 @@ type Channel[T any] struct {
 	run   *runState
 	codec dswire.Codec[T]
 
-	// id is set on a handle that arrived from another run, and mu guards
-	// binding it to this one on first use.
-	id string
-	mu sync.Mutex
+	// id is set on a handle that arrived from another run, capacity is what
+	// the handle said, and mu guards binding it to this run on first use.
+	id       string
+	capacity int
+	mu       sync.Mutex
 }
 
 // NewChannel returns an unbuffered channel: a send completes when a receive
@@ -89,29 +90,36 @@ func (c *Channel[T]) sharedID() string {
 	return c.run.channelID(c.name)
 }
 
-// channelHandle is how a channel appears in a call's input or output.
+// channelHandle is how a channel appears in a call's input or output. The
+// capacity travels with it, since a sender in another run has to know how
+// much room there is.
 type channelHandle struct {
-	Channel string `json:"channel"`
+	Channel  string `json:"channel"`
+	Capacity int    `json:"capacity,omitempty"`
 }
 
 // MarshalJSON is what lets a channel leave its run: in a call's input, in a
 // value sent on another channel, in a result. Marshalling SHARES it — the
-// run's host is told, and what was sent so far goes with it — which needs
-// the run to have a [ChannelHost]. See [WithChannelHost].
+// run's host is told, and what was sent so far and not taken goes with it —
+// which needs the run to have a [ChannelHost]. See [WithChannelHost].
 func (c *Channel[T]) MarshalJSON() ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	id := c.id
+	id, capacity := c.id, c.capacity
 	if c.run != nil {
+		_, replay := c.run.encodingThread()
 		var err error
-		if id, err = c.run.export(context.Background(), c.name); err != nil {
+		if id, err = c.run.export(context.Background(), c.name, replay); err != nil {
 			return nil, err
+		}
+		if cs := c.run.channel(c.name); cs != nil {
+			capacity = cs.capacity
 		}
 	}
 	if id == "" {
 		return nil, errors.New("flow: this channel was created outside a Run and cannot be shared")
 	}
-	return json.Marshal(channelHandle{Channel: id})
+	return json.Marshal(channelHandle{Channel: id, Capacity: capacity})
 }
 
 // UnmarshalJSON receives a channel another run shared. It is bound to this
@@ -126,7 +134,7 @@ func (c *Channel[T]) UnmarshalJSON(b []byte) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.id, c.run, c.name = h.Channel, nil, h.Channel
+	c.id, c.run, c.name, c.capacity = h.Channel, nil, h.Channel, h.Capacity
 	c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
 	return nil
 }
@@ -143,7 +151,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		return err
 	}
 
-	data, err := dswire.EncodeRecord(c.codec, v)
+	data, err := t.encode(func() ([]byte, error) { return dswire.EncodeRecord(c.codec, v) })
 	if err != nil {
 		return fmt.Errorf("flow: encode value for channel %s: %w", c.name, err)
 	}
@@ -195,6 +203,11 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return zero, false, err
 	}
 
+	// Counted before the history is consulted, like a send: the number is
+	// the receive's name to the host, and has to come out the same on a
+	// replay.
+	recvSeq := t.nextRecv(c.name)
+
 	ev, err := t.expect[*protos.ChannelRecvEvent]()
 	if err != nil {
 		return zero, false, err
@@ -224,7 +237,7 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return v, true, t.err()
 	}
 
-	item, err := cs.awaitAny(ctx, t, c.sharedID())
+	item, err := cs.awaitAny(ctx, t, c.sharedID(), recvSeq)
 	if err != nil {
 		return zero, false, err
 	}
@@ -301,7 +314,7 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 	if c.run == nil {
 		// A handle from another run, used here for the first time: reach
 		// the channel through the host and keep it under its id.
-		cs, err := t.run.attach(ctx, c.id)
+		cs, err := t.run.attach(ctx, c.id, c.capacity)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -349,10 +362,15 @@ type chanState struct {
 	// claimed names items a replayed receive has taken before they were
 	// queued, so that they are taken on arrival.
 	claimed map[string]bool
-	// link is set once the channel is shared with other runs. From then on a
-	// send is a queue put — complete when the host has it — and what other
-	// runs send arrives through pump.
-	link ChannelLink
+	// link is set once the channel is shared with other runs. From then on
+	// the host says who takes what: a receive is a want sent on the link,
+	// and what it takes is the item the host's grant names. asked is the
+	// wants this attempt has sent, by want key, and grants what the host
+	// has granted to whom — want key to item key — as it arrives on the
+	// link, along with what other runs send.
+	link   ChannelLink
+	asked  map[string]bool
+	grants map[string]string
 }
 
 func newChanState(capacity int) *chanState {
@@ -391,14 +409,12 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	if it := cs.find(from, seq); it != nil {
 		return it, nil
 	}
-	pending := 0
-	for _, it := range cs.items {
-		if !it.taken && !it.buffered {
-			pending++
-		}
-	}
-	// Shared: a queue, so the send is complete. Local: only if there is room.
-	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.link != nil || pending < cs.capacity}
+	// Complete on arrival if there is room. On a shared channel the count is
+	// what this run has been told, which is the truth a moment ago: two
+	// senders on two machines can each see the last place free and both
+	// take it, and the channel is briefly one over. Bounded, and rare, and
+	// the alternative is a round trip per send.
+	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.roomFor(nil)}
 	if cs.claimed[itemKey(from, seq)] {
 		delete(cs.claimed, itemKey(from, seq))
 		item.taken = true
@@ -426,6 +442,23 @@ func (cs *chanState) claim(from string, seq uint64) {
 		cs.claimed = map[string]bool{}
 	}
 	cs.claimed[itemKey(from, seq)] = true
+}
+
+// grant records the host's grant of one item to one want: the item is taken,
+// by whichever receiver the want names, and a receive here waiting on that
+// want finds its item. The item precedes its grant on the channel's record,
+// so it is always here to be found.
+func (cs *chanState) grant(g ChannelItem) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if it := cs.find(g.From, g.Seq); it != nil {
+		it.taken = true
+	}
+	if cs.grants == nil {
+		cs.grants = map[string]string{}
+	}
+	cs.grants[itemKey(g.To, g.ToSeq)] = itemKey(g.From, g.Seq)
+	cs.broadcast()
 }
 
 // find returns the queued item with an identity, or nil. Call with mu held.
@@ -463,11 +496,18 @@ func (cs *chanState) shut() {
 
 // awaitTaken blocks until a sent item has been received, or returns at once if
 // the channel had room for it. The thread is parked while it waits.
+//
+// Room can open while it waits — a receive takes something ahead of the
+// item — and then the item is in the buffer, as it would be in Go's, and the
+// send is complete.
 func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, item *chanItem) error {
 	parked := false
 	resume := noResume
 	for {
 		cs.mu.Lock()
+		if !item.taken && !item.buffered && cs.roomFor(item) {
+			item.buffered = true
+		}
 		if item.taken || item.buffered {
 			cs.mu.Unlock()
 			return resume(ctx)
@@ -476,7 +516,7 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 		cs.mu.Unlock()
 
 		if !parked {
-			parked, resume = true, t.parkOn(ctx, WaitSend, id)
+			parked, resume = true, t.parkOn(ctx, WaitSend, id, item.seq)
 		}
 		select {
 		case <-wait:
@@ -488,20 +528,52 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 
 // awaitAny blocks until something can be taken, and returns nil when the
 // channel is closed and drained. The thread is parked while it waits.
-func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string) (*chanItem, error) {
+//
+// On a channel of this run's own, the first untaken item is taken here. On
+// a shared channel the host takes it on this receive's behalf: the receive
+// is sent to the host as a want, named by the thread and its receive number,
+// and what it gets is the item the host's grant names — or nothing, once
+// the channel is closed and every item has gone to someone. A channel can
+// become shared while a receive waits on it, and the receive carries on
+// under the new rule.
+func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, recvSeq uint64) (*chanItem, error) {
 	parked := false
 	resume := noResume
+	want := itemKey(t.qualified(), recvSeq)
 	for {
 		cs.mu.Lock()
-		for _, it := range cs.items {
-			if !it.taken {
-				it.taken = true
-				cs.broadcast()
+		link := cs.link
+		if link == nil {
+			for _, it := range cs.items {
+				if !it.taken {
+					it.taken = true
+					cs.broadcast()
+					cs.mu.Unlock()
+					return it, resume(ctx)
+				}
+			}
+		} else {
+			if key, ok := cs.grants[want]; ok {
+				for _, it := range cs.items {
+					if itemKey(it.from, it.seq) == key {
+						cs.mu.Unlock()
+						return it, resume(ctx)
+					}
+				}
+			}
+			if !cs.asked[want] {
+				if cs.asked == nil {
+					cs.asked = map[string]bool{}
+				}
+				cs.asked[want] = true
 				cs.mu.Unlock()
-				return it, resume(ctx)
+				if err := link.Send(ctx, ChannelItem{Want: true, From: t.qualified(), Seq: recvSeq}); err != nil {
+					return nil, fmt.Errorf("flow: receive on a shared channel: %w", err)
+				}
+				continue
 			}
 		}
-		if cs.closed {
+		if cs.closed && !cs.pending() {
 			cs.mu.Unlock()
 			return nil, resume(ctx)
 		}
@@ -509,7 +581,7 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string) (*
 		cs.mu.Unlock()
 
 		if !parked {
-			parked, resume = true, t.parkOn(ctx, WaitRecv, id)
+			parked, resume = true, t.parkOn(ctx, WaitRecv, id, recvSeq)
 		}
 		select {
 		case <-wait:
@@ -517,4 +589,31 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string) (*
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// roomFor reports whether the buffer has a place for item, or for a new item
+// when item is nil: what is in the buffer untaken, plus the senders ahead of
+// it still waiting for a place, come to fewer than the capacity. Senders
+// ahead count because they are owed a place first. Call with mu held.
+func (cs *chanState) roomFor(item *chanItem) bool {
+	used := 0
+	for _, it := range cs.items {
+		if it == item {
+			break
+		}
+		if !it.taken {
+			used++
+		}
+	}
+	return used < cs.capacity
+}
+
+// pending reports whether any item is still untaken. Call with mu held.
+func (cs *chanState) pending() bool {
+	for _, it := range cs.items {
+		if !it.taken {
+			return true
+		}
+	}
+	return false
 }

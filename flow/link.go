@@ -13,34 +13,50 @@ import (
 // they travel through. flow says what a shared channel is; whatever hosts the
 // runs says how the bytes get from one to the other.
 //
-// A shared channel is a QUEUE, not a rendezvous: a send completes once the
-// value is with the host, whatever the channel's declared capacity, since a
-// rendezvous across a network is a round trip nobody asked for. And every run
-// that receives from it sees every value — threads within one run compete for
-// values the way they always did, but two runs each get the whole sequence.
-// One run, one receiver, is the ordinary case and is exactly a queue.
+// A shared channel behaves as a channel between threads does: each value is
+// taken by ONE receiver, wherever the receivers run, and a send waits while
+// the channel is at capacity. Since two receivers on two machines cannot
+// agree between themselves, the host agrees for them — a receive is a want
+// the host answers with a grant, by the rule in [Arbiter] — and since a
+// sender cannot see the other machines' receives, it counts room by what the
+// host has told it. A channel's record is, in order, what was sent, what was
+// wanted, and what the host granted to whom; a run reads its own past off it
+// exactly as another run's.
 
-// ChannelItem is one value on a shared channel, or its close.
+// ChannelItem is one record of a shared channel: a value, a close, a
+// receiver's want, or the host's grant of a value to a want.
 type ChannelItem struct {
 	// From is the sender, as "<run>/<thread>", and Seq is that sender's nth
-	// send on the channel. Together they identify the item everywhere, which
-	// is what lets a replayed receive name the value it took and a copy that
-	// arrives twice be dropped.
+	// send on the channel. Together they identify the value everywhere,
+	// which is what lets a replayed receive name the value it took and a
+	// copy that arrives twice be dropped. On a want, From is the receiver
+	// and Seq its nth receive on the channel; on a grant, they name the
+	// value granted.
 	From string
 	Seq  uint64
 	Data []byte
 	// Closed marks a close rather than a value. From and Seq are empty.
 	Closed bool
+	// Want marks a receiver asking for a value. Data is empty.
+	Want bool
+	// To and ToSeq, set on a grant, name the want — the receiver and its
+	// nth receive — that the value From/Seq is given to. A receive waits
+	// for the grant naming it. Only the host makes grants.
+	To    string
+	ToSeq uint64
 }
 
-// ChannelLink is one run's connection to a shared channel: where its sends
-// go, and where every run's sends — its own included — arrive from.
+// ChannelLink is one run's connection to a shared channel: where what it
+// sends and wants goes, and where the channel's record — every run's sends
+// and wants, its own included, and the host's grants — arrives from.
 type ChannelLink interface {
-	// Send hands the host one item this run sent.
+	// Send hands the host one record this run made: a value, a close, or a
+	// want. The host puts it on the channel's record if it is new, and
+	// grants what it can; see [Arbiter].
 	Send(ctx context.Context, item ChannelItem) error
-	// Items delivers every item on the channel from its beginning, in the
-	// host's order, calling yield for each as it becomes known, and returns
-	// when yield returns false or ctx ends. Items this run sent come back
+	// Items delivers the channel's record from its beginning, in the host's
+	// order, calling yield for each record as it becomes known, and returns
+	// when yield returns false or ctx ends. What this run sent comes back
 	// through here too.
 	Items(ctx context.Context, yield func(ChannelItem) bool) error
 	// Close releases the link. The channel itself is unaffected.
@@ -79,9 +95,14 @@ func (r *runState) linkContext() context.Context {
 // export makes one of this run's channels reachable from other runs, if it
 // is not already, and returns its id.
 //
-// What was sent before the channel left the run goes to the host now, taken
-// or not: another run receiving from the channel is owed the whole sequence.
-func (r *runState) export(ctx context.Context, name string) (string, error) {
+// What was sent before the channel left the run and not yet taken goes to
+// the host now: from here on the host says who takes what, and a value still
+// here is a value it must know about. What was taken stays taken. And none
+// of that when the export is a REPLAY — the thread is re-encoding a value
+// its history says it encoded before — since the host was told then, and
+// what a replayed thread thinks is untaken may be a value another thread has
+// not yet replayed taking.
+func (r *runState) export(ctx context.Context, name string, replay bool) (string, error) {
 	id := r.channelID(name)
 	cs := r.channel(name)
 	if cs == nil {
@@ -108,32 +129,56 @@ func (r *runState) export(ctx context.Context, name string) (string, error) {
 		return id, nil
 	}
 	cs.link = link
-	items := append([]*chanItem(nil), cs.items...)
-	closed := cs.closed
-	// A queue from here on: a send still waiting to be taken is complete
-	// now, since the value is about to be with the host.
-	for _, it := range items {
-		it.buffered = true
+	var items []*chanItem
+	for _, it := range cs.items {
+		if !it.taken {
+			items = append(items, it)
+		}
 	}
+	closed := cs.closed
 	cs.broadcast()
 	cs.mu.Unlock()
 
-	for _, it := range items {
-		if err := link.Send(ctx, ChannelItem{From: it.from, Seq: it.seq, Data: it.data}); err != nil {
-			return "", fmt.Errorf("flow: share channel %s: %w", name, err)
+	if !replay {
+		for _, it := range items {
+			if err := link.Send(ctx, ChannelItem{From: it.from, Seq: it.seq, Data: it.data}); err != nil {
+				return "", fmt.Errorf("flow: share channel %s: %w", name, err)
+			}
 		}
-	}
-	if closed {
-		if err := link.Send(ctx, ChannelItem{Closed: true}); err != nil {
-			return "", fmt.Errorf("flow: share channel %s: %w", name, err)
+		if closed {
+			if err := link.Send(ctx, ChannelItem{Closed: true}); err != nil {
+				return "", fmt.Errorf("flow: share channel %s: %w", name, err)
+			}
 		}
 	}
 	go cs.pump(r.linkContext(), link)
 	return id, nil
 }
 
+// encoding runs encode as thread t's, so that a channel in the value it
+// encodes is exported on t's behalf: a thread replaying an encode it made
+// before exports nothing anew. One encode at a time per run, which is how
+// [Channel.MarshalJSON], given no context, learns whose encode it is in.
+func (r *runState) encoding(t *threadState, encode func() ([]byte, error)) ([]byte, error) {
+	r.encMu.Lock()
+	defer r.encMu.Unlock()
+	r.encoder = t
+	defer func() { r.encoder = nil }()
+	return encode()
+}
+
+// encoder reports the thread whose encode is under way — nil outside one —
+// and whether that thread is replaying. Valid only on the encoding
+// goroutine, which is the one holding encMu.
+func (r *runState) encodingThread() (t *threadState, replay bool) {
+	if r.encoder == nil {
+		return nil, false
+	}
+	return r.encoder, r.encoder.peek() != nil
+}
+
 // attach connects this run to a channel another run owns, once.
-func (r *runState) attach(ctx context.Context, id string) (*chanState, error) {
+func (r *runState) attach(ctx context.Context, id string, capacity int) (*chanState, error) {
 	if cs := r.channel(id); cs != nil {
 		return cs, nil
 	}
@@ -144,7 +189,7 @@ func (r *runState) attach(ctx context.Context, id string) (*chanState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("flow: reach channel %s: %w", id, err)
 	}
-	cs := newChanState(0)
+	cs := newChanState(capacity)
 	cs.link = link
 
 	r.mu.Lock()
@@ -185,16 +230,24 @@ func (r *runState) closeLinks() {
 	}
 }
 
-// pump delivers what arrives on the link into the channel's local state.
+// pump delivers the channel's record, as it arrives on the link, into the
+// channel's local state.
 func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 	_ = link.Items(ctx, func(it ChannelItem) bool {
-		if it.Closed {
+		switch {
+		case it.Closed:
 			cs.shut()
-			return true
+		case it.To != "":
+			cs.grant(it)
+		case it.Want:
+			// Another run's, or this one's coming back. The grant is what
+			// matters, and it follows.
+		default:
+			// Already ours, or already here from an earlier delivery: put
+			// drops the copy. Not announced back to the link, where it came
+			// from.
+			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false)
 		}
-		// Already ours, or already here from an earlier delivery: put drops
-		// the copy. Not announced back to the link, where it came from.
-		_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false)
 		return true
 	})
 }
@@ -218,17 +271,17 @@ func (h *MemChannelHost) Link(_ context.Context, _, id string) (ChannelLink, err
 	defer h.mu.Unlock()
 	ch := h.chans[id]
 	if ch == nil {
-		ch = &memChannel{seen: map[string]bool{}, changed: make(chan struct{})}
+		ch = &memChannel{arbiter: NewArbiter(), changed: make(chan struct{})}
 		h.chans[id] = ch
 	}
 	return &memLink{ch: ch}, nil
 }
 
 type memChannel struct {
+	arbiter *Arbiter
+
 	mu      sync.Mutex
-	items   []ChannelItem
-	seen    map[string]bool
-	closed  bool
+	items   []ChannelItem // the record
 	changed chan struct{}
 }
 
@@ -238,19 +291,11 @@ func (l *memLink) Send(_ context.Context, it ChannelItem) error {
 	ch := l.ch
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	if it.Closed {
-		if ch.closed {
-			return nil
-		}
-		ch.closed = true
-	} else {
-		key := fmt.Sprintf("%s#%d", it.From, it.Seq)
-		if ch.seen[key] {
-			return nil
-		}
-		ch.seen[key] = true
+	recs := ch.arbiter.Offer(it)
+	if len(recs) == 0 {
+		return nil
 	}
-	ch.items = append(ch.items, it)
+	ch.items = append(ch.items, recs...)
 	close(ch.changed)
 	ch.changed = make(chan struct{})
 	return nil

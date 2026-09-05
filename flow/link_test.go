@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ligustah/wings/flow"
 )
@@ -148,5 +149,188 @@ func TestAChannelCannotLeaveARunWithoutAHost(t *testing.T) {
 	}, flow.WithStore(flow.NewMemStore()), flow.Once())
 	if err == nil || !strings.Contains(err.Error(), "no channel host") {
 		t.Fatalf("got %v, want an error naming the missing host", err)
+	}
+}
+
+// takesTwoWhenTold waits to be told, then takes two values and returns their
+// sum, noting when it took the first.
+var takesTwoWhenTold = flow.Define("test.takesTwoWhenTold", func(ctx flow.Context, in feed) (int, error) {
+	select {
+	case <-told.release:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	a, _, err := in.Values.Recv(ctx)
+	if err != nil {
+		return 0, err
+	}
+	told.firstTake.Store(time.Now().UnixNano())
+	b, _, err := in.Values.Recv(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return a + b, nil
+})
+
+var told struct {
+	release   chan struct{}
+	firstTake atomic.Int64
+}
+
+// THE POINT: a shared channel is a channel, not a queue. Its capacity holds
+// across runs: a send with no room waits for a receive in the other run to
+// make some, exactly as a send between threads waits.
+func TestASharedChannelHonoursItsCapacity(t *testing.T) {
+	host := flow.NewMemChannelHost()
+	store := flow.NewMemStore()
+	told.release = make(chan struct{})
+	told.firstTake.Store(0)
+
+	var secondSent time.Time
+	var got int
+	err := flow.Run(t.Context(), "capacity", func(ctx flow.Context) error {
+		ch := ctx.NewBufferedChannel[int](1)
+		fut := ctx.Go(takesTwoWhenTold, feed{Values: ch})
+		if err := ch.Send(ctx, 1); err != nil { // the one place in the buffer
+			return err
+		}
+		time.AfterFunc(100*time.Millisecond, func() { close(told.release) })
+		if err := ch.Send(ctx, 2); err != nil { // no room until the other run takes one
+			return err
+		}
+		secondSent = time.Now()
+		var err error
+		got, err = fut.Await(ctx)
+		return err
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("the other run summed %d, want 3", got)
+	}
+	first := time.Unix(0, told.firstTake.Load())
+	if first.IsZero() || secondSent.Before(first) {
+		t.Fatalf("the second send completed at %s, before the first take at %s: the capacity was not honoured",
+			secondSent.Format(time.StampMicro), first.Format(time.StampMicro))
+	}
+}
+
+// THE POINT: each value on a shared channel goes to ONE receiver, wherever
+// it runs. Two runs receiving from the same channel split what is sent
+// between them; nothing is seen twice and nothing is lost.
+func TestEachValueOnASharedChannelGoesToOneReceiver(t *testing.T) {
+	host := flow.NewMemChannelHost()
+	store := flow.NewMemStore()
+	var totals [2]int
+	err := flow.Run(t.Context(), "split", func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		first := ctx.Go(consumer, feed{Values: ch})
+		second := ctx.Go(consumer, feed{Values: ch})
+		for v := 1; v <= 6; v++ {
+			if err := ch.Send(ctx, v); err != nil {
+				return err
+			}
+		}
+		if err := ch.Close(ctx); err != nil {
+			return err
+		}
+		var err error
+		if totals[0], err = first.Await(ctx); err != nil {
+			return err
+		}
+		totals[1], err = second.Await(ctx)
+		return err
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if totals[0]+totals[1] != 21 {
+		t.Fatalf("the two receivers summed %d and %d, want a total of 21: each value to exactly one of them", totals[0], totals[1])
+	}
+}
+
+// THE POINT: the rule for handing out values is one rule, and a host that
+// starts with a record its predecessor wrote reaches the same state from it
+// — and grants what the predecessor admitted but never got to grant.
+func TestTheArbiterRestoresItsStateFromTheRecord(t *testing.T) {
+	a := flow.NewArbiter()
+	var record []flow.ChannelItem
+	offer := func(it flow.ChannelItem) []flow.ChannelItem {
+		out := a.Offer(it)
+		record = append(record, out...)
+		return out
+	}
+	value := func(seq uint64) flow.ChannelItem {
+		return flow.ChannelItem{From: "p/main", Seq: seq, Data: []byte("v")}
+	}
+	want := func(from string, seq uint64) flow.ChannelItem {
+		return flow.ChannelItem{Want: true, From: from, Seq: seq}
+	}
+
+	if out := offer(value(0)); len(out) != 1 {
+		t.Fatalf("a value with nobody waiting: %d records, want 1", len(out))
+	}
+	out := offer(want("a/main", 0))
+	if len(out) != 2 || out[1].To != "a/main" || out[1].From != "p/main" || out[1].Seq != 0 {
+		t.Fatalf("a want with a value waiting: %+v, want the want and a grant of p/main#0 to a/main#0", out)
+	}
+	if out := offer(want("a/main", 0)); len(out) != 0 {
+		t.Fatalf("the same want again: %d records, want none", len(out))
+	}
+	if out := offer(want("b/main", 0)); len(out) != 1 {
+		t.Fatalf("a want with nothing to give: %d records, want 1", len(out))
+	}
+	out = offer(value(1))
+	if len(out) != 2 || out[1].To != "b/main" || out[1].Seq != 1 {
+		t.Fatalf("a value with a want waiting: %+v, want the value and a grant of p/main#1 to b/main#0", out)
+	}
+	if out := offer(value(1)); len(out) != 0 {
+		t.Fatalf("the same value again: %d records, want none", len(out))
+	}
+	if out := offer(want("c/main", 0)); len(out) != 1 {
+		t.Fatalf("a third want with nothing to give: %d records, want 1", len(out))
+	}
+	for _, tc := range []struct {
+		name string
+		it   flow.ChannelItem
+		want bool
+	}{
+		{"a granted want", want("a/main", 0), true},
+		{"a want still open", want("c/main", 0), false},
+		{"a want never made", want("d/main", 0), false},
+		{"a granted value", value(0), true},
+		{"a value never sent", value(9), false},
+	} {
+		if got := a.Settled(tc.it); got != tc.want {
+			t.Errorf("Settled(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if out := offer(flow.ChannelItem{Closed: true}); len(out) != 1 {
+		t.Fatalf("a close: %d records, want 1", len(out))
+	}
+	if !a.Settled(want("c/main", 0)) {
+		t.Errorf("a want still open on a closed channel is settled: the receiver is owed the close")
+	}
+
+	// A successor that reads the whole record owes nothing.
+	b := flow.NewArbiter()
+	for _, it := range record {
+		b.Restore(it)
+	}
+	if owed := b.Grants(); len(owed) != 0 {
+		t.Fatalf("restored from the whole record, the arbiter owes %+v, want nothing", owed)
+	}
+	// One that reads a record cut before a grant owes that grant.
+	c := flow.NewArbiter()
+	for _, it := range record {
+		if it.To == "b/main" {
+			continue
+		}
+		c.Restore(it)
+	}
+	owed := c.Grants()
+	if len(owed) != 1 || owed[0].To != "b/main" || owed[0].Seq != 1 {
+		t.Fatalf("restored from a record missing its last grant, the arbiter owes %+v, want that grant", owed)
 	}
 }
