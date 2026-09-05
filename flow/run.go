@@ -400,11 +400,12 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// and that is the number a reader of an executor's record can find in the
 	// history.
 	step := t.at() - 1
-	out, callErr := t.run.exec.Invoke(WithOrigin(ctx, Origin{
+	out, callErr := t.run.exec.Invoke(WithOrigin(withForked(ctx, false), Origin{
 		Run:     t.run.name,
 		Thread:  t.id,
 		Step:    step,
 		Attempt: t.run.attempt,
+		Forked:  forkedFrom(ctx),
 	}), name, payload)
 
 	// A call cut short by the caller's own context did not fail; it was

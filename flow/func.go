@@ -337,6 +337,12 @@ type Origin struct {
 	Thread  string
 	Step    uint64
 	Attempt uint64
+	// Forked says the call was made with [Context.Go] or [Context.Map] — a
+	// fan-out — rather than directly. An executor that can run a call where
+	// it is made or somewhere else may use this to decide: a direct call
+	// blocks its caller, so sending it elsewhere gains nothing, while a
+	// fan-out is the case where placing calls across machines is the point.
+	Forked bool
 }
 
 // Zero reports whether o names nothing.
@@ -367,6 +373,20 @@ func WithOrigin(ctx context.Context, o Origin) context.Context {
 func OriginFrom(ctx context.Context) Origin {
 	o, _ := ctx.Value(originKey{}).(Origin)
 	return o
+}
+
+// forkedKey marks the context a forked thread calls its function on, so the
+// call can say it was a fan-out. Cleared again on the context the executor is
+// given, or a call the function makes inside would inherit the mark.
+type forkedKey struct{}
+
+func withForked(ctx context.Context, forked bool) context.Context {
+	return context.WithValue(ctx, forkedKey{}, forked)
+}
+
+func forkedFrom(ctx context.Context) bool {
+	f, _ := ctx.Value(forkedKey{}).(bool)
+	return f
 }
 
 // allocator returns a factory for T when T is a pointer type, and nil

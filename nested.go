@@ -324,6 +324,13 @@ func (e nestedExecutor) Invoke(ctx context.Context, name string, payload []byte)
 	if o.Zero() {
 		return nil, errors.New("wings: " + name + " was called on a worker outside its job's run")
 	}
+	// A direct call runs here. It blocks its caller either way, so sending
+	// it to another worker would move the CPU while this one's slot sat
+	// idle, and pay a commit and a round trip for it. Recorded and replayed
+	// like any call. A fan-out — Go, Map — is the cluster's to place.
+	if !o.Forked {
+		return flow.Local().Invoke(ctx, name, payload)
+	}
 	attempt := attemptKey(e.job.id, e.job.attempt)
 	e.n.runMu.Lock()
 	box := e.n.boxLocked(attempt, callKey(o.Thread, o.Step))

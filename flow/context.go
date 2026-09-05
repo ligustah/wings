@@ -100,7 +100,9 @@ func (c Context) WithValue(key, val any) Context {
 // input, with the results kept in order.
 func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
 	return spawn(c, "Go", func(ctx Context) (Out, error) {
-		return f(ctx, in)
+		// The one call this thread exists for is a fan-out, and says so to
+		// its executor. See Origin.Forked.
+		return f(Context{withForked(ctx, true)}, in)
 	})
 }
 

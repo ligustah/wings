@@ -376,3 +376,27 @@ func TestAJobWaitingOnItsCallIsNotMovedForSilence(t *testing.T) {
 		t.Fatalf("the job ran %d times; waiting on its own call must not count as silence", n)
 	}
 }
+
+// callsDirectly makes the same call as callsWhere, but directly rather than
+// with Go.
+var callsDirectly = flow.Define("test.callsDirectly", func(ctx flow.Context, _ int) (placement, error) {
+	child, err := whereAmI(ctx, 0)
+	if err != nil {
+		return placement{}, err
+	}
+	return placement{Parent: jobFrom(ctx).node.id, Child: child}, nil
+})
+
+// THE POINT: a direct call runs where it is made. It blocks its caller either
+// way, so another worker — even an idle one — would gain nothing but a round
+// trip. Go and Map are the fan-out, and those the cluster places.
+func TestADirectCallRunsWhereItIsMade(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1})
+	got, err := callsDirectly(c.Bind(t.Context()), 0)
+	if err != nil {
+		t.Fatalf("callsDirectly: %v", err)
+	}
+	if got.Child != got.Parent {
+		t.Fatalf("a direct call ran on %s, away from its caller on %s", got.Child, got.Parent)
+	}
+}
