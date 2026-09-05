@@ -53,7 +53,10 @@
 // return. A call a work function makes goes back to the cluster to be placed:
 // the coordinator reads it out of its copy of the run's history and answers
 // it on the worker's control stream, so a function that fans out fans out
-// across the fleet, and a worker never waits on itself.
+// across the fleet, and a worker never waits on itself. A flow.Channel handed
+// to a function in its input crosses machines too: a shared channel is a
+// durable stream relayed through the coordinator, a queue whose every value
+// reaches every run receiving from it.
 //
 // # Using this package directly
 //

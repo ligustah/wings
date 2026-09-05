@@ -63,6 +63,8 @@ type Cluster struct {
 	// jobs write. See output.go. Set once before any worker can run a job, and
 	// only read after, so it needs no lock.
 	outputs *dsclient.MirrorSetHandle
+	// relay merges what runs send on shared channels. See channel.go.
+	relay *channelRelay
 
 	// dropped names the output streams being deleted right now, so the mirror
 	// declines them rather than starting a copy of something on its way out.
@@ -161,6 +163,10 @@ type workerConn struct {
 	// were.
 	submits chan submission
 	appends atomic.Int64
+
+	// pushes names the shared channels being copied onto this worker.
+	// Guarded by Cluster.mu.
+	pushes map[string]bool
 
 	// ctx bounds every goroutine belonging to THIS worker -- its result tail,
 	// and in process its run loop too -- and stop ends them. wg is how close
@@ -418,6 +424,7 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	// Before any worker exists. The mirror reads the fleet afresh on every
 	// pass, so it has nothing to wait for — and a failure here costs nothing,
 	// where a failure after the machines were up used to cost the machines.
+	c.startChannelRelay()
 	if err := c.startOutputMirror(); err != nil {
 		return fail(err, nil)
 	}

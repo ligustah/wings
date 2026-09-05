@@ -51,9 +51,11 @@ type ChannelLink interface {
 // [WithChannelHost], can hand its channels to other runs and use channels
 // handed to it.
 type ChannelHost interface {
-	// Link connects the calling run to the channel named id, which is
-	// "<owning run>/<channel name>".
-	Link(ctx context.Context, id string) (ChannelLink, error)
+	// Link connects the run named run to the channel named id, which is
+	// "<owning run>/<channel name>" — the same run, when it is sharing its
+	// own. Called once per attempt of a run for each channel it shares or
+	// uses.
+	Link(ctx context.Context, run, id string) (ChannelLink, error)
 }
 
 // WithChannelHost lets this run share channels with other runs. Without one,
@@ -94,7 +96,7 @@ func (r *runState) export(ctx context.Context, name string) (string, error) {
 	if r.host == nil {
 		return "", fmt.Errorf("flow: channel %s cannot leave this run: the run has no channel host", name)
 	}
-	link, err := r.host.Link(ctx, id)
+	link, err := r.host.Link(ctx, r.name, id)
 	if err != nil {
 		return "", fmt.Errorf("flow: share channel %s: %w", name, err)
 	}
@@ -108,6 +110,12 @@ func (r *runState) export(ctx context.Context, name string) (string, error) {
 	cs.link = link
 	items := append([]*chanItem(nil), cs.items...)
 	closed := cs.closed
+	// A queue from here on: a send still waiting to be taken is complete
+	// now, since the value is about to be with the host.
+	for _, it := range items {
+		it.buffered = true
+	}
+	cs.broadcast()
 	cs.mu.Unlock()
 
 	for _, it := range items {
@@ -132,7 +140,7 @@ func (r *runState) attach(ctx context.Context, id string) (*chanState, error) {
 	if r.host == nil {
 		return nil, fmt.Errorf("flow: channel %s belongs to another run, and this run has no channel host to reach it", id)
 	}
-	link, err := r.host.Link(ctx, id)
+	link, err := r.host.Link(ctx, r.name, id)
 	if err != nil {
 		return nil, fmt.Errorf("flow: reach channel %s: %w", id, err)
 	}
@@ -202,7 +210,7 @@ type MemChannelHost struct {
 func NewMemChannelHost() *MemChannelHost { return &MemChannelHost{chans: map[string]*memChannel{}} }
 
 // Link implements [ChannelHost].
-func (h *MemChannelHost) Link(ctx context.Context, id string) (ChannelLink, error) {
+func (h *MemChannelHost) Link(_ context.Context, _, id string) (ChannelLink, error) {
 	if id == "" {
 		return nil, errors.New("flow: a channel id is required")
 	}

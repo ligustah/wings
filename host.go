@@ -62,6 +62,7 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 	return append(append([]flow.RunOption{}, opts...),
 		flow.WithStore(flow.NewStore(client)),
 		flow.WithExecutor(clusterExecutor{c}),
+		flow.WithChannelHost(clusterChannels{c}),
 	), nil
 }
 

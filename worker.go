@@ -501,7 +501,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope) (res resultEnv
 	// as the same call, or the coordinator dispatches it twice.
 	payload, err := flow.RunCall(ctx, jobRunName(job.ID), job.Func, job.Payload,
 		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
-		flow.WithExecutor(exec), flow.Once())
+		flow.WithExecutor(exec), flow.WithChannelHost(nodeChannels{n: n, job: state}), flow.Once())
 	// Whatever the attempt wrote is committed before its answer leaves: a
 	// result whose recordings could still be lost would be a handle to
 	// nothing. A commit that fails is the attempt failing.

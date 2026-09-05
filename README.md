@@ -452,7 +452,27 @@ attempt, so a retry that replays a call presents the same one, and the
 coordinator hands back the answer it kept — or lets the retry rejoin the call
 still in flight — rather than running it twice. A job waiting on a call it made
 is not moved for silence, however long the call takes; its total timeout still
-runs. Channels that cross machines are the next step on top of this.
+runs.
+
+### Channels across machines
+
+A `flow.Channel` **travels in a call's input** like any other value. The
+workflow creates one and hands it to a function; the function sends into it or
+receives from it; two functions on two workers can share one the same way. On
+the wire a shared channel is a durable stream relayed through the coordinator:
+every run that uses it has an outbox — on a worker, written inside the
+attempt's transaction and copied home like a recording — and the coordinator
+merges the outboxes into one canonical stream and pushes it to every worker
+using the channel. A worker subscribes by creating its outbox, which the output
+mirror discovers; nothing asks.
+
+Two things differ from a channel between threads. A shared channel is a
+**queue, not a rendezvous**: `Send` completes once the value is durable,
+whatever capacity the channel was created with. And **every run that receives
+sees every value** — threads within one run still compete, but two runs each
+get the whole sequence. Receives replay exactly as they do between threads: a
+moved function is handed the same values in the same order from the channel's
+record, on a worker that never saw the sender.
 
 ## Recordings
 

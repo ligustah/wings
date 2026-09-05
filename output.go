@@ -119,7 +119,7 @@ func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 // A plain split is enough because every part goes through streamPart, which
 // leaves a dot in none of them.
 func parseOutput(stream string) (outputName, bool) {
-	for _, prefix := range []string{recordingPrefix, artifactPrefix, historyPrefix, priorPrefix} {
+	for _, prefix := range []string{recordingPrefix, artifactPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {
 			continue
@@ -280,6 +280,11 @@ func (c *Cluster) startOutputMirror() error {
 			// keeps the next pass from starting it again.
 			if c.wasDropped(cand.Stream) {
 				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
+			}
+			// A worker's outbox for a shared channel is also its subscription
+			// to the channel: from here on the channel is pushed to it.
+			if o.Prefix == chanoutPrefix {
+				c.subscribeChannel(cand.Source, o.Name)
 			}
 			// The same name at the destination, which is what lets one handle
 			// mean the same thing on the worker that wrote it and on the
