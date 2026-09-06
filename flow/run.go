@@ -3,7 +3,7 @@
 //
 // A function is declared once with [Define] and called like any other:
 //
-//	var Digest = flow.Define("digest", func(ctx flow.Context, w Work) (Result, error) { ... })
+//	var Digest = flow.Define(func(ctx flow.Context, w Work) (Result, error) { ... }, flow.WithName("digest"))
 //
 // Where a call runs is decided by the context, not by the call. Inside a
 // [Run] every call is written down before it happens and its answer is written

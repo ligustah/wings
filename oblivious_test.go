@@ -148,12 +148,12 @@ func TestWorkFunctionSeesTheSameContextShapeEverywhere(t *testing.T) {
 	}
 }
 
-var reportsDeadline = flow.Define("test.deadline", func(ctx flow.Context, _ int) (string, error) {
+var reportsDeadline = flow.Define(func(ctx flow.Context, _ int) (string, error) {
 	if _, ok := ctx.Deadline(); ok {
 		return "has deadline", nil
 	}
 	return "no deadline", nil
-})
+}, flow.WithName("test.deadline"))
 
 // JobTimeout, when set, must apply on every target — the guarantee is the
 // config's, not the transport's.

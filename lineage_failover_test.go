@@ -279,7 +279,7 @@ type report struct {
 
 // parentOfSpawn is a work function that forks a thread of run code and waits
 // for it: the parent's worker is killed while the child runs.
-var parentOfSpawn = flow.Define("test.parentOfSpawn", func(ctx flow.Context, in report) (int, error) {
+var parentOfSpawn = flow.Define(func(ctx flow.Context, in report) (int, error) {
 	if err := in.Seen.Send(ctx, sighting{Worker: where(ctx)}); err != nil {
 		return 0, err
 	}
@@ -298,7 +298,7 @@ var parentOfSpawn = flow.Define("test.parentOfSpawn", func(ctx flow.Context, in 
 		return r, nil
 	})
 	return child.Await(ctx)
-})
+}, flow.WithName("test.parentOfSpawn"))
 
 var parentMoves = flow.DefineWorkflow("test.parentMoves", func(ctx flow.Context, _ int) error {
 	seen := ctx.NewBufferedChannel[sighting](4)

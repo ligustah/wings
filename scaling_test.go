@@ -12,14 +12,14 @@ import (
 )
 
 // whereRun waits and then says which worker it ran on.
-var whereRun = flow.Define("test.where", func(ctx flow.Context, d time.Duration) (string, error) {
+var whereRun = flow.Define(func(ctx flow.Context, d time.Duration) (string, error) {
 	select {
 	case <-time.After(d):
 		return jobFrom(ctx).node.id, nil
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-})
+}, flow.WithName("test.where"))
 
 // THE POINT: a job is given its worker when it is submitted, so a worker that
 // arrives after that — a scale-up, or the replacement for a preempted machine —

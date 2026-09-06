@@ -167,7 +167,7 @@ var resumed struct{ release chan struct{} }
 
 // doubleThenWait calls a function, then waits to be released — or for its
 // context to end, which is how its first attempt is interrupted.
-var doubleThenWait = flow.Define("flow.doubleThenWait", func(ctx flow.Context, in int) (int, error) {
+var doubleThenWait = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	v, err := double(ctx, in)
 	if err != nil {
 		return 0, err
@@ -178,7 +178,7 @@ var doubleThenWait = flow.Define("flow.doubleThenWait", func(ctx flow.Context, i
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
-})
+}, flow.WithName("flow.doubleThenWait"))
 
 // THE POINT: a thread handed to another process runs from its own history
 // there. RunThread on a store holding the thread's first attempt replays it

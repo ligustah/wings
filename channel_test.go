@@ -17,7 +17,7 @@ type feed struct {
 }
 
 // sums receives everything on the channel it was handed and returns the total.
-var sums = flow.Define("test.sums", func(ctx flow.Context, in feed) (int, error) {
+var sums = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	total := 0
 	for {
 		v, ok, err := in.Values.Recv(ctx)
@@ -29,17 +29,17 @@ var sums = flow.Define("test.sums", func(ctx flow.Context, in feed) (int, error)
 		}
 		total += v
 	}
-})
+}, flow.WithName("test.sums"))
 
 // counts sends 1..Count on the channel it was handed, then closes it.
-var counts = flow.Define("test.counts", func(ctx flow.Context, in feed) (int, error) {
+var counts = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	for i := 1; i <= in.Count; i++ {
 		if err := in.Values.Send(ctx, i); err != nil {
 			return 0, err
 		}
 	}
 	return in.Count, in.Values.Close(ctx)
-})
+}, flow.WithName("test.counts"))
 
 // THE POINT: a channel is shared by handing it to a call. The workflow on the
 // coordinator and the function on a worker — or two functions on two workers
@@ -173,7 +173,7 @@ var movedRecv struct {
 // receivesThenStalls takes three values, reports progress — which commits
 // its history — and on its first attempt goes quiet until moved. The retry
 // must see the same three values, in the same order, before the rest.
-var receivesThenStalls = flow.Define("test.receivesThenStalls", func(ctx flow.Context, in feed) ([]int, error) {
+var receivesThenStalls = flow.Define(func(ctx flow.Context, in feed) ([]int, error) {
 	movedRecv.attempts.Add(1)
 	var got []int
 	for range 3 {
@@ -203,7 +203,9 @@ var receivesThenStalls = flow.Define("test.receivesThenStalls", func(ctx flow.Co
 		}
 		got = append(got, v)
 	}
-}, flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.receivesThenStalls"),
+
+	flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a moved function replays its receives from the channel's
 // durable record, on a worker that never saw the sender, and gets exactly

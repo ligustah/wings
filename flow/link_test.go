@@ -18,7 +18,7 @@ type feed struct {
 	Values *flow.Channel[int] `json:"values"`
 }
 
-var consumer = flow.Define("test.consumer", func(ctx flow.Context, in feed) (int, error) {
+var consumer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	total := 0
 	for {
 		v, ok, err := in.Values.Recv(ctx)
@@ -30,7 +30,7 @@ var consumer = flow.Define("test.consumer", func(ctx flow.Context, in feed) (int
 		}
 		total += v
 	}
-})
+}, flow.WithName("test.consumer"))
 
 // sharedRuns is an executor that runs each call as a run of its own on the
 // same host, the way a worker does — so a channel in the input really
@@ -79,14 +79,14 @@ func TestAChannelReachesAnotherRun(t *testing.T) {
 }
 
 // producer sends into a channel it was handed and closes it.
-var producer = flow.Define("test.producer", func(ctx flow.Context, in feed) (int, error) {
+var producer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	for i := 1; i <= 3; i++ {
 		if err := in.Values.Send(ctx, i*10); err != nil {
 			return 0, err
 		}
 	}
 	return 3, in.Values.Close(ctx)
-})
+}, flow.WithName("test.producer"))
 
 var replayedRecv struct {
 	attempts atomic.Int32
@@ -154,7 +154,7 @@ func TestAChannelCannotLeaveARunWithoutAHost(t *testing.T) {
 
 // takesTwoWhenTold waits to be told, then takes two values and returns their
 // sum, noting when it took the first.
-var takesTwoWhenTold = flow.Define("test.takesTwoWhenTold", func(ctx flow.Context, in feed) (int, error) {
+var takesTwoWhenTold = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	select {
 	case <-told.release:
 	case <-ctx.Done():
@@ -170,7 +170,7 @@ var takesTwoWhenTold = flow.Define("test.takesTwoWhenTold", func(ctx flow.Contex
 		return 0, err
 	}
 	return a + b, nil
-})
+}, flow.WithName("test.takesTwoWhenTold"))
 
 var told struct {
 	release   chan struct{}

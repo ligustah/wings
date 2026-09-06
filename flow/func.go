@@ -62,8 +62,27 @@ type Bounds struct {
 	Start time.Duration
 }
 
+// definition is what an [Option] configures at [Define] time: the name a
+// function is registered under and its bounds.
+type definition struct {
+	name   string
+	bounds Bounds
+}
+
 // Option configures a function at [Define] time.
-type Option func(*Bounds)
+type Option func(*definition)
+
+// WithName sets the name a function is registered and recorded under.
+//
+// The name identifies the function everywhere but the source — in a run's
+// history, on the wire to an executor — so renaming the variable is free and
+// changing this string is a change to every history that mentions it. The
+// `wings` build step infers the name from the variable a definition is assigned
+// to, so most code needs this only to override that, or when the name cannot be
+// inferred.
+func WithName(name string) Option {
+	return func(d *definition) { d.name = name }
+}
 
 // WithTimeout bounds one call of this function, from the moment an executor
 // starts it to the moment it returns.
@@ -74,11 +93,11 @@ type Option func(*Bounds)
 // spend the same time again to reach the same answer. Use [WithHeartbeatTimeout]
 // for the case where the machine is the suspect.
 func WithTimeout(d time.Duration) Option {
-	return func(b *Bounds) { b.Timeout = d }
+	return func(def *definition) { def.bounds.Timeout = d }
 }
 
 // WithHeartbeatTimeout requires this function to report progress at least this
-// often, using [Context.Heartbeat] or [Context.Step].
+// often, using [Context.Heartbeat].
 //
 // A call that goes quiet for longer is presumed stuck rather than slow, and an
 // executor that can do so runs it again elsewhere — carrying the last
@@ -89,7 +108,7 @@ func WithTimeout(d time.Duration) Option {
 // The clock starts when the call starts, so a function that declares this must
 // heartbeat; one that never does will be moved on every machine in turn.
 func WithHeartbeatTimeout(d time.Duration) Option {
-	return func(b *Bounds) { b.Heartbeat = d }
+	return func(def *definition) { def.bounds.Heartbeat = d }
 }
 
 // WithStartTimeout bounds how long a call may wait in an executor's queue
@@ -101,36 +120,42 @@ func WithHeartbeatTimeout(d time.Duration) Option {
 // must — the right answer for a saturated cluster, where every queue is long
 // and moving a call only puts it at the back of another.
 func WithStartTimeout(d time.Duration) Option {
-	return func(b *Bounds) { b.Start = d }
+	return func(def *definition) { def.bounds.Start = d }
 }
 
-// Define registers a function under name and returns a callable handle.
+// Define registers a function and returns a callable handle. The closure is
+// the only fixed argument; everything else, the name included, is an [Option].
 //
 // Call it in a package-scope var. An executor that runs functions in another
 // process resolves calls through the registry Define populates, and a function
 // defined inside main's body exists only in the process that ran main.
 //
-// The name is what identifies the function everywhere but the source — in a
-// run's history, on the wire to an executor — so renaming the variable is free
-// and renaming the string is a change to every history that mentions it.
+// The name comes from [WithName], or from the `wings` build step, which infers
+// it from the variable this is assigned to. It is what identifies the function
+// everywhere but the source — in a run's history, on the wire to an executor —
+// so renaming the variable is free and changing the name is a change to every
+// history that mentions it.
 //
-// Panics if name is empty or already defined. Both are programming errors, and
-// at package-init time a panic is the report that cannot be ignored.
-func Define[In, Out any](name string, fn func(Context, In) (Out, error), opts ...Option) Func[In, Out] {
-	if name == "" {
-		panic("flow: Define requires a non-empty name")
-	}
+// Panics if the function is nil, if no name was given, or if the name is
+// already defined. All are programming errors, and at package-init time a panic
+// is the report that cannot be ignored.
+func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func[In, Out] {
 	if fn == nil {
 		panic("flow: Define requires a non-nil function")
 	}
+	var cfg definition
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.name == "" {
+		panic("flow: Define requires a name; pass flow.WithName, or let the wings build step infer it")
+	}
 	d := &def[In, Out]{
-		name:     name,
+		name:     cfg.name,
 		fn:       fn,
+		bounds:   cfg.bounds,
 		inCodec:  dswire.ReflectCodec[In]{New: allocator[In]()},
 		outCodec: dswire.ReflectCodec[Out]{New: allocator[Out]()},
-	}
-	for _, opt := range opts {
-		opt(&d.bounds)
 	}
 	register(d)
 

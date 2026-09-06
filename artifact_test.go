@@ -13,13 +13,12 @@ import (
 
 // render writes bytes rather than events, which is the other, entirely separate
 // half of what a job can leave behind.
-var render = flow.Define("test.render", func(ctx flow.Context, size int) (Artifact, error) {
+var render = flow.Define(func(ctx flow.Context, size int) (Artifact, error) {
 	out, err := Create(ctx, "render")
 	if err != nil {
 		return Artifact{}, err
 	}
-	// Written in small pieces, as a real producer would, so the chunking is
-	// exercised rather than a single big Write.
+
 	line := bytes.Repeat([]byte("x"), 997)
 	for written := 0; written < size; written += len(line) {
 		if _, err := out.Write(line); err != nil {
@@ -30,7 +29,7 @@ var render = flow.Define("test.render", func(ctx flow.Context, size int) (Artifa
 		return Artifact{}, err
 	}
 	return out.Artifact(), nil
-})
+}, flow.WithName("test.render"))
 
 // A worker that produced this much as a return value would kill its own
 // connection.
@@ -152,7 +151,7 @@ func TestStopKeepsWhatWasStillBeingCopied(t *testing.T) {
 
 // renderOnce hands the whole file to Write in a single call, which an encoder
 // that builds its output in memory and writes it at the end does.
-var renderOnce = flow.Define("test.render-once", func(ctx flow.Context, size int) (Artifact, error) {
+var renderOnce = flow.Define(func(ctx flow.Context, size int) (Artifact, error) {
 	out, err := Create(ctx, "render")
 	if err != nil {
 		return Artifact{}, err
@@ -164,7 +163,7 @@ var renderOnce = flow.Define("test.render-once", func(ctx flow.Context, size int
 		return Artifact{}, err
 	}
 	return out.Artifact(), nil
-})
+}, flow.WithName("test.render-once"))
 
 // pattern is size bytes that a wrong chunk boundary would visibly scramble.
 func pattern(size int) []byte {
@@ -211,7 +210,7 @@ func TestOneWriteLargerThanAChunkArrivesWholeAndInOrder(t *testing.T) {
 
 // writeForever ignores its context, as a work function that only ever talks to
 // an io.Writer would, and writes until the writer refuses.
-var writeForever = flow.Define("test.write-forever", func(ctx flow.Context, _ int) (int, error) {
+var writeForever = flow.Define(func(ctx flow.Context, _ int) (int, error) {
 	out, err := Create(ctx, "endless")
 	if err != nil {
 		return 0, err
@@ -221,9 +220,11 @@ var writeForever = flow.Define("test.write-forever", func(ctx flow.Context, _ in
 		if _, err := out.Write(line); err != nil {
 			return 0, err
 		}
-		time.Sleep(10 * time.Millisecond) // a producer, not a tight loop
+		time.Sleep(10 * time.Millisecond)
 	}
-}, flow.WithTimeout(300*time.Millisecond))
+}, flow.WithName("test.write-forever"),
+
+	flow.WithTimeout(300*time.Millisecond))
 
 // THE POINT: a job's output used to go out on a background context, so a job
 // that had blown its deadline but only ever checked the writer's error kept

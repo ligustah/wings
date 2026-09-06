@@ -181,7 +181,7 @@ type nestedSpawnReport struct {
 // spawnsInAJob is a work function — itself a thread on a worker — that
 // forks a thread of run code. That thread's lineage is three long: the
 // workflow, this function, the closure.
-var spawnsInAJob = flow.Define("test.spawnsInAJob", func(ctx flow.Context, base int) (nestedSpawnReport, error) {
+var spawnsInAJob = flow.Define(func(ctx flow.Context, base int) (nestedSpawnReport, error) {
 	results := ctx.NewBufferedChannel[int](1)
 	inner := ctx.Spawn(func(ctx flow.Context) (string, error) {
 		return where(ctx), results.Send(ctx, base*2)
@@ -195,7 +195,7 @@ var spawnsInAJob = flow.Define("test.spawnsInAJob", func(ctx flow.Context, base 
 		return nestedSpawnReport{}, err
 	}
 	return nestedSpawnReport{Outer: where(ctx), Inner: ran, Value: v}, nil
-})
+}, flow.WithName("test.spawnsInAJob"))
 
 var forksAJobThatSpawns = flow.DefineWorkflow("test.forksAJobThatSpawns", func(ctx flow.Context, base int) error {
 	var err error

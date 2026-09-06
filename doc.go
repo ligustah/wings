@@ -9,7 +9,7 @@
 //
 //	package job
 //
-//	var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
+//	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
 //		return render(f)
 //	})
 //

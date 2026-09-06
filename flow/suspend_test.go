@@ -9,12 +9,12 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-var napThenDouble = flow.Define("flow.napThenDouble", func(ctx flow.Context, in int) (int, error) {
+var napThenDouble = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	if err := ctx.Sleep(2 * time.Minute); err != nil {
 		return 0, err
 	}
 	return in * 2, nil
-})
+}, flow.WithName("flow.napThenDouble"))
 
 // THE POINT: a thread run on somebody else's behalf hands a long sleep back
 // rather than waiting it out in place. The caller learns when to run the

@@ -58,9 +58,8 @@ type Result struct {
 // process that links this package — including a worker, which never runs
 // the workflow. Nothing here mentions wings: a work function is a flow function,
 // and wings is one place it can be sent to run.
-var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, error) {
-	// The host is an answer from outside the run, different on every machine,
-	// so it is asked for as an effect: recorded once, replayed on a retry.
+var Digest = flow.Define(func(ctx flow.Context, in Work) (Result, error) {
+
 	host, err := ctx.Effect(os.Hostname)
 	if err != nil {
 		return Result{}, err
@@ -74,7 +73,7 @@ var Digest = flow.Define("digest", func(ctx flow.Context, in Work) (Result, erro
 		sum = sha256.Sum256(sum[:])
 	}
 	return Result{Seed: in.Seed, Digest: hex.EncodeToString(sum[:]), Host: host}, nil
-})
+}, flow.WithName("digest"))
 
 // Main is the workflow: what this program is about. wings runs it as a flow
 // once the cluster is up, and tears the cluster down when it returns. Because
@@ -120,7 +119,7 @@ type Batch struct {
 	Results *flow.Channel[Result] `json:"results"`
 }
 
-var DigestBatch = flow.Define("digestBatch", func(ctx flow.Context, in Batch) (int, error) {
+var DigestBatch = flow.Define(func(ctx flow.Context, in Batch) (int, error) {
 	results, err := ctx.Map(Digest, in.Work)
 	if err != nil {
 		return 0, err
@@ -131,7 +130,7 @@ var DigestBatch = flow.Define("digestBatch", func(ctx flow.Context, in Batch) (i
 		}
 	}
 	return len(results), nil
-})
+}, flow.WithName("digestBatch"))
 
 // Fanout is a second workflow, chosen with -workflow fanout. It splits the
 // work into batches, hands each batch a channel to report on, and prints

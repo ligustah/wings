@@ -41,7 +41,7 @@ var stall struct {
 // restore is a long job in three phases, the middle of which goes quiet on its
 // first attempt — a worker that has not died but has stopped saying anything,
 // which is the case a job gets moved for.
-var restore = flow.Define("test.restore", func(ctx flow.Context, _ int) (string, error) {
+var restore = flow.Define(func(ctx flow.Context, _ int) (string, error) {
 	first := stall.attempts.Add(1) == 1
 
 	a, err := ctx.Step("snapshot", func(ctx flow.Context) (string, error) {
@@ -75,7 +75,9 @@ var restore = flow.Define("test.restore", func(ctx flow.Context, _ int) (string,
 		return "", err
 	}
 	return a + b + c, nil
-}, flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.restore"),
+
+	flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: relocating a job must not mean redoing it. What cannot cross a
 // machine boundary is the running goroutine; what can is the result of each

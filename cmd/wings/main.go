@@ -9,7 +9,7 @@
 //
 //	package job
 //
-//	var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) { … })
+//	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) { … }, flow.WithName("render"))
 //
 //	// A workflow is run as a flow once the cluster is up.
 //	var Frames = flow.DefineWorkflow("frames", func(ctx flow.Context, job Job) error {

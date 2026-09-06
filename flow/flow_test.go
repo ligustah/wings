@@ -22,16 +22,16 @@ var calls struct {
 	slow   atomic.Int64
 }
 
-var double = flow.Define("flow.double", func(ctx flow.Context, in int) (int, error) {
+var double = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	calls.double.Add(1)
 	return in * 2, nil
-})
+}, flow.WithName("flow.double"))
 
-var boom = flow.Define("flow.boom", func(ctx flow.Context, in string) (string, error) {
+var boom = flow.Define(func(ctx flow.Context, in string) (string, error) {
 	return "", errors.New("deliberate failure: " + in)
-})
+}, flow.WithName("flow.boom"))
 
-var slow = flow.Define("flow.slow", func(ctx flow.Context, d time.Duration) (string, error) {
+var slow = flow.Define(func(ctx flow.Context, d time.Duration) (string, error) {
 	calls.slow.Add(1)
 	select {
 	case <-time.After(d):
@@ -39,7 +39,7 @@ var slow = flow.Define("flow.slow", func(ctx flow.Context, d time.Duration) (str
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-})
+}, flow.WithName("flow.slow"))
 
 // gated finishes when the test lets it, and counts how often it was started.
 var gate struct {
@@ -47,7 +47,7 @@ var gate struct {
 	open   chan struct{}
 }
 
-var gated = flow.Define("flow.gated", func(ctx flow.Context, in int) (int, error) {
+var gated = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	gate.starts.Add(1)
 	select {
 	case <-gate.open:
@@ -55,7 +55,7 @@ var gated = flow.Define("flow.gated", func(ctx flow.Context, in int) (int, error
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
-})
+}, flow.WithName("flow.gated"))
 
 // quick is a retry policy that does not make a test wait.
 var quick = flow.Backoff(time.Millisecond, time.Millisecond)

@@ -130,7 +130,7 @@ type Tally struct {
 }
 
 // Consume takes from the channel until it closes.
-var Consume = flow.Define("consume", func(ctx flow.Context, in Feed) (Tally, error) {
+var Consume = flow.Define(func(ctx flow.Context, in Feed) (Tally, error) {
 	var t Tally
 	for {
 		v, more, err := in.Values.Recv(ctx)
@@ -146,7 +146,7 @@ var Consume = flow.Define("consume", func(ctx flow.Context, in Feed) (Tally, err
 	var err error
 	t.Pid, err = pid(ctx)
 	return t, err
-})
+}, flow.WithName("consume"))
 
 var Fanin = flow.DefineWorkflow("fanin", func(ctx flow.Context, in Params) error {
 	n := cmp.Or(in.N, 50)
@@ -199,29 +199,31 @@ var Fanin = flow.DefineWorkflow("fanin", func(ctx flow.Context, in Params) error
 
 var ErrExpected = errors.New("expected failure")
 
-var Fails = flow.Define("fails", func(ctx flow.Context, in int) (int, error) {
+var Fails = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	return 0, fmt.Errorf("%w: input %d", ErrExpected, in)
-})
+}, flow.WithName("fails"))
 
-var Panics = flow.Define("panics", func(ctx flow.Context, in int) (int, error) {
+var Panics = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	panic(fmt.Sprintf("on purpose, with %d", in))
-})
+}, flow.WithName("panics"))
 
-var Slow = flow.Define("slow", func(ctx flow.Context, d time.Duration) (int, error) {
+var Slow = flow.Define(func(ctx flow.Context, d time.Duration) (int, error) {
 	select {
 	case <-time.After(d):
 		return int(d), nil
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
-}, flow.WithTimeout(500*time.Millisecond))
+}, flow.WithName("slow"),
 
-var Square = flow.Define("square", func(ctx flow.Context, in int) (int, error) {
+	flow.WithTimeout(500*time.Millisecond))
+
+var Square = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	if in < 0 {
 		return 0, fmt.Errorf("%w: cannot square %d", ErrExpected, in)
 	}
 	return in * in, nil
-})
+}, flow.WithName("square"))
 
 var Flaky = flow.DefineWorkflow("flaky", func(ctx flow.Context, in Params) error {
 	// A function that fails: the error comes back through Await, and the
@@ -527,13 +529,13 @@ var Refused = flow.DefineWorkflow("refused", func(ctx flow.Context, in Params) e
 	return ok("refused")
 })
 
-var StepsThenSpawns = flow.Define("stepsThenSpawns", func(ctx flow.Context, in int) (int, error) {
+var StepsThenSpawns = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	v, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 1, nil })
 	if err != nil {
 		return 0, err
 	}
 	return ctx.Spawn(func(ctx flow.Context) (int, error) { return v * 2, nil }).Await(ctx)
-})
+}, flow.WithName("stepsThenSpawns"))
 
 // --- panicky: a closure that panics on a worker, and one that returns a
 // permanent error, and the workflow going on ---
@@ -690,13 +692,13 @@ var Stepped = flow.DefineWorkflow("stepped", func(ctx flow.Context, in Params) e
 	return ok("stepped")
 })
 
-var Stepper = flow.Define("stepper", func(ctx flow.Context, in int) (int, error) {
+var Stepper = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 19, nil })
 	if err != nil {
 		return 0, err
 	}
 	return ctx.Step("second", func(ctx flow.Context) (int, error) { return a + 22, nil })
-})
+}, flow.WithName("stepper"))
 
 // --- orphaned: a receiver whose only sender fails without closing, and a
 // sender whose channel was closed under it ---
@@ -754,7 +756,7 @@ type Outlet struct {
 	Out *flow.Channel[int]
 }
 
-var Pumps = flow.Define("pumps", func(ctx flow.Context, in Outlet) (int, error) {
+var Pumps = flow.Define(func(ctx flow.Context, in Outlet) (int, error) {
 	p, _ := pid(ctx)
 	inner := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		q, _ := pid(ctx)
@@ -771,7 +773,7 @@ var Pumps = flow.Define("pumps", func(ctx flow.Context, in Outlet) (int, error) 
 	}
 	fmt.Printf("crossed: pumped from pid %d, its thread on pid %d\n", p, q)
 	return in.N, nil
-})
+}, flow.WithName("pumps"))
 
 var Crossed = flow.DefineWorkflow("crossed", func(ctx flow.Context, in Params) error {
 	n := cmp.Or(in.N, 25)

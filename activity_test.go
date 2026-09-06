@@ -16,7 +16,7 @@ import (
 
 // A work function is run code: it may fork, use a channel, call other
 // functions, read the clock and sleep, on whichever worker it lands on.
-var activity = flow.Define("test.activity", func(ctx flow.Context, in int) (string, error) {
+var activity = flow.Define(func(ctx flow.Context, in int) (string, error) {
 	ch := ctx.NewBufferedChannel[int](2)
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for i := range 2 {
@@ -52,7 +52,7 @@ var activity = flow.Define("test.activity", func(ctx flow.Context, in int) (stri
 		return "", err
 	}
 	return fmt.Sprintf("%d/%d/%t", sum, doubled[0], !now.IsZero()), nil
-})
+}, flow.WithName("test.activity"))
 
 // THE POINT: a function on a worker is not a lesser kind of code than the
 // workflow that called it. It runs as a run of its own, so everything a run's
@@ -90,7 +90,7 @@ var replayed struct {
 
 // nestedCounted leaves a trace of every execution where the test can find it
 // from outside the process: a recording, named for the attempt that ran it.
-var nestedCounted = flow.Define("test.nestedCounted", func(ctx flow.Context, in int) (int, error) {
+var nestedCounted = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	replayed.nested.Add(1)
 	rec, err := Record[int](ctx, "nested")
 	if err != nil {
@@ -103,7 +103,7 @@ var nestedCounted = flow.Define("test.nestedCounted", func(ctx flow.Context, in 
 		return 0, err
 	}
 	return in * 3, nil
-})
+}, flow.WithName("test.nestedCounted"))
 
 type stalled struct {
 	V   int    `json:"v"`
@@ -112,7 +112,7 @@ type stalled struct {
 
 // forksThenStalls makes a nested call, reports progress — which commits its
 // history — and then, on its first attempt, goes quiet until moved.
-var forksThenStalls = flow.Define("test.forksThenStalls", func(ctx flow.Context, in int) (stalled, error) {
+var forksThenStalls = flow.Define(func(ctx flow.Context, in int) (stalled, error) {
 	replayed.attempts.Add(1)
 	v, err := ctx.Go(nestedCounted, in).Await(ctx)
 	if err != nil {
@@ -129,7 +129,9 @@ var forksThenStalls = flow.Define("test.forksThenStalls", func(ctx flow.Context,
 		return stalled{}, errors.New("test.forksThenStalls: the first attempt was abandoned")
 	}
 	return stalled{V: v, Job: jobFrom(ctx).id}, nil
-}, flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.forksThenStalls"),
+
+	flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a moved function replays what it already did rather than doing
 // it again. The history of its first attempt reached the coordinator at the
@@ -201,7 +203,7 @@ var visible struct {
 
 // recordsInTwoHalves records, waits to be looked at, reports progress, waits
 // again, records more and returns.
-var recordsInTwoHalves = flow.Define("test.recordsInTwoHalves", func(ctx flow.Context, _ int) (Recording, error) {
+var recordsInTwoHalves = flow.Define(func(ctx flow.Context, _ int) (Recording, error) {
 	rec, err := Record[int](ctx, "log")
 	if err != nil {
 		return Recording{}, err
@@ -230,7 +232,7 @@ var recordsInTwoHalves = flow.Define("test.recordsInTwoHalves", func(ctx flow.Co
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-})
+}, flow.WithName("test.recordsInTwoHalves"))
 
 // THE POINT: what a job writes becomes visible at its commit points and not
 // before. Three events sent and not committed are three events nobody can
@@ -303,18 +305,18 @@ type placement struct {
 }
 
 // whereAmI answers with the worker it ran on.
-var whereAmI = flow.Define("test.whereAmI", func(ctx flow.Context, _ int) (string, error) {
+var whereAmI = flow.Define(func(ctx flow.Context, _ int) (string, error) {
 	return jobFrom(ctx).node.id, nil
-})
+}, flow.WithName("test.whereAmI"))
 
 // callsWhere makes one call and reports where both ran.
-var callsWhere = flow.Define("test.callsWhere", func(ctx flow.Context, _ int) (placement, error) {
+var callsWhere = flow.Define(func(ctx flow.Context, _ int) (placement, error) {
 	child, err := ctx.Go(whereAmI, 0).Await(ctx)
 	if err != nil {
 		return placement{}, err
 	}
 	return placement{Parent: jobFrom(ctx).node.id, Child: child}, nil
-})
+}, flow.WithName("test.callsWhere"))
 
 // THE POINT: a call a work function makes is the cluster's to place. With a
 // second worker idle it goes there; with one worker whose only slot the caller
@@ -356,10 +358,12 @@ var patient struct{ attempts atomic.Int32 }
 
 // waitsOnASlowCall must heartbeat every 200ms, and instead waits 700ms on a
 // call it made.
-var waitsOnASlowCall = flow.Define("test.waitsOnASlowCall", func(ctx flow.Context, _ int) (string, error) {
+var waitsOnASlowCall = flow.Define(func(ctx flow.Context, _ int) (string, error) {
 	patient.attempts.Add(1)
 	return ctx.Go(slow, 700*time.Millisecond).Await(ctx)
-}, flow.WithHeartbeatTimeout(200*time.Millisecond))
+}, flow.WithName("test.waitsOnASlowCall"),
+
+	flow.WithHeartbeatTimeout(200*time.Millisecond))
 
 // THE POINT: a job waiting on a call it made is quiet for as long as the call
 // takes, and the coordinator — which is running the call — does not mistake
@@ -381,13 +385,13 @@ func TestAJobWaitingOnItsCallIsNotMovedForSilence(t *testing.T) {
 
 // callsDirectly makes the same call as callsWhere, but directly rather than
 // with Go.
-var callsDirectly = flow.Define("test.callsDirectly", func(ctx flow.Context, _ int) (placement, error) {
+var callsDirectly = flow.Define(func(ctx flow.Context, _ int) (placement, error) {
 	child, err := whereAmI(ctx, 0)
 	if err != nil {
 		return placement{}, err
 	}
 	return placement{Parent: jobFrom(ctx).node.id, Child: child}, nil
-})
+}, flow.WithName("test.callsDirectly"))
 
 // THE POINT: a direct call runs where it is made. It blocks its caller either
 // way, so another worker — even an idle one — would gain nothing but a round
@@ -405,12 +409,12 @@ func TestADirectCallRunsWhereItIsMade(t *testing.T) {
 
 // whoRunsMe reports which process is running it: a worker by its id, or the
 // coordinator, which has no job around the call.
-var whoRunsMe = flow.Define("test.whoRunsMe", func(ctx flow.Context, _ int) (string, error) {
+var whoRunsMe = flow.Define(func(ctx flow.Context, _ int) (string, error) {
 	if j := jobFrom(ctx); j != nil {
 		return j.node.id, nil
 	}
 	return "coordinator", nil
-})
+}, flow.WithName("test.whoRunsMe"))
 
 // THE POINT: the same rule on the coordinator. A workflow body that calls a
 // function directly runs it where the body is; the threads it forks are what

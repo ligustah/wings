@@ -35,30 +35,30 @@ type point struct {
 	X, Y int
 }
 
-var double = flow.Define("test.double", func(ctx flow.Context, in int) (int, error) {
+var double = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	return in * 2, nil
-})
+}, flow.WithName("test.double"))
 
-var sum = flow.Define("test.sum", func(ctx flow.Context, in point) (int, error) {
+var sum = flow.Define(func(ctx flow.Context, in point) (int, error) {
 	return in.X + in.Y, nil
-})
+}, flow.WithName("test.sum"))
 
-var boom = flow.Define("test.boom", func(ctx flow.Context, in string) (string, error) {
+var boom = flow.Define(func(ctx flow.Context, in string) (string, error) {
 	return "", errors.New("deliberate failure: " + in)
-})
+}, flow.WithName("test.boom"))
 
-var panics = flow.Define("test.panics", func(ctx flow.Context, in int) (int, error) {
+var panics = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	panic("deliberate panic")
-})
+}, flow.WithName("test.panics"))
 
-var slow = flow.Define("test.slow", func(ctx flow.Context, d time.Duration) (string, error) {
+var slow = flow.Define(func(ctx flow.Context, d time.Duration) (string, error) {
 	select {
 	case <-time.After(d):
 		return "finished", nil
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-})
+}, flow.WithName("test.slow"))
 
 // runSeq names each test run distinctly: a run's name is its history, and a
 // second run under a finished one's name would be that run, already done.
@@ -407,7 +407,7 @@ func TestDuplicateDefinePanics(t *testing.T) {
 			t.Fatal("want a panic on duplicate Define")
 		}
 	}()
-	_ = flow.Define("test.double", func(ctx flow.Context, in int) (int, error) { return in, nil })
+	_ = flow.Define(func(ctx flow.Context, in int) (int, error) { return in, nil }, flow.WithName("test.double"))
 }
 
 func TestStopIsIdempotent(t *testing.T) {
@@ -449,9 +449,9 @@ func TestWorkerConcurrencyOverlaps(t *testing.T) {
 	}
 }
 
-var huge = flow.Define("test.huge", func(ctx flow.Context, n int) (string, error) {
+var huge = flow.Define(func(ctx flow.Context, n int) (string, error) {
 	return strings.Repeat("x", n), nil
-})
+}, flow.WithName("test.huge"))
 
 // THE POINT: a result too large to carry is one job's mistake. It used to look
 // like a dropped connection to the coordinator, which declared the worker dead,
@@ -510,9 +510,9 @@ func TestGivingUpOnAJobWithNoWorkerIsHarmless(t *testing.T) {
 
 func ExampleDefine() {
 	// Defined at package scope in real code, so a worker process has it too.
-	greet := flow.Define("example.greet", func(ctx flow.Context, name string) (string, error) {
+	greet := flow.Define(func(ctx flow.Context, name string) (string, error) {
 		return "hello, " + name, nil
-	})
+	}, flow.WithName("example.greet"))
 
 	c, err := Start(context.Background(), Config{Target: InProcess()})
 	if err != nil {

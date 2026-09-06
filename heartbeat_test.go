@@ -30,7 +30,7 @@ var wedge struct {
 // chunks processes items one at a time, heartbeating its position, and can be
 // told to go quiet part-way through. That combination is the whole feature: a
 // job that stops reporting is moved, and the move is cheap because it resumes.
-var chunks = flow.Define("test.chunks", func(ctx flow.Context, total int) (int, error) {
+var chunks = flow.Define(func(ctx flow.Context, total int) (int, error) {
 	from, _, err := ctx.Checkpoint[int]()
 	if err != nil {
 		return 0, err
@@ -40,8 +40,7 @@ var chunks = flow.Define("test.chunks", func(ctx flow.Context, total int) (int, 
 	did := 0
 	for i := from; i < total; i++ {
 		if attempt == 1 && i == from+2 {
-			// Go quiet: still running, still holding the job, reporting
-			// nothing. This is a wedged worker as the coordinator sees one.
+
 			select {
 			case <-wedge.release:
 			case <-ctx.Done():
@@ -60,12 +59,16 @@ var chunks = flow.Define("test.chunks", func(ctx flow.Context, total int) (int, 
 	resumable.done = append(resumable.done, did)
 	resumable.mu.Unlock()
 	return total, nil
-}, flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.chunks"),
 
-var forever = flow.Define("test.forever", func(ctx flow.Context, _ int) (int, error) {
+	flow.WithHeartbeatTimeout(300*time.Millisecond))
+
+var forever = flow.Define(func(ctx flow.Context, _ int) (int, error) {
 	<-ctx.Done()
 	return 0, ctx.Err()
-}, flow.WithTimeout(200*time.Millisecond))
+}, flow.WithName("test.forever"),
+
+	flow.WithTimeout(200*time.Millisecond))
 
 // THE POINT: a job that goes quiet is presumed stuck on its machine rather than
 // slow, and is moved — but moving it must not throw away what it had already
@@ -173,14 +176,16 @@ func TestHeartbeatOutsideAJobIsAnError(t *testing.T) {
 
 // quick is a short job with short bounds. It runs in a fraction of either, so
 // the only way it can fail is by being charged for time it spent waiting.
-var quick = flow.Define("test.quick", func(ctx flow.Context, _ int) (string, error) {
+var quick = flow.Define(func(ctx flow.Context, _ int) (string, error) {
 	select {
 	case <-time.After(20 * time.Millisecond):
 		return "finished", nil
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-}, flow.WithTimeout(300*time.Millisecond), flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.quick"),
+
+	flow.WithTimeout(300*time.Millisecond), flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a bound is on the work, not on the queue in front of it. One worker
 // with one slot is given a slow job, and then a quick one that waits behind it

@@ -81,7 +81,7 @@ func (e *lostAttempt) Place(ctx context.Context, th flow.Thread, body func(flow.
 	return flow.RunThread(ctx, th.Run, th.ID, th.Fn, th.Input, e.opts()...)
 }
 
-var sendsThenDies = flow.Define("test.sendsThenDies", func(ctx flow.Context, in feed) (int, error) {
+var sendsThenDies = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	for i := 1; i <= 3; i++ {
 		if err := in.Values.Send(ctx, i*10); err != nil {
 			return 0, err
@@ -93,7 +93,7 @@ var sendsThenDies = flow.Define("test.sendsThenDies", func(ctx flow.Context, in 
 		return 0, ctx.Err()
 	}
 	return 3, in.Values.Close(ctx)
-})
+}, flow.WithName("test.sendsThenDies"))
 
 var (
 	dyingRuns atomic.Int32

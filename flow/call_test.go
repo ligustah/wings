@@ -17,7 +17,7 @@ var (
 
 	// forking is a function whose body does what a run's body may do: it forks
 	// and joins. Under Execute that is an error; under RunCall it is a run.
-	forking = flow.Define("call.forking", func(ctx flow.Context, in int) (int, error) {
+	forking = flow.Define(func(ctx flow.Context, in int) (int, error) {
 		forkingRuns.Add(1)
 		a := ctx.Go(double, in)
 		b := ctx.Go(double, in+1)
@@ -30,11 +30,11 @@ var (
 			return 0, err
 		}
 		return x + y, nil
-	})
+	}, flow.WithName("call.forking"))
 
-	failsOnce = flow.Define("call.failsOnce", func(ctx flow.Context, _ int) (int, error) {
+	failsOnce = flow.Define(func(ctx flow.Context, _ int) (int, error) {
 		return 0, errors.New("not this time")
-	})
+	}, flow.WithName("call.failsOnce"))
 )
 
 func encodeInt(t *testing.T, v int) []byte {

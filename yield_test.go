@@ -14,13 +14,13 @@ var napping struct{ attempts atomic.Int32 }
 
 // naps sleeps for longer than a short sleep, as the test has set it, and
 // says how many attempts it took.
-var naps = flow.Define("test.naps", func(ctx flow.Context, in int) (int, error) {
+var naps = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	napping.attempts.Add(1)
 	if err := ctx.Sleep(300 * time.Millisecond); err != nil {
 		return 0, err
 	}
 	return in * 2, nil
-})
+}, flow.WithName("test.naps"))
 
 // THE POINT: a thread that sleeps past the short-sleep threshold does not
 // hold a worker for the duration. The worker hands the attempt back with the
@@ -73,7 +73,7 @@ var receiving struct{ attempts atomic.Int32 }
 
 // receivesOnce takes one value off the channel it was handed and reports
 // how many attempts it took to get it.
-var receivesOnce = flow.Define("test.receivesOnce", func(ctx flow.Context, in feed) (int, error) {
+var receivesOnce = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	receiving.attempts.Add(1)
 	v, ok, err := in.Values.Recv(ctx)
 	if err != nil {
@@ -83,7 +83,7 @@ var receivesOnce = flow.Define("test.receivesOnce", func(ctx flow.Context, in fe
 		return 0, nil
 	}
 	return v, nil
-})
+}, flow.WithName("test.receivesOnce"))
 
 // THE POINT: a thread that waits for long enough is unloaded — its attempt
 // ended where it stood and handed back with what it was waiting for — and
@@ -156,7 +156,7 @@ var joining struct {
 }
 
 // slowChild takes a while, and counts its runs.
-var slowChild = flow.Define("test.slowChild", func(ctx flow.Context, d time.Duration) (string, error) {
+var slowChild = flow.Define(func(ctx flow.Context, d time.Duration) (string, error) {
 	joining.children.Add(1)
 	select {
 	case <-time.After(d):
@@ -164,13 +164,13 @@ var slowChild = flow.Define("test.slowChild", func(ctx flow.Context, d time.Dura
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-})
+}, flow.WithName("test.slowChild"))
 
 // awaitsASlowChild forks a thread that takes a while and waits for it.
-var awaitsASlowChild = flow.Define("test.awaitsASlowChild", func(ctx flow.Context, in int) (string, error) {
+var awaitsASlowChild = flow.Define(func(ctx flow.Context, in int) (string, error) {
 	joining.attempts.Add(1)
 	return ctx.Go(slowChild, 700*time.Millisecond).Await(ctx)
-})
+}, flow.WithName("test.awaitsASlowChild"))
 
 // THE POINT: a parent unloaded while it waits for a thread it forked is
 // woken by that thread finishing, and its replay finds the result kept for

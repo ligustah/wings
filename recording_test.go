@@ -23,7 +23,7 @@ type Tick struct {
 
 // simulate produces a long event log and returns only a handle to it. The point
 // of the whole feature: the log never travels as a value.
-var simulate = flow.Define("test.simulate", func(ctx flow.Context, steps int) (Recording, error) {
+var simulate = flow.Define(func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[Tick](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -37,7 +37,7 @@ var simulate = flow.Define("test.simulate", func(ctx flow.Context, steps int) (R
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-})
+}, flow.WithName("test.simulate"))
 
 // THE POINT: a job whose output is measured in megabytes cannot return it as a
 // value — one record on one stream, held whole in memory at both ends, and past
@@ -179,10 +179,8 @@ var resume struct {
 //
 // That is the whole feature in one function: durable execution for the job, and
 // a log the job keeps for itself alongside it.
-var resumeSim = flow.Define("test.resume", func(ctx flow.Context, total int) (int, error) {
-	// The dispatch count, not a counter of our own: a worker in another process
-	// has its own copy of every package variable, and both attempts would think
-	// they were the first.
+var resumeSim = flow.Define(func(ctx flow.Context, total int) (int, error) {
+
 	attempt := ctx.Attempt()
 
 	from := 0
@@ -196,8 +194,7 @@ var resumeSim = flow.Define("test.resume", func(ctx flow.Context, total int) (in
 		read := 0
 		for ev, err := range Replay[Tick](ctx, priors[len(priors)-1]) {
 			if err != nil {
-				// A log that stops early is expected — nobody closed it — so
-				// take what arrived.
+
 				break
 			}
 			if ev.At != read {
@@ -220,8 +217,7 @@ var resumeSim = flow.Define("test.resume", func(ctx flow.Context, total int) (in
 			if err := rec.Flush(); err != nil {
 				return 0, err
 			}
-			// Go quiet: still running, still holding the job, reporting
-			// nothing. This is a wedged worker as the coordinator sees one.
+
 			select {
 			case <-resume.release:
 			case <-ctx.Done():
@@ -241,7 +237,9 @@ var resumeSim = flow.Define("test.resume", func(ctx flow.Context, total int) (in
 		return 0, err
 	}
 	return from, nil
-}, flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.resume"),
+
+	flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a job that is moved must be able to replay what the attempt before
 // it recorded. Without that the whole feature is half a feature — a simulation
@@ -406,7 +404,7 @@ type Beat struct {
 	What string `json:"what"`
 }
 
-var pulse = flow.Define("test.pulse", func(ctx flow.Context, steps int) (Recording, error) {
+var pulse = flow.Define(func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[*Beat](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -420,7 +418,7 @@ var pulse = flow.Define("test.pulse", func(ctx flow.Context, steps int) (Recordi
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-})
+}, flow.WithName("test.pulse"))
 
 // A recording of pointers has to work, because the events worth recording are
 // usually pointers. A codec cannot allocate the thing a pointer points at unless
@@ -472,7 +470,7 @@ func (n *Note) UnmarshalBinary(b []byte) error {
 
 // emit records protobuf events, which is what a simulation's replay actually
 // is. A generated message type is a pointer, always.
-var emit = flow.Define("test.emit", func(ctx flow.Context, steps int) (Recording, error) {
+var emit = flow.Define(func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[*protos.Data](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -486,10 +484,10 @@ var emit = flow.Define("test.emit", func(ctx flow.Context, steps int) (Recording
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-})
+}, flow.WithName("test.emit"))
 
 // scribble records a pointer event with its own binary marshalling.
-var scribble = flow.Define("test.scribble", func(ctx flow.Context, steps int) (Recording, error) {
+var scribble = flow.Define(func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[*Note](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -503,7 +501,7 @@ var scribble = flow.Define("test.scribble", func(ctx flow.Context, steps int) (R
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-})
+}, flow.WithName("test.scribble"))
 
 // THE POINT: the events worth recording are pointers. A generated protobuf type
 // is one and there is no value form of it; so is anything carrying marshalling
@@ -653,7 +651,7 @@ var late struct {
 // completes the recording and returns a handle to it — which is the situation
 // the coordinator has to get right: two attempts of one job, both finishing,
 // only one of them the job.
-var lateSim = flow.Define("test.late", func(ctx flow.Context, steps int) (Recording, error) {
+var lateSim = flow.Define(func(ctx flow.Context, steps int) (Recording, error) {
 	rec, err := Record[Tick](ctx, "replay")
 	if err != nil {
 		return Recording{}, err
@@ -669,7 +667,7 @@ var lateSim = flow.Define("test.late", func(ctx flow.Context, steps int) (Record
 
 	switch ctx.Attempt() {
 	case 0:
-		// Quiet: no beats, so the coordinator moves the job. But not gone.
+
 		select {
 		case <-late.release0:
 		case <-ctx.Done():
@@ -677,7 +675,7 @@ var lateSim = flow.Define("test.late", func(ctx flow.Context, steps int) (Record
 		}
 	default:
 		late.once.Do(func() { close(late.started1) })
-		// Alive and saying so, so this attempt is not moved as well.
+
 		for {
 			select {
 			case <-late.release1:
@@ -694,7 +692,9 @@ var lateSim = flow.Define("test.late", func(ctx flow.Context, steps int) (Record
 		return Recording{}, err
 	}
 	return rec.Recording(), nil
-}, flow.WithHeartbeatTimeout(300*time.Millisecond))
+}, flow.WithName("test.late"),
+
+	flow.WithHeartbeatTimeout(300*time.Millisecond))
 
 // THE POINT: a job that was moved because its worker went quiet may still
 // finish there. Its result carries no more authority than its beats do: the job

@@ -20,7 +20,7 @@ var long struct {
 	release chan struct{}
 }
 
-var longWork = flow.Define("rejoin.long", func(ctx flow.Context, in int) (int, error) {
+var longWork = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	long.starts.Add(1)
 	select {
 	case <-long.release:
@@ -28,7 +28,7 @@ var longWork = flow.Define("rejoin.long", func(ctx flow.Context, in int) (int, e
 		return 0, ctx.Err()
 	}
 	return in * 2, nil
-})
+}, flow.WithName("rejoin.long"))
 
 // rejoining is a placer that recognises a thread still in flight by its key
 // and hands the second asker the first one's answer — what a cluster does
