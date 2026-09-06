@@ -90,7 +90,17 @@ type Cluster struct {
 	// so a workflow attempt that replays a call finds the one its predecessor
 	// was making rather than starting a second.
 	byOrigin map[string]*pendingJob
-	closed   bool
+	// ranAs remembers, per workflow call, the last job that ran it, kept past
+	// the job being forgotten. A thread of run code dispatched later — a
+	// descendant spawned or redispatched after an ancestor's job is already
+	// gone — needs that ancestor's history to replay through, and the history
+	// outlives the job (it is named by job id, and forget keeps the last
+	// attempt). byOrigin does not outlive it, so without this the lookup falls
+	// to the coordinator's own store, where a thread that ran as a job never
+	// wrote. In memory only: a restarted coordinator rebuilds outstanding jobs
+	// from its journal, and a call whose job was already done needs no rerun.
+	ranAs  map[string]string
+	closed bool
 
 	// epoch identifies THIS run of the coordinator, and is part of every name
 	// it mints.
@@ -392,6 +402,7 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		cancel:   cancel,
 		pending:  map[string]*pendingJob{},
 		byOrigin: map[string]*pendingJob{},
+		ranAs:    map[string]string{},
 		epoch:    newEpoch(),
 	}
 
@@ -1041,6 +1052,10 @@ func (c *Cluster) forget(p *pendingJob) {
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
 			delete(c.byOrigin, key)
+			// Remember which job last ran this call, so a thread of run code
+			// that descends from it and is placed after this can still be
+			// given its history to replay through. See threadHistory and ranAs.
+			c.ranAs[key] = p.job.ID
 		}
 	}
 }

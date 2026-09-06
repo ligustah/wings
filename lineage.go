@@ -186,20 +186,40 @@ func (c *Cluster) threadHistory(ctx context.Context, run, thread string) ([]*pro
 	if err != nil {
 		return nil, err
 	}
+	var jobID string
 	c.mu.Lock()
-	var p *pendingJob
 	if thread == "main" && isJobRun(run) {
-		p = c.pending[jobOfRun(run)]
+		// A job's own main thread: its history is that job's, named by the id
+		// carried in the run — found whether or not the job is still
+		// outstanding, so a descendant placed after it can still replay it.
+		jobID = jobOfRun(run)
 	} else {
-		p = c.byOrigin[flow.Origin{Run: run, Thread: thread}.Key()]
+		key := flow.Origin{Run: run, Thread: thread}.Key()
+		if p := c.byOrigin[key]; p != nil {
+			jobID = p.job.ID
+		} else {
+			// No live job for this call. It may have been forgotten while a
+			// thread of run code that descends from it is still to be placed;
+			// the job it last ran as is enough to find its history, which
+			// outlives forget. See ranAs.
+			jobID = c.ranAs[key]
+		}
 	}
 	c.mu.Unlock()
-	if p == nil {
+	if jobID == "" {
+		// A thread the coordinator ran itself — a workflow's own thread — keeps
+		// its history in the coordinator's store, not on any job.
 		return flow.NewStore(client).Events(ctx, run, thread)
 	}
-	name, err := c.lastHistory(ctx, p.job.ID, -1)
-	if err != nil || name == "" {
+	name, err := c.lastHistory(ctx, jobID, -1)
+	if err != nil {
 		return nil, err
+	}
+	if name == "" {
+		// The job's history is gone — dropped once its thread was joined and
+		// nothing more would replay it — so fall back to the coordinator's own
+		// store, which holds it for a thread the coordinator ran itself.
+		return flow.NewStore(client).Events(ctx, run, thread)
 	}
 	st, err := eventStream[*protos.Event](client, name)
 	if err != nil {

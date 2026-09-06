@@ -29,6 +29,63 @@ func TestForkReaches(t *testing.T) {
 	}
 }
 
+// TestThreadHistoryFindsAForgottenAncestorViaRanAs covers the lookup a
+// descendant's placement depends on: a thread of run code dispatched after its
+// ancestor's job is already gone must still find that ancestor's history to
+// replay through. The ancestor→job mapping lives in byOrigin only while the job
+// is outstanding; once forgotten it is kept in ranAs, and the durable history
+// (named by job id) outlives the job. Without that fallback the lookup reads the
+// coordinator's own store — where a thread that ran as a JOB never wrote — and
+// finds nothing, which is the "thread ... has no history to replay" hang.
+func TestThreadHistoryFindsAForgottenAncestorViaRanAs(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
+	ctx := t.Context()
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatalf("sharedClient: %v", err)
+	}
+
+	const run, thread, jobID, child = "deep", "main.0", "jobabc", "main.0.0"
+
+	// A durable history for the job that ran main.0, with the fork of its child.
+	name := historyName(jobID, 0)
+	if err := ensureStream(ctx, client, name); err != nil {
+		t.Fatalf("ensureStream: %v", err)
+	}
+	st, err := eventStream[*protos.Event](client, name)
+	if err != nil {
+		t.Fatalf("eventStream: %v", err)
+	}
+	if _, err := st.Append(ctx, []*protos.Event{
+		{ThreadId: thread, Payload: &protos.Event_Fork{Fork: &protos.ForkEvent{ThreadId: child}}},
+	}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+
+	// The ancestor's job is in neither pending nor byOrigin. Before ranAs
+	// remembers it, the lookup falls to the coordinator's own store, where a
+	// thread that ran as a job never wrote, and finds nothing.
+	if evs, err := c.threadHistory(ctx, run, thread); err != nil {
+		t.Fatalf("threadHistory (no ranAs): %v", err)
+	} else if len(evs) != 0 {
+		t.Fatalf("without ranAs a thread that ran as a job has no coordinator history; got %d events", len(evs))
+	}
+
+	// Once forget has remembered which job last ran the call, the same lookup
+	// finds the durable history and reaches the child's fork.
+	key := flow.Origin{Run: run, Thread: thread}.Key()
+	c.mu.Lock()
+	c.ranAs[key] = jobID
+	c.mu.Unlock()
+	evs, err := c.threadHistory(ctx, run, thread)
+	if err != nil {
+		t.Fatalf("threadHistory (ranAs): %v", err)
+	}
+	if !forkReaches(evs, child) {
+		t.Fatalf("with ranAs remembering job %s, threadHistory should return a history reaching %s; got %d events", jobID, child, len(evs))
+	}
+}
+
 // where is the worker a thread is running on, or "" on the coordinator.
 func where(ctx flow.Context) string {
 	if j := jobFrom(ctx); j != nil {
