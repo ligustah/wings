@@ -3,17 +3,22 @@
 Define a typed Go function. Call it across a cluster that did not exist a minute ago.
 
 ```go
-var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
+var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
-})
+}, flow.WithName("render"))
 
-var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
+// A root, marked with flow.Main, is run as a flow once the cluster is up.
+var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
     images, err := ctx.Map(Render, job.Frames)   // runs wherever the workers are
     ...
-})
+}, flow.WithName("frames"))
+var _ = flow.Main(Frames)
 ```
 
-That is the whole API. The functions and the body are written against
+That is the whole API. There is no separate kind for the two: both are plain
+functions declared with `flow.Define`. One called or forked is what another
+language would call an activity; one marked `flow.Main` and run as the root is
+what it would call a workflow. Same declaration, same replay, same durability. The functions and the body are written against
 [`flow`](flow), a durable-execution framework that knows nothing about
 clusters; wings is where a flow's calls go to run. The context they are given
 is a `flow.Context` — a `context.Context`, so it goes anywhere one is wanted,
@@ -87,20 +92,22 @@ package job
 import "github.com/ligustah/wings/flow"
 
 // Work functions are package-scope vars, so a worker process — which never runs
-// a workflow — still has them registered.
-var Render = flow.Define("render", func(ctx flow.Context, f Frame) (Image, error) {
+// a root — still has them registered.
+var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
-})
+}, flow.WithName("render"))
 
-// A workflow is run as a flow once the cluster is up. A coordinator restarted
-// over the same -dir replays what it already did rather than doing it again.
-var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
+// A root, marked with flow.Main, is run as a flow once the cluster is up. A
+// coordinator restarted over the same -dir replays what it already did rather
+// than doing it again.
+var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
     images, err := ctx.Map(Render, job.Frames)
     if err != nil {
-        return err
+        return flow.None{}, err
     }
-    return write(images, job.Out)
-})
+    return flow.None{}, write(images, job.Out)
+}, flow.WithName("frames"))
+var _ = flow.Main(Frames)
 ```
 
 That is the whole file. No cloud appears in it — and no cluster either. The
@@ -109,9 +116,9 @@ cluster reaches the body through its context: every thread a flow forks —
 coordinator is the cluster's workers. A function called directly runs where
 the call is made, on the thread that made it.
 
-A package that defines one workflow is a binary that runs it. Define several
-and the binary takes `-workflow <name>`; leave it off and it lists them. Each
-runs under its own name in `-dir`, so two workflows over one directory keep
+A package that marks one root with `flow.Main` is a binary that runs it. Mark
+several and the binary takes `-workflow <name>`; leave it off and it lists them.
+Each runs under its own name in `-dir`, so two roots over one directory keep
 separate histories.
 
 The workflow's input is a typed value, given on the command line as JSON:
@@ -122,7 +129,7 @@ The workflow's input is a typed value, given on the command line as JSON:
 ```
 
 Start a fresh run without it and the binary shows the shape it wants. A
-workflow that takes nothing declares `flow.None`. The input is part of the
+root that takes nothing declares `flow.None`. The input is part of the
 run's history: a coordinator restarted over the same `-dir` is given what the
 first start recorded, and one restarted with a different `-input` is refused
 rather than quietly replaying one input's history against another.
@@ -342,9 +349,10 @@ is a millisecond of arithmetic and another an hour of transcoding, and a single
 cluster-wide number is either useless to one or fatal to the other.
 
 ```go
-var Transcode = flow.Define("transcode", transcode,
-    flow.WithTimeout(2*time.Hour),            // total: exceeding it FAILS
-    flow.WithHeartbeatTimeout(30*time.Second) // quiet: exceeding it MOVES
+var Transcode = flow.Define(transcode,
+    flow.WithName("transcode"),
+    flow.WithTimeout(2*time.Hour),             // total: exceeding it FAILS
+    flow.WithHeartbeatTimeout(30*time.Second), // quiet: exceeding it MOVES
 )
 ```
 
@@ -387,41 +395,33 @@ is for the wait itself — how long a job may sit unstarted on a worker's queue
 before it is moved — and is off unless asked for, because on a saturated cluster
 moving a queued job only puts it at the back of another queue.
 
-### Steps
+### Phases
 
-`Step` is the same mechanism with the bookkeeping taken away. Name the
-phases of a long job and a move replays the ones that finished:
+A long job whose phases are expensive breaks them into calls to other
+functions. There is no special phase primitive: a call is recorded, so a move
+replays the phases that finished and runs the rest.
 
 ```go
-func restore(ctx flow.Context, in Backup) (Report, error) {
-    snap, err := ctx.Step("snapshot", func(ctx flow.Context) (Snapshot, error) {
-        return takeSnapshot(ctx, in.Source)      // twenty minutes
-    })
+var Restore = flow.Define(func(ctx flow.Context, in Backup) (Report, error) {
+    snap, err := Snapshot(ctx, in.Source)      // twenty minutes, recorded
     if err != nil {
         return Report{}, err
     }
-    return ctx.Step("restore", func(ctx flow.Context) (Report, error) {
-        return restoreInto(ctx, snap, in.Target) // another forty
-    })
-}
+    return RestoreInto(ctx, Restoration{snap, in.Target}) // another forty
+}, flow.WithName("restore"))
 ```
 
-A job moved after the snapshot finished replays it — a decode, not twenty
-minutes — and starts the restore on the new worker. The phase that was actually
-in flight is paid for twice, and that cost is irreducible: nobody can say whether
-it finished.
-
-Steps are identified by their position, so they must be called in the same order
-every attempt, from one goroutine; a name that does not match the one recorded at
-that position is an error rather than somebody else's value. Each finished step
-is one message to the coordinator, which accumulates them, so a step costs the
-same however many came before it — but it is a message all the same. Use steps
-for coarse phases and `Heartbeat` for a position inside a loop.
+A job moved after `Snapshot` finished replays its result — a decode, not twenty
+minutes — and starts `RestoreInto` on the new worker. The phase that was
+actually in flight is paid for twice, and that cost is irreducible: nobody can
+say whether it finished. A phase called directly runs on the same worker; fork
+it with `ctx.Go` when the point is to place it elsewhere. Use calls for coarse
+phases and `Heartbeat` for a position inside a loop.
 
 ### Inside a run
 
-A work function checkpoints the same way whatever called it — `Step` and
-`Heartbeat` do not know or care which run they are part of. What the run adds
+A work function checkpoints the same way whatever called it — `Heartbeat` does
+not know or care which run it is part of. What the run adds
 is a second way to be interrupted: the run itself can fail and be retried while
 the thread is still running. The retry **rejoins** the thread already in
 flight instead of dispatching a second copy, so the progress that copy would
@@ -461,7 +461,7 @@ just not placed. Fan out with `Map` or `Go` when the point is other machines.
 
 Everything an attempt writes on its worker — that history, its recordings, its
 files — goes into **one transaction**, committed at the points that mean
-something: before every heartbeat and step report, when the function returns,
+something: before every heartbeat report, when the function returns,
 and by age as a net under a function that reports nothing for a long time. The
 coordinator's copy is made **transaction by transaction**: its engine
 subscribes to each worker's finished transactions and applies every one
@@ -496,10 +496,8 @@ worker replays each ancestor from its history to the fork of the next, which
 hands it the closure, and runs the last for real, sharing the run's channels
 with the threads that stayed home. What an ancestor computes between the
 events of its history it computes again, so the code before a `Spawn` should
-be the replayable kind; a `Spawn` after a `Step` cannot be sent, since steps
-are kept with the call and not in the history. A thread of a bare `Run` —
-one with a body and no name — has no root a worker could start from, and
-stays where its parent is.
+be the replayable kind. A thread of a bare `Run` — one with a body and no
+name — has no root a worker could start from, and stays where its parent is.
 
 A wait that lasts is **unloaded**. A thread parked for a minute — on a join, a
 receive, a send — has its attempt ended where it stands, history committed,
@@ -561,8 +559,7 @@ for ev, err := range wings.Replay[Event](ctx, played.Replay) {
 ```
 
 **One event is one record.** They go onto a durable stream of their own on the
-worker, become visible at the job's commit points — every heartbeat, every step,
-its return — are copied onto the coordinator's own storage as they are
+worker, become visible at the job's commit points — every heartbeat, its return — are copied onto the coordinator's own storage as they are
 committed, and come back out one at a time in the order they went in. Neither end ever holds the log:
 a reader takes as many as it wants and pays for no more, and breaking out of the
 range stops the reading.
@@ -587,8 +584,8 @@ counted them did not survive to. A truncated log is precisely a record of how fa
 the work got, and `Replay` reads one to whatever end it has.
 
 This is durability for the job's **own** state, deliberately outside the durable
-execution wings does for the job itself. `Step` and `Heartbeat` are for resuming
-a job; a recording is for describing what it did. wings stores the events and
+execution wings does for the job itself. `Heartbeat` is for resuming a job; a
+recording is for describing what it did. wings stores the events and
 gives them back, and never reads one.
 
 **Cleaning up.** A recording lives on the coordinator's `Dir` until
@@ -622,7 +619,7 @@ The running goroutine. Its stack, its locals, its open sockets and half-filled
 buffers are on that machine and stay there — Go cannot serialise a running
 goroutine, and much of what one holds is not serialisable at anyone's hands. So
 the only thing that can cross a machine boundary is a value the work function
-made explicit, which is what a checkpoint and a step are. Everything else the
+made explicit, which is what a heartbeat and a checkpoint are. Everything else the
 coordinator has — the pending set, the mirrored results, the queue — it already
 holds, and none of it is what a half-finished job knows.
 
