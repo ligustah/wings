@@ -20,8 +20,8 @@ replace (
 require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
-	github.com/ligustah/durable_streams v0.156.0
-	github.com/ligustah/durable_streams/broker v0.241.0
+	github.com/ligustah/durable_streams v0.158.0
+	github.com/ligustah/durable_streams/broker v0.253.0
 	github.com/ligustah/durable_streams/broker/client v0.56.0
 	github.com/ligustah/durable_streams/broker/protos v0.41.0
 	github.com/ligustah/durable_streams/dsclient v0.51.0
