@@ -32,20 +32,21 @@ func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Conte
 	return flow.Run(ctx, name, body, all...)
 }
 
-// RunWorkflow runs a defined workflow on in, on this cluster, the way
-// [CoordinatorMain] runs the one it was asked for: under the workflow's own
+// RunWorkflow runs a root function on in, on this cluster, the way
+// [CoordinatorMain] runs the one it was asked for: under the function's own
 // name, so a coordinator started again over the same Dir resumes it — with
 // the input the first start recorded, whatever is passed here.
 //
-// See [Cluster.Run] for what a run on a cluster is and what opts may say.
-func (c *Cluster) RunWorkflow[In any](ctx context.Context, w flow.Workflow[In], in In, opts ...flow.RunOption) error {
+// f must have been declared a root with [flow.Main]. See [Cluster.Run] for what
+// a run on a cluster is and what opts may say.
+func (c *Cluster) RunWorkflow[In, Out any](ctx context.Context, f flow.Func[In, Out], in In, opts ...flow.RunOption) error {
 	all, err := c.runOptions(opts)
 	if err != nil {
 		return err
 	}
 	ctx, done := c.hosting(ctx)
 	defer done()
-	return w.Run(ctx, in, all...)
+	return flow.RunMain(ctx, f, in, all...)
 }
 
 // runWorkflow is RunWorkflow for a coordinator, which has the workflow as a

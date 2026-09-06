@@ -102,7 +102,7 @@ type spawnReport struct {
 // producesOnAWorker forks a thread of run code that feeds a channel the
 // workflow drains: the thread should run on a worker, the workflow stays on
 // the coordinator, and the channel joins them.
-var producesOnAWorker = flow.DefineWorkflow("test.producesOnAWorker", func(ctx flow.Context, base int) error {
+var producesOnAWorker = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	ch := ctx.NewChannel[int]()
 	producer := ctx.Spawn(func(ctx flow.Context) (string, error) {
 		for i := 1; i <= 3; i++ {
@@ -116,7 +116,7 @@ var producesOnAWorker = flow.DefineWorkflow("test.producesOnAWorker", func(ctx f
 	for {
 		v, ok, err := ch.Recv(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		if !ok {
 			break
@@ -125,11 +125,13 @@ var producesOnAWorker = flow.DefineWorkflow("test.producesOnAWorker", func(ctx f
 	}
 	ran, err := producer.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	produced = spawnReport{Total: total, Ran: ran}
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.producesOnAWorker"))
+
+var _ = flow.Main(producesOnAWorker)
 
 var produced spawnReport
 
@@ -197,11 +199,13 @@ var spawnsInAJob = flow.Define(func(ctx flow.Context, base int) (nestedSpawnRepo
 	return nestedSpawnReport{Outer: where(ctx), Inner: ran, Value: v}, nil
 }, flow.WithName("test.spawnsInAJob"))
 
-var forksAJobThatSpawns = flow.DefineWorkflow("test.forksAJobThatSpawns", func(ctx flow.Context, base int) error {
+var forksAJobThatSpawns = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	var err error
 	nested, err = ctx.Go(spawnsInAJob, base).Await(ctx)
-	return err
-})
+	return flow.None{}, err
+}, flow.WithName("test.forksAJobThatSpawns"))
+
+var _ = flow.Main(forksAJobThatSpawns)
 
 var nested nestedSpawnReport
 

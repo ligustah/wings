@@ -23,7 +23,7 @@ var sightings = make(chan sighting, 4)
 // where it is, and then — on its first attempt — waits to be killed with its
 // worker. Its retry, wherever it lands, must replay the effect rather than
 // draw it again.
-var movesItsSpawn = flow.DefineWorkflow("test.movesItsSpawn", func(ctx flow.Context, _ int) error {
+var movesItsSpawn = flow.Define(func(ctx flow.Context, _ int) (flow.None, error) {
 	seen := ctx.NewBufferedChannel[sighting](2)
 	fut := ctx.Spawn(func(ctx flow.Context) (sighting, error) {
 		r, err := ctx.Effect(func() (int, error) { return rand.IntN(1<<30) + 1, nil })
@@ -46,16 +46,18 @@ var movesItsSpawn = flow.DefineWorkflow("test.movesItsSpawn", func(ctx flow.Cont
 	})
 	first, _, err := seen.Recv(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	sightings <- first
 	again, err := fut.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	sightings <- again
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.movesItsSpawn"))
+
+var _ = flow.Main(movesItsSpawn)
 
 // THE POINT: a thread of run code whose worker dies is moved like any job,
 // and the worker it lands on is given its history — the ancestors it is
@@ -121,11 +123,13 @@ func TestAThreadOfRunCodeMovedToAnotherWorkerReplaysItsHistory(t *testing.T) {
 	}
 }
 
-var spawnsASlowChild = flow.DefineWorkflow("test.spawnsASlowChild", func(ctx flow.Context, takes time.Duration) error {
+var spawnsASlowChild = flow.Define(func(ctx flow.Context, takes time.Duration) (flow.None, error) {
 	var err error
 	rejoined, err = ctx.Spawn(func(ctx flow.Context) (string, error) { return slowChild(ctx, takes) }).Await(ctx)
-	return err
-})
+	return flow.None{}, err
+}, flow.WithName("test.spawnsASlowChild"))
+
+var _ = flow.Main(spawnsASlowChild)
 
 var rejoined string
 
@@ -183,7 +187,7 @@ func TestARestartedCoordinatorRejoinsAThreadOfRunCode(t *testing.T) {
 			var submitted, recovered, attached int
 			var seen []string
 			for _, e := range entries {
-				if e.Run != spawnsASlowChild.Name() {
+				if e.Run != "test.spawnsASlowChild" {
 					continue
 				}
 				seen = append(seen, e.Kind+":"+e.Job+"@"+e.Worker)
@@ -204,7 +208,7 @@ func TestARestartedCoordinatorRejoinsAThreadOfRunCode(t *testing.T) {
 	}
 }
 
-var spawnsSeveralSlowChildren = flow.DefineWorkflow("test.spawnsSeveralSlowChildren", func(ctx flow.Context, takes time.Duration) error {
+var spawnsSeveralSlowChildren = flow.Define(func(ctx flow.Context, takes time.Duration) (flow.None, error) {
 	var futs []*flow.Future[string]
 	for i := range 3 {
 		d := takes + time.Duration(i)*100*time.Millisecond
@@ -214,12 +218,14 @@ var spawnsSeveralSlowChildren = flow.DefineWorkflow("test.spawnsSeveralSlowChild
 	for _, f := range futs {
 		v, err := f.Await(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		several = append(several, v)
 	}
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.spawnsSeveralSlowChildren"))
+
+var _ = flow.Main(spawnsSeveralSlowChildren)
 
 var several []string
 
@@ -256,7 +262,7 @@ func TestARestartedCoordinatorRejoinsSeveralThreadsOfRunCode(t *testing.T) {
 	entries := awaitJournal(t, second, func(es []journalEntry) bool { return countKind(es, journalCompleted) >= 3 })
 	var submitted, recovered, attached int
 	for _, e := range entries {
-		if e.Run != spawnsSeveralSlowChildren.Name() {
+		if e.Run != "test.spawnsSeveralSlowChildren" {
 			continue
 		}
 		switch e.Kind {
@@ -300,23 +306,25 @@ var parentOfSpawn = flow.Define(func(ctx flow.Context, in report) (int, error) {
 	return child.Await(ctx)
 }, flow.WithName("test.parentOfSpawn"))
 
-var parentMoves = flow.DefineWorkflow("test.parentMoves", func(ctx flow.Context, _ int) error {
+var parentMoves = flow.Define(func(ctx flow.Context, _ int) (flow.None, error) {
 	seen := ctx.NewBufferedChannel[sighting](4)
 	fut := ctx.Go(parentOfSpawn, report{Seen: seen})
 	for range 2 {
 		s, _, err := seen.Recv(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		sightings <- s
 	}
 	v, err := fut.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	sightings <- sighting{Worker: "result", Value: v}
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.parentMoves"))
+
+var _ = flow.Main(parentMoves)
 
 // THE POINT: a work function that forked a thread of run code and is waiting
 // on it is moved when its worker dies, and its retry — replaying the fork —
@@ -373,7 +381,7 @@ func TestAJobMovedWhileItsSpawnRunsRejoinsIt(t *testing.T) {
 	entries := awaitJournal(t, c, func(es []journalEntry) bool { return countKind(es, journalCompleted) >= 2 })
 	childSubmits := 0
 	for _, e := range entries {
-		if e.Run == parentMoves.Name() && e.Thread == "main.0.0" && e.Kind == journalSubmitted {
+		if e.Run == "test.parentMoves" && e.Thread == "main.0.0" && e.Kind == journalSubmitted {
 			childSubmits++
 		}
 	}

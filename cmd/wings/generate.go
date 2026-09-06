@@ -67,7 +67,7 @@ func workerMain(workPkg string) ([]byte, error) {
 //		wings.CoordinatorMain(wings.CoordinatorOptions{…})
 //	}
 //
-// The coordinator package is imported for its DefineWorkflow calls, and by
+// The coordinator package is imported for its flow.Main calls, and by
 // name only when it also exports a Provisioner the main has to call.
 func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner bool, providers []string) ([]byte, error) {
 	f := jen.NewFile("main")
@@ -80,7 +80,7 @@ func coordinatorMain(workPkg, coordPkg string, worker platform, hasProvisioner b
 	} else {
 		// Nothing in main names the package, so an aliased import would be
 		// dropped as unused — and with it the workflows. Import it for effect.
-		f.Comment("Linked in for its DefineWorkflow calls; the coordinator runs one of them.")
+		f.Comment("Linked in for its flow.Main calls; the coordinator runs one of them.")
 		f.Anon(coordPkg)
 	}
 

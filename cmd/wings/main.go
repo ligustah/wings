@@ -11,11 +11,12 @@
 //
 //	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) { … }, flow.WithName("render"))
 //
-//	// A workflow is run as a flow once the cluster is up.
-//	var Frames = flow.DefineWorkflow("frames", func(ctx flow.Context, job Job) error {
+//	// A root is run as a flow once the cluster is up.
+//	var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
 //		imgs, err := ctx.Map(Render, job.Frames)
 //		…
 //	})
+//	var _ = flow.Main(Frames)
 //
 // That is all. WHERE the work runs is not in it: -providers links clouds into
 // the coordinator, and -target and -provider choose between them at run time.
@@ -119,8 +120,8 @@ Flags:
   -v                print the go build commands
 
 Your package must declare, at package scope:
-  var X = flow.DefineWorkflow("name", func(ctx flow.Context, in Input) error { … })
-                                          (at least one; with several, the binary takes -workflow;
+  var X = flow.Define(func(ctx flow.Context, in Input) (Out, error) { … })
+  var _ = flow.Main(X)                    (at least one; with several, the binary takes -workflow;
                                           the input comes from -input as JSON, or is flow.None)
   func Provisioner() wings.Provisioner    (optional; overrides -provider)
 
@@ -203,8 +204,8 @@ func build(args []string) error {
 		api.definesWorkflow = workAPI.definesWorkflow
 	}
 	if !api.definesWorkflow {
-		return fmt.Errorf("package %s defines no workflow.\n"+
-			"Add, at package scope:\n\n\tvar Main = flow.DefineWorkflow(\"main\", func(ctx flow.Context, in Input) error { … })\n",
+		return fmt.Errorf("package %s declares no root.\n"+
+			"Add, at package scope:\n\n\tvar Main = flow.Define(func(ctx flow.Context, in Input) (Out, error) { … })\n\tvar _ = flow.Main(Main)\n",
 			coordinate.ImportPath)
 	}
 
@@ -353,12 +354,12 @@ type pkgAPI struct {
 }
 
 // inspectAPI looks for the function the generated main may call, and for the
-// DefineWorkflow call that gives the coordinator something to run.
+// flow.Main call that gives the coordinator a root to run.
 //
-// Parsed rather than probed by compiling: a missing workflow should be one
-// clear sentence naming the call to add, not a compile error inside generated
-// code the user never wrote and cannot see — or worse, a binary that builds
-// and then refuses to start.
+// Parsed rather than probed by compiling: a missing root should be one clear
+// sentence naming the call to add, not a compile error inside generated code
+// the user never wrote and cannot see — or worse, a binary that builds and then
+// refuses to start.
 func inspectAPI(dir string) (pkgAPI, error) {
 	var api pkgAPI
 	fset := token.NewFileSet()
@@ -387,9 +388,9 @@ func inspectAPI(dir string) (pkgAPI, error) {
 						}
 						switch fn := call.Fun.(type) {
 						case *ast.SelectorExpr:
-							api.definesWorkflow = api.definesWorkflow || fn.Sel.Name == "DefineWorkflow"
+							api.definesWorkflow = api.definesWorkflow || fn.Sel.Name == "Main"
 						case *ast.Ident:
-							api.definesWorkflow = api.definesWorkflow || fn.Name == "DefineWorkflow"
+							api.definesWorkflow = api.definesWorkflow || fn.Name == "Main"
 						}
 						return true
 					})

@@ -30,8 +30,8 @@ type CoordinatorOptions struct {
 }
 
 // Your code is not in CoordinatorOptions: it is whatever the linked packages
-// declared with [flow.DefineWorkflow]. A program that defines one workflow
-// runs it; one that defines several is told which by -workflow. Either way it
+// declared as roots with [flow.Main]. A program that declares one root
+// runs it; one that declares several is told which by -workflow. Either way it
 // runs as a durable run on a cluster that is already up — see
 // [Cluster.RunWorkflow] — under its own name in Dir, so a second start over
 // the same directory is that run resuming, and the cluster is torn down when
@@ -209,8 +209,8 @@ func CoordinatorMain(opts CoordinatorOptions) {
 // needs to fix the command line.
 func chooseWorkflow(name string, defined []flow.WorkflowInfo) (flow.WorkflowInfo, error) {
 	if len(defined) == 0 {
-		return flow.WorkflowInfo{}, errors.New("no workflow is defined in this program; " +
-			"declare one at package scope with flow.DefineWorkflow")
+		return flow.WorkflowInfo{}, errors.New("no root is declared in this program; " +
+			"declare one at package scope with flow.Main")
 	}
 	if name == "" {
 		if len(defined) == 1 {

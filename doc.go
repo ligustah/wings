@@ -11,13 +11,14 @@
 //
 //	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
 //		return render(f)
-//	})
+//	}, flow.WithName("render"))
 //
-//	// A workflow is run as a flow once the cluster is up.
-//	var Main = flow.DefineWorkflow("render", func(ctx flow.Context, job Job) error {
+//	// A root is run as a flow once the cluster is up.
+//	var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
 //		images, err := ctx.Map(Render, job.Frames)
 //		...
-//	})
+//	}, flow.WithName("frames"))
+//	var _ = flow.Main(Frames)
 //
 // Nothing in that file names a cluster. The body reaches it through its
 // context: [Cluster.Run] runs a flow whose calls are dispatched to the

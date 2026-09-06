@@ -81,7 +81,7 @@ var Digest = flow.Define(func(ctx flow.Context, in Work) (Result, error) {
 // already did rather than doing it again. It is the only workflow defined, so
 // the binary runs it without being told; a program that defines several takes
 // -workflow.
-var Main = flow.DefineWorkflow("digest", func(ctx flow.Context, in Params) error {
+var Main = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	work := make([]Work, jobs)
 	for i := range work {
@@ -92,7 +92,7 @@ var Main = flow.DefineWorkflow("digest", func(ctx flow.Context, in Params) error
 	results, err := ctx.Map(Digest, work)
 	elapsed := time.Since(start)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 
 	hosts := map[string]int{}
@@ -106,8 +106,10 @@ var Main = flow.DefineWorkflow("digest", func(ctx flow.Context, in Params) error
 	}
 	fmt.Printf("\nfirst result: %s -> %s\n", results[0].Seed, results[0].Digest[:16])
 	fmt.Println(strings.Repeat("-", 40))
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("digest"))
+
+var _ = flow.Main(Main)
 
 // Batch is a work function that does its work by calling another: it digests
 // a batch of seeds through Digest — calls the cluster places like any other,
@@ -145,7 +147,7 @@ var DigestBatch = flow.Define(func(ctx flow.Context, in Batch) (int, error) {
 // workflow from its history to the fork that made the closure, then runs
 // it. The closure calls DigestBatch directly, which runs where the closure
 // does. Either way the batch's own calls fan out across the fleet.
-var Fanout = flow.DefineWorkflow("fanout", func(ctx flow.Context, in Params) error {
+var Fanout = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	const batches = 4
 	results := ctx.NewChannel[Result]()
@@ -171,17 +173,17 @@ var Fanout = flow.DefineWorkflow("fanout", func(ctx flow.Context, in Params) err
 	for range jobs {
 		r, ok, err := results.Recv(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		if !ok {
-			return fmt.Errorf("the results channel closed after %d of %d results", len(hosts), jobs)
+			return flow.None{}, fmt.Errorf("the results channel closed after %d of %d results", len(hosts), jobs)
 		}
 		hosts[r.Host]++
 		fmt.Printf("  %s on %s\n", r.Seed, r.Host)
 	}
 	for _, f := range futures {
 		if _, err := f.Await(ctx); err != nil {
-			return err
+			return flow.None{}, err
 		}
 	}
 
@@ -190,5 +192,7 @@ var Fanout = flow.DefineWorkflow("fanout", func(ctx flow.Context, in Params) err
 		fmt.Printf("  %-24s %d jobs\n", host, n)
 	}
 	fmt.Println(strings.Repeat("-", 40))
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("fanout"))
+
+var _ = flow.Main(Fanout)

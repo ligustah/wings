@@ -21,13 +21,16 @@ var (
 	lastBatch     atomic.Pointer[batch]
 
 	// Defined at package scope, as the docs ask, so the registry sees them.
-	counted = flow.DefineWorkflow("wf.counted", func(ctx flow.Context, in batch) error {
+	counted = flow.Define(func(ctx flow.Context, in batch) (flow.None, error) {
 		runsOfCounted.Add(1)
 		lastBatch.Store(&in)
 		_, err := ctx.Map(double, in.Items)
-		return err
-	})
-	_ = flow.DefineWorkflow("wf.another", func(ctx flow.Context, _ flow.None) error { return nil })
+		return flow.None{}, err
+	}, flow.WithName("wf.counted"))
+	another = flow.Define(func(ctx flow.Context, _ flow.None) (flow.None, error) { return flow.None{}, nil }, flow.WithName("wf.another"))
+
+	_ = flow.Main(counted)
+	_ = flow.Main(another)
 )
 
 // THE POINT: a workflow is a run body with a name, and running it IS running
@@ -38,22 +41,22 @@ func TestAWorkflowRunsOnceUnderItsOwnName(t *testing.T) {
 	runsOfCounted.Store(0)
 	in := batch{Items: []int{1, 2, 3}}
 
-	if err := counted.Run(context.Background(), in, flow.WithStore(store)); err != nil {
+	if err := flow.RunMain(context.Background(), counted, in, flow.WithStore(store)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if err := counted.Run(context.Background(), in, flow.WithStore(store)); err != nil {
+	if err := flow.RunMain(context.Background(), counted, in, flow.WithStore(store)); err != nil {
 		t.Fatalf("second Run: %v", err)
 	}
 	if n := runsOfCounted.Load(); n != 1 {
 		t.Fatalf("the body ran %d times; a finished workflow must not run again on the same store", n)
 	}
 
-	events, err := store.Events(context.Background(), counted.Name(), "main")
+	events, err := store.Events(context.Background(), "wf.counted", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(events) == 0 {
-		t.Fatalf("no history under %q; the workflow's name must be the run's name", counted.Name())
+		t.Fatalf("no history under %q; the workflow's name must be the run's name", "wf.counted")
 	}
 }
 
@@ -65,22 +68,27 @@ func TestAResumedWorkflowIsGivenItsRecordedInput(t *testing.T) {
 	store := flow.NewMemStore()
 	attempts := 0
 	var seen []int
-	w := flow.DefineWorkflow("wf.resumed", func(ctx flow.Context, in batch) error {
+	w := flow.Define(func(ctx flow.Context, in batch) (flow.None, error) {
 		attempts++
 		seen = append(seen, in.Items...)
 		if attempts == 1 {
-			return errors.New("first attempt dies")
+			return flow.None{}, errors.New("first attempt dies")
 		}
-		return nil
-	}, flow.MaxAttempts(1), flow.Backoff(0, 0))
+		return flow.None{}, nil
+	}, flow.WithName("wf.resumed"))
+	_ = flow.Main(w)
+
+	// The retry options that used to be baked into the definition are now given
+	// at each run.
+	retry := []flow.RunOption{flow.MaxAttempts(1), flow.Backoff(0, 0)}
 
 	first := batch{Items: []int{7}}
-	if err := w.Run(context.Background(), first, flow.WithStore(store)); err == nil {
+	if err := flow.RunMain(context.Background(), w, first, append([]flow.RunOption{flow.WithStore(store)}, retry...)...); err == nil {
 		t.Fatal("the first attempt should have failed")
 	}
 
 	// Resumed by name with no input, the way a restarted coordinator does it.
-	if err := flow.RunWorkflow(context.Background(), "wf.resumed", nil, flow.WithStore(store)); err != nil {
+	if err := flow.RunWorkflow(context.Background(), "wf.resumed", nil, append([]flow.RunOption{flow.WithStore(store)}, retry...)...); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	if want := []int{7, 7}; !slices.Equal(seen, want) {
@@ -91,12 +99,12 @@ func TestAResumedWorkflowIsGivenItsRecordedInput(t *testing.T) {
 	// flight, and on one that already finished, which is the same mistake.
 	store2 := flow.NewMemStore()
 	attempts = 0
-	_ = w.Run(context.Background(), first, flow.WithStore(store2))
-	err := w.Run(context.Background(), batch{Items: []int{8}}, flow.WithStore(store2))
+	_ = flow.RunMain(context.Background(), w, first, append([]flow.RunOption{flow.WithStore(store2)}, retry...)...)
+	err := flow.RunMain(context.Background(), w, batch{Items: []int{8}}, append([]flow.RunOption{flow.WithStore(store2)}, retry...)...)
 	if err == nil || !strings.Contains(err.Error(), "different input") {
 		t.Fatalf("want a refusal naming the different input, got %v", err)
 	}
-	err = w.Run(context.Background(), batch{Items: []int{8}}, flow.WithStore(store))
+	err = flow.RunMain(context.Background(), w, batch{Items: []int{8}}, append([]flow.RunOption{flow.WithStore(store)}, retry...)...)
 	if err == nil || !strings.Contains(err.Error(), "different input") {
 		t.Fatalf("a finished run given different input must be refused too, got %v", err)
 	}
@@ -116,9 +124,11 @@ func TestAFreshRunWithoutItsInputIsRefusedWithAnExample(t *testing.T) {
 	}
 
 	// A workflow that takes None wants nothing and gets none.
-	if err := flow.RunWorkflow(context.Background(), "wf.another", nil, flow.WithStore(flow.NewMemStore())); err != nil {
-		t.Fatalf("a None workflow must run without input: %v", err)
-	}
+	t.Run("none root runs without input", func(t *testing.T) {
+		if err := flow.RunWorkflow(context.Background(), "wf.another", nil, flow.WithStore(flow.NewMemStore())); err != nil {
+			t.Fatalf("a None workflow must run without input: %v", err)
+		}
+	})
 }
 
 // RunWorkflow decodes JSON into the workflow's input type: the path a hosting
@@ -167,39 +177,36 @@ func TestDefinedWorkflowsAreListedByName(t *testing.T) {
 	}
 }
 
-// Options declared with the workflow are its defaults; the caller's win.
-func TestRunOptionsGivenAtDefinitionApplyAndCanBeOverridden(t *testing.T) {
+// The run options a caller gives apply to the run.
+func TestRunOptionsGivenAtTheRunApply(t *testing.T) {
 	attempts := 0
-	w := flow.DefineWorkflow("wf.flaky", func(ctx flow.Context, _ flow.None) error {
+	w := flow.Define(func(ctx flow.Context, _ flow.None) (flow.None, error) {
 		attempts++
-		return errors.New("not yet")
-	}, flow.MaxAttempts(2), flow.Backoff(0, 0))
+		return flow.None{}, errors.New("not yet")
+	}, flow.WithName("wf.flaky"))
+	_ = flow.Main(w)
 
-	err := w.Run(context.Background(), flow.None{}, flow.WithStore(flow.NewMemStore()))
-	if err == nil || !strings.Contains(err.Error(), "after 2 attempts") {
-		t.Fatalf("want failure after the 2 attempts the definition allows, got %v", err)
-	}
-
-	attempts = 0
-	err = w.Run(context.Background(), flow.None{}, flow.WithStore(flow.NewMemStore()), flow.MaxAttempts(3))
+	err := flow.RunMain(context.Background(), w, flow.None{}, flow.WithStore(flow.NewMemStore()),
+		flow.MaxAttempts(3), flow.Backoff(0, 0))
 	if err == nil || !strings.Contains(err.Error(), "after 3 attempts") {
-		t.Fatalf("want the caller's 3 attempts to override the definition's 2, got %v", err)
+		t.Fatalf("want failure after the 3 attempts the caller allows, got %v", err)
 	}
 }
 
-func TestDefiningTheSameWorkflowTwicePanics(t *testing.T) {
+func TestDefiningTheSameFunctionTwicePanics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Fatal("a duplicate DefineWorkflow did not panic")
+			t.Fatal("a duplicate flow.Define did not panic")
 		}
 	}()
-	flow.DefineWorkflow("wf.counted", func(ctx flow.Context, _ flow.None) error { return nil })
+	flow.Define(func(ctx flow.Context, _ flow.None) (flow.None, error) { return flow.None{}, nil },
+		flow.WithName("wf.counted"))
 }
 
-func TestTheZeroWorkflowSaysSo(t *testing.T) {
-	var w flow.Workflow[flow.None]
-	if err := w.Run(context.Background(), flow.None{}, flow.WithStore(flow.NewMemStore())); err == nil ||
-		!strings.Contains(err.Error(), "DefineWorkflow") {
-		t.Fatalf("want an error naming DefineWorkflow, got %v", err)
+func TestTheZeroFuncSaysSo(t *testing.T) {
+	var w flow.Func[flow.None, flow.None]
+	if err := flow.RunMain(context.Background(), w, flow.None{}, flow.WithStore(flow.NewMemStore())); err == nil ||
+		!strings.Contains(err.Error(), "flow.Define") {
+		t.Fatalf("want an error naming flow.Define, got %v", err)
 	}
 }

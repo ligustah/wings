@@ -48,7 +48,7 @@ func ok(name string) error {
 
 // --- pipeline: three threads of run code joined by bounded channels ---
 
-var Pipeline = flow.DefineWorkflow("pipeline", func(ctx flow.Context, in Params) error {
+var Pipeline = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 20)
 	raw := ctx.NewBufferedChannel[int](2)
 	squared := ctx.NewBufferedChannel[int](2)
@@ -98,24 +98,26 @@ var Pipeline = flow.DefineWorkflow("pipeline", func(ctx flow.Context, in Params)
 
 	sum, err := sink.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	want := n * (n + 1) * (2*n + 1) / 6
 	if sum != want {
-		return fmt.Errorf("pipeline: the sink summed %d, want %d", sum, want)
+		return flow.None{}, fmt.Errorf("pipeline: the sink summed %d, want %d", sum, want)
 	}
 	a, err := source.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	b, err := transform.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	fmt.Printf("pipeline: %d values, sum of squares %d; source on pid %d, transform on pid %d, workflow on pid %d\n",
 		n, sum, a, b, os.Getpid())
-	return ok("pipeline")
-})
+	return flow.None{}, ok("pipeline")
+}, flow.WithName("pipeline"))
+
+var _ = flow.Main(Pipeline)
 
 // --- fanin: several producers, several consumers, one channel ---
 
@@ -148,7 +150,7 @@ var Consume = flow.Define(func(ctx flow.Context, in Feed) (Tally, error) {
 	return t, err
 }, flow.WithName("consume"))
 
-var Fanin = flow.DefineWorkflow("fanin", func(ctx flow.Context, in Params) error {
+var Fanin = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 50)
 	const producers, consumers = 3, 4
 	values := ctx.NewChannel[int]()
@@ -170,18 +172,18 @@ var Fanin = flow.DefineWorkflow("fanin", func(ctx flow.Context, in Params) error
 	}
 	for _, p := range prods {
 		if _, err := p.Await(ctx); err != nil {
-			return err
+			return flow.None{}, err
 		}
 	}
 	if err := values.Close(ctx); err != nil {
-		return err
+		return flow.None{}, err
 	}
 	total := Tally{}
 	pids := map[int]int{}
 	for _, c := range cons {
 		t, err := c.Await(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		fmt.Printf("fanin: a consumer on pid %d took %d values\n", t.Pid, t.Count)
 		total.Count += t.Count
@@ -190,10 +192,12 @@ var Fanin = flow.DefineWorkflow("fanin", func(ctx flow.Context, in Params) error
 	}
 	all := producers * n
 	if total.Count != all || total.Sum != all*(all+1)/2 {
-		return fmt.Errorf("fanin: consumers took %d values summing %d, want %d summing %d", total.Count, total.Sum, all, all*(all+1)/2)
+		return flow.None{}, fmt.Errorf("fanin: consumers took %d values summing %d, want %d summing %d", total.Count, total.Sum, all, all*(all+1)/2)
 	}
-	return ok("fanin")
-})
+	return flow.None{}, ok("fanin")
+}, flow.WithName("fanin"))
+
+var _ = flow.Main(Fanin)
 
 // --- flaky: every way a thread can go wrong, and the workflow going on ---
 
@@ -225,23 +229,23 @@ var Square = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	return in * in, nil
 }, flow.WithName("square"))
 
-var Flaky = flow.DefineWorkflow("flaky", func(ctx flow.Context, in Params) error {
+var Flaky = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	// A function that fails: the error comes back through Await, and the
 	// workflow goes on.
 	if _, err := ctx.Go(Fails, 1).Await(ctx); err == nil || !strings.Contains(err.Error(), "expected failure") {
-		return fmt.Errorf("flaky: Fails returned %v, want the expected failure", err)
+		return flow.None{}, fmt.Errorf("flaky: Fails returned %v, want the expected failure", err)
 	}
 	// One that panics: the worker survives, the error names the panic.
 	if _, err := ctx.Go(Panics, 2).Await(ctx); err == nil || !strings.Contains(err.Error(), "on purpose") {
-		return fmt.Errorf("flaky: Panics returned %v, want a panic report", err)
+		return flow.None{}, fmt.Errorf("flaky: Panics returned %v, want a panic report", err)
 	}
 	// One that exceeds its own timeout.
 	if _, err := ctx.Go(Slow, 2*time.Second).Await(ctx); err == nil || !strings.Contains(err.Error(), "timeout") {
-		return fmt.Errorf("flaky: Slow returned %v, want a timeout", err)
+		return flow.None{}, fmt.Errorf("flaky: Slow returned %v, want a timeout", err)
 	}
 	// And one that does not.
 	if v, err := ctx.Go(Slow, 10*time.Millisecond).Await(ctx); err != nil || v != int(10*time.Millisecond) {
-		return fmt.Errorf("flaky: a fast Slow returned %d, %v", v, err)
+		return flow.None{}, fmt.Errorf("flaky: a fast Slow returned %d, %v", v, err)
 	}
 	// A thread of run code that fails, on a worker.
 	if _, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
@@ -251,11 +255,11 @@ var Flaky = flow.DefineWorkflow("flaky", func(ctx flow.Context, in Params) error
 		}
 		return 0, fmt.Errorf("%w: from a closure on pid %d", ErrExpected, p)
 	}).Await(ctx); err == nil || !strings.Contains(err.Error(), "from a closure") {
-		return fmt.Errorf("flaky: the failing closure returned %v", err)
+		return flow.None{}, fmt.Errorf("flaky: the failing closure returned %v", err)
 	}
 	// A Map with one bad element fails as a whole.
 	if _, err := ctx.Map(Square, []int{1, 2, -3, 4}); err == nil || !strings.Contains(err.Error(), "cannot square -3") {
-		return fmt.Errorf("flaky: Map returned %v, want the bad element's error", err)
+		return flow.None{}, fmt.Errorf("flaky: Map returned %v, want the bad element's error", err)
 	}
 	// A closure whose own fork fails, handled inside the closure.
 	got, err := ctx.Spawn(func(ctx flow.Context) (string, error) {
@@ -270,19 +274,21 @@ var Flaky = flow.DefineWorkflow("flaky", func(ctx flow.Context, in Params) error
 		return fmt.Sprintf("recovered; squares %v", out), nil
 	}).Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	fmt.Printf("flaky: %s\n", got)
 	// And after all of that, ordinary work still works.
 	out, err := ctx.Map(Square, []int{1, 2, 3})
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	if out[0] != 1 || out[1] != 4 || out[2] != 9 {
-		return fmt.Errorf("flaky: Map gave %v", out)
+		return flow.None{}, fmt.Errorf("flaky: Map gave %v", out)
 	}
-	return ok("flaky")
-})
+	return flow.None{}, ok("flaky")
+}, flow.WithName("flaky"))
+
+var _ = flow.Main(Flaky)
 
 // --- deep: lineages several long, channels at every level ---
 
@@ -336,53 +342,55 @@ func descend(ctx flow.Context, depth, max int) (Level, error) {
 	return l, nil
 }
 
-var Deep = flow.DefineWorkflow("deep", func(ctx flow.Context, in Params) error {
+var Deep = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	depth := cmp.Or(in.Depth, 4)
 	l, err := descend(ctx, 0, depth)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	if l.Depth != depth || len(l.Pids) != depth+1 {
-		return fmt.Errorf("deep: got %+v", l)
+		return flow.None{}, fmt.Errorf("deep: got %+v", l)
 	}
 	v, more, err := l.Back.Recv(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	if !more || v != depth*100 {
-		return fmt.Errorf("deep: the channel handed back up gave %d, %v", v, more)
+		return flow.None{}, fmt.Errorf("deep: the channel handed back up gave %d, %v", v, more)
 	}
 	fmt.Printf("deep: %d levels on pids %v; the deepest's channel gave %d\n", depth+1, l.Pids, v)
-	return ok("deep")
-})
+	return flow.None{}, ok("deep")
+}, flow.WithName("deep"))
+
+var _ = flow.Main(Deep)
 
 // --- effects: what the workflow recorded before a fork, seen by the fork ---
 
-var Effects = flow.DefineWorkflow("effects", func(ctx flow.Context, in Params) error {
+var Effects = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	t0, err := ctx.Now()
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	host, err := ctx.Effect(os.Hostname)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	var rolls []int
 	for range 3 {
 		r, err := ctx.Effect(func() (int, error) { return rand.IntN(1000), nil })
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		rolls = append(rolls, r)
 	}
 	if err := ctx.Sleep(50 * time.Millisecond); err != nil {
-		return err
+		return flow.None{}, err
 	}
 	// A function called directly, on this thread, before the fork: replayed
 	// from the history by the worker that reaches the closure.
 	sq, err := Square(ctx, 12)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	seen := fmt.Sprintf("%s %v %d %s", host, rolls, sq, t0.Format(time.RFC3339Nano))
 
@@ -412,18 +420,20 @@ var Effects = flow.DefineWorkflow("effects", func(ctx flow.Context, in Params) e
 		return view{Seen: fmt.Sprintf("%s %v %d %s", host, rolls, sq, t0.Format(time.RFC3339Nano)), Pid: p, Host: h}, nil
 	}).Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	if v.Seen != seen {
-		return fmt.Errorf("effects: the closure saw %q, the workflow %q", v.Seen, seen)
+		return flow.None{}, fmt.Errorf("effects: the closure saw %q, the workflow %q", v.Seen, seen)
 	}
 	fmt.Printf("effects: the closure on pid %d (%s) saw what the workflow recorded: %s\n", v.Pid, v.Host, seen)
-	return ok("effects")
-})
+	return flow.None{}, ok("effects")
+}, flow.WithName("effects"))
+
+var _ = flow.Main(Effects)
 
 // --- wide: many threads of run code at once, on one channel ---
 
-var Wide = flow.DefineWorkflow("wide", func(ctx flow.Context, in Params) error {
+var Wide = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 50)
 	const each = 20
 	values := ctx.NewBufferedChannel[int](8)
@@ -443,13 +453,13 @@ var Wide = flow.DefineWorkflow("wide", func(ctx flow.Context, in Params) error {
 	for range n * each {
 		v, more, err := values.Recv(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		if !more {
-			return fmt.Errorf("wide: the channel closed after %d values", len(seen))
+			return flow.None{}, fmt.Errorf("wide: the channel closed after %d values", len(seen))
 		}
 		if seen[v] {
-			return fmt.Errorf("wide: value %d received twice", v)
+			return flow.None{}, fmt.Errorf("wide: value %d received twice", v)
 		}
 		seen[v] = true
 	}
@@ -457,18 +467,20 @@ var Wide = flow.DefineWorkflow("wide", func(ctx flow.Context, in Params) error {
 	for _, t := range threads {
 		p, err := t.Await(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		pids[p]++
 	}
 	fmt.Printf("wide: %d threads sent %d values, received once each in %s; threads per pid: %v\n",
 		n, n*each, time.Since(start).Round(time.Millisecond), pids)
-	return ok("wide")
-})
+	return flow.None{}, ok("wide")
+}, flow.WithName("wide"))
+
+var _ = flow.Main(Wide)
 
 // --- sleepy: threads that sleep, and threads that wait on them ---
 
-var Sleepy = flow.DefineWorkflow("sleepy", func(ctx flow.Context, in Params) error {
+var Sleepy = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	naps := []time.Duration{300 * time.Millisecond, 600 * time.Millisecond, 900 * time.Millisecond}
 	if in.Long {
 		// Past flow.ShortSleep: a worker hands the thread back and the
@@ -504,30 +516,34 @@ var Sleepy = flow.DefineWorkflow("sleepy", func(ctx flow.Context, in Params) err
 	for i, f := range futs {
 		slept, err := f.Await(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		if slept < naps[i] {
-			return fmt.Errorf("sleepy: a nap of %s took %s", naps[i], slept)
+			return flow.None{}, fmt.Errorf("sleepy: a nap of %s took %s", naps[i], slept)
 		}
 		fmt.Printf("sleepy: a nap of %s took %s\n", naps[i], slept.Round(time.Millisecond))
 	}
 	fmt.Printf("sleepy: all in %s\n", time.Since(start).Round(time.Millisecond))
-	return ok("sleepy")
-})
+	return flow.None{}, ok("sleepy")
+}, flow.WithName("sleepy"))
+
+var _ = flow.Main(Sleepy)
 
 // --- refused: what a thread of run code cannot do ---
 
-var Refused = flow.DefineWorkflow("refused", func(ctx flow.Context, in Params) error {
+var Refused = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	// A Spawn inside a work function after a Step: steps are kept with the
 	// call, not in the history, so the closure cannot be reached by replay.
 	// It is refused with an error that says so, rather than run wrong.
 	_, err := ctx.Go(StepsThenSpawns, 1).Await(ctx)
 	if err == nil {
-		return errors.New("refused: a Spawn after a Step was not refused")
+		return flow.None{}, errors.New("refused: a Spawn after a Step was not refused")
 	}
 	fmt.Printf("refused: %v\n", err)
-	return ok("refused")
-})
+	return flow.None{}, ok("refused")
+}, flow.WithName("refused"))
+
+var _ = flow.Main(Refused)
 
 var StepsThenSpawns = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	v, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 1, nil })
@@ -540,20 +556,20 @@ var StepsThenSpawns = flow.Define(func(ctx flow.Context, in int) (int, error) {
 // --- panicky: a closure that panics on a worker, and one that returns a
 // permanent error, and the workflow going on ---
 
-var Panicky = flow.DefineWorkflow("panicky", func(ctx flow.Context, in Params) error {
+var Panicky = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	_, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		p, _ := pid(ctx)
 		panic(fmt.Sprintf("a closure panicking on pid %d", p))
 	}).Await(ctx)
 	if err == nil || !strings.Contains(err.Error(), "panicking on pid") {
-		return fmt.Errorf("panicky: the panicking closure returned %v", err)
+		return flow.None{}, fmt.Errorf("panicky: the panicking closure returned %v", err)
 	}
 	fmt.Printf("panicky: %v\n", err)
 	_, err = ctx.Spawn(func(ctx flow.Context) (int, error) {
 		return 0, flow.Permanent(errors.New("permanently wrong"))
 	}).Await(ctx)
 	if err == nil || !strings.Contains(err.Error(), "permanently wrong") {
-		return fmt.Errorf("panicky: the permanent failure returned %v", err)
+		return flow.None{}, fmt.Errorf("panicky: the permanent failure returned %v", err)
 	}
 	// A closure that fails on its first attempt only is retried where it
 	// is, by the thread's own retry, and succeeds.
@@ -565,14 +581,16 @@ var Panicky = flow.DefineWorkflow("panicky", func(ctx flow.Context, in Params) e
 		return n + 41, nil
 	}).Await(ctx)
 	if err != nil || v != 41 {
-		return fmt.Errorf("panicky: after the failures a closure returned %d, %v", v, err)
+		return flow.None{}, fmt.Errorf("panicky: after the failures a closure returned %d, %v", v, err)
 	}
-	return ok("panicky")
-})
+	return flow.None{}, ok("panicky")
+}, flow.WithName("panicky"))
+
+var _ = flow.Main(Panicky)
 
 // --- bulky: values of some size through a channel that crosses machines ---
 
-var Bulky = flow.DefineWorkflow("bulky", func(ctx flow.Context, in Params) error {
+var Bulky = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 12)
 	const size = 256 << 10
 	values := ctx.NewBufferedChannel[[]byte](2)
@@ -592,31 +610,33 @@ var Bulky = flow.DefineWorkflow("bulky", func(ctx flow.Context, in Params) error
 	for {
 		b, more, err := values.Recv(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		if !more {
 			break
 		}
 		if len(b) != size || b[1] != byte(count+1) {
-			return fmt.Errorf("bulky: value %d is %d bytes and starts %v", count, len(b), b[:2])
+			return flow.None{}, fmt.Errorf("bulky: value %d is %d bytes and starts %v", count, len(b), b[:2])
 		}
 		total += len(b)
 		count++
 	}
 	if _, err := producer.Await(ctx); err != nil {
-		return err
+		return flow.None{}, err
 	}
 	if count != n {
-		return fmt.Errorf("bulky: received %d values, want %d", count, n)
+		return flow.None{}, fmt.Errorf("bulky: received %d values, want %d", count, n)
 	}
 	fmt.Printf("bulky: %d values, %d MB\n", count, total>>20)
-	return ok("bulky")
-})
+	return flow.None{}, ok("bulky")
+}, flow.WithName("bulky"))
+
+var _ = flow.Main(Bulky)
 
 // --- cancelled: a thread of run code cut short by its parent's context,
 // where it runs on another machine, and the workflow going on ---
 
-var Cancelled = flow.DefineWorkflow("cancelled", func(ctx flow.Context, in Params) error {
+var Cancelled = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	// A timeout on the wait, not on the thread: the thread is sleeping on
 	// some worker and the parent stops waiting for it.
 	tctx, cancel := ctx.WithTimeout(500 * time.Millisecond)
@@ -629,7 +649,7 @@ var Cancelled = flow.DefineWorkflow("cancelled", func(ctx flow.Context, in Param
 	_, err := slow.Await(tctx)
 	cancel()
 	if !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("cancelled: the wait ended with %v, want a deadline", err)
+		return flow.None{}, fmt.Errorf("cancelled: the wait ended with %v, want a deadline", err)
 	}
 	fmt.Printf("cancelled: the wait ended with %v\n", err)
 	// Cancelled outright, before it could finish.
@@ -643,20 +663,22 @@ var Cancelled = flow.DefineWorkflow("cancelled", func(ctx flow.Context, in Param
 	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
 	_, err = stopped.Await(cctx)
 	if !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("cancelled: the cancelled wait ended with %v", err)
+		return flow.None{}, fmt.Errorf("cancelled: the cancelled wait ended with %v", err)
 	}
 	// And after both, a thread that finishes, awaited normally.
 	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) { return 7, nil }).Await(ctx)
 	if err != nil || v != 7 {
-		return fmt.Errorf("cancelled: the thread after returned %d, %v", v, err)
+		return flow.None{}, fmt.Errorf("cancelled: the thread after returned %d, %v", v, err)
 	}
-	return ok("cancelled")
-})
+	return flow.None{}, ok("cancelled")
+}, flow.WithName("cancelled"))
+
+var _ = flow.Main(Cancelled)
 
 // --- stepped: a thread of run code that uses the progress API — steps,
 // heartbeats, a checkpoint — where it runs ---
 
-var Stepped = flow.DefineWorkflow("stepped", func(ctx flow.Context, in Params) error {
+var Stepped = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return 20, nil })
 		if err != nil {
@@ -679,18 +701,20 @@ var Stepped = flow.DefineWorkflow("stepped", func(ctx flow.Context, in Params) e
 		return b, nil
 	}).Await(ctx)
 	if err != nil {
-		return fmt.Errorf("stepped: %w", err)
+		return flow.None{}, fmt.Errorf("stepped: %w", err)
 	}
 	if v != 42 {
-		return fmt.Errorf("stepped: got %d, want 42", v)
+		return flow.None{}, fmt.Errorf("stepped: got %d, want 42", v)
 	}
 	// The same, inside a work function, which is where steps were made for.
 	w, err := ctx.Go(Stepper, 1).Await(ctx)
 	if err != nil || w != 42 {
-		return fmt.Errorf("stepped: the stepping function returned %d, %v", w, err)
+		return flow.None{}, fmt.Errorf("stepped: the stepping function returned %d, %v", w, err)
 	}
-	return ok("stepped")
-})
+	return flow.None{}, ok("stepped")
+}, flow.WithName("stepped"))
+
+var _ = flow.Main(Stepped)
 
 var Stepper = flow.Define(func(ctx flow.Context, in int) (int, error) {
 	a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 19, nil })
@@ -703,7 +727,7 @@ var Stepper = flow.Define(func(ctx flow.Context, in int) (int, error) {
 // --- orphaned: a receiver whose only sender fails without closing, and a
 // sender whose channel was closed under it ---
 
-var Orphaned = flow.DefineWorkflow("orphaned", func(ctx flow.Context, in Params) error {
+var Orphaned = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	values := ctx.NewChannel[int]()
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		if err := values.Send(ctx, 1); err != nil {
@@ -713,7 +737,7 @@ var Orphaned = flow.DefineWorkflow("orphaned", func(ctx flow.Context, in Params)
 	})
 	v, more, err := values.Recv(ctx)
 	if err != nil || !more || v != 1 {
-		return fmt.Errorf("orphaned: the first receive got %d, %v, %v", v, more, err)
+		return flow.None{}, fmt.Errorf("orphaned: the first receive got %d, %v, %v", v, more, err)
 	}
 	// Nobody will ever send or close: a receive would wait forever, so the
 	// wait is bounded, and reports the bound.
@@ -721,17 +745,17 @@ var Orphaned = flow.DefineWorkflow("orphaned", func(ctx flow.Context, in Params)
 	_, _, err = values.Recv(tctx)
 	cancel()
 	if !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("orphaned: the orphaned receive ended with %v", err)
+		return flow.None{}, fmt.Errorf("orphaned: the orphaned receive ended with %v", err)
 	}
 	fmt.Printf("orphaned: the orphaned receive ended with %v\n", err)
 	_, err = producer.Await(ctx)
 	if err == nil || !strings.Contains(err.Error(), "gives up") {
-		return fmt.Errorf("orphaned: the producer returned %v", err)
+		return flow.None{}, fmt.Errorf("orphaned: the producer returned %v", err)
 	}
 	// Closed under a sender: the sender's send fails rather than hangs.
 	closed := ctx.NewChannel[int]()
 	if err := closed.Close(ctx); err != nil {
-		return err
+		return flow.None{}, err
 	}
 	sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		err := closed.Send(ctx, 1)
@@ -742,10 +766,12 @@ var Orphaned = flow.DefineWorkflow("orphaned", func(ctx flow.Context, in Params)
 		return 1, nil
 	})
 	if _, err := sender.Await(ctx); err != nil {
-		return fmt.Errorf("orphaned: %w", err)
+		return flow.None{}, fmt.Errorf("orphaned: %w", err)
 	}
-	return ok("orphaned")
-})
+	return flow.None{}, ok("orphaned")
+}, flow.WithName("orphaned"))
+
+var _ = flow.Main(Orphaned)
 
 // --- crossed: a channel made by the workflow, sent into a work function on
 // one worker whose spawned thread sends on it, and received on by a thread
@@ -775,7 +801,7 @@ var Pumps = flow.Define(func(ctx flow.Context, in Outlet) (int, error) {
 	return in.N, nil
 }, flow.WithName("pumps"))
 
-var Crossed = flow.DefineWorkflow("crossed", func(ctx flow.Context, in Params) error {
+var Crossed = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 25)
 	values := ctx.NewBufferedChannel[int](3)
 	pump := ctx.Go(Pumps, Outlet{N: n, Out: values})
@@ -796,16 +822,18 @@ var Crossed = flow.DefineWorkflow("crossed", func(ctx flow.Context, in Params) e
 	})
 	sum, err := drain.Await(ctx)
 	if err != nil {
-		return fmt.Errorf("crossed: drain: %w", err)
+		return flow.None{}, fmt.Errorf("crossed: drain: %w", err)
 	}
 	if _, err := pump.Await(ctx); err != nil {
-		return fmt.Errorf("crossed: pump: %w", err)
+		return flow.None{}, fmt.Errorf("crossed: pump: %w", err)
 	}
 	if want := n * (n - 1) / 2; sum != want {
-		return fmt.Errorf("crossed: sum %d, want %d", sum, want)
+		return flow.None{}, fmt.Errorf("crossed: sum %d, want %d", sum, want)
 	}
-	return ok("crossed")
-})
+	return flow.None{}, ok("crossed")
+}, flow.WithName("crossed"))
+
+var _ = flow.Main(Crossed)
 
 // --- mapped: a wide fan-out with Context.Map, results kept in order ---
 //
@@ -813,7 +841,7 @@ var Crossed = flow.DefineWorkflow("crossed", func(ctx flow.Context, in Params) e
 // the children that were on it, and this checks the results still come back
 // complete, in order, and each computed exactly once — a value out of place or
 // missing is a redispatch that lost or reordered a result.
-var Mapped = flow.DefineWorkflow("mapped", func(ctx flow.Context, in Params) error {
+var Mapped = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 50)
 	ins := make([]int, n)
 	for i := range ins {
@@ -821,16 +849,18 @@ var Mapped = flow.DefineWorkflow("mapped", func(ctx flow.Context, in Params) err
 	}
 	out, err := ctx.Map(Square, ins)
 	if err != nil {
-		return fmt.Errorf("mapped: %w", err)
+		return flow.None{}, fmt.Errorf("mapped: %w", err)
 	}
 	if len(out) != n {
-		return fmt.Errorf("mapped: got %d results, want %d", len(out), n)
+		return flow.None{}, fmt.Errorf("mapped: got %d results, want %d", len(out), n)
 	}
 	for i := range ins {
 		if out[i] != i*i {
-			return fmt.Errorf("mapped: out[%d] = %d, want %d", i, out[i], i*i)
+			return flow.None{}, fmt.Errorf("mapped: out[%d] = %d, want %d", i, out[i], i*i)
 		}
 	}
 	fmt.Printf("mapped: %d squares came back in order\n", n)
-	return ok("mapped")
-})
+	return flow.None{}, ok("mapped")
+}, flow.WithName("mapped"))
+
+var _ = flow.Main(Mapped)

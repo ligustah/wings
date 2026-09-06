@@ -23,7 +23,7 @@ func TestChoosingTheWorkflowToRun(t *testing.T) {
 		want    string // workflow name, or a fragment of the error
 		fails   bool
 	}{
-		{"none defined", "", nil, "flow.DefineWorkflow", true},
+		{"none defined", "", nil, "flow.Main", true},
 		{"one, unnamed", "", []flow.WorkflowInfo{one}, "entry.one", false},
 		{"one, named", "entry.one", []flow.WorkflowInfo{one}, "entry.one", false},
 		{"several, unnamed", "", []flow.WorkflowInfo{one, two}, "entry.one, entry.two", true},

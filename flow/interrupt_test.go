@@ -136,7 +136,7 @@ func TestAWaitTheAttemptCutShortIsWaitedForAgain(t *testing.T) {
 	}
 }
 
-var givesUpThenSpawns = flow.DefineWorkflow("test.givesUpThenSpawns", func(ctx flow.Context, base int) error {
+var givesUpThenSpawns = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	slow := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		if err := ctx.Sleep(2 * time.Second); err != nil {
 			return 0, err
@@ -147,17 +147,19 @@ var givesUpThenSpawns = flow.DefineWorkflow("test.givesUpThenSpawns", func(ctx f
 	_, err := slow.Await(tctx)
 	cancel()
 	if !errors.Is(err, context.DeadlineExceeded) {
-		return flow.Permanent(errors.New("the wait ended with something else"))
+		return flow.None{}, flow.Permanent(errors.New("the wait ended with something else"))
 	}
 	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) { return base + 1, nil }).Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	if v != base+1 {
-		return flow.Permanent(errors.New("wrong value"))
+		return flow.None{}, flow.Permanent(errors.New("wrong value"))
 	}
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.givesUpThenSpawns"))
+
+var _ = flow.Main(givesUpThenSpawns)
 
 // THE POINT: a replay toward a thread of run code passes the wait its
 // parent gave up on the way the parent did — at once, with the same error —
@@ -166,7 +168,7 @@ var givesUpThenSpawns = flow.DefineWorkflow("test.givesUpThenSpawns", func(ctx f
 func TestAReplayToAForkPassesAWaitGivenUpOn(t *testing.T) {
 	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
 	started := time.Now()
-	if err := givesUpThenSpawns.Run(t.Context(), 3, p.opts()...); err != nil {
+	if err := flow.RunMain(t.Context(), givesUpThenSpawns, 3, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if took := time.Since(started); took > 2*time.Second {

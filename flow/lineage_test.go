@@ -48,7 +48,7 @@ func (p *placingElsewhere) Place(ctx context.Context, th flow.Thread, body func(
 	return out, err
 }
 
-var spawnsAProducer = flow.DefineWorkflow("test.spawnsAProducer", func(ctx flow.Context, base int) error {
+var spawnsAProducer = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	ch := ctx.NewChannel[int]()
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for i := 1; i <= 3; i++ {
@@ -62,7 +62,7 @@ var spawnsAProducer = flow.DefineWorkflow("test.spawnsAProducer", func(ctx flow.
 	for {
 		v, ok, err := ch.Recv(ctx)
 		if err != nil {
-			return err
+			return flow.None{}, err
 		}
 		if !ok {
 			break
@@ -71,11 +71,13 @@ var spawnsAProducer = flow.DefineWorkflow("test.spawnsAProducer", func(ctx flow.
 	}
 	n, err := producer.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	spawned.total, spawned.count = total, n
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.spawnsAProducer"))
+
+var _ = flow.Main(spawnsAProducer)
 
 var spawned struct{ total, count int }
 
@@ -86,7 +88,7 @@ var spawned struct{ total, count int }
 func TestAThreadOfRunCodeRunsElsewhereByItsLineage(t *testing.T) {
 	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
 	spawned.total, spawned.count = 0, 0
-	if err := spawnsAProducer.Run(t.Context(), 10, p.opts()...); err != nil {
+	if err := flow.RunMain(t.Context(), spawnsAProducer, 10, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if spawned.total != 36 || spawned.count != 3 {
@@ -97,7 +99,7 @@ func TestAThreadOfRunCodeRunsElsewhereByItsLineage(t *testing.T) {
 	}
 }
 
-var spawnsWithin = flow.DefineWorkflow("test.spawnsWithin", func(ctx flow.Context, base int) error {
+var spawnsWithin = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	results := ctx.NewBufferedChannel[int](4)
 	outer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		// A thread of run code forked by one that was itself placed
@@ -113,19 +115,21 @@ var spawnsWithin = flow.DefineWorkflow("test.spawnsWithin", func(ctx flow.Contex
 	})
 	v, err := outer.Await(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	a, _, err := results.Recv(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	b, _, err := results.Recv(ctx)
 	if err != nil {
-		return err
+		return flow.None{}, err
 	}
 	within.awaited, within.received = v, a+b
-	return nil
-})
+	return flow.None{}, nil
+}, flow.WithName("test.spawnsWithin"))
+
+var _ = flow.Main(spawnsWithin)
 
 var within struct{ awaited, received int }
 
@@ -135,7 +139,7 @@ var within struct{ awaited, received int }
 func TestLineagesNest(t *testing.T) {
 	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
 	within.awaited, within.received = 0, 0
-	if err := spawnsWithin.Run(t.Context(), 5, p.opts()...); err != nil {
+	if err := flow.RunMain(t.Context(), spawnsWithin, 5, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if within.awaited != 11 || within.received != 21 {
@@ -168,7 +172,7 @@ func TestAThreadOfABareRunStaysHome(t *testing.T) {
 	}
 }
 
-var spawnsSlowly = flow.DefineWorkflow("test.spawnsSlowly", func(ctx flow.Context, base int) error {
+var spawnsSlowly = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	// A thread off the lineage, not joined by the time the target is
 	// forked: the root's replay, reaching its join and finding none, is
 	// over at once.
@@ -185,12 +189,14 @@ var spawnsSlowly = flow.DefineWorkflow("test.spawnsSlowly", func(ctx flow.Contex
 		return ctx.Spawn(func(ctx flow.Context) (int, error) { return base + 1, nil }).Await(ctx)
 	})
 	if _, err := other.Await(ctx); err != nil {
-		return err
+		return flow.None{}, err
 	}
 	var err error
 	slowly, err = outer.Await(ctx)
-	return err
-})
+	return flow.None{}, err
+}, flow.WithName("test.spawnsSlowly"))
+
+var _ = flow.Main(spawnsSlowly)
 
 var slowly int
 
@@ -200,7 +206,7 @@ var slowly int
 func TestALineageWaitsForAnAncestorStillReplaying(t *testing.T) {
 	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
 	slowly = 0
-	if err := spawnsSlowly.Run(t.Context(), 41, p.opts()...); err != nil {
+	if err := flow.RunMain(t.Context(), spawnsSlowly, 41, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if slowly != 42 {
@@ -208,20 +214,22 @@ func TestALineageWaitsForAnAncestorStillReplaying(t *testing.T) {
 	}
 }
 
-var spawnsAPanic = flow.DefineWorkflow("test.spawnsAPanic", func(ctx flow.Context, base int) error {
+var spawnsAPanic = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
 	_, err := ctx.Spawn(func(ctx flow.Context) (int, error) { panic(fmt.Sprintf("on purpose, %d", base)) }).Await(ctx)
 	if err == nil {
-		return errors.New("the panicking thread returned nothing")
+		return flow.None{}, errors.New("the panicking thread returned nothing")
 	}
-	return flow.Permanent(fmt.Errorf("the thread's result: %w", err))
-})
+	return flow.None{}, flow.Permanent(fmt.Errorf("the thread's result: %w", err))
+}, flow.WithName("test.spawnsAPanic"))
+
+var _ = flow.Main(spawnsAPanic)
 
 // THE POINT: a thread of run code that panics where it was sent has the
 // panic as its result, as one run in-process would, rather than the process
 // that replayed its way to it reporting that the histories fall short.
 func TestAPanicInAThreadRunElsewhereIsItsResult(t *testing.T) {
 	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
-	err := spawnsAPanic.Run(t.Context(), 3, p.opts()...)
+	err := flow.RunMain(t.Context(), spawnsAPanic, 3, p.opts()...)
 	if err == nil || !strings.Contains(err.Error(), "the thread's result: flow: panic in forked work: on purpose, 3") {
 		t.Fatalf("the thread's result is %v, want its panic", err)
 	}

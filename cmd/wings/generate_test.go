@@ -85,7 +85,7 @@ func TestCoordinatorMainWithoutProvisioner(t *testing.T) {
 	// With nothing in main to name it, the package must still be linked in,
 	// or the coordinator has no workflow to run.
 	if !strings.Contains(src, `_ "example.com/app"`) {
-		t.Errorf("the package must be imported for its DefineWorkflow calls:\n\n%s", src)
+		t.Errorf("the package must be imported for its flow.Main calls:\n\n%s", src)
 	}
 	if strings.Contains(src, "app.Provisioner") {
 		t.Errorf("generated a call to Provisioner the package does not export:\n\n%s", src)
@@ -105,7 +105,7 @@ func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
 		t.Errorf("the work package must be linked in for its Define calls:\n\n%s", src)
 	}
 	if !strings.Contains(src, `_ "example.com/app/coord"`) {
-		t.Errorf("the coordinator package must be linked in for its DefineWorkflow calls:\n\n%s", src)
+		t.Errorf("the coordinator package must be linked in for its flow.Main calls:\n\n%s", src)
 	}
 
 	// When main has to call its Provisioner, the same package is imported by
