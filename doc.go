@@ -122,11 +122,11 @@
 // last recorded, so a retry resumes instead of starting over. Only the latest
 // survives — it is a position, not a log.
 //
-// flow.Context.Step is the same thing with the bookkeeping taken away: name the phases of a
-// long job, and a job that moves replays the ones that finished and runs the
-// rest. What can never move is the running goroutine itself — its stack, its
-// locals, its open sockets — so the only thing that crosses a machine boundary
-// is a value the work function made explicit. The phase that was in flight when
+// A job whose phases are expensive breaks them into calls to other functions:
+// each call's result is recorded, so a job that moves replays the calls that
+// finished and runs the rest. What can never move is the running goroutine
+// itself — its stack, its locals, its open sockets — so the only thing that
+// crosses a machine boundary is a value made explicit. The phase in flight when
 // the move happened is paid for twice, and that cost is irreducible: nobody can
 // say whether it finished.
 //
@@ -144,8 +144,8 @@
 //
 // This is durability for the job's OWN state, deliberately outside the durable
 // execution wings does for the job itself. wings stores the events and gives
-// them back, and never reads one. flow.Context.Step and flow.Context.Heartbeat are the other
-// thing: they are about resuming a job, not about describing what it did.
+// them back, and never reads one. flow.Context.Heartbeat is the other thing:
+// it is about resuming a job, not about describing what it did.
 //
 // # Artifacts
 //

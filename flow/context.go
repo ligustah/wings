@@ -15,9 +15,9 @@ import (
 // everything this package does for that code as methods on it: fork with
 // [Context.Go], [Context.Spawn] and [Context.Map]; read the clock with
 // [Context.Now] and wait with [Context.Sleep]; make a [Channel]; report a
-// running call's progress with [Context.Heartbeat] and [Context.Step]. There
-// are no package functions that take a context first: the context IS the
-// handle, and what it can do is what it says.
+// running call's progress with [Context.Heartbeat]. There are no package
+// functions that take a context first: the context IS the handle, and what it
+// can do is what it says.
 //
 // It is a value, cheap to copy, and everything it knows lives in the
 // context.Context it wraps, so a context derived from one with the standard
@@ -135,11 +135,9 @@ func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
 // to the code — the thread's lineage, see [Thread] and [RunLineage] — for a
 // process holding the same code to replay its way to the closure. That
 // process computes again whatever the parent computed between the events of
-// its history up to the fork, so keep that the replayable kind, and know
-// that a Spawn after a [Context.Step] cannot leave: steps are kept with the
-// call, not in the history. A thread of a run started under [Run] with a
-// bare body has no lineage another process could start, and runs where its
-// parent is.
+// its history up to the fork, so keep that the replayable kind. A thread of a
+// run started under [Run] with a bare body has no lineage another process
+// could start, and runs where its parent is.
 //
 //	ch := ctx.NewChannel[int]()
 //	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {

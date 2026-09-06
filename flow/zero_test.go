@@ -62,8 +62,6 @@ func TestTheZeroContextIsSafeAndSaysWhatIsMissing(t *testing.T) {
 	_, err = double(ctx, 1)
 	wantsRun("a defined function", err)
 	wantsRun("Heartbeat", ctx.Heartbeat(1))
-	_, err = ctx.Step("x", func(ctx flow.Context) (int, error) { return 1, nil })
-	wantsRun("Step", err)
 	if _, ok, err := ctx.Checkpoint[int](); ok || err != nil {
 		t.Errorf("Checkpoint on the zero Context: ok=%v err=%v; want no checkpoint and no error", ok, err)
 	}

@@ -80,12 +80,12 @@
 //
 // # Long calls
 //
-// A function that takes a long time reports where it has got to:
-// [Context.Step] for coarse phases, [Context.Heartbeat] for a position inside
-// one. An executor that can
-// lose a machine uses those reports to run the call again elsewhere from
-// where it was, rather than from nothing; an executor that cannot ignores
-// them. The function is written the same way either way.
+// A function that takes a long time reports where it has got to with
+// [Context.Heartbeat] — a position a later attempt reads back with
+// [Context.Checkpoint]. An executor that can lose a machine uses those reports
+// to run the call again elsewhere from where it was, rather than from nothing;
+// an executor that cannot ignores them. The function is written the same way
+// either way.
 //
 // A run adds a second way for a long thread to be interrupted: the parent
 // can fail and be retried while the thread is still running. When the retry

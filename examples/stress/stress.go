@@ -529,30 +529,6 @@ var Sleepy = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 
 var _ = flow.Main(Sleepy)
 
-// --- refused: what a thread of run code cannot do ---
-
-var Refused = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
-	// A Spawn inside a work function after a Step: steps are kept with the
-	// call, not in the history, so the closure cannot be reached by replay.
-	// It is refused with an error that says so, rather than run wrong.
-	_, err := ctx.Go(StepsThenSpawns, 1).Await(ctx)
-	if err == nil {
-		return flow.None{}, errors.New("refused: a Spawn after a Step was not refused")
-	}
-	fmt.Printf("refused: %v\n", err)
-	return flow.None{}, ok("refused")
-}, flow.WithName("refused"))
-
-var _ = flow.Main(Refused)
-
-var StepsThenSpawns = flow.Define(func(ctx flow.Context, in int) (int, error) {
-	v, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 1, nil })
-	if err != nil {
-		return 0, err
-	}
-	return ctx.Spawn(func(ctx flow.Context) (int, error) { return v * 2, nil }).Await(ctx)
-}, flow.WithName("stepsThenSpawns"))
-
 // --- panicky: a closure that panics on a worker, and one that returns a
 // permanent error, and the workflow going on ---
 
@@ -675,15 +651,12 @@ var Cancelled = flow.Define(func(ctx flow.Context, in Params) (flow.None, error)
 
 var _ = flow.Main(Cancelled)
 
-// --- stepped: a thread of run code that uses the progress API — steps,
-// heartbeats, a checkpoint — where it runs ---
+// --- progress: a thread of run code that reports where it is with the
+// heartbeat/checkpoint API where it runs ---
 
 var Stepped = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
-		a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return 20, nil })
-		if err != nil {
-			return 0, err
-		}
+		a := 20
 		for i := range 5 {
 			if err := ctx.Heartbeat(i); err != nil {
 				return 0, err
@@ -693,36 +666,19 @@ var Stepped = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 		if err != nil {
 			return 0, err
 		}
-		fmt.Printf("stepped: checkpoint %d found=%v\n", at, found)
-		b, err := ctx.Step("second", func(ctx flow.Context) (int, error) { return a + 22, nil })
-		if err != nil {
-			return 0, err
-		}
-		return b, nil
+		fmt.Printf("progress: checkpoint %d found=%v\n", at, found)
+		return a + 22, nil
 	}).Await(ctx)
 	if err != nil {
-		return flow.None{}, fmt.Errorf("stepped: %w", err)
+		return flow.None{}, fmt.Errorf("progress: %w", err)
 	}
 	if v != 42 {
-		return flow.None{}, fmt.Errorf("stepped: got %d, want 42", v)
+		return flow.None{}, fmt.Errorf("progress: got %d, want 42", v)
 	}
-	// The same, inside a work function, which is where steps were made for.
-	w, err := ctx.Go(Stepper, 1).Await(ctx)
-	if err != nil || w != 42 {
-		return flow.None{}, fmt.Errorf("stepped: the stepping function returned %d, %v", w, err)
-	}
-	return flow.None{}, ok("stepped")
-}, flow.WithName("stepped"))
+	return flow.None{}, ok("progress")
+}, flow.WithName("progress"))
 
 var _ = flow.Main(Stepped)
-
-var Stepper = flow.Define(func(ctx flow.Context, in int) (int, error) {
-	a, err := ctx.Step("first", func(ctx flow.Context) (int, error) { return in + 19, nil })
-	if err != nil {
-		return 0, err
-	}
-	return ctx.Step("second", func(ctx flow.Context) (int, error) { return a + 22, nil })
-}, flow.WithName("stepper"))
 
 // --- orphaned: a receiver whose only sender fails without closing, and a
 // sender whose channel was closed under it ---

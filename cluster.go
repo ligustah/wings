@@ -317,13 +317,6 @@ type pendingJob struct {
 	// checkpoint is the last progress reported, and is handed to the next
 	// attempt so it resumes rather than starting over.
 	checkpoint []byte
-	// steps are the phases this job has completed, accumulated here rather
-	// than resent by the worker each time — a step then costs one message
-	// whatever came before it. A report that arrives out of order is dropped
-	// and stops the log there: what ships to a retry is the contiguous prefix,
-	// because a log with a hole in it would have a retry skip work it never
-	// did.
-	steps []flow.StepRecord
 }
 
 // overdue reports whether a job has run out of time, and why. Call with mu
@@ -1221,7 +1214,6 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	}
 	p.placed = true
 	job.Checkpoint = p.checkpoint
-	job.Steps = p.steps
 	p.job = job
 	p.worker = w
 	if p.ran == nil {
@@ -1342,9 +1334,6 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 	}
 	if len(b.Checkpoint) > 0 {
 		p.checkpoint = b.Checkpoint
-	}
-	if b.Step != nil && b.Step.Index == len(p.steps) {
-		p.steps = append(p.steps, *b.Step)
 	}
 }
 

@@ -185,13 +185,6 @@ func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
 	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
 }
 
-func (p progressOf) Step(ctx context.Context, step flow.StepRecord) error {
-	if err := p.outputs.commit(ctx); err != nil {
-		return err
-	}
-	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Step: &step})
-}
-
 // sendBeat publishes one progress report.
 //
 // Outside the processor's transaction on purpose: a heartbeat is only useful if
@@ -478,7 +471,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// clock.
 	outputs := newAttemptOutputs(n, job)
 	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, outputs}, flow.Resume{
-		Attempt: job.Attempt, Checkpoint: job.Checkpoint, Steps: job.Steps,
+		Attempt: job.Attempt, Checkpoint: job.Checkpoint,
 	})
 	// And the wings half: which job this is and the worker it is on, so what
 	// it writes goes on this worker's streams, and what its earlier attempts

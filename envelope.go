@@ -87,11 +87,6 @@ type jobEnvelope struct {
 	// it rather than starting over. Empty on a first attempt, and on a retry
 	// of something that never heartbeated.
 	Checkpoint []byte `json:"checkpoint,omitempty"`
-	// Steps are the [flow.Context.Step] calls a previous attempt completed, in order.
-	// A retry replays them from here instead of running them again. The index
-	// each carries is what lets one that went missing leave a detectable hole
-	// rather than a silently shifted list.
-	Steps []flow.StepRecord `json:"steps,omitempty"`
 	// Priors are the event logs earlier attempts of this job left behind,
 	// oldest attempt first. A retry reads them with [Priors] to pick up where
 	// one of them stopped instead of starting over.
@@ -143,10 +138,6 @@ type beatEnvelope struct {
 	// wait lasts, and is not counted towards its worker's load. See slots.go.
 	Wait string `json:"wait,omitempty"`
 	Woke bool   `json:"woke,omitempty"`
-	// Step is one newly completed flow.Context.Step, if this beat reports one. Sent one at
-	// a time rather than as a growing log, so the cost of a step does not climb
-	// with how many came before it; the coordinator does the accumulating.
-	Step *flow.StepRecord `json:"step,omitempty"`
 }
 
 // resultEnvelope is one outcome.
