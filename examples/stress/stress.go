@@ -804,3 +804,31 @@ var Crossed = flow.DefineWorkflow("crossed", func(ctx flow.Context, in Params) e
 	}
 	return ok("crossed")
 })
+
+// --- mapped: a wide fan-out with Context.Map, results kept in order ---
+//
+// Map is a fork per input joined in order; a worker kill mid-Map redispatches
+// the children that were on it, and this checks the results still come back
+// complete, in order, and each computed exactly once — a value out of place or
+// missing is a redispatch that lost or reordered a result.
+var Mapped = flow.DefineWorkflow("mapped", func(ctx flow.Context, in Params) error {
+	n := cmp.Or(in.N, 50)
+	ins := make([]int, n)
+	for i := range ins {
+		ins[i] = i
+	}
+	out, err := ctx.Map(Square, ins)
+	if err != nil {
+		return fmt.Errorf("mapped: %w", err)
+	}
+	if len(out) != n {
+		return fmt.Errorf("mapped: got %d results, want %d", len(out), n)
+	}
+	for i := range ins {
+		if out[i] != i*i {
+			return fmt.Errorf("mapped: out[%d] = %d, want %d", i, out[i], i*i)
+		}
+	}
+	fmt.Printf("mapped: %d squares came back in order\n", n)
+	return ok("mapped")
+})
