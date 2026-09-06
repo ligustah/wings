@@ -94,6 +94,12 @@ type jobEnvelope struct {
 	// Nested says this job is a thread forked BY another job, and goes on
 	// the worker's nested queue rather than its job queue. See nested.go.
 	Nested bool `json:"nested,omitempty"`
+	// Capacity is the cluster's parallelism at dispatch — the value the worker
+	// hands the thread's body through [flow.Context.MaxParallelism], so a thread
+	// that fans out on a worker sizes itself to the fleet and not to the one
+	// machine it runs on. Zero from an older coordinator, or a bare call: the
+	// worker then falls back to its own.
+	Capacity int `json:"capacity,omitempty"`
 }
 
 // answerEnvelope is the outcome of a call a job made, sent back to the worker

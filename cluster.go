@@ -1506,6 +1506,10 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 // is filled in here.
 func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, error) {
 	job.ID = c.epoch + "-" + strconv.FormatUint(c.nextID.Add(1), 36)
+	// The fleet's capacity travels with every job, so a thread that fans out on
+	// a worker reads the cluster's parallelism and not the worker's own. Stamped
+	// here, the one place every dispatch passes through.
+	job.Capacity = c.maxParallelism()
 	p := &pendingJob{
 		job:    job,
 		done:   make(chan struct{}),

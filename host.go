@@ -3,6 +3,7 @@ package wings
 import (
 	"context"
 	"errors"
+	"runtime"
 
 	"github.com/ligustah/durable_streams/dsclient"
 
@@ -167,9 +168,28 @@ func withCluster(ctx context.Context, c *Cluster) context.Context {
 // records that the run failed. The cluster's threads on its workers carry
 // on meanwhile, and the next coordinator rejoins them; see recover.go.
 func (c *Cluster) hosting(ctx context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(withCluster(ctx, c))
+	ctx = flow.WithMaxParallelism(withCluster(ctx, c), c.maxParallelism())
+	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(c.ctx, cancel)
 	return ctx, func() { stop(); cancel() }
+}
+
+// maxParallelism estimates how many calls the cluster can run at once: the
+// largest the fleet may grow to, times how many threads each worker runs. It
+// is what a run body reads through [flow.Context.MaxParallelism] to size a
+// fan-out. An estimate, because a worker left to choose its own concurrency
+// decides from a CPU count the coordinator cannot see (worker.go), so the
+// coordinator stands in with its own.
+func (c *Cluster) maxParallelism() int {
+	workers := c.cfg.Scaling.Max
+	if workers < 1 {
+		workers = 1
+	}
+	concurrency := c.cfg.Concurrency
+	if concurrency < 1 {
+		concurrency = runtime.NumCPU()
+	}
+	return workers * concurrency
 }
 
 func clusterFrom(ctx context.Context) *Cluster {

@@ -478,6 +478,12 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// wrote can be read back.
 	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs}
 	ctx = withJob(ctx, state)
+	// The cluster's parallelism, so a thread that fans out here sizes itself to
+	// the fleet rather than to this one machine. Absent from an older
+	// coordinator's job, or a bare call: flow then falls back to this process's.
+	if job.Capacity > 0 {
+		ctx = flow.WithMaxParallelism(ctx, job.Capacity)
+	}
 	// A thread this job forks is the cluster's to place, like any other: the
 	// fork is read out of this job's history by the coordinator and its
 	// result comes back on the control stream. See nested.go. And a thread
