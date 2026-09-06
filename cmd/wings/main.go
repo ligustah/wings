@@ -195,13 +195,22 @@ func build(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !api.definesWorkflow && coordinate.Dir != work.Dir {
-		// A split build may keep the workflows with the work functions.
+	if coordinate.Dir != work.Dir {
+		// A split build: the work package holds Define calls the coordinator
+		// dispatches against and the worker runs, so its inferred names — and
+		// possibly its workflows — belong in both mains too.
 		workAPI, err := inspectAPI(work.Dir)
 		if err != nil {
 			return err
 		}
-		api.definesWorkflow = workAPI.definesWorkflow
+		api.definesWorkflow = api.definesWorkflow || workAPI.definesWorkflow
+		for site, name := range workAPI.names {
+			if prev, dup := api.names[site]; dup && prev != name {
+				return fmt.Errorf("two definitions share the call site %s (%s and %s); "+
+					"add flow.WithName to one of them", site, prev, name)
+			}
+			api.names[site] = name
+		}
 	}
 	if !api.definesWorkflow {
 		return fmt.Errorf("package %s declares no root.\n"+
@@ -242,7 +251,7 @@ func build(args []string) error {
 	if err := os.MkdirAll(workerDir, 0o755); err != nil {
 		return err
 	}
-	workerSrc, err := workerMain(work.ImportPath)
+	workerSrc, err := workerMain(work.ImportPath, api.names)
 	if err != nil {
 		return err
 	}
@@ -276,7 +285,7 @@ func build(args []string) error {
 	fmt.Fprintf(os.Stderr, "embedded     %-14s %s (gzipped)\n", worker, sizeOf(blobPath))
 
 	coordSrc, err := coordinatorMain(work.ImportPath, coordinate.ImportPath, worker,
-		api.hasProvisioner, providerImports(*providers))
+		api.hasProvisioner, providerImports(*providers), api.names)
 	if err != nil {
 		return err
 	}
@@ -351,17 +360,24 @@ func describe(pkg string) (pkgInfo, error) {
 type pkgAPI struct {
 	definesWorkflow bool
 	hasProvisioner  bool
+	// names is the call site → inferred name table for nameless Define calls:
+	// "<file>:<line>" to the variable the definition is assigned to. It is what
+	// flow.RegisterCallSiteNames is given, so a Define needs no WithName. A
+	// Define that already has a WithName, or is assigned to _, contributes
+	// nothing.
+	names map[string]string
 }
 
-// inspectAPI looks for the function the generated main may call, and for the
-// flow.Main call that gives the coordinator a root to run.
+// inspectAPI looks for the function the generated main may call, for the
+// flow.Main call that gives the coordinator a root to run, and for the names of
+// the variables nameless Define calls are assigned to.
 //
 // Parsed rather than probed by compiling: a missing root should be one clear
 // sentence naming the call to add, not a compile error inside generated code
 // the user never wrote and cannot see — or worse, a binary that builds and then
 // refuses to start.
 func inspectAPI(dir string) (pkgAPI, error) {
-	var api pkgAPI
+	api := pkgAPI{names: map[string]string{}}
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
@@ -386,19 +402,76 @@ func inspectAPI(dir string) (pkgAPI, error) {
 						if !ok {
 							return true
 						}
-						switch fn := call.Fun.(type) {
-						case *ast.SelectorExpr:
-							api.definesWorkflow = api.definesWorkflow || fn.Sel.Name == "Main"
-						case *ast.Ident:
-							api.definesWorkflow = api.definesWorkflow || fn.Name == "Main"
+						if callName(call) == "Main" {
+							api.definesWorkflow = true
 						}
 						return true
 					})
+					if d.Tok == token.VAR {
+						if err := collectNames(fset, d, api.names); err != nil {
+							return api, err
+						}
+					}
 				}
 			}
 		}
 	}
 	return api, nil
+}
+
+// callName is the selector name of a call to flow, e.g. "Define" for
+// flow.Define(…) and for a dot-imported Define(…); "" for anything else.
+func callName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	case *ast.Ident:
+		return fn.Name
+	}
+	return ""
+}
+
+// collectNames records, for each `var X = flow.Define(…)` with no WithName in
+// the GenDecl, the call site → X. The site is the base file name and the line
+// the Define call is written on, which is what Define reads off the call stack
+// at run time; the base name alone so it matches a -trimpath build.
+func collectNames(fset *token.FileSet, d *ast.GenDecl, names map[string]string) error {
+	for _, spec := range d.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		for i, val := range vs.Values {
+			call, ok := val.(*ast.CallExpr)
+			if !ok || callName(call) != "Define" || i >= len(vs.Names) {
+				continue
+			}
+			name := vs.Names[i].Name
+			if name == "_" || hasWithName(call) {
+				// No name to infer, or one already given: nothing to record.
+				continue
+			}
+			pos := fset.Position(call.Pos())
+			site := filepath.Base(pos.Filename) + ":" + fmt.Sprint(pos.Line)
+			if prev, dup := names[site]; dup && prev != name {
+				return fmt.Errorf("two definitions share the call site %s (%s and %s); "+
+					"add flow.WithName to one of them", site, prev, name)
+			}
+			names[site] = name
+		}
+	}
+	return nil
+}
+
+// hasWithName reports whether a Define call already carries a flow.WithName
+// option, in which case nothing is inferred for it.
+func hasWithName(call *ast.CallExpr) bool {
+	for _, arg := range call.Args {
+		if inner, ok := arg.(*ast.CallExpr); ok && callName(inner) == "WithName" {
+			return true
+		}
+	}
+	return false
 }
 
 func scratchDir(moduleDir string) (string, func(), error) {

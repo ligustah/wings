@@ -36,6 +36,11 @@ type def[In, Out any] struct {
 	fn     func(Context, In) (Out, error)
 	bounds Bounds
 
+	// callSite is the "<file>:<line>" this def was defined on, kept when no
+	// name was given so the build step's table can supply one later. See
+	// names.go.
+	callSite string
+
 	inCodec  dswire.Codec[In]
 	outCodec dswire.Codec[Out]
 }
@@ -131,14 +136,18 @@ func WithStartTimeout(d time.Duration) Option {
 // defined inside main's body exists only in the process that ran main.
 //
 // The name comes from [WithName], or from the `wings` build step, which infers
-// it from the variable this is assigned to. It is what identifies the function
-// everywhere but the source — in a run's history, on the wire to an executor —
-// so renaming the variable is free and changing the name is a change to every
-// history that mentions it.
+// it from the variable this is assigned to. Failing both — the flow package used
+// without that build step and with no explicit name — a function falls back to
+// its own call site, "<file>:<line>", so it still works, identified by where it
+// was written. The name is what identifies the function everywhere but the
+// source — in a run's history, on the wire to an executor — so renaming the
+// variable is free and changing the name is a change to every history that
+// mentions it.
 //
-// Panics if the function is nil, if no name was given, or if the name is
-// already defined. All are programming errors, and at package-init time a panic
-// is the report that cannot be ignored.
+// Panics if the function is nil, or if the name — once known — is already
+// defined. A missing name is not a panic here: it may be filled in by the
+// build step's table after all definitions have run (see names.go), and only
+// a call to a function that never got one fails, naming the call site.
 func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func[In, Out] {
 	if fn == nil {
 		panic("flow: Define requires a non-nil function")
@@ -147,9 +156,6 @@ func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	if cfg.name == "" {
-		panic("flow: Define requires a name; pass flow.WithName, or let the wings build step infer it")
-	}
 	d := &def[In, Out]{
 		name:     cfg.name,
 		fn:       fn,
@@ -157,7 +163,18 @@ func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func
 		inCodec:  dswire.ReflectCodec[In]{New: allocator[In]()},
 		outCodec: dswire.ReflectCodec[Out]{New: allocator[Out]()},
 	}
-	register(d)
+	if cfg.name != "" {
+		register(d)
+	} else {
+		// No explicit name: record where this was written and wait for the
+		// build step's table to name it. runtime.Caller(1) is the flow.Define
+		// call itself.
+		d.callSite = callSite(1)
+		deferName(d.callSite, func(name string) {
+			d.name = name
+			register(d)
+		})
+	}
 
 	return func(ctx Context, in In) (Out, error) {
 		return d.dispatch(ctx, in)
@@ -176,7 +193,8 @@ type capture struct {
 	taken   bool
 	name    string
 	payload []byte
-	codec   any // the function's output codec, a dswire.Codec[Out]
+	codec   any     // the function's output codec, a dswire.Codec[Out]
+	handler handler // the def itself, so a caller can read its name once resolved
 	err     error
 }
 
@@ -219,10 +237,19 @@ func (d *def[In, Out]) dispatch(ctx Context, in In) (Out, error) {
 	var zero Out
 
 	if cap, ok := ctx.Value(captureKey{}).(*capture); ok && !cap.taken {
-		// Asked what this call would be, not to make it. See capture.
-		cap.taken, cap.name, cap.codec = true, d.name, d.outCodec
+		// Asked what this call would be, not to make it. See capture. The
+		// handler goes too, so a caller that describes a still-nameless
+		// definition can read its name once the build step's table resolves it.
+		cap.taken, cap.name, cap.codec, cap.handler = true, d.name, d.outCodec, d
 		cap.payload, cap.err = d.encodeInput(ctx, in)
 		return zero, nil
+	}
+
+	if d.name == "" {
+		// Deferred and not yet resolved: no WithName, and no table entry has
+		// arrived. This is the last moment names can be settled, so settle them,
+		// defaulting this one to its call site if nothing named it.
+		ensureNamesResolved()
 	}
 
 	payload, err := d.encodeInput(ctx, in)
@@ -310,6 +337,52 @@ func register(h handler) {
 		panic(fmt.Sprintf("flow: function %q is already defined", h.Name()))
 	}
 	registry[h.Name()] = h
+}
+
+// deferredDef is a definition waiting for the build step's table to name it:
+// where it was written, and what to do once the name is known.
+type deferredDef struct {
+	site  string
+	apply func(name string)
+}
+
+var (
+	pendingMu   sync.Mutex
+	pendingDefs []deferredDef
+)
+
+// deferName records a nameless definition and tries at once to resolve it from
+// the table, in case that is already in — which it is not during package init,
+// but is for a Define reached after [RegisterCallSiteNames] has run. It does
+// not default here: a name may still arrive.
+func deferName(site string, apply func(name string)) {
+	pendingMu.Lock()
+	pendingDefs = append(pendingDefs, deferredDef{site: site, apply: apply})
+	pendingMu.Unlock()
+	resolvePendingDefs(false)
+}
+
+// resolvePendingDefs names and registers deferred definitions. With defaulting
+// off it takes only those the table covers, leaving the rest for later; with it
+// on — once no more names can arrive, at first use — every remaining definition
+// takes its own call site as its name, so a definition with no WithName and no
+// table entry still works, identified by where it was written.
+func resolvePendingDefs(defaulting bool) {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	kept := pendingDefs[:0]
+	for _, d := range pendingDefs {
+		name := nameForSite(d.site)
+		if name == "" {
+			if !defaulting {
+				kept = append(kept, d)
+				continue
+			}
+			name = d.site
+		}
+		d.apply(name)
+	}
+	pendingDefs = kept
 }
 
 func lookup(name string) (handler, bool) {

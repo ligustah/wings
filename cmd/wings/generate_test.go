@@ -29,7 +29,7 @@ func mustGenerate(t *testing.T, b []byte, err error) string {
 // jennifer separates top-level statements with a blank line, so the directive
 // and the var have to be one statement. This is the test that they still are.
 func TestEmbedDirectiveStaysAttachedToItsVar(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, true, nil)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, true, nil, nil)
 	src := mustGenerate(t, b, err)
 
 	lines := strings.Split(src, "\n")
@@ -57,7 +57,7 @@ func TestEmbedDirectiveStaysAttachedToItsVar(t *testing.T) {
 }
 
 func TestCoordinatorMainWiresTheOptions(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "arm64"}, true, nil)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "arm64"}, true, nil, nil)
 	src := mustGenerate(t, b, err)
 
 	for _, want := range []string{
@@ -79,7 +79,7 @@ func TestCoordinatorMainWiresTheOptions(t *testing.T) {
 // Without an exported Provisioner the field must be nil rather than absent or a
 // call to a function that does not exist.
 func TestCoordinatorMainWithoutProvisioner(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil, nil)
 	src := mustGenerate(t, b, err)
 
 	// With nothing in main to name it, the package must still be linked in,
@@ -98,7 +98,7 @@ func TestCoordinatorMainWithoutProvisioner(t *testing.T) {
 // A split build still has to link the work package, or the coordinator has
 // nothing registered to dispatch against.
 func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
-	b, err := coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, false, nil)
+	b, err := coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, false, nil, nil)
 	src := mustGenerate(t, b, err)
 
 	if !strings.Contains(src, `_ "example.com/app/job"`) {
@@ -110,7 +110,7 @@ func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
 
 	// When main has to call its Provisioner, the same package is imported by
 	// name instead — once, not both ways.
-	b, err = coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, true, nil)
+	b, err = coordinatorMain("example.com/app/job", "example.com/app/coord", platform{"linux", "amd64"}, true, nil, nil)
 	src = mustGenerate(t, b, err)
 	if !strings.Contains(src, `app "example.com/app/coord"`) {
 		t.Errorf("the coordinator package must be imported as app when its Provisioner is called:\n\n%s", src)
@@ -122,7 +122,7 @@ func TestSplitBuildStillLinksTheWorkPackage(t *testing.T) {
 
 // The unsplit case must not import the same package twice.
 func TestUnsplitBuildImportsThePackageOnce(t *testing.T) {
-	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil)
+	b, err := coordinatorMain("example.com/app", "example.com/app", platform{"linux", "amd64"}, false, nil, nil)
 	src := mustGenerate(t, b, err)
 
 	if n := strings.Count(src, `"example.com/app"`); n != 1 {
@@ -130,8 +130,43 @@ func TestUnsplitBuildImportsThePackageOnce(t *testing.T) {
 	}
 }
 
+// THE POINT: the inferred names table is compiled into BOTH mains and seeded
+// before any work runs, so a Define with no WithName is named from its variable
+// on the coordinator and the worker alike.
+func TestBothMainsSeedTheNamesTable(t *testing.T) {
+	names := map[string]string{"job.go:12": "Render", "job.go:18": "Frames"}
+
+	wb, werr := workerMain("example.com/app", names)
+	worker := mustGenerate(t, wb, werr)
+	cb, cerr := coordinatorMain("example.com/app", "example.com/app",
+		platform{"linux", "amd64"}, false, nil, names)
+	coord := mustGenerate(t, cb, cerr)
+
+	for _, src := range []string{worker, coord} {
+		for _, want := range []string{
+			"flow.RegisterCallSiteNames",
+			`"job.go:12": "Render"`,
+			`"job.go:18": "Frames"`,
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("generated main is missing %q:\n\n%s", want, src)
+			}
+		}
+	}
+}
+
+// With every definition named by WithName there is nothing to infer, and no
+// table call is emitted.
+func TestNoNamesTableWhenEmpty(t *testing.T) {
+	wb, werr := workerMain("example.com/app", nil)
+	worker := mustGenerate(t, wb, werr)
+	if strings.Contains(worker, "RegisterCallSiteNames") {
+		t.Errorf("emitted a names table for a package that needs none:\n\n%s", worker)
+	}
+}
+
 func TestWorkerMainIsJustTheEntrypoint(t *testing.T) {
-	b, err := workerMain("example.com/app")
+	b, err := workerMain("example.com/app", nil)
 	src := mustGenerate(t, b, err)
 
 	if !strings.Contains(src, `_ "example.com/app"`) {

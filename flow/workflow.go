@@ -53,7 +53,7 @@ func Main[In, Out any](f Func[In, Out]) struct{} {
 	// input to record otherwise.
 	empty, err := dswire.EncodeRecord(codec, *new(In))
 	if err != nil {
-		panic("flow: Main: encode the zero input of " + cap.name + ": " + err.Error())
+		panic("flow: Main: encode the zero input of a root: " + err.Error())
 	}
 	m := mainHandler{
 		name:       cap.name,
@@ -67,13 +67,61 @@ func Main[In, Out any](f Func[In, Out]) struct{} {
 			return dswire.EncodeRecord(codec, in)
 		},
 	}
+	// The name may not be known yet: like the function it marks, a root declared
+	// with a nameless Define at package scope is named later by the build step's
+	// table. registerMain takes it now if the name is in, and holds it against
+	// the function's resolution if it is not. See names.go.
+	registerMain(cap.handler, m)
+	return struct{}{}
+}
+
+// registerMain records a root: at once when its name is known, or against its
+// function's later resolution when it is not.
+func registerMain(h handler, m mainHandler) {
 	workflowsMu.Lock()
 	defer workflowsMu.Unlock()
+	if m.name != "" {
+		addWorkflowLocked(m)
+		return
+	}
+	pendingMains = append(pendingMains, pendingMain{h: h, m: m})
+}
+
+// addWorkflowLocked inserts a named root, panicking on a duplicate. Called with
+// workflowsMu held.
+func addWorkflowLocked(m mainHandler) {
 	if _, dup := workflows[m.name]; dup {
 		panic(fmt.Sprintf("flow: %q is already a root; flow.Main was called on it twice", m.name))
 	}
 	workflows[m.name] = m
-	return struct{}{}
+}
+
+// pendingMain is a root whose function had no name when [Main] ran: the
+// function, to read its name once resolved, and the handler built from it.
+type pendingMain struct {
+	h handler
+	m mainHandler
+}
+
+var pendingMains []pendingMain
+
+// resolvePendingMains registers every held root whose function has since been
+// named. Called by [RegisterCallSiteNames] after the functions are resolved,
+// so their names are in place to be read here.
+func resolvePendingMains() {
+	workflowsMu.Lock()
+	defer workflowsMu.Unlock()
+	kept := pendingMains[:0]
+	for _, pm := range pendingMains {
+		name := pm.h.Name()
+		if name == "" {
+			kept = append(kept, pm)
+			continue
+		}
+		pm.m.name = name
+		addWorkflowLocked(pm.m)
+	}
+	pendingMains = kept
 }
 
 // mainHandler is a function registered as a root: enough to start it by name
@@ -148,6 +196,7 @@ func (m mainHandler) run(ctx context.Context, payload []byte, opts []RunOption) 
 // the input the first attempt recorded — passing a different one is an error,
 // not a quiet restart.
 func RunMain[In, Out any](ctx context.Context, f Func[In, Out], in In, opts ...RunOption) error {
+	ensureNamesResolved()
 	cap, err := describe(Context{context.Background()}, f, in)
 	if err != nil {
 		return fmt.Errorf("flow: RunMain requires a function made by flow.Define: %w", err)
@@ -200,6 +249,7 @@ type WorkflowInfo struct {
 // For a program that hosts roots and must say which it can run — or, when
 // exactly one is declared, run that without being told.
 func Workflows() []WorkflowInfo {
+	ensureNamesResolved()
 	workflowsMu.RLock()
 	defer workflowsMu.RUnlock()
 	all := make([]WorkflowInfo, 0, len(workflows))
@@ -220,6 +270,7 @@ func Workflows() []WorkflowInfo {
 // that takes input is refused with an example of what it wants. The error for
 // an unknown name lists the names there are.
 func RunWorkflow(ctx context.Context, name string, input []byte, opts ...RunOption) error {
+	ensureNamesResolved()
 	workflowsMu.RLock()
 	w, ok := workflows[name]
 	workflowsMu.RUnlock()

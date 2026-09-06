@@ -201,6 +201,10 @@ func functionBody(fn string, input []byte) func(ctx Context) ([]byte, error) {
 // execute runs one thread of a run in a process where it has no parent: the
 // main thread, or a forked thread that was handed to this process.
 func execute(ctx context.Context, run, thread, fn string, input []byte, body func(ctx Context) ([]byte, error), opts []RunOption) ([]byte, error) {
+	// A run is a use: names must be settled before its body forks or calls
+	// anything, defaulting any the build step did not supply. A no-op once
+	// resolved, which it already is by the time work runs under wings.
+	ensureNamesResolved()
 	ro := newRunOptions(opts)
 
 	if run == "" {
