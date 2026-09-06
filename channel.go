@@ -224,12 +224,30 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 			c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
 			return
 		}
-		st, err := eventStream[flow.ChannelItem](client, name)
-		if err != nil {
-			return
-		}
 		var from int64
 		for c.ctx.Err() == nil {
+			// The handle is re-opened every pass, not held for the life of the
+			// loop. The coordinator's copy of an outbox is made by the output
+			// mirror, which creates the stream; a handle opened in the window
+			// before the mirror's first append is bound to the empty stream and
+			// never sees what the mirror writes after — so it would wait here
+			// forever while the records sit unread, and whoever waits on those
+			// values hangs. A moved attempt's outbox is exactly that window: it
+			// is discovered and tailed the moment it appears, before it is fed.
+			// A fresh handle each pass sees what is there now.
+			st, err := eventStream[flow.ChannelItem](client, name)
+			if err != nil {
+				if c.ctx.Err() != nil || c.wasDropped(name) {
+					return
+				}
+				if ok, _ := client.StreamExists(c.ctx, name); !ok {
+					return
+				}
+				if pause(c.ctx, time.Second) != nil {
+					return
+				}
+				continue
+			}
 			readCtx, cancel := context.WithTimeout(c.ctx, followPoll)
 			recs, err := st.ReadBlocking(readCtx, from, recordBatch)
 			expired := readCtx.Err() != nil
@@ -247,10 +265,8 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 					if ok, _ := client.StreamExists(c.ctx, name); !ok {
 						return
 					}
-					select {
-					case <-c.ctx.Done():
+					if pause(c.ctx, time.Second) != nil {
 						return
-					case <-time.After(time.Second):
 					}
 				}
 				continue
