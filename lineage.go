@@ -4,11 +4,27 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
 
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
+)
+
+const (
+	// lineageReachWait bounds how long the coordinator waits for an ancestor's
+	// history to reach the fork of the next thread on a lineage.
+	//
+	// A read of the coordinator's own engine can come back short of records
+	// that are durably there while a kill's churn is being absorbed — the fork
+	// that dispatched this thread is on record, so a truncated read is
+	// transient and a re-read a moment later has it. Bounded because a genuinely
+	// missing fork must still fail rather than wait forever; paid only on the
+	// rare read that comes back short, since a complete read returns at once.
+	lineageReachWait = 5 * time.Second
+	// lineageReachPoll is how often that wait re-reads.
+	lineageReachPoll = 50 * time.Millisecond
 )
 
 // A thread of run code — one a workflow or a work function forks with
@@ -72,13 +88,15 @@ func (c *Cluster) hydrateLineage(ctx context.Context, w *workerConn, job jobEnve
 		return nil
 	}
 	var events []*protos.Event
-	for _, id := range job.Lineage[:len(job.Lineage)-1] {
-		evs, err := c.threadHistory(ctx, runOf(job), id)
+	run := runOf(job)
+	for i, id := range job.Lineage[:len(job.Lineage)-1] {
+		// The next thread on the path is forked from this one, so this
+		// ancestor's history must contain that fork for a replay to reach the
+		// thread being placed. Read it making sure of that, retrying a short
+		// read rather than shipping a history the worker cannot replay past.
+		evs, err := c.historyReaching(ctx, run, id, job.Lineage[i+1])
 		if err != nil {
 			return err
-		}
-		if len(evs) == 0 {
-			return fmt.Errorf("wings: thread %s of run %s has no history to replay", id, runOf(job))
 		}
 		events = append(events, evs...)
 	}
@@ -109,6 +127,55 @@ func (c *Cluster) hydrateLineage(ctx context.Context, w *workerConn, job jobEnve
 		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
 	}
 	return nil
+}
+
+// historyReaching reads a thread's history and makes sure it records the fork
+// of child, the next thread on a lineage, re-reading a short result until it
+// does or lineageReachWait runs out.
+//
+// A read of the coordinator's own engine can come back missing records that are
+// durably there while the churn of a worker being killed and its work
+// redispatched is still settling; the fork is on record — it is what dispatched
+// child in the first place — so a re-read a moment later has it, and shipping
+// the short history instead would fail the replay on a fork that does exist. A
+// complete read returns on the first try, so the wait is paid only on the rare
+// truncated one; when it does run out, the best available history is shipped so
+// the replay reports precisely which fork it could not reach, exactly as it did
+// before this retry existed.
+func (c *Cluster) historyReaching(ctx context.Context, run, id, child string) ([]*protos.Event, error) {
+	deadline := time.Now().Add(lineageReachWait)
+	for {
+		evs, err := c.threadHistory(ctx, run, id)
+		if err != nil {
+			return nil, err
+		}
+		if forkReaches(evs, child) {
+			return evs, nil
+		}
+		if !time.Now().Before(deadline) {
+			if len(evs) == 0 {
+				return nil, fmt.Errorf("wings: thread %s of run %s has no history to replay", id, run)
+			}
+			return evs, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(lineageReachPoll):
+		}
+	}
+}
+
+// forkReaches reports whether a history records a fork whose child is the given
+// thread id — the coordinator-side test of whether replaying that history can
+// reach the next thread on a lineage.
+func forkReaches(events []*protos.Event, child string) bool {
+	for _, e := range events {
+		if f := e.GetFork(); f != nil && f.GetThreadId() == child {
+			return true
+		}
+	}
+	return false
 }
 
 // threadHistory is the coordinator's copy of one thread's history: the last

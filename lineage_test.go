@@ -5,7 +5,29 @@ import (
 	"testing"
 
 	"github.com/ligustah/wings/flow"
+	"github.com/ligustah/wings/flow/protos"
 )
+
+// TestForkReaches covers the predicate hydrateLineage uses to decide whether an
+// ancestor's history — as read from the coordinator's engine, which can come
+// back short under kill churn — records the fork of the next thread on a
+// lineage, and so is complete enough to ship for a replay to reach it.
+func TestForkReaches(t *testing.T) {
+	fork := func(child string) *protos.Event {
+		return &protos.Event{Payload: &protos.Event_Fork{Fork: &protos.ForkEvent{ThreadId: child}}}
+	}
+	history := []*protos.Event{{ThreadId: "main"}, fork("main.0"), fork("main.1")}
+
+	if !forkReaches(history, "main.1") {
+		t.Error("a history that records main.1's fork should reach it")
+	}
+	if forkReaches(history, "main.2") {
+		t.Error("a history missing main.2's fork should not reach it (a short read)")
+	}
+	if forkReaches(nil, "main.0") {
+		t.Error("an empty history reaches no fork")
+	}
+}
 
 // where is the worker a thread is running on, or "" on the coordinator.
 func where(ctx flow.Context) string {
