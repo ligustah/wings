@@ -9,7 +9,7 @@
 //
 //	package job
 //
-//	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) { … }, flow.WithName("render"))
+//	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) { … })
 //
 //	// A root is run as a flow once the cluster is up.
 //	var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
@@ -18,7 +18,8 @@
 //	})
 //	var _ = flow.Main(Frames)
 //
-// That is all. WHERE the work runs is not in it: -providers links clouds into
+// The names are inferred from the variables — Render, Frames — so flow.WithName
+// is only for overriding that. WHERE the work runs is not in it: -providers links clouds into
 // the coordinator, and -target and -provider choose between them at run time.
 //
 // For a cloud wings does not ship you may instead export

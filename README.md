@@ -5,13 +5,13 @@ Define a typed Go function. Call it across a cluster that did not exist a minute
 ```go
 var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
-}, flow.WithName("render"))
+})
 
 // A root, marked with flow.Main, is run as a flow once the cluster is up.
 var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
     images, err := ctx.Map(Render, job.Frames)   // runs wherever the workers are
     ...
-}, flow.WithName("frames"))
+})
 var _ = flow.Main(Frames)
 ```
 
@@ -95,7 +95,7 @@ import "github.com/ligustah/wings/flow"
 // a root — still has them registered.
 var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
-}, flow.WithName("render"))
+})
 
 // A root, marked with flow.Main, is run as a flow once the cluster is up. A
 // coordinator restarted over the same -dir replays what it already did rather
@@ -106,7 +106,7 @@ var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
         return flow.None{}, err
     }
     return flow.None{}, write(images, job.Out)
-}, flow.WithName("frames"))
+})
 var _ = flow.Main(Frames)
 ```
 
@@ -115,6 +115,12 @@ cluster reaches the body through its context: every thread a flow forks —
 `ctx.Map`, `ctx.Go` — goes to the placer bound there, which for the
 coordinator is the cluster's workers. A function called directly runs where
 the call is made, on the thread that made it.
+
+Neither function is named. `wings build` reads the variable each `flow.Define`
+is assigned to and compiles the name in — `Render`, `Frames` — so a definition
+needs `flow.WithName("…")` only to override that. The name identifies the
+function in a run's history and on the wire, so renaming the variable is free
+while changing an explicit name rewrites what every history refers to.
 
 A package that marks one root with `flow.Main` is a binary that runs it. Mark
 several and the binary takes `-workflow <name>`; leave it off and it lists them.
@@ -350,7 +356,6 @@ cluster-wide number is either useless to one or fatal to the other.
 
 ```go
 var Transcode = flow.Define(transcode,
-    flow.WithName("transcode"),
     flow.WithTimeout(2*time.Hour),             // total: exceeding it FAILS
     flow.WithHeartbeatTimeout(30*time.Second), // quiet: exceeding it MOVES
 )
@@ -408,7 +413,7 @@ var Restore = flow.Define(func(ctx flow.Context, in Backup) (Report, error) {
         return Report{}, err
     }
     return RestoreInto(ctx, Restoration{snap, in.Target}) // another forty
-}, flow.WithName("restore"))
+})
 ```
 
 A job moved after `Snapshot` finished replays its result — a decode, not twenty

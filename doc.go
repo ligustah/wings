@@ -11,16 +11,18 @@
 //
 //	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
 //		return render(f)
-//	}, flow.WithName("render"))
+//	})
 //
 //	// A root is run as a flow once the cluster is up.
 //	var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
 //		images, err := ctx.Map(Render, job.Frames)
 //		...
-//	}, flow.WithName("frames"))
+//	})
 //	var _ = flow.Main(Frames)
 //
-// Nothing in that file names a cluster. The body reaches it through its
+// The functions are not named: the `wings build` step infers each name from the
+// variable it is assigned to — Render, Frames — so a definition needs
+// flow.WithName only to override that. Nothing in that file names a cluster. The body reaches it through its
 // context: [Cluster.Run] runs a flow whose calls are dispatched to the
 // cluster's workers and whose history is kept on the cluster's own storage, so
 // a coordinator started again over the same directory replays what it already
