@@ -169,6 +169,12 @@ _, err := io.Copy(dst, flow.NewByteReader(ctx, out))
 Chunks are `flow.ByteChunk` in size, recorded and replayed like any channel value, so
 a moved job gets back exactly what it streamed.
 
+Where a channel is drained matters. A `Recv` on the run's own thread takes from a
+buffer the coordinator holds; a `Recv` on a *worker* thread is a round trip to the
+coordinator per item — a want, a park, and a wake. For a high-volume channel, drain
+it on the run's own thread (or a thread that stays on the coordinator) rather than
+forking the draining loop onto a worker.
+
 ## Recordings
 
 A long job's progress is often a sequence of events. `Record` keeps one on a durable
