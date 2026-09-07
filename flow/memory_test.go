@@ -78,6 +78,28 @@ func TestChanStateConsumeDropsItemData(t *testing.T) {
 	}
 }
 
+// THE POINT: a drained channel does not keep its received items. The queue is
+// pruned of consumed items, so a long drain neither walks an ever-growing list
+// (quadratic) nor holds a wave's worth of item structs.
+func TestChanStatePrunesReceivedItems(t *testing.T) {
+	cs := newChanState(unbounded)
+	const n = 5000
+	for i := 0; i < n; i++ {
+		it, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false)
+		if err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		it.taken = true
+		cs.consume(it)
+	}
+	cs.mu.Lock()
+	held := len(cs.items)
+	cs.mu.Unlock()
+	if held > 256 {
+		t.Fatalf("queue held %d items after receiving %d; received items are not pruned", held, n)
+	}
+}
+
 // THE POINT: a live thread does not keep the values it records. Its history is
 // persisted and replayed from the store, so holding it in memory only grew the
 // heap for the run's whole life (the coordinator memory issue).

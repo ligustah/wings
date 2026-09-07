@@ -393,6 +393,9 @@ type chanItem struct {
 	// buffered means the send completed on arrival, because the channel had
 	// room for it.
 	buffered bool
+	// consumed means a receive has decoded and recorded this item; nothing reads
+	// it again, so it may be pruned from the queue. See [chanState.prune].
+	consumed bool
 }
 
 // chanState is one channel's runtime, shared by every thread using it. Its own
@@ -405,6 +408,9 @@ type chanState struct {
 	items   []*chanItem
 	closed  bool
 	changed chan struct{}
+	// floor is len(items) after the last prune; the queue is compacted once it has
+	// grown enough past it that pruning stays amortised. See [chanState.prune].
+	floor int
 	// claimed names items a replayed receive took before they were queued, so
 	// they are taken on arrival.
 	claimed map[string]bool
@@ -513,7 +519,34 @@ func (cs *chanState) grant(g ChannelItem) {
 func (cs *chanState) consume(item *chanItem) {
 	cs.mu.Lock()
 	item.data = nil
+	item.consumed = true
+	// Amortised: compact once the queue has grown well past its last floor, so a
+	// long drain does not walk (find/roomFor/awaitAny/pending) an ever-growing
+	// list of received items — quadratic over a wave — and does not hold their
+	// structs. Doubling keeps a backlog that never drains from thrashing.
+	if len(cs.items) >= 2*cs.floor+64 {
+		cs.prune()
+	}
 	cs.mu.Unlock()
+}
+
+// prune drops consumed items from the queue. Safe because nothing reads a
+// consumed item again: a receive has it, a replayed receive reads its value from
+// the store, put dedupes an echo before the item is consumed (the value precedes
+// its grant on the record), and a cross-run sender's own item is never consumed
+// here so it stays to dedupe. Call with mu held.
+func (cs *chanState) prune() {
+	kept := cs.items[:0]
+	for _, it := range cs.items {
+		if !it.consumed {
+			kept = append(kept, it)
+		}
+	}
+	for i := len(kept); i < len(cs.items); i++ {
+		cs.items[i] = nil // let the pruned items be collected
+	}
+	cs.items = kept
+	cs.floor = len(cs.items)
 }
 
 // find returns the queued item with an identity, or nil. Call with mu held.
