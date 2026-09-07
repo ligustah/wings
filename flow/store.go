@@ -18,6 +18,13 @@ type Sink interface {
 	Append(ctx context.Context, ev *protos.Event) error
 }
 
+// EventAt pairs an event with its offset on a thread's stream, so a value
+// dropped when the history was loaded can be read back by offset later.
+type EventAt struct {
+	Event  *protos.Event
+	Offset int64
+}
+
 // Store is where histories live, one per thread of a run: it hands out a Sink to
 // write a thread's events, reads them back so the thread can resume, and drops
 // them once the thread is over. Per thread because the thread is the unit that
@@ -26,6 +33,13 @@ type Store interface {
 	// Sink returns the destination for one thread's events. Resolved once
 	// per attempt of the thread rather than per event.
 	Sink(ctx context.Context, run, thread string) (Sink, error)
+
+	// Read returns up to n of a thread's events starting at offset, oldest
+	// first, each paired with its offset. Fewer than n (including none) means the
+	// history ends there. Reading a thread that never started yields nothing and
+	// no error. Replay both streams the history in (offset 0 on) and reads back a
+	// single value it dropped (its offset, n=1).
+	Read(ctx context.Context, run, thread string, offset int64, n int) ([]EventAt, error)
 
 	// Events returns everything recorded for a thread, oldest first. A
 	// thread that has never started yields no events and no error.
@@ -118,25 +132,36 @@ func (s *streamStore) Sink(ctx context.Context, run, thread string) (Sink, error
 	return &streamSink{store: s, name: streamName(run, thread)}, nil
 }
 
-func (s *streamStore) Events(ctx context.Context, run, thread string) ([]*protos.Event, error) {
+func (s *streamStore) Read(ctx context.Context, run, thread string, offset int64, n int) ([]EventAt, error) {
 	name := streamName(run, thread)
 	st, err := s.open(ctx, name, false)
 	if err != nil || st == nil {
 		return nil, err
 	}
+	recs, err := st.Read(ctx, offset, n)
+	if err != nil {
+		return nil, fmt.Errorf("flow: read %s at %d: %w", name, offset, err)
+	}
+	out := make([]EventAt, len(recs))
+	for i, r := range recs {
+		out[i] = EventAt{Event: r.Record, Offset: r.Offset}
+	}
+	return out, nil
+}
 
+func (s *streamStore) Events(ctx context.Context, run, thread string) ([]*protos.Event, error) {
 	var out []*protos.Event
 	for from := int64(0); ; {
-		recs, err := st.Read(ctx, from, 512)
+		batch, err := s.Read(ctx, run, thread, from, 512)
 		if err != nil {
-			return nil, fmt.Errorf("flow: read %s at %d: %w", name, from, err)
+			return nil, err
 		}
-		if len(recs) == 0 {
+		if len(batch) == 0 {
 			return out, nil
 		}
-		for _, r := range recs {
-			out = append(out, r.Record)
-			from = r.Offset + 1
+		for _, e := range batch {
+			out = append(out, e.Event)
+			from = e.Offset + 1
 		}
 	}
 }
@@ -202,6 +227,20 @@ func (m *MemStore) Sink(ctx context.Context, run, thread string) (Sink, error) {
 		threads[thread] = append(threads[thread], ev)
 		return nil
 	}), nil
+}
+
+func (m *MemStore) Read(ctx context.Context, run, thread string, offset int64, n int) ([]EventAt, error) {
+	m.mu.Lock()
+	evs := m.events[run][thread]
+	m.mu.Unlock()
+	if offset < 0 {
+		offset = 0
+	}
+	var out []EventAt
+	for i := offset; i < int64(len(evs)) && len(out) < n; i++ {
+		out = append(out, EventAt{Event: evs[i], Offset: i})
+	}
+	return out, nil
 }
 
 func (m *MemStore) Events(ctx context.Context, run, thread string) ([]*protos.Event, error) {

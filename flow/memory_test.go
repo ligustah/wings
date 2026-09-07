@@ -19,6 +19,9 @@ func (s *discardSink) Append(_ context.Context, _ *protos.Event) error { s.n++; 
 type discardStore struct{ sink discardSink }
 
 func (s *discardStore) Sink(context.Context, string, string) (Sink, error) { return &s.sink, nil }
+func (s *discardStore) Read(context.Context, string, string, int64, int) ([]EventAt, error) {
+	return nil, nil
+}
 func (s *discardStore) Events(context.Context, string, string) ([]*protos.Event, error) {
 	return nil, nil
 }

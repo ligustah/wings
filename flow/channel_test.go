@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -95,6 +97,85 @@ func TestSendRecordsNoValue(t *testing.T) {
 	}
 	if sends != 1 || recvs != 1 {
 		t.Fatalf("got %d sends, %d recvs; want 1 each", sends, recvs)
+	}
+}
+
+// THE POINT: resuming a channel-heavy run does not load every received value
+// into memory. Values are dropped from the replay slice at load and read back
+// one at a time from their offsets on the durable store, so a replay holds the
+// run's metadata, not its whole traffic — the resume side of the coordinator
+// memory issue. Uses the durable store (not MemStore, whose Read hands back the
+// very events it keeps, so a replay would alias them and hide the cost).
+func TestReplayDoesNotHoldReceivedValues(t *testing.T) {
+	const n, size = 2000, 8192 // ~16 MB of received payload
+
+	body := func(sum *int) func(flow.Context) error {
+		return func(c flow.Context) error {
+			ch := c.NewUnboundedChannel[[]byte]()
+			for i := 0; i < n; i++ {
+				b := make([]byte, size)
+				for j := range b {
+					b[j] = byte(i + j) // varied, so the codec cannot compress it away
+				}
+				if err := ch.Send(c, b); err != nil {
+					return err
+				}
+			}
+			if err := ch.Close(c); err != nil {
+				return err
+			}
+			for {
+				v, ok, err := ch.Recv(c)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					break
+				}
+				*sum += len(v) // touch it, do not retain it
+			}
+			return nil
+		}
+	}
+
+	client, _ := streams(t, filepath.Join(t.TempDir(), "engine"))
+	store := flow.NewStore(client)
+	name := flow.NewName()
+
+	var recSum int
+	if err := flow.Run(t.Context(), name, body(&recSum), flow.WithStore(store)); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if recSum != n*size {
+		t.Fatalf("recorded sum %d, want %d", recSum, n*size)
+	}
+
+	var m runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+	before := m.HeapAlloc
+
+	var grew int64
+	var repSum int
+	replay := func(c flow.Context) error {
+		if err := body(&repSum)(c); err != nil {
+			return err
+		}
+		// Measured while the thread is still live and holding its replay slice.
+		runtime.GC()
+		runtime.ReadMemStats(&m)
+		grew = int64(m.HeapAlloc) - int64(before)
+		return nil
+	}
+	if err := flow.Replay(t.Context(), name, replay, flow.WithStore(store)); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if repSum != n*size {
+		t.Fatalf("replayed sum %d, want %d", repSum, n*size)
+	}
+	if grew > int64(n*size/4) {
+		t.Fatalf("replay held %d bytes after replaying %d received values of %d bytes (%.0f%% of the payload); "+
+			"received values are being held in memory on replay", grew, n, size, 100*float64(grew)/float64(n*size))
 	}
 }
 

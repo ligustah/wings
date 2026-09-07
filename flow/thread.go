@@ -113,9 +113,13 @@ type threadState struct {
 
 	// events is this thread's history with what this attempt records appended.
 	// Guarded by run.mu: a fork reads ahead in the parent's history from the
-	// goroutine placing the child.
-	events []*protos.Event
-	serial uint64
+	// goroutine placing the child. Big channel values are dropped from it at load;
+	// offsets holds each event's stream offset so a dropped value can be read
+	// back when replay reaches it. offsets aligns with events over the replayed
+	// prefix (nothing this attempt records is added to either).
+	events  []*protos.Event
+	offsets []int64
+	serial  uint64
 
 	sink    Sink
 	sinkErr error // the first persistence failure, if any
@@ -230,6 +234,25 @@ func (t *threadState) expect[E protos.Events]() (E, error) {
 	t.serial++
 	t.run.mu.Unlock()
 	return payload, nil
+}
+
+// recordedValue reads back the channel value dropped at load from the event
+// replayed at position pos, from this thread's own stream by the offset load
+// kept. Called only while replaying a recorded receive, whose value the body is
+// owed. The thread's own stream is not dropped while it replays, so the value is
+// there to be read.
+func (t *threadState) recordedValue(ctx context.Context, pos uint64) ([]byte, error) {
+	t.run.mu.Lock()
+	off := t.offsets[pos]
+	t.run.mu.Unlock()
+	batch, err := t.run.store.Read(ctx, t.run.name, t.id, off, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) == 0 || batch[0].Offset != off {
+		return nil, fmt.Errorf("flow: the recorded value at offset %d of thread %q is gone", off, t.id)
+	}
+	return batch[0].Event.GetChannelRecv().GetValue().GetSerialized(), nil
 }
 
 // record appends an event to this thread and hands it to the sink. A sink

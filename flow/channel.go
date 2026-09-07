@@ -239,6 +239,7 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	if err, ok := t.interrupted("recv"); ok {
 		return zero, false, err
 	}
+	pos := t.at()
 	ev, err := t.expect[*protos.ChannelRecvEvent]()
 	if err != nil {
 		return zero, false, err
@@ -257,7 +258,13 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		// than waited for, since its sender may since have been joined; a copy
 		// that turns up from a replaying sender is taken on arrival.
 		cs.claim(ev.GetFromThreadId(), ev.GetFromSeq())
-		v, err := dswire.DecodeRecord(c.codec, ev.GetValue().GetSerialized())
+		// The value was dropped from the replay slice at load; read it back from
+		// its offset now, rather than have held every received value in memory.
+		data, err := t.recordedValue(ctx.base(), pos)
+		if err != nil {
+			return zero, false, fmt.Errorf("flow: read the recorded value from channel %s: %w", c.name, err)
+		}
+		v, err := dswire.DecodeRecord(c.codec, data)
 		if err != nil {
 			return zero, false, fmt.Errorf("flow: decode the recorded value from channel %s: %w", c.name, err)
 		}
@@ -451,6 +458,7 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	if cs.claimed[itemKey(from, seq)] {
 		delete(cs.claimed, itemKey(from, seq))
 		item.taken = true
+		item.data = nil // claimed by a replayed receive; its value comes from the offset, not here
 	}
 	cs.items = append(cs.items, item)
 	cs.broadcast()
@@ -469,6 +477,10 @@ func (cs *chanState) claim(from string, seq uint64) {
 			it.taken = true
 			cs.broadcast()
 		}
+		// A replayed receive reads its value back from the offset it recorded, not
+		// from the buffer, so the re-sent copy queued here is dead weight — drop it
+		// rather than hold the run's whole traffic in memory on a resume.
+		it.data = nil
 		return
 	}
 	if cs.claimed == nil {

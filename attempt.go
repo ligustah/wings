@@ -225,6 +225,49 @@ func (h *historyStore) Events(ctx context.Context, _, thread string) ([]*protos.
 	}
 }
 
+// Read returns up to n of one thread's events at or after offset in the
+// attempt's combined stream, each with its offset there. Because threads share
+// the stream, offsets are sparse per thread; paging by the last offset plus one
+// carries on scanning, and n=1 at a known event's offset reads it back.
+func (h *historyStore) Read(ctx context.Context, _, thread string, offset int64, n int) ([]flow.EventAt, error) {
+	run := h.name
+	ok, err := h.a.node.client.StreamExists(ctx, run)
+	if err != nil {
+		return nil, fmt.Errorf("wings: look for history %s: %w", run, err)
+	}
+	if !ok {
+		return nil, nil
+	}
+	st, err := h.stream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	from := offset
+	if from < 0 {
+		from = 0
+	}
+	var out []flow.EventAt
+	for len(out) < n {
+		recs, err := st.Read(ctx, from, recordBatch)
+		if err != nil {
+			return nil, fmt.Errorf("wings: read history %s: %w", run, err)
+		}
+		if len(recs) == 0 {
+			return out, nil
+		}
+		for _, r := range recs {
+			from = r.Offset + 1
+			if r.Record.GetThreadId() == thread {
+				out = append(out, flow.EventAt{Event: r.Record, Offset: r.Offset})
+				if len(out) >= n {
+					break
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 func (h *historyStore) Sink(ctx context.Context, _, _ string) (flow.Sink, error) {
 	return &historySink{h: h}, nil
 }

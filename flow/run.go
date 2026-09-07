@@ -70,6 +70,7 @@ import (
 	"slices"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/ligustah/wings/flow/protos"
@@ -208,7 +209,7 @@ type threadRunner struct {
 func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	store := r.opts.store
 
-	history, err := store.Events(ctx, r.name, r.id)
+	history, offsets, err := r.load(ctx, store)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +257,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	for {
 		attempt++
 
-		out, status, runErr := r.attempt(ctx, history, attempt, sink)
+		out, status, runErr := r.attempt(ctx, history, offsets, attempt, sink)
 
 		if r.readonly {
 			// One pass over the history is all a replay is.
@@ -295,10 +296,58 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 		}
 
 		// The next attempt replays everything recorded so far.
-		if history, err = store.Events(ctx, r.name, r.id); err != nil {
+		if history, offsets, err = r.load(ctx, store); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// loadBatch is how many events a resuming thread reads at a time. A whole
+// history is not held at once: each batch's big channel values are dropped as it
+// arrives (see stripValue), so the peak is one batch, not the run.
+const loadBatch = 512
+
+// load reads the thread's history, dropping the big channel values so the replay
+// slice holds only metadata; each value is read back from its offset when replay
+// reaches it. The returned offsets align with the returned events.
+func (r *threadRunner) load(ctx context.Context, store Store) ([]*protos.Event, []int64, error) {
+	var events []*protos.Event
+	var offsets []int64
+	for from := int64(0); ; {
+		batch, err := store.Read(ctx, r.name, r.id, from, loadBatch)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(batch) == 0 {
+			return events, offsets, nil
+		}
+		for _, ea := range batch {
+			events = append(events, strippedEvent(ea.Event))
+			offsets = append(offsets, ea.Offset)
+			from = ea.Offset + 1
+		}
+	}
+}
+
+// strippedEvent returns the event without its big channel value, so replay does
+// not hold every value in memory for the run's life. A receive's value is read
+// back from its offset when replay reaches it (see [Channel.Recv]); a send's is
+// no longer recorded, so this only clears what older histories still carry. The
+// value is dropped on a clone, never on the argument, because an in-memory store
+// hands back the very event it is keeping. Events with no value are returned as
+// they came, so the clone is paid only where there is a value to shed.
+func strippedEvent(ev *protos.Event) *protos.Event {
+	if ev.GetChannelRecv().GetValue() == nil && ev.GetChannelSend().GetValue() == nil {
+		return ev
+	}
+	c := proto.Clone(ev).(*protos.Event)
+	if r := c.GetChannelRecv(); r != nil {
+		r.Value = nil
+	}
+	if s := c.GetChannelSend(); s != nil {
+		s.Value = nil
+	}
+	return c
 }
 
 // describe names the thread in an error: the run alone for main.
@@ -311,7 +360,7 @@ func (r *threadRunner) describe() string {
 
 // attempt runs the body once over the given history and returns what it produced
 // and what became of it.
-func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, attempt uint64, sink Sink) ([]byte, protos.WorkflowStatus, error) {
+func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, offsets []int64, attempt uint64, sink Sink) ([]byte, protos.WorkflowStatus, error) {
 	run := r.run
 	if run == nil {
 		run = newRunState(r.name, r.opts)
@@ -322,11 +371,13 @@ func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, att
 		defer run.finish()
 		defer cancel()
 	}
+	events, evOffsets := replayable(history, offsets)
 	t := &threadState{
 		id:       r.id,
 		attempt:  attempt,
 		run:      run,
-		events:   replayable(history),
+		events:   events,
+		offsets:  evOffsets,
 		sink:     sink,
 		readonly: r.readonly,
 		ctx:      ctx,
@@ -533,15 +584,19 @@ func isMarker(ev *protos.Event) bool {
 	return ev.GetRunStart() != nil || ev.GetRunEnd() != nil
 }
 
-// replayable is a thread's history without its attempt markers.
-func replayable(history []*protos.Event) []*protos.Event {
-	var out []*protos.Event
-	for _, ev := range history {
+// replayable is a thread's history without its attempt markers, with the stream
+// offset of each event kept alongside so a value dropped at load can be read
+// back. The two slices stay aligned.
+func replayable(history []*protos.Event, offsets []int64) ([]*protos.Event, []int64) {
+	var evs []*protos.Event
+	var offs []int64
+	for i, ev := range history {
 		if !isMarker(ev) {
-			out = append(out, ev)
+			evs = append(evs, ev)
+			offs = append(offs, offsets[i])
 		}
 	}
-	return out
+	return evs, offs
 }
 
 // finished reports the terminal outcome of a thread, if it reached one.
