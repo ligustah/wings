@@ -38,6 +38,13 @@ func (c *Cluster) RunWorkflow[In, Out any](ctx context.Context, f flow.Func[In, 
 	return flow.RunMain(ctx, f, in, all...)
 }
 
+// Signal delivers a typed event to a running workflow by name: the run named
+// run receives it through [flow.Context.Signal] under name. It is held until the
+// run asks for it, so the run need not be waiting yet.
+func (c *Cluster) Signal[In any](ctx context.Context, run, name string, v In) error {
+	return flow.Deliver(ctx, clusterChannels{c}, run, name, v)
+}
+
 func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) error {
 	all, err := c.runOptions(nil)
 	if err != nil {

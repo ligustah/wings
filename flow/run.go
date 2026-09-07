@@ -33,6 +33,7 @@
 //
 //   - use [Context.Now], not time.Now
 //   - use [Context.Sleep], not time.Sleep
+//   - draw randomness with [Context.Rand] or [Context.UUID]
 //   - wrap other nondeterministic reads in [Context.Effect]
 //   - fork with [Context.Map], [Context.Go] or [Context.Spawn], never a goroutine
 //

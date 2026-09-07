@@ -109,6 +109,27 @@ func ExampleContext_Select() {
 	// Output: true
 }
 
+func ExampleContext_Signal() {
+	host := flow.NewMemChannelHost()
+	name := flow.NewName()
+	// Delivered before the run asks; the host holds it until it does.
+	if err := flow.Deliver(context.Background(), host, name, "approval", "shipped"); err != nil {
+		log.Fatal(err)
+	}
+	err := flow.Run(context.Background(), name, func(ctx flow.Context) error {
+		v, err := ctx.Signal[string]("approval")
+		if err != nil {
+			return err
+		}
+		fmt.Println(v)
+		return nil
+	}, flow.WithStore(flow.NewMemStore()), flow.WithChannelHost(host))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Output: shipped
+}
+
 func ExampleByteWriter() {
 	var n int
 	err := flow.Run(context.Background(), flow.NewName(), func(ctx flow.Context) error {
