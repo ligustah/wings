@@ -246,7 +246,11 @@ func (t *threadState) record[E protos.Events](payload E) *protos.Event {
 		ThreadId:  t.id,
 		Payload:   protos.PackEventPayload(payload),
 	}
-	t.events = append(t.events, ev)
+	// Not retained in t.events: a recorded event is persisted to the sink and
+	// never read back this attempt (peek/expect/joined past the replay boundary
+	// are live), and a later attempt replays it from the store. Keeping it held
+	// a whole run's events — channel values included — in memory for the run's
+	// life. t.events holds only what is still to be replayed. See [Store].
 	t.serial++
 	t.persistLocked(ev)
 	return ev

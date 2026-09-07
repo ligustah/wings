@@ -272,6 +272,10 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	if err != nil {
 		return zero, false, err
 	}
+	// The value has been decoded for the caller and recorded to history; the
+	// buffered item is never read again, so drop its bytes rather than keep the
+	// channel's whole traffic in memory. The recorded event holds its own copy.
+	cs.consume(item)
 	return v, true, t.err()
 }
 
@@ -474,6 +478,17 @@ func (cs *chanState) grant(g ChannelItem) {
 	}
 	cs.grants[itemKey(g.To, g.ToSeq)] = itemKey(g.From, g.Seq)
 	cs.broadcast()
+}
+
+// consume drops a received item's value once the receiver has decoded and
+// recorded it. Nothing reads a taken item's data again — find, roomFor and
+// pending use only its identity and flags — and holding it kept every value ever
+// received on the channel in memory for the channel's life. The recorded event
+// keeps its own reference to the bytes, so this does not disturb replay.
+func (cs *chanState) consume(item *chanItem) {
+	cs.mu.Lock()
+	item.data = nil
+	cs.mu.Unlock()
 }
 
 // find returns the queued item with an identity, or nil. Call with mu held.
