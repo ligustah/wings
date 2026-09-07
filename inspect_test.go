@@ -2,8 +2,10 @@ package wings
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/ligustah/wings/flow"
@@ -54,6 +56,23 @@ func TestInspectionAPIReportsLiveState(t *testing.T) {
 	getJSON(t, "http://"+c.uiAddr+"/api/pending", &pending)
 	if len(pending) != 0 {
 		t.Fatalf("pending returned %d with no work submitted, want 0", len(pending))
+	}
+}
+
+// THE POINT: the coordinator serves the embedded web UI at the root.
+func TestUIServesTheWebApp(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), UI: "127.0.0.1:0"})
+	resp, err := http.Get("http://" + c.uiAddr + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /: status %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "<title>wings</title>") {
+		t.Fatalf("root did not serve the UI page; got %d bytes", len(body))
 	}
 }
 

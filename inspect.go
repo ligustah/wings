@@ -39,6 +39,7 @@ func (c *Cluster) uiHandler() http.Handler {
 	mux.HandleFunc("GET /api/pending", c.handlePending)
 	mux.HandleFunc("GET /api/runs", c.handleRuns)
 	mux.HandleFunc("GET /api/runs/{run}", c.handleRun)
+	mux.Handle("GET /", uiStatic())
 	return mux
 }
 

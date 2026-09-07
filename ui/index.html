@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wings</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --border: #262c36; --fg: #d7dde5;
+    --muted: #8b949e; --accent: #4c9aff; --good: #3fb950; --bad: #f85149;
+    --warn: #d29922; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .5px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { background: var(--bg); border: 1px solid var(--border); border-radius: 999px;
+    padding: 2px 10px; font-size: 12px; color: var(--muted); }
+  .chip b { color: var(--fg); font-weight: 600; }
+  main { display: grid; grid-template-columns: 320px 1fr; gap: 0; height: calc(100vh - 53px); }
+  .side { border-right: 1px solid var(--border); overflow-y: auto; }
+  .detail { overflow-y: auto; padding: 16px; }
+  section { margin: 0; }
+  .sec-title { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); padding: 12px 16px 6px; position: sticky; top: 0;
+    background: var(--bg); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  tr.run { cursor: pointer; }
+  tr.run:hover { background: var(--panel); }
+  tr.run.sel { background: #1c2530; }
+  .mono { font-family: var(--mono); }
+  .status { font-size: 11px; padding: 1px 7px; border-radius: 4px; border: 1px solid var(--border); }
+  .status.completed { color: var(--good); border-color: #1f4428; }
+  .status.failed { color: var(--bad); border-color: #5a2321; }
+  .status.running, .status.suspended, .status.backoff { color: var(--warn); border-color: #5a4620; }
+  .empty { color: var(--muted); padding: 16px; font-style: italic; }
+  .thread { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--panel); }
+  .thread-head { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); }
+  .thread-head .id { font-family: var(--mono); font-weight: 600; }
+  .thread-head .fn { color: var(--muted); font-size: 12px; }
+  .thread-head .meta { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .events { padding: 4px 0; }
+  .ev { display: grid; grid-template-columns: 44px 90px 1fr; gap: 10px; padding: 3px 12px;
+    font-size: 12.5px; align-items: baseline; }
+  .ev:hover { background: var(--bg); }
+  .ev .seq { color: var(--muted); font-family: var(--mono); text-align: right; }
+  .ev .kind { font-family: var(--mono); }
+  .ev .kind.call, .ev .kind.effect { color: var(--accent); }
+  .ev .kind.fork, .ev .kind.join { color: #c778dd; }
+  .ev .kind.send, .ev .kind.recv, .ev .kind.select { color: var(--good); }
+  .ev .kind.interrupted { color: var(--warn); }
+  .ev .detail { color: var(--fg); font-family: var(--mono); word-break: break-word; }
+  .ev .err { color: var(--bad); }
+  .hint { color: var(--muted); font-size: 13px; }
+  .dead { color: var(--bad); }
+  .draining { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>wings</h1>
+  <div class="chips" id="chips"></div>
+</header>
+<main>
+  <div class="side">
+    <section>
+      <div class="sec-title">Runs</div>
+      <table><tbody id="runs"></tbody></table>
+    </section>
+    <section>
+      <div class="sec-title">Workers</div>
+      <table><tbody id="workers"></tbody></table>
+    </section>
+    <section>
+      <div class="sec-title">Pending</div>
+      <table><tbody id="pending"></tbody></table>
+    </section>
+  </div>
+  <div class="detail" id="detail">
+    <p class="hint">Select a run to see its threads and event timeline.</p>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let selected = null;
+
+async function getJSON(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path + ": " + r.status);
+  return r.json();
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+function statusEl(s) {
+  return `<span class="status ${esc(s)}">${esc(s)}</span>`;
+}
+
+async function refreshCluster() {
+  try {
+    const st = await getJSON("api/status");
+    $("chips").innerHTML = [
+      ["target", st.target], ["workers", st.workers], ["outstanding", st.outstanding],
+      ["dir", st.dir],
+    ].map(([k, v]) => `<span class="chip">${k} <b>${esc(v)}</b></span>`).join("");
+  } catch (e) { /* transient */ }
+
+  try {
+    const ws = await getJSON("api/workers");
+    $("workers").innerHTML = ws.length ? ws.map(w => `<tr>
+      <td class="mono">${esc(w.id)}</td>
+      <td>${esc(w.kind)}</td>
+      <td>${w.dead ? '<span class="dead">dead</span>' : w.draining ? '<span class="draining">draining</span>' : "load " + w.load}</td>
+    </tr>`).join("") : `<tr><td class="empty" colspan="3">none</td></tr>`;
+  } catch (e) {}
+
+  try {
+    const ps = await getJSON("api/pending");
+    $("pending").innerHTML = ps.length ? ps.map(p => `<tr>
+      <td class="mono">${esc(p.run || p.id)}</td>
+      <td>${esc(p.fn || "")}</td>
+      <td>${p.blocked ? "blocked" : p.placed ? "placed" : "queued"}</td>
+    </tr>`).join("") : `<tr><td class="empty" colspan="3">none</td></tr>`;
+  } catch (e) {}
+}
+
+async function refreshRuns() {
+  try {
+    const runs = await getJSON("api/runs");
+    $("runs").innerHTML = runs.length ? runs.map(r => `<tr class="run ${r.run === selected ? "sel" : ""}" data-run="${esc(r.run)}">
+      <td class="mono">${esc(r.run)}</td>
+      <td>${statusEl(r.status)}</td>
+    </tr>`).join("") : `<tr><td class="empty" colspan="2">no runs recorded</td></tr>`;
+    for (const tr of $("runs").querySelectorAll("tr.run")) {
+      tr.onclick = () => selectRun(tr.dataset.run);
+    }
+  } catch (e) {}
+}
+
+async function selectRun(run) {
+  selected = run;
+  for (const tr of $("runs").querySelectorAll("tr.run")) {
+    tr.classList.toggle("sel", tr.dataset.run === run);
+  }
+  await refreshDetail();
+}
+
+async function refreshDetail() {
+  if (!selected) return;
+  let snap;
+  try {
+    snap = await getJSON("api/runs/" + encodeURIComponent(selected));
+  } catch (e) {
+    $("detail").innerHTML = `<p class="hint">Could not load ${esc(selected)}: ${esc(e.message)}</p>`;
+    return;
+  }
+  const threads = (snap.threads || []).map(t => `<div class="thread">
+    <div class="thread-head">
+      <span class="id">${esc(t.id)}</span>
+      ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
+      ${statusEl(t.status)}
+      <span class="meta">${(t.events || []).length} events${t.attempts > 1 ? " · attempt " + t.attempts : ""}</span>
+    </div>
+    <div class="events">${(t.events || []).map(ev => `<div class="ev">
+      <span class="seq">${ev.seq}</span>
+      <span class="kind ${esc(ev.kind)}">${esc(ev.kind)}</span>
+      <span class="detail">${esc(ev.detail)}${ev.error ? ` <span class="err">${esc(ev.error)}</span>` : ""}</span>
+    </div>`).join("") || '<div class="ev"><span class="seq"></span><span></span><span class="hint">no events</span></div>'}</div>
+  </div>`).join("");
+  $("detail").innerHTML = `<h2 class="mono" style="margin:0 0 14px">${esc(snap.run)}</h2>${threads}`;
+}
+
+async function tick() {
+  await Promise.all([refreshCluster(), refreshRuns(), refreshDetail()]);
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
