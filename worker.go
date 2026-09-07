@@ -506,29 +506,68 @@ func startServedBroker(dir, listen string, log *slog.Logger) (*servedBroker, err
 	if err != nil {
 		return nil, fmt.Errorf("wings: start broker: %w", err)
 	}
-	s := &servedBroker{broker: b, client: dsclient.Wrap(b.Client())}
-
-	lis, err := net.Listen("tcp", listen)
+	srv, lis, err := serveBroker(b.Service(), listen, log)
 	if err != nil {
 		_ = b.Close()
-		return nil, fmt.Errorf("wings: listen on %s: %w", listen, err)
+		return nil, err
+	}
+	return &servedBroker{broker: b, client: dsclient.Wrap(b.Client()), srv: srv, lis: lis}, nil
+}
+
+// serveBroker stands up a gRPC server for a durable-streams service on listen,
+// so another process can reach it. Used for a worker's own broker and, in
+// shared-broker mode, for the coordinator's engine.
+func serveBroker(service protos.DurableStreamsServer, listen string, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	lis, err := net.Listen("tcp", listen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wings: listen on %s: %w", listen, err)
 	}
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMessage),
 		grpc.MaxSendMsgSize(maxMessage),
 	)
-	protos.RegisterDurableStreamsServer(srv, b.Service())
-	s.srv, s.lis = srv, lis
-
+	protos.RegisterDurableStreamsServer(srv, service)
 	go func() {
 		if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			log.Error("wings: broker server stopped", "err", err)
 		}
 	}()
-	return s, nil
+	return srv, lis, nil
 }
 
 func (s *servedBroker) addr() string { return s.lis.Addr().String() }
+
+// workerStore is where a worker keeps its streams: the coordinator's engine,
+// dialed over WINGS_BROKER in shared-broker mode and holding no data of its own,
+// or a served broker of its own otherwise. It returns a client, the address to
+// announce, and a close.
+func workerStore(log *slog.Logger) (*dsclient.Client, string, func(), error) {
+	if broker := os.Getenv(envBroker); broker != "" {
+		backend, err := dialWorker(broker)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("wings: dial shared broker %s: %w", broker, err)
+		}
+		return dsclient.Wrap(backend), broker, func() { _ = backend.Close() }, nil
+	}
+
+	dir := os.Getenv(envDir)
+	if dir == "" {
+		// Only when started by hand: the coordinator always sets WINGS_DIR.
+		dir = defaultWorkerDataDir
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, "", nil, fmt.Errorf("wings: worker data dir: %w", err)
+	}
+	listen := os.Getenv(envListen)
+	if listen == "" {
+		listen = "127.0.0.1:0"
+	}
+	b, err := startServedBroker(dir, listen, log)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	return b.client, b.addr(), func() { _ = b.close() }, nil
+}
 
 func (s *servedBroker) close() error {
 	if s == nil {
@@ -555,26 +594,15 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		id = "worker"
 	}
 
-	dir := os.Getenv(envDir)
-	if dir == "" {
-		// Only when started by hand: the coordinator always sets WINGS_DIR.
-		dir = defaultWorkerDataDir
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("wings: worker data dir: %w", err)
-	}
-	listen := os.Getenv(envListen)
-	if listen == "" {
-		listen = "127.0.0.1:0"
-	}
-
-	b, err := startServedBroker(dir, listen, log)
+	// A shared broker: dial the coordinator's engine instead of running one, so
+	// this worker keeps no data of its own. Otherwise stand up a served broker.
+	client, addr, closeStore, err := workerStore(log)
 	if err != nil {
 		return err
 	}
-	defer b.close()
+	defer closeStore()
 
-	n, err := newWorkerNode(ctx, b.client, id, concurrency, jobTimeout, log)
+	n, err := newWorkerNode(ctx, client, id, concurrency, jobTimeout, log)
 	if err != nil {
 		return err
 	}
@@ -583,11 +611,11 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		go n.watchPreemption(ctx, url)
 	}
 
-	// The parent reads this to learn the port, so it must be first on stdout and
-	// flushed before anything blocks.
-	fmt.Fprintln(os.Stdout, readyPrefix+b.addr())
+	// The parent reads this to know the worker is up, so it must be first on
+	// stdout and flushed before anything blocks.
+	fmt.Fprintln(os.Stdout, readyPrefix+addr)
 
-	n.log.Info("wings: worker serving", "addr", b.addr(), "concurrency", n.concurrency)
+	n.log.Info("wings: worker serving", "addr", addr, "concurrency", n.concurrency)
 	err = n.run(ctx)
 	if n.leaving.Load() {
 		// Taken back: stay up until the machine goes, so the coordinator can

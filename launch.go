@@ -63,16 +63,79 @@ func (c *Cluster) launchLocalProcess(ctx context.Context, n int) ([]*workerConn,
 		return nil, fmt.Errorf("wings: locate this executable: %w", err)
 	}
 
+	// Shared-broker mode: the children write into the coordinator's engine, which
+	// it serves on loopback, so there is no per-worker broker to copy from.
+	var broker string
+	if c.cfg.LocalSharedBroker {
+		if broker, err = c.serveEngine(); err != nil {
+			return nil, err
+		}
+	}
+
 	var out []*workerConn
 	for range n {
 		id := c.workerID("local")
-		w, err := c.spawnLocal(ctx, exe, id, filepath.Join(c.dir, id))
+		var w *workerConn
+		if c.cfg.LocalSharedBroker {
+			w, err = c.spawnLocalShared(ctx, exe, id, broker)
+		} else {
+			w, err = c.spawnLocal(ctx, exe, id, filepath.Join(c.dir, id))
+		}
 		if err != nil {
 			return nil, closePartial(ctx, out, err)
 		}
 		out = append(out, w)
 	}
 	return out, nil
+}
+
+// spawnLocalShared starts a worker child that dials the coordinator's engine
+// rather than running its own broker. Its streams live in the shared engine, so
+// the coordinator reaches them through its own client — as for an in-process
+// worker — and copies nothing.
+func (c *Cluster) spawnLocalShared(ctx context.Context, exe, id, broker string) (*workerConn, error) {
+	cmd := exec.Command(exe)
+	cmd.Env = append(os.Environ(), sharedWorkerEnv(id, broker, c.cfg.Concurrency, c.cfg.JobTimeout)...)
+	cmd.Stderr = os.Stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("wings: worker %s stdout: %w", id, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("wings: start worker %s: %w", id, err)
+	}
+
+	// The child announces readiness once it has dialed the engine; the address it
+	// reports is the engine's, which the coordinator already has.
+	if _, err := awaitReady(ctx, stdout, id); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
+	// ownsClient false: the engine outlives any one worker.
+	w, err := c.connect(id, client, false)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
+	w.proc = cmd.Process
+	w.exited = make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(w.exited)
+	}()
+
+	c.log.Info("wings: local shared-broker worker started", "worker", id, "pid", cmd.Process.Pid)
+	return w, nil
 }
 
 func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerConn, error) {
@@ -130,6 +193,23 @@ func workerEnv(id, listen, dir string, concurrency int, jobTimeout time.Duration
 		envWorkerID + "=" + id,
 		envListen + "=" + listen,
 		envDir + "=" + dir,
+	}
+	if concurrency > 0 {
+		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))
+	}
+	if jobTimeout > 0 {
+		env = append(env, envJobTimeout+"="+jobTimeout.String())
+	}
+	return env
+}
+
+// sharedWorkerEnv is workerEnv for a worker that dials the coordinator's engine
+// at broker instead of running its own, so it is given no dir or listen address.
+func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout time.Duration) []string {
+	env := []string{
+		envMode + "=" + modeWorker,
+		envWorkerID + "=" + id,
+		envBroker + "=" + broker,
 	}
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))

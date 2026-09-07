@@ -18,6 +18,7 @@ import (
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -46,6 +47,12 @@ type Cluster struct {
 	// engine is the instance itself, for what only the engine can do: pull
 	// a worker's transactions. See pull.go.
 	engine *embed.InProcess
+	// engineSrv serves the engine on loopback so worker child processes can dial
+	// it, for the shared-broker local target. Nil otherwise.
+	engineOnce sync.Once
+	engineErr  error
+	engineSrv  *grpc.Server
+	engineAddr string
 
 	// journal is the coordinator's own durable record, on that same instance.
 	// It is the one thing the coordinator keeps for itself rather than for a
@@ -568,6 +575,24 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 		c.engine = b
 	})
 	return c.shared, c.sharedErr
+}
+
+// serveEngine serves the coordinator's engine on loopback so worker child
+// processes can dial it, for the shared-broker local target. Served once; the
+// address is stable for the cluster's life.
+func (c *Cluster) serveEngine() (string, error) {
+	if _, err := c.sharedClient(); err != nil {
+		return "", err
+	}
+	c.engineOnce.Do(func() {
+		srv, lis, err := serveBroker(c.engine.Service(), "127.0.0.1:0", c.log)
+		if err != nil {
+			c.engineErr = err
+			return
+		}
+		c.engineSrv, c.engineAddr = srv, lis.Addr().String()
+	})
+	return c.engineAddr, c.engineErr
 }
 
 // closeShared releases the embedded instance, once every worker that reads
@@ -1446,7 +1471,11 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	// The journal writes through the shared instance, so drain it before that
 	// instance goes away, and after the workers so their closing entries are in it.
 	c.journal.close()
-	// Last: the in-process workers read through the shared instance.
+	// After the workers that dialed it are gone, stop serving the engine, then
+	// release it last — the in-process workers read through it.
+	if c.engineSrv != nil {
+		c.engineSrv.GracefulStop()
+	}
 	errs = append(errs, c.closeShared())
 	return errors.Join(errs...)
 }

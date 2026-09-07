@@ -11,6 +11,7 @@ const (
 	envMode        = "WINGS_MODE"
 	envListen      = "WINGS_LISTEN"
 	envDir         = "WINGS_DIR"
+	envBroker      = "WINGS_BROKER"
 	envConcurrency = "WINGS_CONCURRENCY"
 	envJobTimeout  = "WINGS_JOB_TIMEOUT"
 	envWorkerID    = "WINGS_WORKER_ID"
@@ -87,6 +88,13 @@ type Config struct {
 	// ./wings-data in the working directory, kept across restarts so a run
 	// resumes; set it to put that state somewhere else.
 	Dir string
+
+	// LocalSharedBroker, for the [LocalProcess] target, has the worker child
+	// processes write into the coordinator's own broker instead of each running
+	// its own — no per-worker data and no output copied between brokers, at the
+	// cost of no longer rehearsing the remote target's mirror. Ignored by other
+	// targets.
+	LocalSharedBroker bool
 
 	// JobTimeout bounds a single work function call. Zero means no limit.
 	JobTimeout time.Duration
