@@ -576,7 +576,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// an error that says what to do instead.
 	if len(payload) > maxResult {
 		res.Error = fmt.Sprintf("wings: the result of %s is %d bytes, more than a result may be (%d); "+
-			"return a wings.Artifact for output this size rather than a value", job.Func, len(payload), maxResult)
+			"stream output this size over a flow.Channel rather than returning it", job.Func, len(payload), maxResult)
 		return res
 	}
 	res.Payload = payload

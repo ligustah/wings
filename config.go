@@ -36,8 +36,9 @@ const (
 	// turn.
 	//
 	// Sixty-four megabytes is generous for a result and still an amount of
-	// memory a process can hold several of. Anything genuinely large belongs in
-	// an [Artifact], which is streamed in chunks and never held whole.
+	// memory a process can hold several of. Anything genuinely large belongs on
+	// a flow.Channel, streamed in chunks with flow.ByteWriter and never held
+	// whole.
 	maxMessage = 64 << 20
 
 	// maxResult is the largest encoded result a worker will send back. Below

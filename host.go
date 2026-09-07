@@ -155,7 +155,7 @@ func threadOrigin(th flow.Thread) flow.Origin {
 type clusterKey struct{}
 
 // withCluster marks a context as the coordinator's, so what needs the
-// cluster's own storage — reading an artifact back, replaying a recording —
+// cluster's own storage — replaying a recording, draining a shared channel —
 // can find it.
 func withCluster(ctx context.Context, c *Cluster) context.Context {
 	return context.WithValue(ctx, clusterKey{}, c)

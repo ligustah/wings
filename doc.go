@@ -149,12 +149,15 @@
 // them back, and never reads one. flow.Context.Heartbeat is the other thing:
 // it is about resuming a job, not about describing what it did.
 //
-// # Artifacts
+// # Large output
 //
-// Separately, and sharing nothing with the above: a job can produce a file.
-// [Create] gives an io.Writer whose bytes leave the worker as they are written
-// and land on the coordinator's storage, and [Open] reads them back. A retry is
-// not handed its predecessor's files, because a file is not a position.
+// A result travels whole in one record, so output measured in megabytes — a
+// render, an archive, a core dump — does not belong in one. Stream it over a
+// flow.Channel instead: the workflow hands the channel to the work function,
+// which writes to it through a flow.ByteWriter, and reads it back through a
+// flow.ByteReader wherever the workflow runs. The bytes are recorded and
+// relayed like any channel's, so a moved attempt replays exactly what it sent,
+// and every chunk is committed with the attempt that wrote it.
 //
 // # Communication
 //

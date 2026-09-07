@@ -840,7 +840,7 @@ func (c *Cluster) tail(w *workerConn) {
 				c.log.Error("wings: skipping a result too large for the connection to carry",
 					"worker", w.id, "offset", from, "err", err,
 					"hint", "the worker that produced it was built from different source; "+
-						"a result this size belongs in a wings.Artifact")
+						"output this size belongs on a flow.Channel, streamed rather than returned")
 				from++
 				continue
 			}

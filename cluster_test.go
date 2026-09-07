@@ -466,7 +466,7 @@ func TestAResultTooLargeFailsTheJobNotTheWorker(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error from a result too large to carry")
 	}
-	if !strings.Contains(err.Error(), "Artifact") {
+	if !strings.Contains(err.Error(), "Channel") {
 		t.Fatalf("the error should say what to do instead: %v", err)
 	}
 

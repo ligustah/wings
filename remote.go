@@ -23,7 +23,7 @@ import (
 //
 // The one place that knows how, so the message limits are the same whichever
 // target put the worker there. gRPC's defaults are four megabytes in each
-// direction, which a result or a batch of artifact chunks passes without
+// direction, which a result or a batch of channel chunks passes without
 // trying — and a message the transport will not carry does not fail cleanly, it
 // looks exactly like a dropped connection.
 func dialWorker(addr string) (*dsremote.Client, error) {

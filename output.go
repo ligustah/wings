@@ -30,9 +30,9 @@ import (
 // streams to copy is re-derived from their names on every pass, so it is never
 // stale.
 //
-// Nothing here knows what a recording or an artifact is. They are separate
-// features that both need a stream to survive its worker, the way two programs
-// both need a filesystem.
+// Nothing here knows what a recording or a channel's outbox is. They are
+// separate features that both need a stream to survive its worker, the way two
+// programs both need a filesystem.
 
 const (
 	// outputSet names the mirror. It becomes the consumer group each copy's
@@ -75,13 +75,11 @@ const (
 	outputAppend = 30 * time.Second
 )
 
-// The three families of stream a job's output lives in. All three are built and
-// taken apart by outputName below, and nothing else may assume their shape.
+// The families of stream a job's output lives in. All are built and taken apart
+// by outputName below, and nothing else may assume their shape.
 const (
 	// recordingPrefix is a job's event log. See recording.go.
 	recordingPrefix = "wings.replay."
-	// artifactPrefix is a job's file. See artifact.go.
-	artifactPrefix = "wings.artifact."
 	// priorPrefix is where a PREVIOUS attempt's log is put on the worker that is
 	// about to run the next one.
 	//
@@ -122,7 +120,7 @@ func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 // A plain split is enough because every part goes through streamPart, which
 // leaves a dot in none of them.
 func parseOutput(stream string) (outputName, bool) {
-	for _, prefix := range []string{recordingPrefix, artifactPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
+	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {
 			continue
@@ -161,19 +159,21 @@ func streamPart(s string) string {
 	return b.String()
 }
 
-// batchFor is how many records of one kind of output move per transaction.
-func batchFor(prefix string) int {
-	if prefix == artifactPrefix {
-		return artifactBatch
-	}
-	return recordBatch
-}
+// chanoutBatch is how many records of a shared channel's outbox move per
+// transaction of the mirror that copies it home.
+//
+// Small, because an outbox record is a channel value and a channel value can be
+// a [flow.Bytes] chunk — up to a quarter of a megabyte of opaque output. A
+// batch the size a log of tiny events would use (see recordBatch) would be a
+// message megabytes across, which the transport will not carry; this keeps one
+// well under the gRPC limit while still moving several chunks at a time.
+const chanoutBatch = 8
 
 // jobOutput resolves the job an output belongs to and stands its stream up.
 //
-// The one thing [Record] and [Create] both call, because both need a stream on
-// the worker that the coordinator will keep. What they put in it is their own
-// business, and they share no code past this point.
+// What [Record] calls to get a stream on the worker that the coordinator will
+// keep. What goes in it is the recording's business, and shares no code past
+// this point.
 func jobOutput(ctx context.Context, prefix, name string) (*dsclient.Client, string, error) {
 	if name == "" {
 		return nil, "", errors.New("wings: this needs a name")
@@ -300,14 +300,9 @@ func (c *Cluster) startOutputMirror() error {
 			}
 			// The same name at the destination, which is what lets one handle
 			// mean the same thing on the worker that wrote it and on the
-			// coordinator that kept it.
-			//
-			// The batch is per stream because the two kinds are nothing alike. A
-			// recording is one event per record, so a log is as many records as
-			// it has events and a small batch is thousands of round trips; a file
-			// is a quarter of a megabyte per record, and the same number would be
-			// a message nothing should try to carry.
-			return dsclient.MirrorTarget{Name: cand.Stream, Batch: batchFor(o.Prefix)}, nil
+			// coordinator that kept it. A small batch because an outbox record can
+			// be a quarter-megabyte byte-stream chunk; see chanoutBatch.
+			return dsclient.MirrorTarget{Name: cand.Stream, Batch: chanoutBatch}, nil
 		},
 		OnStreamError: func(cand dsclient.MirrorCandidate, err error) error {
 			// A copy cut short by the cluster stopping is not trouble.

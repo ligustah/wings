@@ -539,6 +539,34 @@ from the channel's record, on a worker that never saw the sender, and a receive
 abandoned mid-wait asks again under the same name and gets the grant already
 made for it.
 
+### Streaming raw bytes
+
+A result travels whole in one record, so output measured in megabytes — a
+render, an archive, a core dump — does not belong in one. **Stream it over a
+channel** of `flow.Bytes`, which a `flow.ByteWriter` and `flow.ByteReader` turn
+into an ordinary `io.Writer` and `io.Reader`:
+
+```go
+var Render = flow.Define(func(ctx flow.Context, in RenderIn) (flow.None, error) {
+    w := flow.NewByteWriter(ctx, in.Out)   // an ordinary io.Writer
+    defer w.Close()                        // flushes and closes the channel
+    return flow.None{}, encode(w)
+})
+
+// The workflow makes the channel, forks the render, and reads the bytes back
+// wherever it runs.
+out := ctx.NewBufferedChannel[flow.Bytes](8)
+done := ctx.Go(Render, RenderIn{Out: out})
+_, err := io.Copy(dst, flow.NewByteReader(ctx, out))
+```
+
+The writer splits large writes into `flow.ByteChunk` values so neither end ever
+holds the whole thing, and a `flow.Bytes` rides the wire as its own bytes rather
+than the base64 a `[]byte` would cost. The chunks are recorded and relayed like
+any channel's values — committed with the attempt that sends them, and replayed
+in the same order onto a worker that never saw the sender — so a moved job gets
+back exactly what it streamed.
+
 ## Recordings
 
 A long job's progress is usually a **sequence of events** — a simulation's ticks,
@@ -598,27 +626,7 @@ gives them back, and never reads one.
 of attempts that were abandoned are removed without being asked once the job
 settles: nobody holds a handle to those.
 
-## Artifacts
-
-Separately, and with nothing in common but the word "big": a job can produce a
-**file**. A result is one record on one stream, held whole in memory at both
-ends, which is the wrong shape for a render, an archive or a core dump.
-
-```go
-out, err := wings.Create(ctx, "render")
-_ = encode(ctx, out)                  // an ordinary io.Writer
-_ = out.Close()
-return Result{Video: out.Artifact()}, nil
-```
-
-read back with `wings.Open(ctx, a)`, an `io.ReadCloser`, and removed with
-`a.Discard(ctx)`. What a job writes is opaque bytes in whatever format it and its
-caller agree on.
-
-Artifacts are not events and are not replayed into anything. A retry is not
-handed its predecessor's files, because a file is not a position.
-
-### What cannot be moved
+## What cannot be moved
 
 The running goroutine. Its stack, its locals, its open sockets and half-filled
 buffers are on that machine and stay there — Go cannot serialise a running
