@@ -105,14 +105,17 @@ func (a *Arbiter) admit(it ChannelItem) bool {
 			return false
 		}
 		a.asked[key] = true
-		a.wants = append(a.wants, it)
+		a.wants = append(a.wants, ChannelItem{From: it.From, Seq: it.Seq, Want: true})
 	default:
 		key := itemKey(it.From, it.Seq)
 		if a.seen[key] {
 			return false
 		}
 		a.seen[key] = true
-		a.values = append(a.values, it)
+		// Only the identity is kept: match, has, withoutItem and Settled read no
+		// more, and the value's bytes travel on in Offer's returned record. Storing
+		// the whole item held a wave's worth of relayed values on the coordinator.
+		a.values = append(a.values, ChannelItem{From: it.From, Seq: it.Seq})
 	}
 	return true
 }
