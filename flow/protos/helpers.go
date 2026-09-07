@@ -70,9 +70,7 @@ func UnpackEventPayload(event *Event) proto.Message {
 	return event.ProtoReflect().Get(which).Message().Interface()
 }
 
-// EventType names the payload's message type, for diagnostics. A replay that
-// finds the wrong kind of event reports with this, and the name is what tells
-// somebody their workflow function changed shape between attempts.
+// EventType names the payload's message type, for diagnostics.
 func EventType(event *Event) string {
 	payload := UnpackEventPayload(event)
 	if payload == nil {

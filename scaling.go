@@ -7,63 +7,36 @@ import (
 	"time"
 )
 
-// Scaling turns the worker count into something wings manages rather than
-// something you choose.
-//
-// It is deliberately provider-independent: the decision is made from the queue
-// alone, and carrying it out goes through the same per-target path that brought
-// the first workers up. So the same configuration adds a goroutine, a child
-// process, or a cloud VM, and a policy tuned locally means the same thing in
-// production.
-//
-// The zero value means a fixed fleet of [Config.Workers], which is this same
-// policy with Min and Max equal: there is no separate code for a fixed count.
-// What that buys is that a fixed fleet is MAINTAINED rather than launched
-// once — a worker that dies or is preempted is replaced on the next tick,
-// where it used to be simply gone.
+// Scaling makes the worker count follow the queue, from the queue alone, so the
+// same policy adds a goroutine, a child process, or a cloud VM. The zero value
+// is a fixed fleet of [Config.Workers] — the same policy with Min and Max equal,
+// which is still maintained: a dead or preempted worker is replaced.
 type Scaling struct {
-	// Min is the floor, held even when there is no work at all. Below 1 there
-	// would be nothing to send the first job to, so 0 is read as 1.
+	// Min is the floor, held even with no work. 0 is read as 1.
 	Min int
-	// Max is the ceiling, and enabling autoscaling means setting it. It is a
-	// spend limit as much as a capacity one: with a cloud target every worker
-	// above the floor is a machine being billed.
+	// Max is the ceiling; setting it enables autoscaling. With a cloud target it
+	// is a spend limit.
 	Max int
 
-	// JobsPerWorker is how much backlog one worker is expected to carry.
-	// Workers wanted is outstanding jobs divided by this, so 1 means a worker
-	// per queued job and 10 means a worker per ten.
-	//
-	// Defaults to [Config.Concurrency] when that is set, and to 1 otherwise. A
-	// worker with four slots carries four jobs at once, and a policy that asked
-	// for a machine per queued job would build four times the fleet the queue
-	// needs. When Concurrency is left to the worker, nothing here knows how many
-	// slots one has, so the default is the conservative one.
+	// JobsPerWorker is how much backlog one worker should carry: workers wanted
+	// is outstanding jobs divided by this. Defaults to [Config.Concurrency], else 1.
 	JobsPerWorker int
 
-	// IdleTimeout is how long a worker must have had nothing to do before it is
-	// torn down. Defaults to 60s.
-	//
-	// The right value is dominated by what a replacement COSTS: a goroutine is
-	// free to recreate and a cloud VM is minutes of boot plus an upload, so a
-	// timeout that looks thrifty on the local target can leave a remote cluster
-	// permanently rebuilding itself.
+	// IdleTimeout is how long a worker must be idle before it is retired.
+	// Defaults to 60s. Weigh it against what a replacement costs to boot.
 	IdleTimeout time.Duration
 
 	// Interval is how often the policy is evaluated. Defaults to 2s.
 	Interval time.Duration
 
-	// MaxStep bounds how many workers one decision may add. Defaults to Max,
-	// i.e. unbounded within the ceiling. Lower it when provisioning is slow or
-	// rate-limited and a burst of queued work should not become a burst of
-	// simultaneous machine creations.
+	// MaxStep bounds how many workers one decision may add. Defaults to Max.
+	// Lower it when provisioning is slow or rate-limited.
 	MaxStep int
 }
 
 func (s Scaling) enabled() bool { return s.Max > 0 }
 
-// fixed reports whether the fleet holds one size, which is what a plain
-// Config.Workers becomes.
+// fixed reports whether the fleet holds one size.
 func (s Scaling) fixed() bool { return s.Min == s.Max }
 
 // fixedFleet is the policy a plain worker count means: n workers, kept at n.
@@ -71,8 +44,6 @@ func fixedFleet(n int) Scaling { return Scaling{Min: n, Max: n} }
 
 func (s Scaling) validate() error {
 	if !s.enabled() {
-		// Nothing to check: with Max unset the whole struct is inert, and
-		// rejecting a stray field would be rejecting a zero value.
 		return nil
 	}
 	if s.Min < 0 {
@@ -87,9 +58,8 @@ func (s Scaling) validate() error {
 	return nil
 }
 
-// withDefaults fills the blanks. Applied once at Start so the loop never has to
-// ask whether a field was set. concurrency is [Config.Concurrency], which is
-// what a worker's share of the backlog defaults to.
+// withDefaults fills the blanks, once at Start. concurrency is
+// [Config.Concurrency], the default for JobsPerWorker.
 func (s Scaling) withDefaults(concurrency int) Scaling {
 	if !s.enabled() {
 		return s
@@ -124,19 +94,16 @@ func (s Scaling) initialWorkers(configured int) int {
 	return s.Min
 }
 
-// want is how many workers the given backlog calls for, clamped to the bounds.
+// want is how many workers the backlog calls for, rounded up and clamped to the
+// bounds.
 func (s Scaling) want(outstanding int) int {
-	// Round up: with JobsPerWorker=10, nine queued jobs still need a worker.
 	n := (outstanding + s.JobsPerWorker - 1) / s.JobsPerWorker
 	return min(max(n, s.Min), s.Max)
 }
 
-// autoscale evaluates the policy on a timer until the cluster stops.
-//
-// One goroutine, and every decision is carried out synchronously inside it.
-// That matters most for the slowest target: provisioning can take minutes, and
-// a loop that fired again while the last decision was still in flight would
-// answer the same backlog by creating the same machines twice.
+// autoscale evaluates the policy on a timer until the cluster stops. One
+// goroutine, each decision carried out synchronously, so a slow provision cannot
+// answer the same backlog twice.
 func (c *Cluster) autoscale() {
 	s := c.cfg.Scaling
 	t := time.NewTicker(s.Interval)
@@ -190,9 +157,7 @@ func (c *Cluster) scaleUp(n, outstanding int) {
 
 	workers, err := c.launch(c.ctx, n)
 	if err != nil {
-		// Not fatal. The cluster keeps running at its current size and the next
-		// tick tries again; a quota refusal or a slow zone should cost
-		// throughput, not the run.
+		// Not fatal: the next tick tries again.
 		c.log.Error("wings: scale up failed", "add", n, "err", err)
 		return
 	}
@@ -201,12 +166,8 @@ func (c *Cluster) scaleUp(n, outstanding int) {
 	}
 }
 
-// scaleDown retires up to n workers that have been idle long enough.
-//
-// Draining is marked under the same lock that assigns work, which is what makes
-// this safe: a worker cannot be chosen for a job between being found idle and
-// being taken out of service, so nothing is ever sent to a worker that is
-// already closing.
+// scaleDown retires up to n idle workers. Draining is marked under the lock that
+// assigns work, so nothing is sent to a worker that is already closing.
 func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 	if n <= 0 || len(idle) == 0 {
 		return
@@ -218,8 +179,7 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 		if len(retire) >= n {
 			break
 		}
-		// Re-checked under the lock: this list was gathered earlier, and a job
-		// may have landed on one of them since.
+		// Re-checked under the lock: a job may have landed since.
 		if w.inflight != 0 || w.draining || w.dead.Load() {
 			continue
 		}
@@ -228,13 +188,9 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 	}
 	c.mu.Unlock()
 
-	// Still in c.workers here, and that is the point: the fleet the output
-	// mirror is given is c.workers, so a worker taken out of it has its copies
-	// cancelled. Marked draining, so nothing new is sent to it either way.
+	// Still in c.workers, so their output is still being mirrored while they
+	// drain; marked draining, so nothing new is sent.
 	for _, w := range retire {
-		// What its jobs wrote may still be mid-copy. They finished — that is why
-		// this worker is idle — but finishing is not the same as having been
-		// kept, and in a moment this machine stops being readable.
 		c.drainOutputs(context.WithoutCancel(c.ctx), w, "")
 	}
 
@@ -243,15 +199,11 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 		return slices.Contains(retire, w)
 	})
 	c.mu.Unlock()
-	// So the mirror lets go of them now rather than on its next pass. Its copies
-	// read through a client that is about to be closed, and every one of them
-	// would report a failure a tick at a time until it noticed.
+	// So the mirror drops them now rather than failing against a closing client.
 	c.pokeOutputs()
 
 	for _, w := range retire {
-		// Tell the tail goroutine this was deliberate, so the read error that
-		// closing causes is not reported as a lost worker and does not trigger
-		// a redispatch of jobs that do not exist.
+		// Deliberate, so the closing read error is not read as a lost worker.
 		w.dead.Store(true)
 		c.log.Info("wings: retiring idle worker", "worker", w.id)
 		c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "retired while idle"})
@@ -261,16 +213,9 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 	}
 }
 
-// reapDead releases workers that died on their own.
-//
-// Their tail goroutine has already redispatched what they owed; this is what
-// releases the machine, so that a cloud instance whose worker crashed stops
-// being billed rather than lingering until Stop.
-//
-// Driven by the watchdog rather than by the scaling loop, which is where it
-// used to live: a cluster with a fixed worker count has no scaling loop, so a
-// machine whose worker crashed was never released at all. Nothing about a dead
-// machine costing money depends on whether autoscaling was asked for.
+// reapDead releases workers that died on their own, so a crashed worker's
+// machine stops billing rather than lingering until Stop. Driven by the watchdog
+// so it runs even with a fixed fleet.
 func (c *Cluster) reapDead() {
 	var reaped []*workerConn
 
@@ -284,8 +229,6 @@ func (c *Cluster) reapDead() {
 	})
 	c.mu.Unlock()
 	if len(reaped) > 0 {
-		// Same as retiring: the mirror is still copying from a machine that is
-		// gone, and would go on failing against it until its next pass.
 		c.pokeOutputs()
 	}
 

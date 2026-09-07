@@ -8,43 +8,28 @@ import (
 	"sync"
 )
 
-// A thread of run code — one forked with [Context.Spawn] — is a closure, and
-// a closure cannot be sent to another process. What CAN be sent is the way
-// to reach it: the run's code is in every process that holds it, and the
-// closure is what that code arrives at after replaying the thread's
-// ancestors up to the fork that made it. So a thread of run code is placed
-// elsewhere by shipping its LINEAGE — the path of thread ids from a thread
-// the other process can start on its own down to the thread itself — and
-// the histories of the threads on that path. The other process replays each
-// ancestor from its history, read-only, to the fork of the next; the fork
-// hands it the closure; and the last one it runs for real, as [RunThread]
-// runs a thread that runs a function.
-//
-// The root of a lineage is a thread the other process can start with nothing
-// but a name: a workflow, by the name it is defined under, or a function on
-// its recorded input. A run started with a bare body under [Run] has no such
-// root, and its threads of run code stay home.
-//
-// An ancestor replayed this way is REPLAYED ONLY. It records nothing, it
-// parks nowhere, it does not report progress, and when its history runs out
-// it stops rather than doing anything new; what it computes between the
-// events of its history it computes again, which is the same determinism a
-// retry already asks of it. A thread it forks that is not on the path is not
-// run: its join, if the ancestor reached it, is in the history.
+// Placing a thread of run code elsewhere. A thread is a closure, which cannot be
+// shipped between processes; what can is its LINEAGE — the path of thread ids
+// from a root the other process can start on its own (a workflow by name, or a
+// function on its recorded input) down to the thread, plus each thread on that
+// path's history. The other process replays each ancestor from its history,
+// read-only, to the fork that made the next, and runs the last for real. A run
+// started with a bare body under [Run] has no startable root, so its threads of
+// run code stay home.
 
-// Root is the thread a lineage starts from, as another process can start
-// it: a workflow by name, or a function on its input. Exactly one is set.
+// Root is the thread a lineage starts from, as another process can start it: a
+// workflow by name, or a function on its input. Exactly one is set.
 type Root struct {
 	Workflow string
 	Function string
 	Input    []byte
 }
 
-// known reports whether the root is one a process can start from.
+// known reports whether the root names something a process can start from.
 func (r Root) known() bool { return r.Workflow != "" || r.Function != "" }
 
-// lineageOf is the path of thread ids from root to thread: root's ancestry
-// is dropped, and every id between is one segment longer than the last.
+// lineageOf is the path of thread ids from root down to thread, root first, or
+// nil if thread does not descend from root.
 func lineageOf(root, thread string) []string {
 	if thread == root {
 		return []string{root}
@@ -61,16 +46,14 @@ func lineageOf(root, thread string) []string {
 	return path
 }
 
-// RunLineage runs the last thread of lineage in this process, by replaying
-// its ancestors from their histories to the forks that made them — see the
-// top of this file — and then running it as [RunThread] would: on its own
-// history, under the run's options, [Once] applying to it.
+// RunLineage runs the last thread of lineage in this process by replaying its
+// ancestors from their histories to the forks that made them — see the top of
+// this file — then running it as [RunThread] would, with [Once] applying to it.
 //
-// The histories of every thread on the path must be in the store. root says
-// how to start the first; the workflow or function it names must be defined
-// in this process. What the thread forks goes to the run's [Placer], and
-// every channel of the run is shared through its [ChannelHost], since the
-// rest of the run is elsewhere.
+// Every thread on the path must have its history in the store, and root says how
+// to start the first; the workflow or function it names must be defined here.
+// What the thread forks goes to the run's [Placer], and the run needs a
+// [ChannelHost], since the rest of it is elsewhere.
 func RunLineage(ctx context.Context, run string, root Root, lineage []string, opts ...RunOption) ([]byte, error) {
 	ro := newRunOptions(opts)
 	if run == "" {
@@ -102,8 +85,8 @@ func RunLineage(ctx context.Context, run string, root Root, lineage []string, op
 	if ro.host == nil {
 		return nil, errors.New("flow: RunLineage requires a ChannelHost: the run's channels are shared with the rest of it")
 	}
-	// The one runState for every thread here, ancestor and target alike:
-	// they are threads of one run, and the channels between them live on it.
+	// One runState for every thread here, ancestor and target alike: they are
+	// threads of one run, and the channels between them live on it.
 	rs := newRunState(run, ro)
 	rs.fragment = true
 	defer rs.finish()
@@ -113,8 +96,8 @@ func RunLineage(ctx context.Context, run string, root Root, lineage []string, op
 	rs.placer = p
 	rs.forked = p.forked
 
-	// The root's replay is stopped as soon as the target is over, whether
-	// or not it reached the end of its history.
+	// Stop the root's replay as soon as the target is over, reached the end of
+	// its history or not.
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	rootDone := make(chan error, 1)
@@ -134,12 +117,10 @@ func RunLineage(ctx context.Context, run string, root Root, lineage []string, op
 		return nil, ctx.Err()
 	}
 
-	// The root stopped, and the target has not reported. A thread on the
-	// path whose fork is on record is on its way to the placer, or being
-	// replayed there on a goroutine of its own, and may yet reach the
-	// target's fork: the root's replay only outran it. Wait until nothing
-	// on the path is in flight; if the target has not come by then, the
-	// histories do not reach it.
+	// The root stopped before the target reported. A path thread whose fork is
+	// on record may still be on its way to the placer, or replaying there: the
+	// root's replay only outran it. Wait until nothing on the path is in flight;
+	// if the target has not come by then, the histories do not reach it.
 	for p.inflight() > 0 {
 		select {
 		case res := <-p.done:
@@ -184,10 +165,8 @@ func rootBody(root Root) (func(ctx Context) ([]byte, error), error) {
 	return nil, fmt.Errorf("flow: %w: the lineage names no workflow and no function to start from", ErrUnknownRoot)
 }
 
-// ErrUnknownRoot is returned by [RunLineage] when the root of the lineage is
-// not something this process can start: the workflow or function it names
-// is not defined here. A placer that gets it can only run the thread where
-// the code is.
+// ErrUnknownRoot is returned by [RunLineage] when the root's workflow or
+// function is not defined in this process, so it cannot start the lineage.
 var ErrUnknownRoot = errors.New("flow: unknown lineage root")
 
 type lineageResult struct {
@@ -195,8 +174,8 @@ type lineageResult struct {
 	err error
 }
 
-// lineagePlacer is the placer of the threads a lineage's replay forks: those
-// on the path are replayed, the last for real, and the rest are not run.
+// lineagePlacer is the placer of the threads a lineage's replay forks: those on
+// the path are replayed, the last for real, and the rest are not run.
 type lineagePlacer struct {
 	ctx   context.Context // RunLineage's: the target's, not an ancestor's
 	rs    *runState
@@ -204,12 +183,11 @@ type lineagePlacer struct {
 	inner Placer // where the target's own forks go
 	done  chan lineageResult
 
-	// changed is nudged whenever a thread on the path stops being in
-	// flight, for RunLineage to look again.
+	// changed is nudged whenever a path thread stops being in flight.
 	changed chan struct{}
 
 	mu       sync.Mutex
-	flying   int   // threads on the path forked and not yet done replaying
+	flying   int   // path threads forked and not yet done replaying
 	failed   error // what an ancestor's replay failed with, if one did
 	taken    bool
 	reported bool
@@ -217,8 +195,8 @@ type lineagePlacer struct {
 
 func (p *lineagePlacer) target() string { return p.path[len(p.path)-1] }
 
-// onPath reports whether a thread is an ancestor of the target, or the
-// target: one this process replays or runs.
+// onPath reports whether id is the target or one of its ancestors: one this
+// process replays or runs.
 func (p *lineagePlacer) onPath(id string) bool {
 	for _, want := range p.path[1:] {
 		if id == want {
@@ -228,10 +206,9 @@ func (p *lineagePlacer) onPath(id string) bool {
 	return false
 }
 
-// forked is told of every fork as it is recorded, before the placer sees it.
-// A fork of a thread on the path means that thread is coming — to be
-// replayed toward the target, or run as it — and a root whose replay ends
-// first has not outrun the history, only the goroutine.
+// forked is told of every fork before the placer sees it. A fork of a path
+// thread means it is coming, so a root whose replay ends first has not outrun
+// the history, only the goroutine.
 func (p *lineagePlacer) forked(th Thread, joined bool) {
 	if !p.onPath(th.ID) {
 		return
@@ -239,9 +216,9 @@ func (p *lineagePlacer) forked(th Thread, joined bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if joined {
-		// Its parent's history already holds its join: it is over, and so
-		// is everything under it, the target included. The histories this
-		// process would have run them from are gone.
+		// Its parent's history already holds its join: it, and everything under
+		// it including the target, is over. The histories to run them from are
+		// gone.
 		if th.ID == p.target() && !p.reported {
 			p.reported = true
 			p.done <- lineageResult{nil, fmt.Errorf("flow: thread %s has already finished: its parent's history holds its join", th.ID)}
@@ -251,7 +228,7 @@ func (p *lineagePlacer) forked(th Thread, joined bool) {
 	p.flying++
 }
 
-// landed is forked's other end: a thread on the path is done replaying.
+// landed is forked's other end: a path thread is done replaying.
 func (p *lineagePlacer) landed(err error) {
 	p.mu.Lock()
 	p.flying--
@@ -265,7 +242,7 @@ func (p *lineagePlacer) landed(err error) {
 	}
 }
 
-// inflight is how many threads on the path are forked and still replaying.
+// inflight is how many path threads are forked and still replaying.
 func (p *lineagePlacer) inflight() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -284,8 +261,7 @@ func (p *lineagePlacer) failure() error {
 
 func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Context) ([]byte, error)) ([]byte, error) {
 	if th.Parent == p.target() {
-		// The target's own fork, which is real work: it goes where the run
-		// sends its threads.
+		// The target's own fork: real work, sent where the run sends its threads.
 		if p.inner == nil {
 			return InProcess().Place(ctx, th, body)
 		}
@@ -298,12 +274,12 @@ func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Cont
 		}
 	}
 	if depth < 0 || depth+1 >= len(p.path) || th.ID != p.path[depth+1] {
-		// Forked by an ancestor, off the path: not this process's to run.
-		// Its join, if the ancestor got that far, is in the history.
+		// Forked by an ancestor, off the path: not this process's to run. Its
+		// join, if the ancestor got that far, is in the history.
 		return nil, errOffLineage
 	}
 	if th.ID != p.target() {
-		// An ancestor: replayed to the next fork, and no further.
+		// An ancestor: replayed to the next fork, no further.
 		r := &threadRunner{run: p.rs, name: th.Run, id: th.ID, fn: th.Fn, input: th.Input,
 			body: body, opts: p.rs.opts, readonly: true}
 		out, err := r.execute(ctx)
@@ -321,11 +297,10 @@ func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Cont
 	p.mu.Unlock()
 	defer p.landed(nil)
 
-	// The target, for real: on RunLineage's own context, since the ancestor
-	// that forked it is stopped once it is over. A panic in it is its
-	// result, as it would be in a thread run in-process — caught here
-	// rather than by the ancestor's fork, which would take it for the
-	// ancestor's own and leave RunLineage with nothing to report.
+	// The target, for real, on RunLineage's own context: the ancestor that
+	// forked it stops once it is over. Its panic is caught here as its result,
+	// not by the ancestor's fork, which would take it for the ancestor's own and
+	// leave RunLineage with nothing to report.
 	r := &threadRunner{run: p.rs, name: th.Run, id: th.ID, fn: th.Fn, input: th.Input,
 		body: body, opts: p.rs.opts, top: true}
 	out, err := func() (out []byte, err error) {
@@ -345,18 +320,18 @@ func (p *lineagePlacer) Place(ctx context.Context, th Thread, body func(ctx Cont
 	return out, err
 }
 
-// errOffLineage is what a replayed ancestor's fork of a thread not on the
-// path returns: nothing ran, and the join in the history says what it made.
+// errOffLineage is returned for an ancestor's fork of a thread off the path:
+// nothing runs here, and the join in the history says what it made.
 var errOffLineage = errors.New("flow: a thread off the lineage is not run here")
 
-// errExhausted is what a read-only replay meets at the end of its history:
-// the next thing its body does would be new, and a replay does nothing new.
+// errExhausted is what a read-only replay meets at the end of its history: the
+// next thing its body would do is new, and a replay does nothing new.
 var errExhausted = errors.New("flow: the history ends here; a read-only replay goes no further")
 
-// Share makes every channel of the run reachable from other processes, for
-// a placer about to send a thread of run code elsewhere: the thread may use
-// any of them. Channels made after this leave the run the ordinary way, in a
-// value that is encoded. No-op outside a run.
+// Share makes every channel of the run reachable from other processes, for a
+// placer about to send a thread of run code elsewhere: the thread may use any of
+// them. Channels made after this leave the run the ordinary way, encoded in a
+// value. No-op outside a run.
 func Share(ctx context.Context) error {
 	t := threadFrom(ctx)
 	if t == nil {

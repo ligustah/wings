@@ -19,13 +19,9 @@ import (
 	"github.com/ligustah/wings/internal/payload"
 )
 
-// dialWorker opens the coordinator's connection to one worker's broker.
-//
-// The one place that knows how, so the message limits are the same whichever
-// target put the worker there. gRPC's defaults are four megabytes in each
-// direction, which a result or a batch of channel chunks passes without
-// trying — and a message the transport will not carry does not fail cleanly, it
-// looks exactly like a dropped connection.
+// dialWorker opens the coordinator's connection to one worker's broker, raising
+// the gRPC message limit to maxMessage: an oversized message otherwise looks
+// like a dropped connection rather than failing cleanly.
 func dialWorker(addr string) (*dsremote.Client, error) {
 	return dsremote.Dial([]string{addr},
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -36,26 +32,16 @@ func dialWorker(addr string) (*dsremote.Client, error) {
 }
 
 const (
-	// remoteWorkDir is where the worker binary and its data live on a machine,
-	// relative to the SSH user's home directory.
-	//
-	// Relative on purpose. It used to be /opt/wings, which the SSH user cannot
-	// create on a stock image without sudo, and wings asks a [Machine] for a
-	// shell and a file copy, not for root. Home is the one directory every
-	// account can write, and both scp and the shell resolve a relative path
-	// against it.
+	// remoteWorkDir holds the worker binary and its data, relative to the SSH
+	// user's home — the one directory every account can write without sudo.
 	remoteWorkDir = "wings"
-	// remoteDialTimeout bounds waiting for a deployed worker's broker to answer
-	// through the tunnel.
+	// remoteDialTimeout bounds waiting for a deployed worker's broker to answer.
 	remoteDialTimeout = 90 * time.Second
 )
 
-// launchRemote provisions machines, deploys this program to each, and connects
-// to the broker every one of them starts.
-//
-// The binary is cross-compiled once and uploaded n times: the machines are
-// identical by construction, so compiling per machine would be the same work
-// repeated.
+// launchRemote provisions n machines, deploys this program to each, and connects
+// to the broker each starts. The binary is cross-compiled once and uploaded n
+// times.
 func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error) {
 	if c.cfg.Target.prov == nil {
 		return nil, errors.New("wings: Remote target has no Provisioner")
@@ -66,14 +52,8 @@ func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error
 		return nil, err
 	}
 
-	// Written down BEFORE anything is created. If the process dies between this
-	// and the machines existing, the record still names what was about to be
-	// made, and a later start can go and look for it. Recording after the fact
-	// would leave a window in which a billed machine exists that nothing knows
-	// about — and that is the window a crash finds.
-	//
-	// A failure to record refuses the launch outright, for the same reason: an
-	// unrecorded machine is one nothing will ever clean up.
+	// Recorded before creation, so a crash mid-provision still leaves a note
+	// naming the machine. A failure to record refuses the launch.
 	leases := make([]string, n)
 	for i := range leases {
 		leases[i] = newLease()
@@ -84,8 +64,7 @@ func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error
 
 	machines, err := c.cfg.Target.prov.Provision(ctx, leases)
 	if err != nil {
-		// The intents stay. Some of these machines may exist despite the error,
-		// and the record is the only thing that will find them.
+		// The intents stay: some machines may exist despite the error.
 		for _, lease := range leases {
 			_ = c.machines.write(context.WithoutCancel(ctx), machineRecord{
 				Kind: machineFailed, Lease: lease, Err: err.Error(),
@@ -123,9 +102,8 @@ func (c *Cluster) deployAll(ctx context.Context, machines []Machine, image *work
 	wg.Wait()
 
 	if err := errors.Join(errs...); err != nil {
-		// Release every machine, including the ones that came up fine — a
-		// cluster missing workers it was asked for is not the cluster the
-		// caller asked for, and the rest would bill on unattended.
+		// Release every machine, including the ones that came up fine, or they
+		// bill on unattended.
 		release := context.WithoutCancel(ctx)
 		for i, m := range machines {
 			if conns[i] != nil {
@@ -140,18 +118,9 @@ func (c *Cluster) deployAll(ctx context.Context, machines []Machine, image *work
 	return conns, nil
 }
 
-// reattach recovers the machines a previous coordinator left running.
-//
-// This is what the write-ahead record is for. Every lease that has not been
-// released is offered to the provisioner; what comes back is still out there
-// and still billing, and is either put back to work or destroyed. What does not
-// come back is gone, and the record is closed so no later start looks for it
-// again.
-//
-// A machine that comes back but whose worker has died is destroyed rather than
-// redeployed. Redeploying would be possible, but it would also mean a machine
-// in an unknown state — half a previous run's data, a worker that may be about
-// to come back — and a fresh one costs a boot.
+// reattach recovers the machines a previous coordinator left running: every
+// unreleased lease is offered to the provisioner, and what comes back is resumed
+// or destroyed. A machine whose worker has died is destroyed, not redeployed.
 func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 	if c.cfg.Target.kind != targetRemote || c.cfg.Target.prov == nil {
 		return nil, nil
@@ -166,9 +135,8 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 
 	re, ok := c.cfg.Target.prov.(Reattacher)
 	if !ok {
-		// Nothing can be recovered, and leaving the record open would mean
-		// trying again on every start forever. Say so loudly: those machines
-		// may still exist and still be billing.
+		// Nothing can be recovered; say so loudly, since those machines may still
+		// be billing, and close the record so it is not retried forever.
 		c.log.Error("wings: machines were left running by a previous run and this provider "+
 			"cannot reattach; they must be cleaned up by hand",
 			"leases", leases, "provider", fmt.Sprintf("%T", c.cfg.Target.prov))
@@ -190,8 +158,7 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 	for _, m := range found {
 		alive[m.ID()] = m
 	}
-	// A lease nothing came back for is gone. Closing the record is what stops
-	// every future start from hunting for a machine that no longer exists.
+	// A lease nothing came back for is gone; close its record.
 	for _, lease := range leases {
 		if _, ok := alive[lease]; !ok {
 			_ = c.machines.write(ctx, machineRecord{
@@ -203,9 +170,8 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 		return nil, nil
 	}
 
-	// All at once, as deployAll does: each is a tunnel and a dial, and a dial
-	// to a worker that is not answering is the whole of its timeout. One
-	// machine at a time made a restart with a few of those a wait of minutes.
+	// All at once: a dial to a worker that is not answering costs its whole
+	// timeout, and serially those add up to minutes.
 	conns := make([]*workerConn, len(found))
 	release := context.WithoutCancel(ctx)
 	var wg sync.WaitGroup
@@ -239,16 +205,12 @@ func (c *Cluster) reattach(ctx context.Context) ([]*workerConn, error) {
 }
 
 // reconnect opens a tunnel to a recovered machine and picks its worker back up.
-//
-// No upload and no start: the binary is already there and the process is still
-// running, because a worker is launched detached precisely so it outlives the
-// session that started it. All that is missing is the way back in.
+// The binary is already there and running detached, so this only re-establishes
+// access.
 func (c *Cluster) reconnect(ctx context.Context, m Machine) (*workerConn, error) {
-	// The worker kept the id it was started with, and its streams are named
-	// after it — so recovering the name is what recovers the queue. Asked
-	// FIRST: a machine with an intent but no recorded worker never finished
-	// starting one, and there is nothing on it to dial. It used to get a
-	// tunnel and the full dial timeout before being destroyed anyway.
+	// The worker's streams are named after its id, so recovering the name
+	// recovers the queue. Asked first: a machine with no recorded worker has
+	// nothing to dial.
 	id, err := c.workerIDFor(ctx, m.ID())
 	if err != nil {
 		return nil, err
@@ -304,9 +266,8 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 	env := map[string]string{
 		envMode:     modeWorker,
 		envWorkerID: id,
-		// Loopback only. The broker authenticates nobody, so the tunnel is what
-		// stands between it and the internet; binding 0.0.0.0 here would put an
-		// open one on a public IP.
+		// Loopback only: the broker authenticates nobody, so the tunnel is what
+		// keeps it off the internet.
 		envListen: fmt.Sprintf("127.0.0.1:%d", defaultRemotePort),
 		envDir:    path.Join(remoteWorkDir, "data"),
 	}
@@ -327,10 +288,7 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 		return nil, fmt.Errorf("wings: tunnel to %s: %w", m.ID(), err)
 	}
 
-	// The worker is still booting its broker behind the tunnel, so the first
-	// dials legitimately fail. We poll rather than read a ready line: stdout
-	// went to a log file on the machine when the process was detached, which is
-	// what lets it outlive the SSH session that started it.
+	// The broker is still booting, so the first dials fail; poll for it.
 	backend, err := dialUntilReady(ctx, local, m.ID())
 	if err != nil {
 		return nil, err
@@ -354,8 +312,7 @@ func dialUntilReady(ctx context.Context, addr, machineID string) (*dsremote.Clie
 	for {
 		backend, err := dialWorker(addr)
 		if err == nil {
-			// Dial may succeed against a tunnel whose far end is not serving
-			// yet, so ask a question only a live broker can answer.
+			// A dial can succeed before the broker serves, so ask it something.
 			if _, err = backend.ListStreams(deadline); err == nil {
 				return backend, nil
 			}
@@ -372,24 +329,16 @@ func dialUntilReady(ctx context.Context, addr, machineID string) (*dsremote.Clie
 	}
 }
 
-// workerImage is the worker to deploy, and where its bytes come from.
-//
-// Two sources, because there are two ways a coordinator can have a worker: one
-// compiled into it, which is already in memory, or one cross-compiled on the
-// spot, which go build wrote to a file. Neither is converted into the other —
-// the embedded one is never written to disk just to have a path, and the built
-// one is never slurped into memory just to have bytes.
+// workerImage is the worker to deploy: bytes embedded in the coordinator, or a
+// path to a cross-compiled binary.
 type workerImage struct {
 	blob []byte // embedded
 	path string // cross-compiled
 	size int64
 }
 
-// open returns a fresh reader over the image.
-//
-// Fresh per call, because machines are deployed to in parallel and each needs
-// its own position in the stream. Safe to call concurrently: the byte slice is
-// never written after it is set, and a file gets its own handle each time.
+// open returns a fresh reader over the image, safe to call concurrently for the
+// parallel deploys.
 func (w *workerImage) open() (io.ReadCloser, error) {
 	if w.blob != nil {
 		return io.NopCloser(bytes.NewReader(w.blob)), nil
@@ -401,14 +350,8 @@ func (w *workerImage) open() (io.ReadCloser, error) {
 	return f, nil
 }
 
-// workerImage produces the worker to deploy.
-//
-// A coordinator built by `wings build` carries its worker, so this is a
-// decompression into memory and the machine running it needs no Go toolchain
-// and no source — which is the point of that command. A coordinator built by
-// plain `go build` carries nothing, and cross-compiling one on the spot is the
-// fallback: it still works, it just requires the toolchain and the module
-// source to be present, and it says so.
+// workerImage produces the worker to deploy: the embedded one from `wings build`,
+// or a cross-compiled fallback that needs a Go toolchain and the module source.
 func (c *Cluster) workerImage(ctx context.Context) (*workerImage, error) {
 	blob, meta, err := payload.Get()
 	if err == nil {

@@ -12,36 +12,20 @@ import (
 	"github.com/ligustah/durable_streams/dswire"
 )
 
-// Everything an attempt writes on its worker — its history, its recordings,
-// its files — goes into one transaction, committed at the points that mean
-// something (see attempt.go). The coordinator's copy of it is made the same
-// way: one transaction at the source is one transaction at the destination,
-// applied whole or not at all, in the order they were committed. So what a
-// retry is handed is never a history a step ahead of the recording it names,
-// and never a file whose last chunk landed before the event that says it
-// was written.
-//
-// The engine does this. A worker's broker publishes its finished
-// transactions, with their records, off its transaction log; the
-// coordinator's engine PULLS them, subscribed per worker, and applies each
-// under its own producer with a durable cursor and a per-writer mark, so a
-// coordinator that restarts resumes where it left off and a transaction
-// delivered twice is applied once. The worker keeps a transaction until the
-// coordinator says it is durable here, and no longer.
-//
-// A worker's outbox for a shared channel is the one thing an attempt writes
-// OUTSIDE a transaction — it has to be seen at once, not at the next commit
-// point — and it comes home by the stream mirror in output.go, which is what
-// carried everything before the engine could carry transactions.
+// The coordinator copies what an attempt commits (its history, recordings, byte
+// streams) transaction by transaction, applied whole and in commit order, so a
+// retry is never handed a history ahead of the recording it names. The engine
+// does this: a worker's broker publishes finished transactions, the coordinator
+// pulls them per worker under a durable cursor, exactly once. A shared channel's
+// outbox is the exception — written outside a transaction, it comes by the
+// stream mirror (output.go).
 
-// pullSource names one worker's subscription at the coordinator. It keys the
-// cursor, so it is the worker's id: stable across a coordinator restart that
-// finds the worker again, and never two workers' at once.
+// pullSource keys a worker's subscription cursor; the worker id is stable across
+// a coordinator restart.
 func pullSource(workerID string) string { return "wings.worker." + workerID }
 
-// pull keeps the coordinator's copy of what one worker's attempts commit,
-// until the worker is gone. One loop per worker with a broker of its own; an
-// in-process worker shares the coordinator's engine and has nothing to copy.
+// pull keeps the coordinator's copy of what one worker's attempts commit, until
+// the worker is gone. In-process workers share the engine and have nothing to copy.
 func (c *Cluster) pull(w *workerConn) {
 	if w.remote == nil || c.engine == nil {
 		return
@@ -52,8 +36,7 @@ func (c *Cluster) pull(w *workerConn) {
 			Source:   pullSource(w.id),
 			Producer: "wings.pull." + w.id,
 			Open: func(ctx context.Context, from int64) (streams.TransactionSource, error) {
-				// Resolved on every open rather than once: the connection
-				// behind a remote client is the cluster's to replace.
+				// Resolved each open: the connection is the cluster's to replace.
 				broker := w.remote.Conn()
 				if broker == nil {
 					var err error
@@ -63,9 +46,8 @@ func (c *Cluster) pull(w *workerConn) {
 				}
 				return broker.SubscribeTransactions(ctx, "wings.coordinator", from)
 			},
-			// One incarnation per writer: an attempt's transactional id is
-			// its own, and a job moved is a new attempt under a new id, so
-			// no writer is ever superseded by another under the same name.
+			// One incarnation per writer: a moved job is a new attempt under a
+			// new id, so no writer is superseded under the same name.
 			Epoch:  func(string) (uint16, error) { return 1, nil },
 			Only:   c.pullWanted,
 			Stream: c.pulledStream,
@@ -74,16 +56,12 @@ func (c *Cluster) pull(w *workerConn) {
 			return
 		}
 		if errors.Is(err, streams.ErrIncompleteTransaction) {
-			// Fatal by the engine's design: a transaction it cannot copy
-			// whole is one it will not copy at all, and skipping it would
-			// leave a hole nothing downstream can detect. Said loudly, once,
-			// rather than every second.
+			// Fatal by design: a transaction that cannot be copied whole would
+			// leave an undetectable hole. Said once, not every second.
 			c.log.Error("wings: cannot keep a worker's transactions; a transaction cannot be copied whole",
 				"worker", w.id, "err", err)
 			return
 		}
-		// A connection dropped, a broker restarting: the cursor is durable,
-		// so resuming costs nothing but the look.
 		c.log.Debug("wings: stopped keeping a worker's transactions; resuming", "worker", w.id, "err", err)
 		select {
 		case <-w.ctx.Done():
@@ -93,16 +71,11 @@ func (c *Cluster) pull(w *workerConn) {
 	}
 }
 
-// pullWanted says whether a worker's transaction is one the coordinator
-// still wants: an attempt's, while the job is outstanding on that attempt.
-// What an attempt the job has moved on from committed late is not — the
-// move took what was home, and the next attempt runs from that — and nor
-// is what a settled job's attempt committed after the result. Declined
-// here rather than by the stream map, because the coordinator discards
-// such an attempt's streams on the worker, and a transaction whose records
-// are gone cannot be copied whole; the engine stops the whole loop over
-// one it wants and cannot copy, and rightly, but one nobody wants is not
-// a hole.
+// pullWanted declines only an attempt the job has already moved past — those
+// streams are discarded on the worker, so their transactions arrive with records
+// gone, which the engine cannot copy whole. The current attempt, and anything
+// not yet known or already settled, is wanted, since a job's last transaction is
+// pulled after it finishes.
 func (c *Cluster) pullWanted(workload string) bool {
 	rest, ok := strings.CutPrefix(workload, attemptWorkloadPrefix)
 	if !ok {
@@ -121,25 +94,15 @@ func (c *Cluster) pullWanted(workload string) bool {
 	defer c.mu.Unlock()
 	for id, p := range c.pending {
 		if streamPart(id) == part {
-			// Decline only an attempt the job has already moved PAST: those
-			// are the streams the coordinator discards, so those are the
-			// transactions that arrive with their records gone. The current
-			// attempt and any the coordinator has yet to hear of are wanted.
 			return attempt >= p.job.Attempt
 		}
 	}
-	// Not pending: settled, or not yet known here. Its outputs may still be
-	// on their way home — a job's last transaction is pulled after it
-	// finishes — so it is wanted. A truly abandoned attempt's incomplete
-	// transaction is the rare exception the pull loop still guards against;
-	// declining every settled job to catch it would lose the outputs of
-	// every job that finishes before its transaction is pulled.
 	return true
 }
 
-// pulledStream says where a record of a worker's transaction goes here: the
-// same name, for what a job wrote; nowhere, for what is not the job's output
-// or is a copy of the coordinator's own.
+// pulledStream says where a pulled record goes on the coordinator: the same name
+// for a job's output; nowhere for plumbing, a prior (put there by the
+// coordinator), a channel outbox, or a stream the job has finished with.
 func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 	name, _, ok := streams.SplitPartitionLogName(sourceLog)
 	if !ok {
@@ -147,31 +110,21 @@ func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 	}
 	o, ok := parseOutput(name)
 	if !ok {
-		// The worker's own plumbing, or a channel pushed onto it: nothing
-		// the coordinator wants a copy of.
 		return "", false
 	}
 	switch {
 	case o.Prefix == priorPrefix:
-		// Put there BY the coordinator, for a retry. Forwarding it back
-		// would be a copy of a copy.
 		return "", false
 	case o.Prefix == chanoutPrefix:
-		// Not written in a transaction, so never here; declined all the
-		// same, so that if it ever were it would still come the one way.
 		return "", false
 	case c.wasDropped(name):
-		// A stream this job has finished with: a late transaction of an
-		// abandoned attempt, arriving after the job settled.
 		return "", false
 	}
 	return name, true
 }
 
-// pulledLevel reports whether the coordinator's copies of a job's outputs on
-// a worker are as complete as the worker's own — every stream of every
-// attempt of the job, or of every job when job is empty. What the worker has
-// committed and the coordinator has not yet applied is the gap.
+// pulledLevel reports whether the coordinator's copies of a job's outputs (or
+// every job's, when job is empty) are as complete as the worker's own.
 func (c *Cluster) pulledLevel(ctx context.Context, w *workerConn, job string) (bool, error) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -204,8 +157,8 @@ func (c *Cluster) pulledLevel(ctx context.Context, w *workerConn, job string) (b
 	return true, nil
 }
 
-// committedThrough is the offset of the last committed record of a stream,
-// or -1 when the stream is empty or not there.
+// committedThrough is the offset of a stream's last committed record, or -1 when
+// it is empty or absent.
 func committedThrough(ctx context.Context, client *dsclient.Client, name string) (int64, error) {
 	ok, err := client.StreamExists(ctx, name)
 	if err != nil || !ok {

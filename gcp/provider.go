@@ -7,9 +7,8 @@ import (
 	"github.com/ligustah/wings"
 )
 
-// Importing this package registers the "gcp" provider, the way importing a
-// database driver registers it. That is what lets a program choose GCP with
-// `-target remote -provider gcp` while naming no cloud in its own code.
+// Importing this package registers the "gcp" provider, so a program can select
+// it with `-target remote -provider gcp` while naming no cloud in its own code.
 func init() { wings.RegisterProvider(&provider{}) }
 
 type provider struct {
@@ -25,8 +24,7 @@ type provider struct {
 
 func (p *provider) Name() string { return "gcp" }
 
-// Flags are registered on the command line with a "gcp." prefix, so these
-// become -gcp.project, -gcp.zone and so on.
+// Flags registers -gcp.project, -gcp.zone and the rest under a "gcp." prefix.
 func (p *provider) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&p.project, "project", "", "GCP project id (required for -provider gcp)")
 	fs.StringVar(&p.zone, "zone", "", "GCP zone, e.g. europe-west1-b (required for -provider gcp)")
@@ -40,8 +38,6 @@ func (p *provider) Flags(fs *flag.FlagSet) {
 }
 
 func (p *provider) New() (wings.Provisioner, error) {
-	// Named individually rather than as one "incomplete configuration": the
-	// whole value of this message is telling the user which flag to add.
 	switch {
 	case p.project == "" && p.zone == "":
 		return nil, errors.New("-gcp.project and -gcp.zone are required")

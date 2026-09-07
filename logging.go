@@ -5,17 +5,8 @@ import (
 	"log/slog"
 )
 
-// streamLogger is the logger handed to the durable-streams machinery.
-//
-// That layer logs producer initialisation and every transaction begin and
-// commit at INFO. For a stream store those are the interesting events; here
-// they are one line per batch of work about plumbing the caller was promised
-// they would never have to think about, and they bury wings' own messages. So
-// the substrate is filtered to warnings and above while the caller's own logger
-// keeps whatever level they set.
-//
-// Raise it deliberately when a worker is misbehaving — the transaction log is
-// exactly what you want then.
+// streamLogger filters the durable-streams substrate to warnings and above; its
+// INFO is a line per transaction, which buries wings' own logging.
 func streamLogger(base *slog.Logger) *slog.Logger {
 	return slog.New(&levelFilter{inner: base.Handler(), min: slog.LevelWarn})
 }

@@ -8,12 +8,9 @@ import (
 	"github.com/ligustah/durable_streams/dswire"
 )
 
-// Future is a thread that is running while the run does something else.
-//
-// Get one from [Context.Go] or [Context.Spawn]. It is not a promise you can
-// pass anywhere: it belongs to the thread that created it and must be awaited
-// by that thread, because the order of the forks and joins is part of what
-// makes the run replayable.
+// Future is a running thread, from [Context.Go] or [Context.Spawn]. It must be
+// awaited by the thread that created it: the order of forks and joins is part of
+// the run's replay.
 type Future[Out any] struct {
 	out  []byte
 	err  error
@@ -25,14 +22,6 @@ type Future[Out any] struct {
 	codec   dswire.Codec[Out]
 }
 
-// spawn forks a thread: the work behind [Context.Go] and [Context.Spawn].
-//
-// fn and input say what the thread runs when it runs a defined function,
-// and body is that function bound to that input — or, for a thread of run
-// code, the code. The fork is recorded on the parent with fn and input, so a
-// reader of the parent's history alone can start the thread; then the
-// thread goes to the placer, unless the parent's history already holds its
-// join, in which case it is over and its result is waiting there.
 func spawn[Out any](ctx Context, who, fn string, input []byte, codec dswire.Codec[Out], body func(ctx Context) ([]byte, error)) *Future[Out] {
 	fut := &Future[Out]{done: make(chan struct{}), codec: codec}
 
@@ -53,8 +42,8 @@ func spawn[Out any](ctx Context, who, fn string, input []byte, codec dswire.Code
 		return fut
 	}
 
-	// Joined on a previous attempt: the thread is over and its result is in
-	// the parent's history, where Await will find it. Nothing to run.
+	// Joined on a previous attempt: over, result already in the parent's
+	// history. Nothing to run.
 	joined := parent.joined(th.ID)
 	if parent.run.forked != nil {
 		parent.run.forked(th, joined)
@@ -77,16 +66,9 @@ func spawn[Out any](ctx Context, who, fn string, input []byte, codec dswire.Code
 	return fut
 }
 
-// Await blocks until the thread finishes and returns its result.
-//
-// Awaiting twice is a programming error rather than a second wait: the join is
-// recorded, and recording it twice would put an event in the history that the
-// next attempt does not produce.
-//
-// The error a thread ends with is on record, like a call's: a run that
-// returns it is not retried, since the thread was retried already and a
-// replay would find the same answer. Handle it in the body if the run can go
-// on without that thread.
+// Await blocks until the thread finishes and returns its result. Await it once.
+// The thread's error is on record like a call's: returning it does not retry the
+// run, so handle it in the body if the run can continue without the thread.
 func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	var zero Out
 
@@ -98,8 +80,8 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	}
 	f.awaited = true
 
-	// Given up on last time, by the caller's own timeout or cancel: given
-	// up on again, at once. The thread runs on regardless, as it did.
+	// Given up on last time by the caller's timeout or cancel: give up again at
+	// once. The thread runs on regardless.
 	if err, ok := f.parent.interrupted("join"); ok {
 		return zero, err
 	}
@@ -107,13 +89,11 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	select {
 	case <-f.done:
 	default:
-		// Not over yet: the thread waits, and is not running while it does.
 		resume := f.parent.park(ctx, WaitJoin)
 		select {
 		case <-f.done:
 		case <-ctx.Done():
-			// Going on without the thread, so going on as a running
-			// thread: the slot given up to wait is taken back first.
+			// Reclaim the slot given up to wait before continuing.
 			_ = resume(f.parent.base())
 			return zero, f.parent.interrupt("join", ctx.Err())
 		}
@@ -122,12 +102,8 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 		}
 	}
 
-	// Interrupted rather than finished: whatever was running the thread
-	// stopped, and recording that as its result would have the next attempt
-	// replay a failure that never happened. The fork stays without a join,
-	// which is what makes that attempt run the thread again. (A wait the
-	// caller's own context cut short returned above, and is on record as
-	// the caller's giving up, not as the thread's result.)
+	// A context-cancelled thread keeps its fork unjoined, so the next attempt
+	// reruns it rather than replaying a failure that never happened.
 	if f.err != nil && (ctx.Err() != nil || errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded)) {
 		return zero, f.err
 	}
@@ -138,9 +114,7 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 		return zero, err
 	}
 	if !replaying {
-		// Over, and its result is the parent's now. The thread's own history
-		// has nothing left to say; a drop that fails leaves it behind, which
-		// costs storage and nothing else.
+		// The result is the parent's now; drop the thread's own history.
 		_ = f.parent.run.store.Drop(context.WithoutCancel(ctx), f.thread.Run, f.thread.ID)
 	}
 	if callErr != nil {
@@ -153,8 +127,6 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	return v, nil
 }
 
-// describe names the thread in an error: by its function when it runs one,
-// which is what the reader will recognise.
 func (th Thread) describe() string {
 	if th.Fn != "" {
 		return th.Fn

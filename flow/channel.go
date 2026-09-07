@@ -12,33 +12,22 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// Channel carries typed values between the threads of one run.
+// Channel carries typed values between the threads of one run, like a Go
+// channel. A receive is recorded — which send it took — so a replay waits for
+// that same value rather than whatever the scheduler offers first; a send
+// records only when it completed.
 //
-// It is what a Go channel is for, with one difference that matters: a run
-// can be replayed, and a Go channel cannot promise that the same value arrives
-// first twice. So a receive is RECORDED — which thread's which send it took —
-// and on a later attempt it waits for exactly that item rather than for
-// whatever the scheduler offers. A send is not recorded that way, because a
-// thread's nth send on a channel always carries the same value; what is
-// recorded about a send is when it COMPLETED, which on an unbuffered channel is
-// somebody else's decision.
-//
-// Create one with [Context.NewChannel] or [Context.NewBufferedChannel], inside a Run, at a
-// point every attempt reaches — the same rule as everything else in a run's
-// body. Pass it to threads forked by [Context.Go] or [Context.Map]
-// the way you would pass a Go channel to a goroutine; it is safe to use from all
-// of them at once.
-//
-// Not usable outside a Run. There is no history there to record a receive
-// in, and a channel whose receives are not recorded is exactly the
-// non-determinism this type exists to remove.
+// Create one with [Context.NewChannel] or [Context.NewBufferedChannel] inside a
+// Run, at a point every attempt reaches, and pass it to threads forked by
+// [Context.Go] or [Context.Map]. Safe to use from all of them at once. Not
+// usable outside a Run.
 type Channel[T any] struct {
 	name  string
 	run   *runState
 	codec dswire.Codec[T]
 
-	// id is set on a handle that arrived from another run, capacity is what
-	// the handle said, and mu guards binding it to this run on first use.
+	// id and capacity are set on a handle that arrived from another run; mu
+	// guards binding it to this run on first use.
 	id       string
 	capacity int
 	mu       sync.Mutex
@@ -62,21 +51,17 @@ func (c Context) NewBufferedChannel[T any](capacity int) *Channel[T] {
 func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	t := threadFrom(ctx)
 	if t == nil {
-		// Deliberately a channel that fails on use rather than a nil one: the
-		// mistake is worth an error at the point it is made, and returning nil
-		// would turn it into a panic somewhere else.
+		// A channel that errors on use, not a nil deref somewhere else.
 		return &Channel[T]{}
 	}
 	name := t.newChannelName()
 	t.run.declareChannel(name, capacity)
 	if t.run.fragment {
-		// The rest of the run is elsewhere, and any thread of it may use
-		// this. Linked, and nothing announced: there is nothing on it yet,
-		// and if this is a replay the live run announced then.
+		// Fragment run: any thread of it may use this, so link now; a replay's
+		// live run already announced what was on it.
 		if _, err := t.run.export(ctx, name, true); err != nil {
-			// Reported on first use rather than here, where there is no
-			// error to return: a channel that cannot be shared is one this
-			// process cannot use.
+			// A channel that cannot be shared is unusable here; report on first
+			// use, where an error can be returned.
 			t.run.mu.Lock()
 			delete(t.run.channels, name)
 			t.run.mu.Unlock()
@@ -89,13 +74,10 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	}
 }
 
-// Name is the channel's identity in the history, derived from the thread that
-// created it and how many it had created before. Exported for diagnostics.
+// Name is the channel's identity in its run's history, for diagnostics.
 func (c *Channel[T]) Name() string { return c.name }
 
-// sharedID is the channel's name to other runs: the id it came with, for a
-// handle from another run, and otherwise the run's name and its own. Call
-// after bind, which is what sets c.run.
+// sharedID is the channel's id to other runs. Valid after bind sets c.run.
 func (c *Channel[T]) sharedID() string {
 	if c.id != "" {
 		return c.id
@@ -103,18 +85,16 @@ func (c *Channel[T]) sharedID() string {
 	return c.run.channelID(c.name)
 }
 
-// channelHandle is how a channel appears in a call's input or output. The
-// capacity travels with it, since a sender in another run has to know how
-// much room there is.
+// channelHandle is how a channel travels in encoded input or output; the
+// capacity goes with it so a sender in another run knows the room.
 type channelHandle struct {
 	Channel  string `json:"channel"`
 	Capacity int    `json:"capacity,omitempty"`
 }
 
-// MarshalJSON is what lets a channel leave its run: in a call's input, in a
-// value sent on another channel, in a result. Marshalling SHARES it — the
-// run's host is told, and what was sent so far and not taken goes with it —
-// which needs the run to have a [ChannelHost]. See [WithChannelHost].
+// MarshalJSON shares the channel so it can travel in a call's input, a result,
+// or a value sent on another channel: the run's host is told and untaken sends
+// go with it, so the run needs a [ChannelHost]. See [WithChannelHost].
 func (c *Channel[T]) MarshalJSON() ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -135,8 +115,8 @@ func (c *Channel[T]) MarshalJSON() ([]byte, error) {
 	return json.Marshal(channelHandle{Channel: id, Capacity: capacity})
 }
 
-// UnmarshalJSON receives a channel another run shared. It is bound to this
-// run on first use, which needs this run to have a [ChannelHost] too.
+// UnmarshalJSON receives a channel another run shared; it binds to this run on
+// first use, which also needs a [ChannelHost].
 func (c *Channel[T]) UnmarshalJSON(b []byte) error {
 	var h channelHandle
 	if err := json.Unmarshal(b, &h); err != nil {
@@ -152,24 +132,14 @@ func (c *Channel[T]) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// ErrChannelClosed is what [Channel.Send] returns on a channel that was
-// closed before the send: nothing was sent. A send under way when the
-// channel closes is not refused — what it offered is there to be drained,
-// like anything else queued — and a receiver drains a closed channel before
-// finding it closed.
+// ErrChannelClosed is returned by [Channel.Send] on a channel closed before the
+// send: nothing is sent, and it is returned again on replay.
 var ErrChannelClosed = errors.New("flow: send on a closed channel")
 
-// Send puts a value on the channel.
-//
-// It blocks until the value is taken, or until the buffer has room. A send that
-// completed on a previous attempt returns as soon as the value is queued: it is
-// already known to have got through, and making a replay wait again for
-// something that already happened is how a resumed run deadlocks.
-//
-// On a channel already closed it sends nothing and returns
-// [ErrChannelClosed] — rather than panicking, as a Go send would, since a
-// closed channel is a fact of the run's state that a thread elsewhere may
-// have made — and returns it again on replay.
+// Send puts a value on the channel, blocking until it is taken or the buffer
+// has room. A send that completed on a previous attempt returns as soon as the
+// value is queued. On a closed channel it sends nothing and returns
+// [ErrChannelClosed] rather than panicking.
 func (c *Channel[T]) Send(ctx Context, v T) error {
 	t, cs, err := c.bind(ctx)
 	if err != nil {
@@ -183,18 +153,16 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 
 	seq := t.nextSend(c.name)
 
-	// Given up on last time, by the sender's own timeout or cancel, with the
-	// value queued: queued again, for a receiver of this attempt, and given
-	// up on again.
+	// Given up on before, with the value queued: queue it again for a receiver
+	// of this attempt and give up again.
 	if ierr, ok := t.interrupted("send"); ok {
 		if _, err := cs.put(ctx, t.qualified(), seq, data, true); err != nil {
 			return err
 		}
 		return ierr
 	}
-	// Consumed before waiting, not after. The event says the send completed,
-	// and a replay that waited first would be waiting for a receive that has
-	// already been replayed away.
+	// Consume the event before waiting: a replay that waited first would wait
+	// for a receive already replayed away.
 	ev, err := t.expect[*protos.ChannelSendEvent]()
 	if err != nil {
 		return err
@@ -214,13 +182,10 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		}
 		return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 	}
-	// A replayed send is announced to other runs AGAIN. Nearly always they
-	// have it, and the host drops the copy by its identity; but the record
-	// of a send is made where the sender is, and the copy of it that other
-	// runs see is carried separately, so an attempt that ended between the
-	// two — the machine died, or the attempt was moved on — has a history
-	// that says it sent what nobody ever received. The replay is what
-	// puts that right, and only if it announces.
+	// A replayed send announces to other runs again: the record is made where
+	// the sender is, but the copy other runs see travels separately, so an
+	// attempt that died between the two left a send nobody received. Only the
+	// replay's announce repairs it; duplicates are dropped by identity.
 	item, err := cs.put(ctx, t.qualified(), seq, data, true)
 	if err != nil {
 		return err
@@ -243,11 +208,9 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 	return t.err()
 }
 
-// Recv takes the next value off the channel.
-//
-// The second result is false when the channel is closed and everything sent has
-// been taken, exactly as a Go receive reports it. It blocks until there is
-// something to take or the channel is closed.
+// Recv takes the next value off the channel. It blocks until there is something
+// to take or the channel is closed; the second result is false when the channel
+// is closed and drained, as a Go receive reports it.
 func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	var zero T
 
@@ -256,9 +219,8 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return zero, false, err
 	}
 
-	// Counted before the history is consulted, like a send: the number is
-	// the receive's name to the host, and has to come out the same on a
-	// replay.
+	// Counted before consulting the history, like a send: the number names the
+	// receive to the host and must come out the same on a replay.
 	recvSeq := t.nextRecv(c.name)
 
 	if err, ok := t.interrupted("recv"); ok {
@@ -277,14 +239,10 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		if ev.GetClosed() {
 			return zero, false, t.err()
 		}
-		// The one place replay differs from a live run: the value is the one
-		// the history says was taken, not the first one going. Two sends
-		// racing produced one order last time and would produce another
-		// now, and the run already acted on the first. The item itself is
-		// claimed rather than waited for — the thread that sent it may have
-		// been joined since, and a joined thread does not run again — so a
-		// copy of it that does turn up, from a sender replaying, is taken
-		// on arrival and not offered to a later receive.
+		// Replay takes the value the history names, not the first going: races
+		// ordered one way last time and the run acted on that. Claimed rather
+		// than waited for, since its sender may since have been joined; a copy
+		// that turns up from a replaying sender is taken on arrival.
 		cs.claim(ev.GetFromThreadId(), ev.GetFromSeq())
 		v, err := dswire.DecodeRecord(c.codec, ev.GetValue().GetSerialized())
 		if err != nil {
@@ -326,11 +284,8 @@ func (c *Channel[T]) decode(item *chanItem) (T, error) {
 	return v, nil
 }
 
-// Close says nothing more will be sent.
-//
-// Receives drain what is already there and then report the channel closed.
-// Recorded like a send, and ordered against the closing thread's other sends,
-// because a receiver observes it exactly as it observes them.
+// Close says nothing more will be sent. Receives drain what is queued and then
+// report the channel closed. Recorded and ordered like a send.
 func (c *Channel[T]) Close(ctx Context) error {
 	t, cs, err := c.bind(ctx)
 	if err != nil {
@@ -381,8 +336,8 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 		return nil, nil, fmt.Errorf("flow: channel %s was used outside a run's thread", c.name)
 	}
 	if c.run == nil {
-		// A handle from another run, used here for the first time: reach
-		// the channel through the host and keep it under its id.
+		// A handle from another run, first used here: attach through the host
+		// and keep it under its id.
 		cs, err := t.run.attach(ctx, c.id, c.capacity)
 		if err != nil {
 			return nil, nil, err
@@ -411,16 +366,14 @@ type chanItem struct {
 	data []byte
 
 	taken bool
-	// buffered means this item completed its send on arrival, because the
-	// channel had room for it.
+	// buffered means the send completed on arrival, because the channel had
+	// room for it.
 	buffered bool
 }
 
-// chanState is one channel's runtime, shared by every thread using it.
-//
-// Its own lock rather than the run's: the run's lock guards the event log, and
-// a thread blocked on a receive would hold it for as long as it waited, which
-// would stop every other thread from recording anything.
+// chanState is one channel's runtime, shared by every thread using it. Its own
+// lock, not the run's: a thread blocked on a receive must not hold the lock that
+// guards the event log.
 type chanState struct {
 	capacity int
 
@@ -428,15 +381,12 @@ type chanState struct {
 	items   []*chanItem
 	closed  bool
 	changed chan struct{}
-	// claimed names items a replayed receive has taken before they were
-	// queued, so that they are taken on arrival.
+	// claimed names items a replayed receive took before they were queued, so
+	// they are taken on arrival.
 	claimed map[string]bool
-	// link is set once the channel is shared with other runs. From then on
-	// the host says who takes what: a receive is a want sent on the link,
-	// and what it takes is the item the host's grant names. asked is the
-	// wants this attempt has sent, by want key, and grants what the host
-	// has granted to whom — want key to item key — as it arrives on the
-	// link, along with what other runs send.
+	// link is set once the channel is shared with other runs. From then the
+	// host decides who takes what: asked is the wants this attempt has sent,
+	// and grants maps a want key to the item key the host gave it.
 	link   ChannelLink
 	asked  map[string]bool
 	grants map[string]string
@@ -452,14 +402,13 @@ func (cs *chanState) broadcast() {
 	cs.changed = make(chan struct{})
 }
 
-// put queues a value and reports the item it queued. On a shared channel a
-// new item is announced to the host first, when announce says so.
+// put queues a value and reports the item it queued. On a shared channel a new
+// item is announced to the host first, when announce says so.
 func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []byte, announce bool) (*chanItem, error) {
 	cs.mu.Lock()
-	// An item already queued under this identity was sent by a previous attempt
-	// of the same thread and is being sent again by the replay of it — or
-	// came back from the host as the copy of one sent here. Reuse it, or a
-	// receive naming that identity would find two.
+	// Already queued under this identity by a previous attempt's send now
+	// replaying, or returned from the host as the copy of one sent here: reuse
+	// it, or a receive naming that identity would find two.
 	if it := cs.find(from, seq); it != nil {
 		cs.mu.Unlock()
 		return it, nil
@@ -478,11 +427,9 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	if it := cs.find(from, seq); it != nil {
 		return it, nil
 	}
-	// Complete on arrival if there is room. On a shared channel the count is
-	// what this run has been told, which is the truth a moment ago: two
-	// senders on two machines can each see the last place free and both
-	// take it, and the channel is briefly one over. Bounded, and rare, and
-	// the alternative is a round trip per send.
+	// Room is what this run has been told, true a moment ago: two senders on
+	// two machines can each take the last place, and the channel is briefly one
+	// over. Bounded and rare, and the alternative is a round trip per send.
 	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.roomFor(nil)}
 	if cs.claimed[itemKey(from, seq)] {
 		delete(cs.claimed, itemKey(from, seq))
@@ -513,10 +460,9 @@ func (cs *chanState) claim(from string, seq uint64) {
 	cs.claimed[itemKey(from, seq)] = true
 }
 
-// grant records the host's grant of one item to one want: the item is taken,
-// by whichever receiver the want names, and a receive here waiting on that
-// want finds its item. The item precedes its grant on the channel's record,
-// so it is always here to be found.
+// grant records the host giving one item to one want: the item is marked taken,
+// and a receive here waiting on that want finds it. The item precedes its grant
+// on the record, so it is always here to be found.
 func (cs *chanState) grant(g ChannelItem) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -569,12 +515,10 @@ func (cs *chanState) shut() {
 	}
 }
 
-// awaitTaken blocks until a sent item has been received, or returns at once if
-// the channel had room for it. The thread is parked while it waits.
-//
-// Room can open while it waits — a receive takes something ahead of the
-// item — and then the item is in the buffer, as it would be in Go's, and the
-// send is complete.
+// awaitTaken blocks until a sent item is received, returning at once if the
+// channel had room for it. Room can open while it waits — a receive takes
+// something ahead of it — and then the item is buffered and the send complete.
+// The thread is parked while it waits.
 func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, item *chanItem) error {
 	parked := false
 	resume := noResume
@@ -602,16 +546,11 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 	}
 }
 
-// awaitAny blocks until something can be taken, and returns nil when the
-// channel is closed and drained. The thread is parked while it waits.
-//
-// On a channel of this run's own, the first untaken item is taken here. On
-// a shared channel the host takes it on this receive's behalf: the receive
-// is sent to the host as a want, named by the thread and its receive number,
-// and what it gets is the item the host's grant names — or nothing, once
-// the channel is closed and every item has gone to someone. A channel can
-// become shared while a receive waits on it, and the receive carries on
-// under the new rule.
+// awaitAny blocks until something can be taken, and returns nil when the channel
+// is closed and drained. On the run's own channel it takes the first untaken
+// item; on a shared channel the receive is sent to the host as a want and it
+// takes the item the host's grant names. A channel can become shared while a
+// receive waits, and the receive carries on. The thread is parked while it waits.
 func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, recvSeq uint64) (*chanItem, error) {
 	parked := false
 	resume := noResume
@@ -669,9 +608,9 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 }
 
 // roomFor reports whether the buffer has a place for item, or for a new item
-// when item is nil: what is in the buffer untaken, plus the senders ahead of
-// it still waiting for a place, come to fewer than the capacity. Senders
-// ahead count because they are owed a place first. Call with mu held.
+// when item is nil: untaken items plus the senders ahead of it still waiting
+// come to fewer than the capacity. Senders ahead count because they are owed a
+// place first. Call with mu held.
 func (cs *chanState) roomFor(item *chanItem) bool {
 	used := 0
 	for _, it := range cs.items {

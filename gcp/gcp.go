@@ -39,14 +39,9 @@ type Config struct {
 	DiskSizeGB int64
 	// Network defaults to "global/networks/default".
 	Network string
-	// Preemptible requests Spot instances — much cheaper, and they can be
-	// reclaimed mid-job. wings redispatches what a lost worker owed, so this is
-	// a real option rather than a trap, but only if your work is idempotent.
-	//
-	// A preempted instance deletes itself rather than stopping, since wings
-	// never restarts one, and the coordinator asks the API whether a worker
-	// that stopped answering still exists, so a preemption costs seconds
-	// rather than the whole reconnect window.
+	// Preemptible requests Spot instances — much cheaper, reclaimable mid-job.
+	// wings redispatches a lost worker's work, so this is safe for idempotent
+	// work. A preempted instance deletes itself rather than stopping.
 	Preemptible bool
 
 	// NamePrefix prefixes generated instance names. Defaults to "wings".
@@ -73,14 +68,13 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// GCP returns a [Provisioner] that creates Compute Engine instances.
+// New returns a [wings.Provisioner] that creates Compute Engine instances.
+// Instances are deleted by [wings.Cluster.Stop], and billed until then.
 //
 //	wings.Start(ctx, wings.Config{
 //		Target:  wings.Remote(gcp.New(gcp.Config{Project: "p", Zone: "europe-west1-b"})),
 //		Workers: 4,
 //	})
-//
-// Instances are deleted by [Cluster.Stop]. They are billed until then.
 func New(cfg Config) wings.Provisioner { return &gcpProvisioner{cfg: cfg.withDefaults()} }
 
 func (c Config) withDefaults() Config {
@@ -120,16 +114,16 @@ type gcpProvisioner struct {
 	// provisioner that scaled up ten times held ten clients' worth of
 	// connections. A provisioner lives as long as its cluster, and so does
 	// this.
+	// One Compute client for the provisioner's life, made on first use.
 	once      sync.Once
 	client    *compute.InstancesClient
 	clientErr error
 }
 
-// instances is the Compute API client, made once.
+// instances returns the Compute API client, made once.
 func (p *gcpProvisioner) instances(ctx context.Context) (*compute.InstancesClient, error) {
 	p.once.Do(func() {
-		// Detached from the first caller's context: the client outlives the
-		// call that happened to make it.
+		// Detached from the caller's context: the client outlives the call.
 		p.client, p.clientErr = compute.NewInstancesRESTClient(context.WithoutCancel(ctx), p.cfg.ClientOptions...)
 		if p.clientErr != nil {
 			p.clientErr = fmt.Errorf("wings: compute client: %w", p.clientErr)
@@ -138,11 +132,8 @@ func (p *gcpProvisioner) instances(ctx context.Context) (*compute.InstancesClien
 	return p.client, p.clientErr
 }
 
-// Provision creates n instances in parallel and returns once each accepts SSH.
-//
-// In parallel because these are minutes, not milliseconds: eight machines
-// created in sequence is eight boot times, and the whole point of asking for
-// eight is not to wait for them one after another.
+// Provision creates one instance per lease in parallel and returns once each
+// accepts SSH.
 func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wings.Machine, error) {
 	if p.cfg.Project == "" || p.cfg.Zone == "" {
 		return nil, fmt.Errorf("gcp: Config needs both Project and Zone")
@@ -170,9 +161,8 @@ func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wing
 	}
 	wg.Wait()
 
-	// Any failure means none of them: a half-provisioned cluster that still
-	// returned would leave the rest running and billing with nothing tracking
-	// them.
+	// Any failure means none of them: a half-provisioned batch would leave
+	// instances running and billing untracked.
 	var failed error
 	for _, err := range errs {
 		if err != nil {
@@ -191,29 +181,15 @@ func (p *gcpProvisioner) Provision(ctx context.Context, leases []string) ([]wing
 	return machines, nil
 }
 
-// instanceName is how a lease becomes a name GCE will accept.
-//
-// Deterministic, because it is also how a lease is found again: reattachment
-// looks up exactly this name, so the mapping has to be a function and not a
-// choice made once and remembered.
+// instanceName maps a lease to its GCE instance name, deterministically so
+// reattachment can find it again.
 func (p *gcpProvisioner) instanceName(lease string) string {
 	return p.cfg.NamePrefix + "-" + lease
 }
 
-// Reattach finds instances a previous coordinator created and lets this one
-// back in.
-//
-// The awkward part is the credential. wings mints an ephemeral SSH key per run
-// and never writes it down — deliberately, so nothing it creates outlives the
-// cluster — which means the key that opened these machines died with the
-// process that made them. So this installs a NEW public key on each instance
-// through the metadata API and connects with that.
-//
-// The alternative was to persist the private key to disk so a later run could
-// reuse it, and it is worth being clear about why not: that turns a
-// memory-only credential into a file, on the coordinator, for the lifetime of
-// the data directory. Pushing a fresh key costs a metadata write and the
-// seconds the guest agent takes to apply it, and keeps the promise.
+// Reattach finds instances a previous coordinator created and lets this one back
+// in. The per-run SSH key died with that coordinator, so it installs a fresh
+// public key on each instance through the metadata API and connects with that.
 func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings.Machine, error) {
 	if p.cfg.Project == "" || p.cfg.Zone == "" {
 		return nil, fmt.Errorf("gcp: Config needs both Project and Zone")
@@ -235,8 +211,7 @@ func (p *gcpProvisioner) Reattach(ctx context.Context, leases []string) ([]wings
 		wg.Go(func() {
 			m, err := p.reattachOne(ctx, client, lease, signer, authorizedKey)
 			if err != nil {
-				// Not fatal, and not even unusual: a lease whose machine was
-				// preempted or never created is exactly what this is for.
+				// Expected: a lease whose machine was preempted or never created.
 				p.cfg.Logger.Info("wings: machine not recovered", "lease", lease, "err", err)
 				return
 			}
@@ -273,12 +248,8 @@ func (p *gcpProvisioner) reattachOne(
 		return nil, fmt.Errorf("not found: %w", err)
 	}
 	if status := got.GetStatus(); status != "RUNNING" {
-		// It exists and is not serving: a Spot instance that was preempted
-		// and stopped, one somebody stopped by hand, one still booting when
-		// the previous coordinator died. None will be resumed — wings never
-		// restarts a machine — and reporting it as not recovered would close
-		// the lease and leave a stopped instance billing for its disk. So it
-		// is deleted here, where it was found.
+		// Not serving and never resumed; delete it so a stopped instance does
+		// not bill for its disk after the lease closes.
 		log.Info("wings: deleting an instance that is not running", "status", status)
 		if op, err := client.Delete(ctx, &computepb.DeleteInstanceRequest{
 			Project: p.cfg.Project, Zone: p.cfg.Zone, Instance: name,
@@ -294,12 +265,10 @@ func (p *gcpProvisioner) reattachOne(
 		return nil, fmt.Errorf("instance has no external IP")
 	}
 
-	// created is TRUE although this run did not make it: we are taking
-	// responsibility for it, and Close must delete it like any other.
+	// created: true so Close deletes this recovered instance like any other.
 	m := &gcpMachine{name: name, lease: lease, ip: ip, cfg: p.cfg, client: client, log: log, created: true}
 
-	// The fingerprint is GCE's optimistic-concurrency token: a write carrying a
-	// stale one is refused rather than clobbering somebody else's change.
+	// The fingerprint is GCE's optimistic-concurrency token for the metadata write.
 	meta := got.GetMetadata()
 	items := []*computepb.Items{{
 		Key:   new("ssh-keys"),
@@ -325,9 +294,6 @@ func (p *gcpProvisioner) reattachOne(
 		return nil, fmt.Errorf("install key: %w", err)
 	}
 
-	// Dial retries, which it has to here: the guest agent applies the new key
-	// on its own schedule, so the first several attempts failing is the normal
-	// path rather than a problem.
 	dialCtx, cancel := context.WithTimeout(ctx, p.cfg.BootTimeout)
 	defer cancel()
 
@@ -374,11 +340,8 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 					Key:   new("ssh-keys"),
 					Value: new(fmt.Sprintf("%s:%s", p.cfg.User, authorizedKey)),
 				},
-				// The key above is installed by the guest agent from
-				// metadata, and OS Login — which a project may enforce by
-				// default — ignores metadata keys entirely. Said explicitly
-				// on the instance, so the run does not depend on a project
-				// setting nobody remembers.
+				// OS Login ignores metadata SSH keys; disable it so the key
+				// above is honored regardless of the project default.
 				{
 					Key:   new("enable-oslogin"),
 					Value: new("FALSE"),
@@ -391,10 +354,8 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 		inst.Scheduling = &computepb.Scheduling{
 			ProvisioningModel: new("SPOT"),
 			Preemptible:       new(true),
-			// Delete on preemption rather than stop. A stopped instance keeps
-			// its disk and bills for it, and wings never restarts one: a
-			// preempted worker is a lost worker, its jobs are moved, and the
-			// scaler replaces the machine with a fresh one.
+			// Delete on preemption, not stop: wings never restarts one, and a
+			// stopped instance still bills for its disk.
 			InstanceTerminationAction: new("DELETE"),
 		}
 	}
@@ -409,8 +370,7 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 		return nil, fmt.Errorf("wings: create instance %s: %w", name, err)
 	}
 
-	// From here on the instance may exist even if we fail, so every exit deletes
-	// it rather than leaking a billed VM.
+	// The instance may now exist even if we fail, so every exit deletes it.
 	m := &gcpMachine{
 		name:    name,
 		lease:   lease,
@@ -487,9 +447,8 @@ type gcpMachine struct {
 	err  error
 }
 
-// ID is the lease, not the instance name: it is what the coordinator wrote down
-// before this machine existed, and matching a recovered machine back to that
-// record is what makes recovery possible. The instance name is in the logs.
+// ID is the lease the coordinator recorded before the machine existed, which is
+// what makes recovery possible.
 func (m *gcpMachine) ID() string { return m.lease }
 
 func (m *gcpMachine) Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error {
@@ -498,9 +457,8 @@ func (m *gcpMachine) Upload(ctx context.Context, src io.Reader, size int64, remo
 
 func (m *gcpMachine) Start(ctx context.Context, cmd string, env map[string]string) error {
 	if m.cfg.Preemptible {
-		// The metadata server says, thirty seconds ahead, that this instance
-		// is being taken back; wait_for_change makes the request block until
-		// it does. The worker hands its work over in that time.
+		// The worker polls this URL for the ~30s preemption notice and hands
+		// its work over in that window.
 		withNotice := make(map[string]string, len(env)+1)
 		maps.Copy(withNotice, env)
 		withNotice[wings.PreemptionURLEnv] = preemptionURL
@@ -509,19 +467,15 @@ func (m *gcpMachine) Start(ctx context.Context, cmd string, env map[string]strin
 	return m.ssh.Start(ctx, cmd, env, "/tmp/wings-worker.log")
 }
 
-// preemptionURL is where a Compute Engine instance learns it is about to be
-// preempted.
+// preemptionURL blocks until the instance is flagged for preemption.
 const preemptionURL = "http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true"
 
 func (m *gcpMachine) Forward(ctx context.Context, remotePort int) (string, error) {
 	return m.ssh.Forward(ctx, remotePort)
 }
 
-// Alive asks the API whether the instance still exists and is running.
-//
-// This is what lets a preempted Spot worker be given up on in seconds rather
-// than at the end of the reconnect window: the connection to it dropped, and
-// the cloud can say outright that nothing is coming back.
+// Alive asks the API whether the instance still exists and is running, so a
+// preempted worker is given up on in seconds rather than at the reconnect timeout.
 func (m *gcpMachine) Alive(ctx context.Context) (bool, error) {
 	got, err := m.client.Get(ctx, &computepb.GetInstanceRequest{
 		Project:  m.cfg.Project,
@@ -574,11 +528,8 @@ func (m *gcpMachine) Close(ctx context.Context) error {
 	return m.err
 }
 
-// ephemeralKey mints a keypair for this run only.
-//
-// Per-run rather than reusing the operator's key: nothing wings creates outlives
-// the cluster, so its credential should not either, and it means running wings
-// never requires handing it a private key you use for anything else.
+// ephemeralKey mints a keypair for this run only, so wings never needs a
+// long-lived private key and its credential dies with the cluster.
 func ephemeralKey() (ssh.Signer, string, error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

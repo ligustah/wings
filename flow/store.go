@@ -13,28 +13,15 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// Sink is where one thread's events are written down.
-//
-// One method, because a thread's history is append-only and nothing in the
-// engine ever rewrites it. That is the shape this design gained by moving off
-// a relational store: the engine it comes from rewrote the whole run on every
-// event — cloning the run, all its threads and all their events, per call —
-// which is quadratic in the length of a run. Appending one record is not.
+// Sink is where one thread's events are written down. Append-only.
 type Sink interface {
 	Append(ctx context.Context, ev *protos.Event) error
 }
 
-// Store is where histories live, one per thread of a run: it hands out a
-// Sink to write a thread's events, reads them back so the thread can resume
-// where it stopped, and drops them once the thread is over.
-//
-// Per THREAD rather than per run because the thread is the unit that moves.
-// A run's main thread is one stream; each thread it forks is another, which
-// can be written on whichever machine runs that thread and read back on
-// whichever runs it next, without touching the rest of the run. A thread's
-// history is the business of the process running it — nothing else reads it
-// and nothing connects to it — so a Store is expected to be local and
-// broker-less.
+// Store is where histories live, one per thread of a run: it hands out a Sink to
+// write a thread's events, reads them back so the thread can resume, and drops
+// them once the thread is over. Per thread because the thread is the unit that
+// moves; a Store is expected to be local and broker-less.
 type Store interface {
 	// Sink returns the destination for one thread's events. Resolved once
 	// per attempt of the thread rather than per event.
@@ -44,28 +31,22 @@ type Store interface {
 	// thread that has never started yields no events and no error.
 	Events(ctx context.Context, run, thread string) ([]*protos.Event, error)
 
-	// Drop discards a thread's history. Called once the thread has been
-	// joined: its result is in its parent's history from then on, and a
-	// replay of the parent never runs it again. Dropping a thread that has
-	// no history is not an error.
+	// Drop discards a thread's history, once the thread has been joined and its
+	// result lives in the parent's history. Dropping a thread with no history is
+	// not an error.
 	Drop(ctx context.Context, run, thread string) error
 }
 
-// NewName mints a run name nothing else will have. Use it when a run has no
-// natural identity of its own; prefer a name derived from what the work is
-// about, since that is what makes a resumed run find its history.
+// NewName mints a run name nothing else will have. Prefer a name derived from
+// what the work is about, so a resumed run finds its history.
 func NewName() string { return uuid.New().String() }
 
 func streamName(run, thread string) string {
 	return "flow.thread." + run + "." + thread
 }
 
-// streamStore keeps each thread's history on its own durable stream.
-//
-// Per thread rather than one stream for everything because a stream is the
-// unit of reading here: resuming a thread means replaying exactly its own
-// events, and a shared stream would mean reading everyone else's to find
-// them.
+// streamStore keeps each thread's history on its own durable stream, so resuming
+// a thread replays exactly its own events.
 type streamStore struct {
 	client *dsclient.Client
 }
@@ -86,11 +67,8 @@ func (s *streamStore) open(ctx context.Context, name string, create bool) (*dscl
 			return nil, fmt.Errorf("flow: create %s: %w", name, err)
 		}
 	}
-	// The codec resolves *protos.Event through proto.Message, so events go down
-	// as protobuf rather than as JSON of a protobuf. New is not optional: Event
-	// is a pointer type, and a codec with no way to allocate one can encode but
-	// cannot decode — which shows up only when the history is read back, which
-	// is to say on the resume that the whole design exists for.
+	// New is required: *protos.Event is a pointer type, and a codec with no way
+	// to allocate one can encode but not decode on resume.
 	st, err := s.client.OpenStream[*protos.Event](name, dsclient.WithCodec[*protos.Event](
 		dswire.ReflectCodec[*protos.Event]{New: func() *protos.Event { return &protos.Event{} }},
 	))
@@ -100,8 +78,8 @@ func (s *streamStore) open(ctx context.Context, name string, create bool) (*dscl
 	return st, nil
 }
 
-// Sink opens the thread's stream on first use rather than here: a thread that
-// records nothing should leave nothing behind.
+// Sink opens the thread's stream on first use, so a thread that records nothing
+// leaves nothing behind.
 func (s *streamStore) Sink(ctx context.Context, run, thread string) (Sink, error) {
 	return &streamSink{store: s, name: streamName(run, thread)}, nil
 }
@@ -153,9 +131,7 @@ type streamSink struct {
 }
 
 // Append is serialised because a thread's events can come from more than one
-// goroutine — the thread's own and the attempt's bookkeeping — and a stream
-// handle carries a position. The lock is not contended in practice: an append
-// is the tail of a call that just took milliseconds at least.
+// goroutine and a stream handle carries a position.
 func (s *streamSink) Append(ctx context.Context, ev *protos.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -170,12 +146,8 @@ func (s *streamSink) Append(ctx context.Context, ev *protos.Event) error {
 	return err
 }
 
-// MemStore keeps history in memory.
-//
-// A run on one of these still replays within a process — a retry after a
-// failed call costs nothing it already paid for — it just does not survive
-// the process. Right for tests, and for work short enough that a crash means
-// starting over anyway.
+// MemStore keeps history in memory: a run still replays within a process but
+// does not survive it. Right for tests.
 type MemStore struct {
 	mu     sync.Mutex
 	events map[string]map[string][]*protos.Event // run → thread → events
@@ -211,8 +183,7 @@ func (m *MemStore) Drop(ctx context.Context, run, thread string) error {
 	return nil
 }
 
-// Threads names the threads of a run that have a history, sorted. A thread
-// that was joined has none: its history was dropped with the join.
+// Threads names the threads of a run that have a history, sorted.
 func (m *MemStore) Threads(run string) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

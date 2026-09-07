@@ -12,92 +12,50 @@ import (
 	"github.com/ligustah/durable_streams/dsclient"
 )
 
-// Getting a job's streams off a worker and onto the coordinator, and back again
-// when the job moves.
-//
-// A worker owns its storage, and a cloud worker's storage is destroyed the
-// moment its work is done. Anything a job writes that has to outlive the machine
-// must be copied while the machine is still up. What an attempt commits comes
-// home as the transactions it committed — see pull.go. What is written outside
-// one, a shared channel's outbox, comes by a mirror: [dsclient.MirrorSet],
-// which discovers streams on another deployment, forwards each one verbatim,
-// and commits how far it has got in the same transaction as the records
-// themselves. The mirror is also what carries a copy the OTHER way, onto the
-// worker a retry is about to run on.
-//
-// wings therefore keeps no bookkeeping about any of it. Where a copy has reached
-// lives at the destination beside the data, so the two cannot disagree; which
-// streams to copy is re-derived from their names on every pass, so it is never
-// stale.
-//
-// Nothing here knows what a recording or a channel's outbox is. They are
-// separate features that both need a stream to survive its worker, the way two
-// programs both need a filesystem.
+// Getting a job's streams off a worker onto the coordinator, and back when the
+// job moves. What an attempt commits comes home as its transactions (pull.go);
+// what is written outside one — a shared channel's outbox — comes by a
+// [dsclient.MirrorSet], which also carries a copy the other way onto the worker
+// a retry runs on. No bookkeeping: where a copy has reached lives at the
+// destination, and what to copy is re-derived from stream names each pass.
 
 const (
-	// outputSet names the mirror. It becomes the consumer group each copy's
-	// position is stored under, so it is a constant rather than anything
-	// per-run: a coordinator that restarts resumes its copies where they had got
-	// to instead of making them again.
+	// outputSet names the mirror's consumer group, so a restarted coordinator
+	// resumes its copies rather than remaking them.
 	outputSet = "wings.outputs"
 
-	// outputDiscover is how often the fleet is re-read and re-listed without
-	// being asked.
-	//
-	// Long, deliberately. The set FOLLOWS each worker's catalog, so a job
-	// creating a stream wakes a pass at the moment it happens rather than at the
-	// next tick — the window this used to bound is closed by the create itself.
-	// What remains for the ticker is what no per-worker watch can see: a machine
-	// arriving or leaving, a watch that was lost, a worker too old to serve a
-	// catalog at all. wings pokes on the first of those, so this is the net
-	// under the other two.
+	// outputDiscover is the fallback fleet re-list interval; the set otherwise
+	// follows each worker's catalog live.
 	outputDiscover = 5 * time.Minute
 
-	// outputDrain bounds how long taking work off a worker waits for the copy of
-	// what it wrote to catch up.
-	//
-	// Generous, because it is paid per redispatch and per retirement rather than
-	// per anything frequent, and it ends early the moment the copy is level.
+	// outputDrain bounds how long taking work off a worker waits for its copy to
+	// catch up.
 	outputDrain = 15 * time.Second
 
 	// outputPoll is how often that wait looks again.
 	outputPoll = 50 * time.Millisecond
 
-	// outputWait bounds how long a reader waits for output still on its way —
-	// the handle travels in the result, and what it names travels behind it.
+	// outputWait bounds how long a reader waits for output still on its way
+	// behind the handle that named it.
 	outputWait = 2 * time.Minute
 
-	// outputAppend bounds one append of a job's output to its worker's own
-	// storage, which is on the same machine and should take milliseconds. It is
-	// a net under a broker that has stopped answering: without one, a job
-	// writing a file could hang there past the deadline it was given, and the
-	// deadline is what a caller was promised.
+	// outputAppend bounds one append to a worker's own storage — a net under a
+	// broker that has stopped answering.
 	outputAppend = 30 * time.Second
 )
 
-// The families of stream a job's output lives in. All are built and taken apart
-// by outputName below, and nothing else may assume their shape.
 const (
 	// recordingPrefix is a job's event log. See recording.go.
 	recordingPrefix = "wings.replay."
-	// priorPrefix is where a PREVIOUS attempt's log is put on the worker that is
-	// about to run the next one.
-	//
-	// A namespace of its own, and this is the only reason it has one: a worker's
-	// output is mirrored to the coordinator, and a copy travelling the other way
-	// must not be caught by that mirror and forwarded straight back. Two mirrors
-	// writing one destination interleave their records and fence each other's
-	// producer, so the two directions are kept where they cannot meet.
+	// priorPrefix holds a previous attempt's log on the worker running the next
+	// one, out of reach of the mirror carrying that worker's output the other
+	// way — two mirrors on one destination fence each other.
 	priorPrefix = "wings.prior."
 )
 
-// outputName is one output's stream name, taken apart.
-//
-// The name carries everything the coordinator needs to know about a stream it
-// finds on a worker — whose it is, which attempt wrote it, what the job called
-// it. That is what lets there be no register of outputs anywhere: a register
-// would be a second answer to a question the name already answers, and a second
-// answer can be wrong.
+// outputName is one output's stream name, taken apart. The name carries whose
+// it is, which attempt wrote it, and what the job called it, so no register of
+// outputs is needed.
 type outputName struct {
 	Prefix  string
 	Job     string
@@ -105,20 +63,14 @@ type outputName struct {
 	Name    string
 }
 
-// String builds the stream name.
 func (o outputName) String() string {
 	return o.Prefix + streamPart(o.Job) + "." + strconv.Itoa(o.Attempt) + "." + streamPart(o.Name)
 }
 
-// in returns the same output in another family — the coordinator's copy of a
-// recording, and the copy of it put on a worker for a retry, are the same thing
-// under two prefixes.
+// in returns the same output under another prefix.
 func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 
-// parseOutput takes a stream name apart, and reports whether it is one of ours.
-//
-// A plain split is enough because every part goes through streamPart, which
-// leaves a dot in none of them.
+// parseOutput takes a stream name apart and reports whether it is one of ours.
 func parseOutput(stream string) (outputName, bool) {
 	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
@@ -138,13 +90,8 @@ func parseOutput(stream string) (outputName, bool) {
 	return outputName{}, false
 }
 
-// streamPart makes one part of a stream name safe to join with dots.
-//
-// A job id is minted here and is already safe, but the output's name is the
-// caller's word and a work function may call its output whatever it likes.
-// Rather than reject those, map them: everything outside a small safe set
-// becomes an underscore — dots especially, since a dot is what separates the
-// parts.
+// streamPart maps everything outside [A-Za-z0-9_-] to an underscore, so a
+// caller's output name is safe to join with dots.
 func streamPart(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -159,21 +106,13 @@ func streamPart(s string) string {
 	return b.String()
 }
 
-// chanoutBatch is how many records of a shared channel's outbox move per
-// transaction of the mirror that copies it home.
-//
-// Small, because an outbox record is a channel value and a channel value can be
-// a [flow.Bytes] chunk — up to a quarter of a megabyte of opaque output. A
-// batch the size a log of tiny events would use (see recordBatch) would be a
-// message megabytes across, which the transport will not carry; this keeps one
-// well under the gRPC limit while still moving several chunks at a time.
+// chanoutBatch is how many outbox records the mirror moves per transaction.
+// Small, because an outbox record can be a quarter-megabyte [flow.Bytes] chunk,
+// and recordBatch of those would exceed the transport limit.
 const chanoutBatch = 8
 
-// jobOutput resolves the job an output belongs to and stands its stream up.
-//
-// What [Record] calls to get a stream on the worker that the coordinator will
-// keep. What goes in it is the recording's business, and shares no code past
-// this point.
+// jobOutput stands up a stream for [Record] on the worker the coordinator will
+// keep it from.
 func jobOutput(ctx context.Context, prefix, name string) (*dsclient.Client, string, error) {
 	if name == "" {
 		return nil, "", errors.New("wings: this needs a name")
@@ -206,18 +145,9 @@ func ensureStream(ctx context.Context, client *dsclient.Client, name string) err
 	return nil
 }
 
-// awaitStream waits for a stream to be here, when something is still expected to
-// arrive in it.
-//
-// A handle travels in the result, and the result is a different stream from the
-// output it names — so on the coordinator a handle can arrive before the mirror
-// has finished, or even started, copying what it points at. A reader that took
-// absence for an answer would report a file that never arrived when it was
-// merely early, which is the worst way to lose data.
-//
-// expect says whether anything is still coming. A handle from a writer that
-// never finished — a dead attempt's — names whatever did arrive, and waiting on
-// that would be waiting for a machine that is gone.
+// awaitStream waits for a stream that is still expected to arrive — the handle
+// travels ahead of what it names. expect is false for a dead attempt's handle,
+// whose output will never arrive.
 func awaitStream(ctx context.Context, client *dsclient.Client, name string, expect bool) error {
 	deadline := ctx
 	if expect {
@@ -248,17 +178,9 @@ func awaitStream(ctx context.Context, client *dsclient.Client, name string, expe
 	}
 }
 
-// startOutputMirror begins keeping a copy of what jobs write OUTSIDE their
-// transactions, anywhere in the fleet, for as long as the cluster runs: the
-// outboxes of shared channels. What an attempt commits comes home as the
-// transactions it committed; see pull.go.
-//
-// ONE set over every worker, not one per worker. wings' machines come and go —
-// autoscaling adds and retires them, and a crash retires one without asking —
-// so the fleet is handed over as [dsclient.MirrorSet.LiveSources], read again on
-// every pass. A machine that appears has its streams picked up; one that goes
-// has its copies stopped and its name released. Nothing else in the fleet
-// notices either.
+// startOutputMirror keeps a copy of what jobs write outside their transactions —
+// shared-channel outboxes — over one set spanning the whole fleet, re-read each
+// pass so machines coming and going are picked up and released.
 func (c *Cluster) startOutputMirror() error {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -272,57 +194,35 @@ func (c *Cluster) startOutputMirror() error {
 		Discover: outputDiscover,
 		Select: func(cand dsclient.MirrorCandidate) (dsclient.MirrorTarget, error) {
 			o, ok := parseOutput(cand.Stream)
-			// Everything else on a worker is wings' own plumbing — its jobs, its
-			// results, its heartbeats — which the coordinator talks to directly
-			// and has no use for a copy of. A prior is declined too: it was put
-			// there BY a mirror, and forwarding it back would be two mirrors
-			// writing one destination.
+			// A prior was put there by a mirror; forwarding it back would be two
+			// mirrors on one destination. Everything else non-output is plumbing.
 			if !ok || o.Prefix == priorPrefix {
 				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
 			}
-			// What an attempt commits — its history, its recordings, its
-			// files — is pulled as the transactions that wrote it, which
-			// this mirror cannot see the boundaries of. Only what is written
-			// outside one comes this way.
+			// Transactional output (history, recordings) is pulled instead; only
+			// what is written outside a transaction comes this way.
 			if o.Prefix != chanoutPrefix {
 				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
 			}
-			// A stream this job has finished with. Declining it is what makes
-			// dropping it stick: forgetting a copy stops it, and only a decision
-			// keeps the next pass from starting it again.
 			if c.wasDropped(cand.Stream) {
 				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
 			}
-			// A worker's outbox for a shared channel is also its subscription
-			// to the channel: from here on the channel is pushed to it.
+			// A worker's outbox is also its subscription to the channel.
 			if o.Prefix == chanoutPrefix {
 				c.subscribeChannel(cand.Source, o.Name)
 			}
-			// The same name at the destination, which is what lets one handle
-			// mean the same thing on the worker that wrote it and on the
-			// coordinator that kept it. A small batch because an outbox record can
-			// be a quarter-megabyte byte-stream chunk; see chanoutBatch.
 			return dsclient.MirrorTarget{Name: cand.Stream, Batch: chanoutBatch}, nil
 		},
 		OnStreamError: func(cand dsclient.MirrorCandidate, err error) error {
-			// A copy cut short by the cluster stopping is not trouble.
 			if c.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 				c.log.Warn("wings: keeping worker output", "worker", cand.Source,
 					"stream", cand.Stream, "err", err)
 			}
-			return nil // one worker having trouble is not the fleet stopping
+			return nil // one worker's trouble is not the fleet stopping
 		},
 		OnDiscoveryDegraded: func(source string, err error) {
-			// A worker that cannot be followed is discovered by listing on the
-			// interval instead — which still works, and is exactly why it is
-			// worth saying out loud. It would otherwise present as a healthy
-			// cluster that quietly took minutes to keep anything a job wrote,
-			// and on a fleet that retires idle machines those minutes are the
-			// whole risk.
-			//
-			// Reported unfiltered: a worker that is merely shutting down no
-			// longer arrives here, and it takes a persistent failure rather
-			// than one, so anything that reaches this is worth the line.
+			// Falling back to polling still works, but silently adds minutes of
+			// lag on a fleet that retires idle machines — worth a line.
 			c.log.Warn("wings: cannot follow a worker's new streams; falling back to polling",
 				"worker", source, "every", outputDiscover, "err", err)
 		},
@@ -340,11 +240,8 @@ func (c *Cluster) startOutputMirror() error {
 	return nil
 }
 
-// mirrorSources is the fleet as the mirror should see it right now.
-//
-// An in-process worker is left out, and has to be: it shares the coordinator's
-// engine, so what a job wrote there already IS the coordinator's copy, and
-// mirroring it would forward a stream onto itself.
+// mirrorSources is the fleet as the mirror should see it now. An in-process
+// worker is left out: its writes already are the coordinator's copy.
 func (c *Cluster) mirrorSources(shared *dsclient.Client) []dsclient.MirrorSource {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -359,35 +256,17 @@ func (c *Cluster) mirrorSources(shared *dsclient.Client) []dsclient.MirrorSource
 	return out
 }
 
-// pokeOutputs tells the mirror the FLEET has changed.
-//
-// Not that a stream has: the set follows each worker's catalog and learns that
-// by itself, at the moment it happens. What it cannot see is a machine — the
-// list of workers is wings' own, read on a discovery pass, and on an autoscaling
-// cluster a machine that has just arrived would otherwise write for a whole
-// interval before anything was keeping what it wrote. So the pokes are exactly
-// the fleet changes: a worker adopted, and workers taken away.
-//
-// Pokes coalesce, so scaling up by twenty costs one pass rather than twenty.
+// pokeOutputs tells the mirror the fleet changed, so a just-arrived machine is
+// copied at once rather than after a discovery interval. Pokes coalesce.
 func (c *Cluster) pokeOutputs() {
 	if c.outputs != nil {
 		c.outputs.Poke()
 	}
 }
 
-// hydrate puts the coordinator's copy of a job's earlier recordings onto the
-// worker that is about to run it again.
-//
-// The same mirror, run the other way and in bulk: the coordinator is the source,
-// the worker is the destination, and StopWhenCaughtUp makes it one pass that
-// copies what it finds and returns rather than a mirror left running.
-//
-// This is what a moved job needs, and there is no way around it. A retry reads
-// what its predecessor wrote through its OWN storage, because a worker on a
-// machine somewhere cannot reach the coordinator's — so the log has to be there
-// before the job is. Running it twice costs nothing: the position is committed
-// at the destination together with the records, so a pass over a stream already
-// copied copies nothing, and one over a stream copied halfway resumes.
+// hydrate copies a job's earlier recordings from the coordinator onto the worker
+// about to run it again — a moved job reads its predecessor's output through its
+// own storage. One resumable pass: a stream already copied copies nothing.
 func (c *Cluster) hydrate(ctx context.Context, w *workerConn, priors []Recording) error {
 	if len(priors) == 0 {
 		return nil
@@ -397,11 +276,9 @@ func (c *Cluster) hydrate(ctx context.Context, w *workerConn, priors []Recording
 		return err
 	}
 	if w.client == client {
-		return nil // one engine; it is already where it needs to be
+		return nil // one engine; already where it needs to be
 	}
 
-	// What to copy, keyed by the name it has on the coordinator. A prior's
-	// handle names where it will land, and the two differ only by prefix.
 	want := make(map[string]string, len(priors))
 	for _, rec := range priors {
 		o, ok := parseOutput(rec.ID)
@@ -429,17 +306,9 @@ func (c *Cluster) hydrate(ctx context.Context, w *workerConn, priors []Recording
 	})
 }
 
-// hydrateHistory puts the coordinator's copy of a job's last history onto the
-// worker about to run its next attempt, under THAT attempt's name.
-//
-// A retry replays its predecessor's history and carries on, and what it then
-// records is the whole history — the replayed part and its own — under its own
-// name, so the attempt after it needs only the one stream. The copy is a
-// one-shot mirror like hydrate's; with one engine it is a copy within it,
-// which the mirror does as readily.
-//
-// The last attempt's, not the longest: the recordings a retry is told to
-// prefer are the last attempt's too, and the two were committed together.
+// hydrateHistory copies a job's last history onto the worker about to run its
+// next attempt, under that attempt's name, so the retry replays to where its
+// predecessor got and carries on under its own name.
 func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnvelope) error {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -460,9 +329,8 @@ func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnve
 	})
 }
 
-// lastHistory is the coordinator's copy of a job's last history from an
-// attempt before the one given — any attempt, when before is negative — or
-// "" when there is none.
+// lastHistory is the coordinator's copy of a job's last history from an attempt
+// before the one given (any attempt when before is negative), or "".
 func (c *Cluster) lastHistory(ctx context.Context, job string, before int) (string, error) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -485,23 +353,9 @@ func (c *Cluster) lastHistory(ctx context.Context, job string, before int) (stri
 	return source, nil
 }
 
-// drainOutputs waits for the coordinator's copies of what a worker holds to be
-// as complete as the worker's own.
-//
-// Called at the two moments a worker is about to stop being readable: a job
-// being taken off it, and the machine itself being retired. The mirror runs in
-// the background, and between a job writing its last record and the copy
-// catching up there is a window where those records exist only on a machine that
-// is going away.
-//
-// Caught up is a MOMENT, not a promise. It is an answer about a machine that has
-// been told to stop, which is why both callers have already stopped sending it
-// work before asking.
-//
-// Best effort, and bounded. A worker is often being abandoned BECAUSE it stopped
-// answering, in which case nothing here can succeed and what survives is
-// whatever the coordinator already had. That is still a prefix, which is still
-// valid.
+// drainOutputs waits, bounded and best-effort, for the coordinator's copies of
+// what a worker holds to be as complete as the worker's own, before it stops
+// being readable. Both callers have already stopped sending it work.
 func (c *Cluster) drainOutputs(ctx context.Context, from *workerConn, job string) {
 	client, err := c.sharedClient()
 	if err != nil || from == nil || from.client == client || c.outputs == nil {
@@ -510,17 +364,14 @@ func (c *Cluster) drainOutputs(ctx context.Context, from *workerConn, job string
 	ctx, cancel := context.WithTimeout(ctx, outputDrain)
 	defer cancel()
 
-	// Ordinarily its streams are already being copied — the set followed the
-	// creates. The exception is a worker adopted so recently that the fleet
-	// change has not been reconciled, and a worker the set has not listed reports
-	// NOT drained rather than "no copies, nothing outstanding" — which is the
-	// answer that matters here, since the two look identical from outside.
+	// A worker the set has not listed yet reports not-drained; poke so a
+	// recently-adopted one is reconciled.
 	c.pokeOutputs()
 
 	for {
 		done, err := c.outputs.CaughtUp(ctx, from.id)
 		if err != nil {
-			return // not a source of this set; there is nothing to wait for
+			return // not a source of this set; nothing to wait for
 		}
 		if done {
 			// And the transactions, which come the other way. See pull.go.
@@ -537,23 +388,14 @@ func (c *Cluster) drainOutputs(ctx context.Context, from *workerConn, job string
 	}
 }
 
-// priorsOf finds the event logs a job's earlier attempts left on the
-// coordinator, oldest attempt first, each named as it will be found on the
-// worker that is about to be given it.
-//
-// Derived by looking, not remembered. The coordinator's copies are the fact —
-// they are what a retry can actually be handed — and a list kept beside them
-// would be a second answer that can disagree. A job has few attempts and this is
-// asked only when one is being moved.
+// priorsOf finds a job's earlier attempts' logs on the coordinator, oldest
+// first, each named as the worker about to run the retry will find it: under the
+// prior namespace for a worker with its own storage, or in place in process.
 func (c *Cluster) priorsOf(ctx context.Context, w *workerConn, job string) ([]Recording, error) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return nil, err
 	}
-	// Where the retry will look. A worker with storage of its own is given a
-	// copy under the prior namespace, out of reach of the mirror carrying its
-	// own output the other way; in process there is one engine and one copy, and
-	// the retry reads the original where it already is.
 	lands := priorPrefix
 	if w.client == client {
 		lands = recordingPrefix
@@ -582,35 +424,17 @@ func (c *Cluster) priorsOf(ctx context.Context, w *workerConn, job string) ([]Re
 	return out, nil
 }
 
-// dropOutputsOf deletes what a job's ABANDONED attempts wrote, on both sides.
-//
-// The attempt that produced the result is the one whose handles the caller is
-// holding, so its output stays until the caller discards it. Every earlier
-// attempt's is unreachable — a handle only ever leaves in a result, and an
-// attempt that was moved produced none — so it goes, from the worker that wrote
-// it as well as from the coordinator that kept it.
-//
-// The order is the whole of it. A copy still running would put back a
-// destination deleted under it the moment its source produced another record,
-// and it would put it back holding only those new records — the position lives
-// at the destination, and deleting a stream does not roll it back. So: decline
-// it, so no pass starts it again; forget the copy, so none is running; then
-// delete, source first.
-//
-// writers is which worker ran each attempt, the kept one included. An attempt's
-// output is on the worker that ran it and nowhere else, so that is the one
-// worker asked to delete it; the fleet used to be asked in full, an
-// exists-and-delete round trip per worker per stream, and on a fleet of fifty
-// that was a hundred calls to remove one stream from one machine. A worker no
-// longer in the fleet is skipped: its storage went with it, or is going.
+// dropOutputsOf deletes what a job's abandoned attempts wrote, on both sides;
+// the kept attempt's output stays until the caller discards it. Order matters:
+// decline the stream, forget the copy, then delete source-first, or a running
+// copy would put a deleted destination back. writers says which worker ran each
+// attempt, so only that worker is asked to delete its stream.
 func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerConn) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return
 	}
 	ctx := context.WithoutCancel(c.ctx)
-	// The coordinator's own catalog, one call on the embedded engine. What it
-	// finds is the fact: a stale stream is one the coordinator kept a copy of.
 	names, err := client.ListStreams(ctx)
 	if err != nil {
 		c.log.Warn("wings: could not look for abandoned output", "job", job, "err", err)
@@ -622,9 +446,8 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 		if !ok || o.Job != streamPart(job) {
 			continue
 		}
-		// The kept attempt's recordings and files are what the caller's
-		// handles name. Its history is not: a history is for the attempt
-		// after this one, and there is none.
+		// The kept attempt's recordings stay; its history does not, since a
+		// history is for the next attempt and there is none.
 		if o.Attempt == keep && o.Prefix != historyPrefix {
 			continue
 		}
@@ -639,15 +462,9 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 	}
 
 	c.markDropped(staleNames)
-	// Only until they are gone: after the source is deleted there is nothing
-	// left to offer, so the decision has nothing to decide and holding it would
-	// grow a map for the life of the cluster.
 	defer c.unmarkDropped(staleNames)
 
 	fleet := c.fleet()
-	// reachable is a worker whose storage can still be asked to delete: still in
-	// the fleet, and not the coordinator's own engine, where the worker's copy
-	// IS the coordinator's and is deleted with it below.
 	reachable := func(w *workerConn) bool {
 		return w != nil && w.client != client && slices.Contains(fleet, w)
 	}
@@ -662,9 +479,7 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 					"worker", w.id, "stream", name, "err", err)
 			}
 		}
-		// A recording was also put, as a prior, on the worker of every attempt
-		// after the one that wrote it — that is how a retry reads it — and those
-		// copies are the retry's business only until it settles.
+		// A recording was also copied as a prior onto every later attempt's worker.
 		if o.Prefix == recordingPrefix {
 			prior := o.in(priorPrefix).String()
 			for attempt, w := range writers {
@@ -690,12 +505,8 @@ func (c *Cluster) fleet() []*workerConn {
 	return append([]*workerConn(nil), c.workers...)
 }
 
-// markDropped and wasDropped are how a stream being deleted stays deleted.
-//
-// Forgetting a copy stops it; it does not decline the stream, so the next
-// discovery pass would find it and start again. The decision is what closes
-// that, and it is only needed for as long as the stream still exists to be
-// offered.
+// markDropped records a stream as deleted so no discovery pass restarts its
+// copy; wasDropped reports it, unmarkDropped clears it once the stream is gone.
 func (c *Cluster) markDropped(names []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

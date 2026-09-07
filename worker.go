@@ -24,13 +24,9 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// workerNode is the loop that drains one worker's job stream.
-//
-// It owns NO broker. Given a *dsclient.Client and a name, it declares its pair
-// of streams and consumes them — so the same type serves a goroutine sharing
-// one in-process engine with a dozen others, and a worker process that spun up
-// a broker of its own. What differs between the targets is which client it is
-// handed, and nothing else.
+// workerNode drains one worker's job streams. It owns no broker: given a
+// *dsclient.Client and a name it declares and consumes its streams, so the same
+// type serves an in-process goroutine and a worker process with its own broker.
 type workerNode struct {
 	id          string
 	concurrency int
@@ -47,32 +43,23 @@ type workerNode struct {
 	control *dsclient.Stream[controlEnvelope]
 	nested  *dsclient.Stream[jobEnvelope]
 
-	// answers are the outcomes of calls made by attempts running here, by
-	// attempt and then by the call's position. See nested.go. Guarded by
-	// runMu, with running, since an answer is only kept for an attempt that
-	// is.
+	// answers holds outcomes of calls made by attempts running here, by attempt
+	// then call position (see nested.go). Guarded by runMu with running.
 	answers map[string]map[string]*answerBox
 
-	// running is how to stop each attempt in flight here, keyed by job and
-	// attempt. A cancellation names both, so one for an attempt already moved
-	// away cannot stop the one that replaced it on this same worker.
-	runMu   sync.Mutex
+	runMu sync.Mutex
+	// running is how to stop each attempt in flight, keyed by job and attempt so
+	// a cancellation cannot stop the attempt that replaced a moved one here.
 	running map[string]context.CancelCauseFunc
-	// leaving is set once the machine is being taken back. Nothing new is run
-	// after it: a job taken off the queue is answered with an error instead,
-	// and the coordinator, told, has already moved it elsewhere.
+	// leaving is set once the machine is being taken back; nothing new runs after it.
 	leaving atomic.Bool
-	// stopped names attempts the coordinator stopped BEFORE they started here:
-	// a job moved for waiting too long on this queue is still on this queue,
-	// and would otherwise run in full when its turn came. Cleared when the
-	// attempt is taken off the queue and refused on the spot.
+	// stopped names attempts the coordinator stopped before they started here, so
+	// one moved off this queue is refused rather than run when its turn comes.
 	stopped map[string]string
 
-	// open names the streams this worker has already stood up for a job, so one
-	// attempt opening the same name twice is refused rather than silently
-	// producing two under one handle. The names carry the attempt, so a retry
-	// that lands back on this same worker opens a new one rather than colliding
-	// with what its predecessor left here.
+	// open names streams already stood up for a job, so opening the same name
+	// twice is refused. Names carry the attempt, so a retry back on this worker
+	// does not collide with its predecessor.
 	openMu sync.Mutex
 	open   map[string]bool
 }
@@ -99,9 +86,7 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 	return n, nil
 }
 
-// declareStreams creates this worker's job and result streams if they are not
-// already there. StreamExists is node-local, which is the right question for
-// both an embedded engine and a single-node broker.
+// declareStreams creates this worker's streams if they are not already there.
 func (n *workerNode) declareStreams(ctx context.Context) error {
 	for _, name := range []string{jobStreamFor(n.id), resultStreamFor(n.id), beatStreamFor(n.id), controlStreamFor(n.id), nestedStreamFor(n.id)} {
 		ok, err := n.client.StreamExists(ctx, name)
@@ -134,15 +119,9 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 	return nil
 }
 
-// declareOutput stands a stream up on this worker for one attempt of one job to
-// write.
-//
-// Nothing announces it. The coordinator's mirror finds it by listing this
-// worker, and the name says which job and which attempt it belongs to — so
-// there is no register here to be out of date with what is actually on disk.
-//
-// One stream per output, so a job writing a gigabyte of video cannot hold up
-// another job's events behind it.
+// declareOutput stands a stream up on this worker for one attempt to write. The
+// coordinator's mirror finds it by name; one stream per output, so a large one
+// cannot hold up another's records.
 func (n *workerNode) declareOutput(ctx context.Context, stream, name string) (*dsclient.Client, error) {
 	n.openMu.Lock()
 	if n.open == nil {
@@ -155,18 +134,15 @@ func (n *workerNode) declareOutput(ctx context.Context, stream, name string) (*d
 	n.open[stream] = true
 	n.openMu.Unlock()
 
-	// Deliberately not ctx: a job whose deadline expires between here and the
-	// first record would leave a stream half-made, and the next attempt looking
-	// at it.
+	// Not ctx: a deadline here would leave a half-made stream for the next attempt.
 	if err := ensureStream(context.WithoutCancel(ctx), n.client, stream); err != nil {
 		return nil, err
 	}
 	return n.client, nil
 }
 
-// progressOf is one running attempt's [flow.Progress]: its heartbeats and
-// finished steps go on this worker's beat stream, tagged with the job and
-// attempt they are about.
+// progressOf is one attempt's [flow.Progress]: heartbeats and finished steps go
+// on this worker's beat stream tagged with the job and attempt.
 type progressOf struct {
 	n       *workerNode
 	job     string
@@ -174,10 +150,8 @@ type progressOf struct {
 	outputs *attemptOutputs
 }
 
-// A report of progress is a commit point. What the attempt has written is
-// committed BEFORE the coordinator is told how far it got, so a checkpoint
-// never claims more than a retry can be handed: a lost beat costs a resume
-// from slightly earlier, and a failed commit sends no beat at all.
+// Heartbeat commits what the attempt has written before reporting progress, so a
+// checkpoint never claims more than a retry can be handed.
 func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
 	if err := p.outputs.commit(ctx); err != nil {
 		return err
@@ -185,29 +159,19 @@ func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
 	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
 }
 
-// sendBeat publishes one progress report.
-//
-// Outside the processor's transaction on purpose: a heartbeat is only useful if
-// it arrives WHILE the job is running, and anything written inside that
-// transaction becomes visible when the job finishes, which is exactly too late.
+// sendBeat publishes one progress report, outside the attempt's transaction so
+// it is visible while the job runs, and off a background context so a job on its
+// dying deadline still delivers its last checkpoint.
 func (n *workerNode) sendBeat(ctx context.Context, b beatEnvelope) error {
-	// Deliberately not ctx: a job whose deadline has just expired is precisely
-	// the one whose last checkpoint is worth having, and sending on the dying
-	// context would drop it.
 	if _, err := n.beats.Append(context.WithoutCancel(ctx), []beatEnvelope{b}); err != nil {
 		return fmt.Errorf("wings: send progress for job %s: %w", b.Job, err)
 	}
 	return nil
 }
 
-// run serves the worker's two queues until ctx is cancelled or the machine
-// is being taken back.
-//
-// Both queues are read continuously and every job runs on a goroutine of
-// its own, taking a running slot when it starts and giving it up while it
-// waits — see slots.go. A worker therefore takes as much work as the
-// coordinator sends it, which is bounded by what the coordinator counts as
-// running here, and a job never waits behind a batch that is waiting on it.
+// run serves the worker's job and nested queues until ctx is cancelled or the
+// machine is taken back. Each queue is read continuously; each job runs on its
+// own goroutine, taking a slot when running and yielding it while waiting (slots.go).
 func (n *workerNode) run(ctx context.Context) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
@@ -219,12 +183,9 @@ func (n *workerNode) run(ctx context.Context) error {
 	return nil
 }
 
-// tailControl follows the coordinator's word about jobs already here, and
-// stops the attempts it names.
-//
-// Read from the END of the stream: whatever a previous coordinator said is
-// about attempts that are long gone, and a cancellation for an attempt not
-// running here is nothing to do either way.
+// tailControl follows the coordinator's word about jobs already here — answers
+// and cancellations — from the end of the stream, since older records concern
+// attempts long gone.
 func (n *workerNode) tailControl(ctx context.Context) {
 	info, err := n.control.Info(ctx)
 	if err != nil {
@@ -265,12 +226,8 @@ func (n *workerNode) tailControl(ctx context.Context) {
 }
 
 // watchPreemption polls the URL the machine gave for the cloud's decision to
-// take it back, and acts on it once.
-//
-// See [PreemptionURLEnv]. A request that blocks until the answer changes is
-// used as such; one that answers at once is asked again after a moment. An
-// error is not a preemption — a metadata server that is briefly unreachable
-// is not a machine that is going away — so it is retried, a little later.
+// take it back, and calls leave once. A transient error is not a preemption and
+// is retried. See [PreemptionURLEnv].
 func (n *workerNode) watchPreemption(ctx context.Context, url string) {
 	client := &http.Client{Timeout: 2 * time.Minute}
 	for ctx.Err() == nil {
@@ -300,9 +257,8 @@ func (n *workerNode) watchPreemption(ctx context.Context, url string) {
 	}
 }
 
-// leave is what a worker does with the notice: tells the coordinator, so its
-// jobs are moved now; refuses new ones; and ends the attempts running here,
-// whose answers are no longer wanted anywhere.
+// leave tells the coordinator this worker is going so its jobs move now, refuses
+// new ones, and ends the attempts running here.
 func (n *workerNode) leave() {
 	n.log.Warn("wings: this machine is being taken back; handing its work over")
 	n.leaving.Store(true)
@@ -321,11 +277,12 @@ func (n *workerNode) leave() {
 	}
 }
 
-// attemptKey names one attempt of one job, for running.
+// attemptKey names one attempt of one job.
 func attemptKey(job string, attempt int) string { return job + "/" + strconv.Itoa(attempt) }
 
-// startAttempt registers an attempt as running and returns the context to run
-// it under, which a cancellation from the coordinator ends.
+// startAttempt registers an attempt as running and returns the context to run it
+// under, which a coordinator cancellation ends. An attempt stopped before it
+// started is cancelled at once.
 func (n *workerNode) startAttempt(ctx context.Context, job jobEnvelope) (context.Context, func()) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	key := attemptKey(job.ID, job.Attempt)
@@ -350,8 +307,8 @@ func (n *workerNode) startAttempt(ctx context.Context, job jobEnvelope) (context
 	}
 }
 
-// stopAttempt ends an attempt the coordinator no longer wants, if it is
-// running here.
+// stopAttempt ends an attempt the coordinator no longer wants, or marks it so it
+// is refused if it reaches the queue later.
 func (n *workerNode) stopAttempt(c controlEnvelope) {
 	why := c.Why
 	if why == "" {
@@ -361,8 +318,6 @@ func (n *workerNode) stopAttempt(c controlEnvelope) {
 	n.runMu.Lock()
 	cancel, ok := n.running[key]
 	if !ok {
-		// Not running yet, or already finished. Either way the answer is the
-		// same: if it turns up on the queue later, it is not run.
 		if n.stopped == nil {
 			n.stopped = map[string]string{}
 		}
@@ -376,14 +331,9 @@ func (n *workerNode) stopAttempt(c controlEnvelope) {
 	cancel(fmt.Errorf("wings: the coordinator stopped this job: %s", why))
 }
 
-// serve runs the jobs on one queue as they arrive, each on a goroutine of
-// its own. Results go on the result stream one at a time.
-//
-// The loop ends when the machine is being taken back. The coordinator was
-// told and is moving these jobs, and a result from here — an error saying an
-// attempt was cut short — could reach it BEFORE the move and be delivered as
-// the job's answer; so nothing is reported after that, and nothing more is
-// taken.
+// serve runs the jobs on one queue as they arrive, each on its own goroutine.
+// The loop ends when the machine is taken back: nothing is reported or taken
+// after that, since a late result could beat the coordinator's move.
 func (n *workerNode) serve(ctx context.Context, queue *dsclient.Stream[jobEnvelope], nested bool) {
 	info, err := queue.Info(ctx)
 	if err != nil {
@@ -444,11 +394,8 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		return res
 	}
 
-	// The function's own bound wins over the cluster-wide default: one function
-	// is a millisecond of arithmetic and another an hour of transcoding, and
-	// the number that knows which is the one declared beside the code. A
-	// function this worker does not have is left to Execute to refuse, which
-	// names what it does have.
+	// The function's own bound wins over the cluster default; a function this
+	// worker lacks is left to Execute to refuse.
 	timeout := n.timeout
 	if bounds, ok := flow.BoundsOf(job.Func); ok && bounds.Timeout > 0 {
 		timeout = bounds.Timeout
@@ -458,47 +405,33 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	// Stoppable from the coordinator's side. A job whose last caller gave up,
-	// or that was moved elsewhere, is one nobody wants the answer to, and the
-	// slot it holds is worth more than the answer.
+	// Stoppable from the coordinator: a job nobody waits on is not worth its slot.
 	ctx, finish := n.startAttempt(ctx, job)
 	defer finish()
 
-	// Progress reporting, and whatever the last attempt got to. Installed for
-	// every job rather than only for functions that declare a heartbeat
-	// timeout: calling Heartbeat is always allowed, and it is the checkpoint
-	// that makes a redispatch cheap whether or not anything is watching the
-	// clock.
+	// Progress and the last attempt's checkpoint, installed for every job since
+	// Heartbeat is always allowed and the checkpoint is what makes a redispatch cheap.
 	outputs := newAttemptOutputs(n, job)
 	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, outputs}, flow.Resume{
 		Attempt: job.Attempt, Checkpoint: job.Checkpoint,
 	})
-	// And the wings half: which job this is and the worker it is on, so what
-	// it writes goes on this worker's streams, and what its earlier attempts
-	// wrote can be read back.
 	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs}
 	ctx = withJob(ctx, state)
-	// The cluster's parallelism, so a thread that fans out here sizes itself to
-	// the fleet rather than to this one machine. Absent from an older
-	// coordinator's job, or a bare call: flow then falls back to this process's.
+	// The fleet's parallelism, so a thread fanning out here sizes to the fleet;
+	// absent from an older coordinator or a bare call, flow falls back to this process.
 	if job.Capacity > 0 {
 		ctx = flow.WithMaxParallelism(ctx, job.Capacity)
 	}
-	// A thread this job forks is the cluster's to place, like any other: the
-	// fork is read out of this job's history by the coordinator and its
-	// result comes back on the control stream. See nested.go. And a thread
-	// that waits gives the job's slot up while it does. See slots.go.
+	// A thread this job forks is the cluster's to place (nested.go); a waiting
+	// thread yields the job's slot (slots.go).
 	placer := nestedPlacer{n: n, job: state}
-	// Now, not when the job was appended: the coordinator's clocks on this job
-	// run from here, so time it spent waiting behind others on this worker is
-	// not counted against the work. Best-effort like every beat — a lost one
-	// is made good by the first real report, and until then the job is merely
-	// not yet under its bounds.
+	// From now, not from when the job was appended, so time queued behind others
+	// is not counted against the work.
 	if err := n.sendBeat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Started: true}); err != nil {
 		n.log.Warn("wings: could not report a job as started", "job", job.ID, "err", err)
 	}
 
-	// A panicking work function must cost one job, not the worker.
+	// A panicking work function costs one job, not the worker.
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 8192)
@@ -509,24 +442,10 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		}
 	}()
 
-	// As the thread it is, not a bare call. The function's body is a thread
-	// of the run that forked it, so it may fork, use a channel, read the
-	// clock, sleep and call other functions, and a retry replays all of
-	// that from the history rather than doing it again — the history being
-	// the coordinator's copy of the last attempt's, put on this worker under
-	// this attempt's name before the job arrived. One attempt per dispatch:
-	// whether to try again, and where, is the coordinator's decision, and
-	// the error is its input.
-	//
-	// Under the thread's own name in its own run: that is what the threads
-	// this one forks are named under, and a retry that replays a fork must
-	// present it as the same thread, or the coordinator dispatches it twice.
-	// A bare call, which belongs to no run, is the main thread of a run made
-	// up for the job.
-	//
-	// A thread of run code is reached by replaying its ancestors, whose
-	// histories the coordinator put on this worker with the job, in the
-	// same stream. See lineage.go.
+	// Run as the thread it is, from the coordinator's copy of the last attempt's
+	// history, so a retry replays what its predecessor did. One attempt per
+	// dispatch: whether and where to retry is the coordinator's call. A thread of
+	// run code is reached by replaying its ancestors (lineage.go).
 	runOpts := []flow.RunOption{
 		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
 		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
@@ -539,41 +458,31 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	} else {
 		payload, err = flow.RunThread(ctx, runOf(job), threadOf(job), job.Func, job.Payload, runOpts...)
 	}
-	// Whatever the attempt wrote is committed before its answer leaves: a
-	// result whose recordings could still be lost would be a handle to
-	// nothing. A commit that fails is the attempt failing.
+	// Commit what the attempt wrote before its answer leaves; a failed commit is
+	// the attempt failing.
 	if cerr := outputs.finish(ctx); cerr != nil && err == nil {
 		err = cerr
 	}
 	if err != nil {
-		// Not an answer but a yield: the thread is to be run again later,
-		// somewhere, and says when. See yield.go.
+		// A yield, not an answer: run again later, and when. See yield.go.
 		if y := yieldOf(ctx, err); y != nil {
 			res.Yield = y
 			return res
 		}
 		res.Error = err.Error()
-		// Say what actually happened. A work function that gives up on its
-		// context reports "context deadline exceeded", which names neither the
-		// function nor the bound it broke — and this is the one place that
-		// knows both. The parent's cancellation is excluded: a worker being
-		// shut down is not a slow job.
+		// Name the function and bound rather than a bare "deadline exceeded"; the
+		// parent's own cancellation (a shutdown) is excluded.
 		if timeout > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
 			res.Error = fmt.Sprintf("wings: %s exceeded its %s timeout", job.Func, timeout)
 		}
-		// Likewise a job the coordinator stopped: say so, rather than
-		// "context canceled". Nobody reads this result, but the worker's log
-		// does.
+		// Likewise a coordinator stop, rather than "context canceled".
 		if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.Canceled) && cause != context.Canceled {
 			res.Error = cause.Error()
 		}
 		return res
 	}
-	// Refused here rather than discovered on the far side. A result the
-	// transport cannot carry does not fail cleanly there: the read that could
-	// not carry it looked like a dropped connection, and the worker holding it
-	// — and its machine — paid for one job's mistake. Here the job pays, with
-	// an error that says what to do instead.
+	// Refused here, where the job pays, rather than as an uncarryable read on the
+	// coordinator that looks like a dropped connection.
 	if len(payload) > maxResult {
 		res.Error = fmt.Sprintf("wings: the result of %s is %d bytes, more than a result may be (%d); "+
 			"stream output this size over a flow.Channel rather than returning it", job.Func, len(payload), maxResult)
@@ -583,12 +492,8 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	return res
 }
 
-// servedBroker is a broker a WORKER PROCESS stands up for itself, together with
-// the gRPC server that lets the coordinator in.
-//
-// Only the out-of-process targets build one. In process there is no socket and
-// no second process, so there is nothing to serve and the cluster's own engine
-// is used directly.
+// servedBroker is a broker a worker process stands up for itself, with the gRPC
+// server that lets the coordinator in. In-process targets need none.
 type servedBroker struct {
 	broker *embed.InProcess
 	client *dsclient.Client
@@ -632,18 +537,16 @@ func (s *servedBroker) close() error {
 	if s.srv != nil {
 		s.srv.GracefulStop()
 	}
-	// The client wraps the broker's own backend, which Close also releases, so
-	// only one of them may do it.
+	// The client wraps the broker's backend, which Close also releases, so only
+	// one of them may do it.
 	return s.broker.Close()
 }
 
-// isWorkerProcess reports whether this process was started by wings as a
-// worker.
+// isWorkerProcess reports whether wings started this process as a worker.
 func isWorkerProcess() bool { return os.Getenv(envMode) == modeWorker }
 
 // runWorkerProcess is what a worker binary does instead of returning from
-// Start. It serves until the process is killed, which is how the coordinator
-// stops it.
+// [Start]: it serves until the process is killed.
 func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	concurrency, _ := strconv.Atoi(os.Getenv(envConcurrency))
 	jobTimeout, _ := time.ParseDuration(os.Getenv(envJobTimeout))
@@ -675,21 +578,19 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	// A machine that will be told when it is being taken back, and where.
 	if url := os.Getenv(PreemptionURLEnv); url != "" {
 		go n.watchPreemption(ctx, url)
 	}
 
-	// The parent reads this to learn the port, so it must be the first thing on
-	// stdout and must be flushed before anything blocks.
+	// The parent reads this to learn the port, so it must be first on stdout and
+	// flushed before anything blocks.
 	fmt.Fprintln(os.Stdout, readyPrefix+b.addr())
 
 	n.log.Info("wings: worker serving", "addr", b.addr(), "concurrency", n.concurrency)
 	err = n.run(ctx)
 	if n.leaving.Load() {
-		// The loop ended because the machine is being taken back. The broker
-		// stays up until it is: the coordinator is still copying what the
-		// jobs here wrote, and those seconds are what the notice is for.
+		// Taken back: stay up until the machine goes, so the coordinator can
+		// finish copying what the jobs here wrote.
 		n.log.Info("wings: no longer taking work; serving what was written here until the machine goes")
 		<-ctx.Done()
 		return nil

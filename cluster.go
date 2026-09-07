@@ -37,16 +37,9 @@ type Cluster struct {
 	dir    string
 	tmpDir string
 
-	// shared is the cluster's own embedded durable-streams instance: no broker,
-	// no listener, no port. Every cluster has one, because the coordinator keeps
-	// its journal there whatever the target is.
-	//
-	// The in-process target then runs EVERYTHING on it — every worker's stream
-	// pair as well — so coordinator and workers meet on one engine instead of
-	// one per worker. One rather than many because a worker that is a goroutine
-	// is not a machine: giving each its own meant its own directory, its own
-	// locks and its own shutdown, and retiring one meant closing an engine out
-	// from under whatever still referenced it.
+	// shared is the cluster's own embedded durable-streams instance (no broker,
+	// no port), where the coordinator keeps its journal whatever the target. The
+	// in-process target runs every worker's streams on it too.
 	shared     *dsclient.Client
 	sharedOnce sync.Once
 	sharedErr  error
@@ -76,45 +69,24 @@ type Cluster struct {
 	// Guarded by mu.
 	dropped map[string]bool
 
-	// mu guards workers, pending, closed, and every workerConn field that
-	// changes after construction (inflight, draining, idleSince).
-	//
-	// One lock rather than per-field atomics because the load-bearing operation
-	// is a COMPOUND one: choosing a worker and charging a job to it must be
-	// indivisible against the scaler deciding that same worker is idle and
-	// removing it. Atomics make each half safe and the pair still wrong.
+	// mu guards workers, pending, closed and the mutable workerConn fields. One
+	// lock, not per-field atomics, because choosing a worker and charging a job
+	// to it must be indivisible against the scaler retiring that same worker.
 	mu      sync.Mutex
 	workers []*workerConn
 	pending map[string]*pendingJob
-	// byOrigin indexes outstanding jobs by the workflow call they belong to,
-	// so a workflow attempt that replays a call finds the one its predecessor
-	// was making rather than starting a second.
+	// byOrigin indexes outstanding jobs by the workflow call they belong to, so
+	// a replayed call rejoins its job rather than starting a second.
 	byOrigin map[string]*pendingJob
-	// ranAs remembers, per workflow call, the last job that ran it, kept past
-	// the job being forgotten. A thread of run code dispatched later — a
-	// descendant spawned or redispatched after an ancestor's job is already
-	// gone — needs that ancestor's history to replay through, and the history
-	// outlives the job (it is named by job id, and forget keeps the last
-	// attempt). byOrigin does not outlive it, so without this the lookup falls
-	// to the coordinator's own store, where a thread that ran as a job never
-	// wrote. In memory only: a restarted coordinator rebuilds outstanding jobs
-	// from its journal, and a call whose job was already done needs no rerun.
+	// ranAs remembers, per workflow call, the last job that ran it, kept past the
+	// job being forgotten: a thread of run code dispatched later needs that
+	// ancestor's history to replay through. In memory only.
 	ranAs  map[string]string
 	closed bool
 
-	// epoch identifies THIS run of the coordinator, and is part of every name
-	// it mints.
-	//
-	// Names outlive the process that chose them: a worker's mirror stream is
-	// named after the worker and sits on a persistent Dir, and a job id appears
-	// in results that are still on a worker's queue. A counter that restarts at
-	// zero therefore hands a new worker a name whose stream already has a read
-	// position — so its results are skipped as already seen, and every job sent
-	// to it hangs. Reattachment made that reachable within one process, since
-	// recovered workers keep the names they were started with.
-	//
-	// Deliberately NOT stored. Its whole purpose is to differ from last time,
-	// and a value read back from disk is the one thing that cannot.
+	// epoch identifies this coordinator run and is part of every name it mints,
+	// so a restarted coordinator never reuses a name whose durable stream already
+	// has a read position. Deliberately not stored — its purpose is to differ.
 	epoch string
 
 	nextID  atomic.Uint64
@@ -127,32 +99,27 @@ type Cluster struct {
 type workerConn struct {
 	id     string
 	client *dsclient.Client
-	// remote is the connection to the worker's own broker, for what a worker
-	// with an engine of its own publishes and the client above cannot
-	// reach: its finished transactions. Nil for an in-process worker. See
-	// pull.go.
+	// remote reaches the worker's own broker for its finished transactions,
+	// which the client above cannot. Nil in process. See pull.go.
 	remote  *dsremote.Client
 	jobs    *dsclient.Stream[jobEnvelope]
 	results *dsclient.Stream[resultEnvelope]
-	// control is the coordinator's word to this worker about a job already
-	// on it: stop this one, nobody wants the answer.
+	// control carries the coordinator's word about a job already here: stop it,
+	// or here is a call's answer.
 	control *dsclient.Stream[controlEnvelope]
-	// nested is the queue of calls made by jobs, which the worker takes off
-	// without regard to how full its job queue is. See nested.go.
+	// nested is the queue of calls made by jobs, taken off regardless of the job
+	// queue's depth. See nested.go.
 	nested *dsclient.Stream[jobEnvelope]
 
-	// beats is progress reported by jobs still running here. Read on its own
-	// goroutine rather than with results, because it says something about a
-	// job that has NOT finished and waiting for the result stream to produce
-	// would defeat the purpose.
+	// beats is progress from jobs still running here, read on its own goroutine
+	// since it concerns unfinished jobs.
 	beats *dsclient.Stream[beatEnvelope]
-	// beatsFrom is where following beats begins: the end of the stream as it
-	// was before this worker could be given anything to beat about.
+	// beatsFrom is where following beats begins: the stream's end before this
+	// worker could be given anything.
 	beatsFrom int64
 
-	// ownsClient is false for an in-process worker, whose backend the worker
-	// node itself closes. Closing it twice takes the broker down under the half
-	// of the process still using it.
+	// ownsClient is false for an in-process worker, whose backend the node
+	// closes; closing it twice takes the broker down under the rest of the process.
 	ownsClient bool
 
 	node    *workerNode // in-process only; shares the cluster engine, owns nothing
@@ -164,52 +131,38 @@ type workerConn struct {
 	// for a worker that is not a machine.
 	lease string
 
-	// exited closes when a worker we can actually observe has stopped.
-	//
-	// It is what separates "gone" from "unreachable", and the distinction is the
-	// whole reason retrying is safe. A child process is a fact: we started it,
-	// we can wait on it, and once it has exited no amount of patience brings it
-	// back. A remote machine across a dropped connection is not a fact — it is
-	// probably fine — so that case waits out the reconnect window instead. Nil
-	// for a worker whose liveness cannot be observed directly.
+	// exited closes when an observable worker (a child process) has stopped,
+	// separating "gone" from merely "unreachable" — a dropped remote connection
+	// waits out the reconnect window instead. Nil when liveness cannot be observed.
 	exited chan struct{}
 
 	// mirror copies this worker's results onto the coordinator's own durable
 	// streams, and holds the offset to resume reading from.
 	mirror *mirror
 
-	// submits is the way onto this worker's queue. See submit.go: jobs that
-	// arrive together go in one append, and appends counts how many there
-	// were.
+	// submits is the way onto this worker's queue (submit.go): jobs arriving
+	// together go in one append, counted by appends.
 	submits chan submission
 	appends atomic.Int64
 
-	// pushes names the shared channels being copied onto this worker.
-	// Guarded by Cluster.mu.
+	// pushes names the shared channels being copied onto this worker. Guarded by Cluster.mu.
 	pushes map[string]bool
 
-	// ctx bounds every goroutine belonging to THIS worker -- its result tail,
-	// and in process its run loop too -- and stop ends them. wg is how close
-	// waits for them.
-	//
-	// Per worker rather than per cluster because a worker can now be retired
-	// while the cluster runs on. A goroutine still reading from a worker whose
-	// resources are being released is the bug this prevents, and autoscaling is
-	// what made it reachable.
+	// ctx bounds every goroutine of this worker, so retiring one while the
+	// cluster runs on releases its resources without a goroutine still reading
+	// them. wg is how close waits for them.
 	ctx  context.Context
 	stop context.CancelFunc
 	wg   sync.WaitGroup
 
-	// Guarded by Cluster.mu. blocked is how many of the inflight jobs have
-	// reported a thread waiting; what the worker is running is the
-	// difference, and that is its load.
+	// Guarded by Cluster.mu. blocked is how many inflight jobs have a thread
+	// waiting; inflight minus blocked is the worker's load.
 	inflight  int
 	blocked   int
 	draining  bool
 	idleSince time.Time
 
-	// dead is set by the worker's own tail goroutine, which does not hold
-	// Cluster.mu, so it stays atomic.
+	// dead is set by the worker's tail goroutine, which does not hold Cluster.mu.
 	dead atomic.Bool
 }
 
@@ -237,99 +190,54 @@ func (w *workerConn) hasExited() bool {
 type pendingJob struct {
 	job    jobEnvelope
 	worker *workerConn
-	// placed says the job has been put on some worker at least once. A job
-	// that could not be — every worker was gone — is held, with no worker,
-	// until one arrives, and placing it then is not a retry: it never ran.
-	//
-	// Guarded by Cluster.mu.
+	// placed says the job has been put on a worker at least once; one held for
+	// want of a worker has never run, so placing it later is not a retry.
 	placed bool
-	// ran is which worker each attempt was sent to, by attempt number. What an
-	// abandoned attempt wrote is on the worker that ran it and nowhere else, so
-	// this is the one worker to delete it from when the job settles — rather
-	// than asking every worker in the fleet whether it holds each stream.
-	//
-	// Guarded by Cluster.mu.
+	// ran is which worker each attempt was sent to, so the one worker holding an
+	// abandoned attempt's output is the one asked to delete it.
 	ran map[int]*workerConn
 
-	// done closes once, when the job has an outcome, and res is that outcome.
-	//
-	// A closed channel rather than a value on one because a job can now have
-	// more than one waiter: a workflow that is retried rejoins the call its
-	// previous attempt was making instead of dispatching a second copy of it,
-	// and a value channel delivers to exactly one of them.
+	// done closes once when the job has an outcome; a channel, not a value, since
+	// a retried workflow can rejoin a call and a job may have several waiters.
 	done chan struct{}
 	res  resultEnvelope
 	once sync.Once
-	// waiters counts who is still interested. A caller that gives up abandons
-	// the job only when it was the last one — the point of rejoining is that
-	// the work carries on.
-	//
-	// Guarded by Cluster.mu.
+	// waiters counts who is still interested; the last to give up abandons the job.
 	waiters int
-	// origin is what larger piece of work this job is a step of, kept so a
-	// redispatch or a failure can be recorded against the same run as the
-	// submit — the caller's context is long gone by then.
+	// origin is the larger work this job is a step of, kept so a redispatch or
+	// failure records against the right run after the caller's context is gone.
 	origin flow.Origin
 
-	// bounds are those declared on the function. Read once at submit so the
-	// watchdog does not go through the registry per job per tick.
+	// bounds declared on the function, read once at submit.
 	bounds flow.Bounds
 
-	// The calls this job makes, when it is a run that makes them. See
-	// nested.go. followed says which attempts' histories are being read for
-	// calls; children counts the calls dispatched and not yet answered; and
-	// answers keeps every answer by the call's position, so an attempt that
-	// replays a call already answered is handed the answer again rather than
-	// having the work done twice.
-	//
-	// All guarded by Cluster.mu.
+	// The calls this job makes when it is a run (nested.go): followed is which
+	// attempts' histories are being read, children the calls not yet answered,
+	// answers every answer by call position so a replayed call is not re-run.
 	followed map[int]bool
 	children int
 	answers  map[string]resultEnvelope
-	// blocked says the job's worker reported a thread of it waiting, and
-	// has not yet reported it woken. Guarded by Cluster.mu.
+	// blocked says the worker reported a thread of this job waiting.
 	blocked bool
-	// yield is set while the job is off every worker by its own choice,
-	// waiting for what would bring it back. See yield.go. Guarded by
-	// Cluster.mu.
+	// yield is set while the job is off every worker by its own choice. See yield.go.
 	yield *yieldEnvelope
-	// recovered says a restarted coordinator took this job back from its
-	// journal rather than dispatching it (recover.go), and incomplete that
-	// nothing has yet forked it in this process: the envelope has no input,
-	// so it cannot be sent anywhere. Both guarded by Cluster.mu.
+	// recovered says a restarted coordinator took this job from its journal;
+	// incomplete says nothing has forked it in this process yet, so it has no input.
 	recovered  bool
 	incomplete bool
-	// since is when the current attempt was dispatched, started when the
-	// worker reported beginning it, and beat when it last reported progress.
-	//
-	// The bounds on the work run from started, not since: a job can sit behind
-	// others on a busy worker for longer than its own timeout, and none of that
-	// is time the work took. Until started is set neither bound applies, and
-	// only the start bound does. Zero beat means it has not beaten yet, which
-	// is why the heartbeat clock then runs from started: a function that
-	// declares a heartbeat timeout and never beats must be caught, not
-	// exempted.
-	//
-	// Guarded by Cluster.mu.
+	// since is when the current attempt was dispatched, started when the worker
+	// began it, beat when it last reported progress. The work's bounds run from
+	// started, not since, so time queued is not charged to the work.
 	since   time.Time
 	started time.Time
 	beat    time.Time
-	// checkpoint is the last progress reported, and is handed to the next
-	// attempt so it resumes rather than starting over.
+	// checkpoint is the last progress reported, handed to the next attempt.
 	checkpoint []byte
 }
 
-// overdue reports whether a job has run out of time, and why. Call with mu
-// held.
-//
-// The two bounds mean different things and get different remedies, so this
-// answers with which one was hit rather than with a bare yes.
-//
-// A job the worker has not yet begun is measured against the start bound
-// alone. Its timeout and heartbeat bounds are about the work, and charging them
-// for a queue the job is waiting in would fail a quick job for being behind a
-// slow one — or move it, to the back of another queue, until it ran out of
-// attempts having never once run.
+// overdue reports whether a job has run out of time and which bound it hit, so
+// each gets its own remedy. A job not yet begun is measured against the start
+// bound alone. Call with mu held.
 func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	if p.started.IsZero() {
 		if p.bounds.Start > 0 && !p.since.IsZero() && now.Sub(p.since) > p.bounds.Start {
@@ -340,10 +248,8 @@ func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	if p.bounds.Timeout > 0 && now.Sub(p.started) > p.bounds.Timeout {
 		tooSlow = true
 	}
-	// A job waiting on a thread it forked is quiet for as long as the thread
-	// takes, and is not stuck: the coordinator itself is running what it is
-	// waiting for. Nor is one whose worker says it is waiting — on a channel,
-	// on the clock. Its total bound still runs.
+	// A job waiting on a thread it forked or on a channel is not stuck; its total
+	// bound still runs.
 	if p.bounds.Heartbeat > 0 && p.children == 0 && !p.blocked {
 		last := p.beat
 		if last.IsZero() {
@@ -356,11 +262,9 @@ func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	return stuck, tooSlow
 }
 
-// Start brings up the workers described by cfg.
-//
-// IN A WORKER PROCESS THIS NEVER RETURNS. A binary launched by wings serves
-// work until it is shut down, so everything after this call in your main is
-// coordinator-only by construction. See the package doc.
+// Start brings up the workers described by cfg. In a worker process it never
+// returns: the binary serves work until shutdown, so code after it is
+// coordinator-only. See the package doc.
 func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	log := cfg.logger()
 
@@ -376,15 +280,11 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	if err := cfg.Scaling.validate(); err != nil {
 		return nil, err
 	}
-	// A plain worker count IS a policy: that many, kept at that many. One
-	// loop maintains the fleet whichever way it was asked for, so a fixed
-	// fleet that loses a machine to a preemption gets it back rather than
-	// running short until Stop.
+	// A fixed worker count is a policy of that many kept at that many, so a lost
+	// machine is replaced rather than left short until Stop.
 	if !cfg.Scaling.enabled() {
 		cfg.Scaling = fixedFleet(cfg.workers())
 	}
-	// Normalised once, here, so nothing downstream has to ask whether a field
-	// was set — the scaling loop reads its policy as given.
 	cfg.Scaling = cfg.Scaling.withDefaults(cfg.Concurrency)
 
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -409,12 +309,7 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.tmpDir = c.dir
 	}
 
-	// Opened before any worker exists, so the record starts at the beginning of
-	// the run rather than at the first thing that happened to succeed.
-	//
-	// Every target gets one, including the remote one: the coordinator's account
-	// of its own decisions is local by definition, and a cluster whose machines
-	// have all been destroyed is exactly when you want it.
+	// Opened before any worker exists, so the record starts at the run's start.
 	client, err := c.sharedClient()
 	if err != nil {
 		cancel()
@@ -437,12 +332,8 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 
 	c.journal.record(journalEntry{Kind: journalClusterStart})
 
-	// fail undoes everything above and everything between here and a
-	// successful return: whatever goroutines have started, whatever workers
-	// were brought up — released properly, so a machine that was destroyed
-	// has its lease closed — and then the record and the engine. One path
-	// rather than one per failure, because the path that was written by hand
-	// for a late failure was the one that leaked.
+	// fail undoes everything brought up so far — goroutines, workers (released so
+	// their leases close), then the record and engine — on one path.
 	fail := func(err error, workers []*workerConn) (*Cluster, error) {
 		cancel()
 		release := context.WithoutCancel(ctx)
@@ -456,27 +347,20 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		return nil, err
 	}
 
-	// Before any worker exists. The mirror reads the fleet afresh on every
-	// pass, so it has nothing to wait for — and a failure here costs nothing,
-	// where a failure after the machines were up used to cost the machines.
 	c.startChannelRelay()
 	if err := c.startOutputMirror(); err != nil {
 		return fail(err, nil)
 	}
 
-	// Before provisioning anything: whatever a previous coordinator left
-	// running is still billing, and is either put back to work or destroyed.
-	// Doing this first also means the machines it recovers count towards the
-	// number wanted, so a restart does not double the cluster.
-	//
-	// Only reachable with a persistent Dir. With a temporary one the record is
-	// created fresh and empty every time, which is correct: nothing was left.
+	// Before provisioning: recover whatever a previous coordinator left running
+	// and still billing, so those machines count towards the number wanted and a
+	// restart does not double the cluster.
 	workers, err := c.reattach(ctx)
 	if err != nil {
 		return fail(err, nil)
 	}
-	// And whatever it left running on them, before any of them is read:
-	// a result that arrives must find its job.
+	// And its outstanding jobs, before any worker is read, so an arriving result
+	// finds its job.
 	if err := c.recoverJobs(ctx, workers); err != nil {
 		return fail(err, workers)
 	}
@@ -504,18 +388,10 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	return c, nil
 }
 
-// releaseWorker closes a worker and closes its machine's lease.
-//
-// The two belong together, and they did not used to: a worker retired by the
-// scaler or reaped after dying was closed without the record being told, so its
-// lease stayed open and every future start went hunting for a machine that had
-// been destroyed on purpose. Anything that takes a worker out of service goes
-// through here.
-//
-// The lease is closed only once the machine is actually gone, so a crash
-// between the two leaves it open and the next start looks for it — which is the
-// safe direction to be wrong in. A machine that is looked for and not found
-// costs one API call; one that is never looked for bills forever.
+// releaseWorker closes a worker and its machine's lease together — anything
+// taking a worker out of service goes through here. The lease closes only once
+// the machine is gone, so a crash between the two errs towards looking for a
+// machine that no longer exists rather than one that bills unwatched.
 func (c *Cluster) releaseWorker(ctx context.Context, w *workerConn) error {
 	err := w.close(ctx)
 	c.dropWorkerStreams(ctx, w)
@@ -528,16 +404,9 @@ func (c *Cluster) releaseWorker(ctx context.Context, w *workerConn) error {
 }
 
 // dropWorkerStreams removes what a worker that is not coming back left on the
-// coordinator's storage.
-//
-// A worker's streams are named after it, and a name is never reused, so on a
-// persistent Dir every worker that was ever retired, reaped or stopped left its
-// mirror behind — and an in-process worker its queue, results and beats too,
-// since those are on the shared engine — and every autoscale cycle minted more.
-// A local worker's broker directory is the same leak on disk.
-//
-// Best effort: a copy that could not be removed is a leak, not a worker that
-// failed to stop, and the caller is releasing a machine.
+// coordinator's storage. Streams are named per worker and names are never reused,
+// so on a persistent Dir they would otherwise accumulate across autoscale cycles.
+// Best effort: what cannot be removed is a leak, not a failure to stop.
 func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -561,12 +430,8 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 
 // adopt puts a freshly launched worker into service and starts tailing it.
 func (c *Cluster) adopt(w *workerConn) {
-	// Beats are followed from the END of the stream: whatever a previous
-	// coordinator's jobs reported is about jobs no longer outstanding. The end
-	// is measured now, while nothing can be sent to this worker yet. Newest is
-	// the log end, and the beat stream is not transactional — nothing appends
-	// to it inside a transaction — so the record after it is the next one
-	// anybody will write.
+	// Beats are followed from the stream's end: older ones concern jobs no
+	// longer outstanding. Measured now, while nothing can be sent here yet.
 	if info, err := w.beats.Info(c.ctx); err != nil {
 		if c.ctx.Err() == nil {
 			c.log.Warn("wings: cannot find the end of a worker's heartbeats; following from the start",
@@ -583,8 +448,8 @@ func (c *Cluster) adopt(w *workerConn) {
 
 	c.journal.record(journalEntry{Kind: journalWorkerUp, Worker: w.id})
 
-	// Each loop is counted twice: on the worker, so closing it can wait for
-	// its own loops, and on the cluster, so Stop can wait for all of them.
+	// Counted twice: on the worker so close waits for its loops, on the cluster
+	// so Stop waits for all of them.
 	loop := func(run func(*workerConn)) {
 		c.wg.Add(1)
 		w.wg.Go(func() {
@@ -597,24 +462,18 @@ func (c *Cluster) adopt(w *workerConn) {
 	loop(c.submitter)
 	loop(c.pull)
 
-	// A machine the mirror has not been told about yet. It will find this one on
-	// its own eventually, and eventually is a long time to be writing output
-	// nothing is keeping.
+	// So the mirror keeps this worker's output at once, not after a discovery pass.
 	c.pokeOutputs()
 
 	c.placeHeld()
 }
 
-// placeHeld sends the jobs that were waiting for a worker to the fleet as it
-// is now. Called when a worker arrives, which is the only time the answer to
-// "is there anywhere to send this" changes from no to yes.
+// placeHeld sends jobs that were waiting for a worker, now that one has arrived.
 func (c *Cluster) placeHeld() {
 	var held []*pendingJob
 	c.mu.Lock()
 	for _, p := range c.pending {
-		// Not one that is off every worker by choice: that one is waiting
-		// for something other than a worker. Nor one with nothing to send
-		// yet, or nothing left to do.
+		// Skip a job waiting by choice (yield), or with nothing to send or do.
 		if p.worker == nil && p.yield == nil && !p.incomplete && !p.finished() {
 			held = append(held, p)
 		}
@@ -643,16 +502,14 @@ func (c *Cluster) launch(ctx context.Context, n int) ([]*workerConn, error) {
 	}
 }
 
-// workerID mints a name unique for the life of the cluster. Reusing an index
-// after a worker is torn down would make two workers share a transactional id
-// on the broker, which fences the live one.
+// workerID mints a name unique for the cluster's life; a reused name would make
+// two workers share a transactional id and fence the live one.
 func (c *Cluster) workerID(prefix string) string {
 	return fmt.Sprintf("%s-%s-%d", prefix, c.epoch, c.nextSeq.Add(1)-1)
 }
 
-// connect wires a worker's streams onto a backend the coordinator can reach.
-// The one function every target funnels through, and the reason a remote worker
-// needs no code of its own here.
+// connect wires a worker's streams onto a backend the coordinator can reach —
+// the one function every target funnels through.
 func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*workerConn, error) {
 	w := &workerConn{id: id, client: client, ownsClient: owns,
 		submits: make(chan submission, submitBatch)}
@@ -681,8 +538,7 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 }
 
 // connectBackend is connect for a backend the coordinator owns outright — the
-// out-of-process targets, where the client exists only to talk to this one
-// worker and dies with it.
+// out-of-process targets, whose client dies with the worker.
 func (c *Cluster) connectBackend(id string, backend dswire.Backend) (*workerConn, error) {
 	w, err := c.connect(id, dsclient.Wrap(backend), true)
 	if err != nil {
@@ -694,23 +550,17 @@ func (c *Cluster) connectBackend(id string, backend dswire.Backend) (*workerConn
 	return w, nil
 }
 
-// sharedClient is the cluster's own embedded durable-streams instance, created
-// on first use and torn down by [Cluster.Stop].
-//
-// Every target uses it: the journal, the machine record and the copies of
-// what jobs write all live here, whatever a worker is. The in-process target
-// goes further and runs its workers on it too, which is what makes that target
-// honest: coordinator and workers are the same process, so there is nothing to
-// serve over a socket and nothing to dial — they open the same streams on the
-// same engine. Above this line the coordinator sees a *dsclient.Client either
-// way, which is why one connect serves every target.
 // boundsOf is what a function declared about itself, or nothing for one this
-// binary does not define — the worker will refuse that job and say so.
+// binary does not define.
 func boundsOf(name string) flow.Bounds {
 	b, _ := flow.BoundsOf(name)
 	return b
 }
 
+// sharedClient is the cluster's own embedded durable-streams instance — home to
+// the journal, the machine record and the copies of what jobs write — created on
+// first use and torn down by [Cluster.Stop]. The in-process target runs its
+// workers on it too.
 func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 	c.sharedOnce.Do(func() {
 		dir := filepath.Join(c.dir, "engine")
@@ -726,39 +576,29 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 	return c.shared, c.sharedErr
 }
 
-// closeShared releases the embedded instance. Called once, after every worker
-// that reads through it is gone.
+// closeShared releases the embedded instance, once every worker that reads
+// through it is gone.
 func (c *Cluster) closeShared() error {
 	if c.sharedStop == nil {
 		return nil
 	}
-	// The client wraps the engine's own backend, which Close also releases, so
-	// only one of them may do it.
+	// The client wraps the engine's backend, which Close also releases; only one may.
 	err := c.sharedStop()
 	c.sharedStop, c.shared = nil, nil
 	return err
 }
 
-// tail mirrors a worker's results onto the coordinator's own streams and
-// delivers them, until the cluster stops or the worker is genuinely gone.
-//
-// "Genuinely" is the change from a version that treated any error as death. A
-// transient read failure — a five-second network blip, a broker restarting — is
-// indistinguishable at this line from a machine that burned down, and giving up
-// on the first one meant redispatching the jobs of a healthy worker and then
-// destroying the VM that was still holding them. The worker's queue survives a
-// dropped connection by design; throwing the worker away was the coordinator
-// declining to use that.
+// tail mirrors a worker's results onto the coordinator's streams and delivers
+// them, until the cluster stops or the worker is genuinely gone — a transient
+// read failure is not death, since the worker's queue survives a dropped connection.
 func (c *Cluster) tail(w *workerConn) {
 	from := w.mirror.next
 
 	var (
 		trouble  time.Time // when the current run of failures began
 		attempts int
-		// batch is how many results one read asks for. Every result is under
-		// maxResult on its own, but a read returns many, and a batch of large
-		// ones can together exceed what one message carries. That is not a
-		// dead worker; it is a read that asked for too much.
+		// batch is how many results one read asks for; halved when a batch of
+		// legal results is together too large to carry.
 		batch = resultBatch
 	)
 
@@ -767,10 +607,8 @@ func (c *Cluster) tail(w *workerConn) {
 			return
 		}
 
-		// Checked BEFORE the read, not only after it. A wedged connection does
-		// not fail — it hangs — so a window enforced only on the way out of a
-		// read is a window a hung read never reaches. This is the difference
-		// between giving up in the configured time and never giving up at all.
+		// Checked before the read: a wedged connection hangs rather than fails,
+		// so a window enforced only after a read is one a hung read never reaches.
 		if !trouble.IsZero() && time.Since(trouble) >= c.cfg.reconnect() {
 			c.log.Error("wings: worker did not come back", "worker", w.id, "after", time.Since(trouble))
 			c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "unreachable"})
@@ -779,11 +617,8 @@ func (c *Cluster) tail(w *workerConn) {
 			return
 		}
 
-		// EVERY read is bounded, including the healthy one. A broken connection
-		// does not always fail: a read issued on one can simply never return,
-		// and an unbounded read there is a worker that is neither delivering
-		// results nor being given up on — the worst of both. While in trouble
-		// the bound is the remaining window, so retries cannot outlast it.
+		// Every read is bounded: a broken connection can hang forever, and while
+		// in trouble the bound is the remaining window so retries cannot outlast it.
 		var (
 			recs []dsclient.OffsetRecord[resultEnvelope]
 			err  error
@@ -793,21 +628,14 @@ func (c *Cluster) tail(w *workerConn) {
 			recs, err = w.results.ReadBlocking(readCtx, from, batch)
 			expired := readCtx.Err() != nil
 			cancel()
-			// Our own poll expiring on a healthy worker is not news: it means
-			// nothing was produced in that interval, which is what an idle
-			// worker looks like. Judged by the context, not the error: over
-			// gRPC the error is a status that does not wrap the context's, and
-			// a worker with nothing to say for thirty seconds was being taken
-			// for one that had gone quiet.
+			// Our own poll expiring on a healthy worker is just an idle interval,
+			// judged by the context since gRPC's error does not wrap it.
 			if err != nil && expired && w.ctx.Err() == nil {
 				continue
 			}
 		} else {
-			// A worker in trouble is asked a question it can answer at once. A
-			// blocking read on an idle worker times out however healthy the
-			// link is, so one that had recovered but had no result to deliver
-			// could never be seen to be back; a plain read of whatever is
-			// there returns immediately on a live link, empty or not.
+			// A worker in trouble is asked a non-blocking question, so a recovered
+			// one with nothing to deliver is still seen to be back.
 			limit := min(c.cfg.reconnect()-time.Since(trouble), 5*time.Second)
 			readCtx, cancel := context.WithTimeout(w.ctx, limit)
 			recs, err = w.results.Read(readCtx, from, batch)
@@ -822,21 +650,16 @@ func (c *Cluster) tail(w *workerConn) {
 				return // already retired deliberately
 			}
 
-			// A message too large is not a link that might come back, and it
-			// is not a dead worker either. Nearly always it is a batch of
-			// legal results that is too much at once, so ask for fewer. Only
-			// a single record that cannot be carried is a genuine oversized
-			// result — which a worker built from this source never sends — and
-			// even that costs the one job, not the worker holding it and the
-			// machine under it, which used to be declared dead and destroyed.
+			// A too-large message is neither a broken link nor a dead worker:
+			// usually a batch of legal results, so ask for fewer.
 			if status.Code(err) == codes.ResourceExhausted {
 				if batch > 1 {
 					batch /= 2
 					continue
 				}
-				// Nothing can be decoded, so nothing says which job it was. It
-				// stays outstanding until its own bound settles it; the record
-				// is left where it is, since a resume would only skip it again.
+				// A single record that cannot be carried: nothing decodes, so
+				// nothing says which job it was. Skipped; it stays outstanding
+				// until its own bound settles it.
 				c.log.Error("wings: skipping a result too large for the connection to carry",
 					"worker", w.id, "offset", from, "err", err,
 					"hint", "the worker that produced it was built from different source; "+
@@ -845,9 +668,8 @@ func (c *Cluster) tail(w *workerConn) {
 				continue
 			}
 
-			// A worker we can see has exited is dead now, not in two minutes.
-			// Waiting out the window for it would leave its jobs unredispatched
-			// for no reason at all.
+			// A worker we can see has exited is dead now; no reason to wait out
+			// the reconnect window.
 			if w.hasExited() {
 				c.log.Error("wings: worker exited", "worker", w.id, "err", err)
 				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "process exited"})
@@ -861,10 +683,8 @@ func (c *Cluster) tail(w *workerConn) {
 				c.log.Warn("wings: lost contact with worker, retrying",
 					"worker", w.id, "err", err, "giving_up_after", c.cfg.reconnect())
 			}
-			// A cloud that can say the machine is gone is not waited for.
-			// The window exists because a dropped connection is usually the
-			// network; a preempted or deleted instance is not coming back,
-			// and its jobs would sit unmoved for the whole of it.
+			// The reconnect window is for a dropped network connection; a machine
+			// the cloud confirms is gone is not coming back, so do not wait it out.
 			if c.machineGone(w) {
 				c.log.Error("wings: worker's machine is gone", "worker", w.id, "after", time.Since(trouble))
 				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "machine is gone"})
@@ -883,21 +703,19 @@ func (c *Cluster) tail(w *workerConn) {
 			c.log.Info("wings: worker is back", "worker", w.id, "after", time.Since(trouble))
 			trouble, attempts = time.Time{}, 0
 		}
-		// Grown back after a read that fit, so a run of large results costs a
-		// few smaller reads rather than a permanently timid one.
+		// Grown back after a read that fit, so a run of large results is not
+		// paid for by a permanently timid batch.
 		batch = min(batch*2, resultBatch)
 
 		for _, r := range recs {
-			// Written down before it is handed over, so a result a caller saw
-			// completed is never one a recovery would see outstanding.
+			// Mirrored before delivery, so a result a caller saw completed is
+			// never one a recovery would see outstanding.
 			if err := w.mirror.append(w.ctx, r.Offset, r.Record); err != nil {
 				if w.ctx.Err() != nil {
 					return
 				}
-				// The coordinator's own storage failing is not the worker's
-				// fault and retrying the read would not fix it, so this is
-				// reported and the result still delivered: losing the record is
-				// bad, losing the work as well is worse.
+				// Coordinator storage failing is not the worker's fault and a
+				// re-read would not fix it: report, but still deliver.
 				c.log.Error("wings: could not mirror result", "worker", w.id, "err", err)
 			}
 			from = r.Offset + 1
@@ -906,9 +724,8 @@ func (c *Cluster) tail(w *workerConn) {
 	}
 }
 
-// machineGone asks a worker's machine, if it is one that can be asked, whether
-// it has ceased to exist. Only a definite no counts: an unanswered question is
-// the ordinary reconnect wait.
+// machineGone asks a worker's machine, if it can be asked, whether it has ceased
+// to exist. Only a definite answer counts; an unanswered question is not gone.
 func (c *Cluster) machineGone(w *workerConn) bool {
 	p, ok := w.machine.(Prober)
 	if !ok {
@@ -943,18 +760,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// deliver hands one result to whoever is waiting for it.
-//
-// An unknown id is normal rather than alarming: a worker's stream survives the
-// coordinator that wrote to it, so a restart against a persistent Dir replays
-// results nobody is waiting for any more.
-//
-// So is a result from an attempt that was moved away. The job was taken off
-// that worker on the suspicion it was stuck, and a worker that was merely slow
-// finishes anyway. Its answer is not the answer: the retry is the attempt the
-// job now is, its worker was already credited back when the job left it, and
-// its outputs are exactly what the coordinator deletes once the job settles.
-// Delivering it would hand the caller handles to streams on their way out.
+// deliver hands one result to whoever is waiting for it. An unknown id (a
+// restart replaying old results) and a result from a moved-away attempt are both
+// ignored: the latter's outputs are being deleted, so delivering it would hand
+// the caller handles to streams on their way out.
 func (c *Cluster) deliver(res resultEnvelope) {
 	c.mu.Lock()
 	p, ok := c.pending[res.ID]
@@ -980,9 +789,8 @@ func (c *Cluster) deliver(res resultEnvelope) {
 	if ok {
 		wake = c.noteSettledLocked(p, res)
 		if p.recovered && p.waiters == 0 {
-			// Recovered, and nothing has forked it again yet: the result is
-			// kept, unclaimed, for the fork that will. Off its worker,
-			// which has no more to do with it.
+			// Recovered and not yet re-forked: the result is kept, unclaimed,
+			// for the fork that will, and taken off its worker.
 			c.unblockLocked(p)
 			c.release(p.worker)
 			p.worker = nil
@@ -1024,20 +832,13 @@ func (c *Cluster) forget(p *pendingJob) {
 	}
 	c.unblockLocked(p)
 	delete(c.pending, p.job.ID)
-	// Every attempt but the one that produced the result wrote something
-	// nobody holds a handle to. Only worth looking when there WAS an earlier
-	// attempt, which is rare.
-	//
-	// Not once the cluster is stopping. This can be reached from a caller's
-	// own goroutine — one giving up on a result — which is not counted in the
-	// wait group, and adding to a group that Stop may already be waiting on
-	// is a misuse. closed is set under this same lock before Stop waits, so
-	// seeing it clear here means the add lands first.
+	// Abandoned attempts left outputs nobody holds a handle to; drop them. Not
+	// while stopping: this can run on a caller's uncounted goroutine, and closed
+	// is set under this lock before Stop waits, so seeing it clear means the add
+	// to the wait group lands first.
 	if p.job.Attempt > 0 && !c.closed {
 		job, keep := p.job.ID, p.job.Attempt
 		writers := maps.Clone(p.ran)
-		// On the cluster's wait group, so Stop does not close the storage this
-		// is deleting through while it is still deleting.
 		c.wg.Go(func() {
 			c.dropOutputsOf(job, keep, writers)
 		})
@@ -1045,9 +846,8 @@ func (c *Cluster) forget(p *pendingJob) {
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
 			delete(c.byOrigin, key)
-			// Remember which job last ran this call, so a thread of run code
-			// that descends from it and is placed after this can still be
-			// given its history to replay through. See threadHistory and ranAs.
+			// A later thread of run code descending from this call replays
+			// through its history; ranAs remembers which job to ask. See threadHistory.
 			c.ranAs[key] = p.job.ID
 		}
 	}
@@ -1069,13 +869,8 @@ func workerID(w *workerConn) string {
 	return w.id
 }
 
-// release credits a finished job back to its worker. Call with mu held.
-//
-// A job briefly has no worker: moveJob credits the old one and clears it
-// before dropping the lock to fail the job, and a caller giving up on that
-// job in between finds it still pending and releases whatever it holds. That
-// worker was already credited, so there is nothing to do — and there used to
-// be a nil dereference instead.
+// release credits a finished job back to its worker. Call with mu held. A nil
+// worker is expected: a job briefly has none while moveJob fails it.
 func (c *Cluster) release(w *workerConn) {
 	if w == nil {
 		return
@@ -1094,11 +889,9 @@ func (c *Cluster) charge(w *workerConn) {
 	w.idleSince = time.Time{}
 }
 
-// redispatchFrom re-sends everything a dead worker still owed us.
-//
-// This is where at-least-once is actually paid for: the job may have completed
-// on the dead worker and died with its result, or never have run at all, and
-// nothing here can tell those apart.
+// redispatchFrom re-sends everything a dead worker still owed us. This is where
+// at-least-once is paid for: a job may have finished on the dead worker and died
+// with its result, and nothing here can tell that from one that never ran.
 func (c *Cluster) redispatchFrom(dead *workerConn) {
 	c.mu.Lock()
 	var orphans []*pendingJob
@@ -1119,26 +912,16 @@ func (c *Cluster) redispatchFrom(dead *workerConn) {
 	}
 }
 
-// moveJob sends one outstanding job to a different worker.
-//
-// The job keeps its id and gains an attempt, and it carries whatever
-// checkpoint the last attempt reported — so a long job that was most of the way
-// through does not start from nothing. That is what makes moving one affordable
-// enough to do on suspicion rather than only on certainty.
-//
-// The worker it came from is credited back. It has to be: a worker is reaped
-// only once nothing is outstanding on it, so a dead worker whose jobs were
-// moved away without this was never reaped, and its machine billed on until the
-// cluster stopped — which is precisely the case reaping exists for.
+// moveJob sends one outstanding job to a different worker. The job keeps its id,
+// gains an attempt, and carries its last checkpoint so a long job does not
+// restart from nothing. The old worker is credited back, or it would never be
+// reaped and its machine would bill on until the cluster stopped.
 func (c *Cluster) moveJob(p *pendingJob, why string) { c.move(p, why, true) }
 
-// move is moveJob, with a say in whether the move counts against the job.
-//
-// A move on suspicion — a worker lost, a job gone quiet — is an attempt that
-// may have run, and counted so that a job which kills every worker it lands
-// on is eventually given up on. A move for balance is of a job that has not
-// started, from a queue it was merely waiting on, and counting that would
-// have a job fail for having been moved to where it could run sooner.
+// move is moveJob, with a say in whether the move counts against the job's
+// attempt budget. A move on suspicion is counted (so a job that kills every
+// worker is eventually given up on); a move for balance, of a job that has not
+// started, is not.
 func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	c.mu.Lock()
 	if cur, still := c.pending[p.job.ID]; !still || cur != p {
@@ -1148,8 +931,8 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	c.unblockLocked(p)
 	from, left := p.worker, p.job.Attempt
 	if p.incomplete {
-		// Recovered from the journal, which has no input: there is nothing
-		// to send until the replay forks it again. Held until then.
+		// Recovered from the journal, which has no input: nothing to send until
+		// the replay forks it again. Held until then.
 		if from != nil {
 			c.release(from)
 		}
@@ -1165,9 +948,6 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		c.stopOn(from, job.ID, left, why)
 		return
 	}
-	// At-least-once has no natural end, and a job that kills whatever worker it
-	// lands on would be moved forever while the caller waited on a cluster that
-	// merely looked busy.
 	if counted && p.placed && p.job.Attempt+1 >= c.cfg.attempts() {
 		if from != nil {
 			c.release(from)
@@ -1181,18 +961,16 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	}
 	w := c.pickBut(from)
 	if w == nil {
-		// Nowhere to send it, for now. The fleet is kept at its size, so a
-		// replacement is on its way, and this job waits for it — held with
-		// no worker, its clocks stopped, until adopt places it. It used to
-		// be failed on the spot, which made every preemption of the last
-		// machine a failed run.
+		// Nowhere to send it now. The fleet is kept at size, so a replacement is
+		// coming; the job waits with no worker and its clocks stopped until adopt
+		// places it, rather than failing on the spot.
 		if from != nil {
 			c.release(from)
 		}
 		p.worker = nil
 		p.since, p.started, p.beat = time.Time{}, time.Time{}, time.Time{}
-		// Copied under the lock: the worker this waits for may arrive and
-		// place it before the lines below run, and placing rewrites p.job.
+		// Copied under the lock: adopt may place this job (rewriting p.job)
+		// before the lines below run.
 		job := p.job
 		c.mu.Unlock()
 		c.log.Warn("wings: no live worker for a job; holding it until one arrives",
@@ -1207,8 +985,7 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		c.release(from)
 	}
 	job := p.job
-	// A held job being placed for the first time is not on its second
-	// attempt: nothing ran.
+	// A held job placed for the first time is not on its second attempt: nothing ran.
 	if p.placed {
 		job.Attempt++
 	}
@@ -1231,28 +1008,16 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		Worker: w.id, Attempt: job.Attempt, Err: why,
 	}.from(p.origin))
 
-	// Off the watchdog's goroutine: a retry carrying a large recording has to
-	// have it put on the new worker first, and a sweep must not wait on a copy.
-	//
-	// On the cluster's wait group, so Stop waits for it. Every caller of this
-	// is itself counted, so the count cannot be zero here — and left uncounted
-	// it would outlive Stop and finish its move against a journal and an
-	// engine that had already been closed.
+	// Off the watchdog's goroutine (copying a large recording must not stall a
+	// sweep), but on the wait group so it does not outlive Stop and run against a
+	// closed engine.
 	c.wg.Go(func() {
-		// The attempt being left behind may well still be running — a worker
-		// that was merely slow finishes anyway — and its answer is not the
-		// answer. Stop it, so the slot it holds is not lost to an attempt
-		// nobody will read. After the copy of what it wrote is level, since
-		// stopping it first would cut that short.
+		// Stop the abandoned attempt so its slot is not lost, but only after its
+		// outputs are level below: stopping first would cut that copy short.
 		defer c.stopOn(from, job.ID, left, why)
-		// What the abandoned attempts recorded goes with the job. Their handles
-		// never left — a handle only ever leaves in a result, and an attempt
-		// that was moved produced none — so this is the only way the work they
-		// did reaches the attempt that has to redo it.
-		// What the old worker recorded may not have reached the coordinator
-		// yet; a job can stall sooner than the mirror looks. Wait for it before
-		// deciding what the retry gets, or the retry resumes from less than
-		// actually survived.
+		// What abandoned attempts recorded reaches the retry only through here;
+		// their handles never left in a result. Wait for the old worker's writes
+		// to reach the coordinator first, or the retry resumes from less than survived.
 		c.drainOutputs(c.ctx, from, job.ID)
 
 		priors, err := c.priorsOf(c.ctx, w, job.ID)
@@ -1262,28 +1027,24 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		}
 		job.Priors = priors
 		if err := c.hydrate(c.ctx, w, job.Priors); err != nil {
-			// Not fatal. A retry that cannot read what its predecessor wrote
-			// starts from the beginning, which is slow but correct; refusing to
-			// run it at all is neither.
+			// Not fatal: a retry that cannot read its predecessor's recordings
+			// starts over, which is slow but correct.
 			c.log.Warn("wings: could not give a retry its predecessor's recordings",
 				"job", job.ID, "worker", w.id, "err", err)
 			job.Priors = nil
 		}
 		if err := c.hydrateHistory(c.ctx, w, job); err != nil {
-			// The same trade: a retry without its history starts the function
-			// from the top, which is at-least-once doing what it says.
+			// Same trade: a retry without its history starts from the top.
 			c.log.Warn("wings: could not give a retry its predecessor's history",
 				"job", job.ID, "worker", w.id, "err", err)
 		}
 		if err := c.hydrateLineage(c.ctx, w, job); err != nil {
 			// Not the same trade: a thread of run code without its ancestors
-			// cannot be reached at all. The attempt fails on the worker, and
-			// the next is tried elsewhere.
+			// cannot run at all, so the attempt fails and the next is tried elsewhere.
 			c.log.Warn("wings: could not give a thread of run code its ancestors' histories",
 				"job", job.ID, "worker", w.id, "err", err)
 		}
 		if err := c.send(c.ctx, w, job); err != nil {
-			// As at submit: the worker's failing, not the job's.
 			c.log.Warn("wings: could not hand a moved job to a worker; moving it again",
 				"job", job.ID, "worker", w.id, "err", err)
 			c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true)
@@ -1291,14 +1052,9 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	})
 }
 
-// onBeat records that a job is still alive, and where it has got to.
-//
-// A beat for an id nobody is waiting for is ordinary rather than alarming: the
-// job may have just finished, or been moved elsewhere, and the worker's report
-// was already in flight. So is one from an attempt the job has moved on from:
-// the worker it was left on may wake and report, and that report says nothing
-// about the attempt now running — crediting it would reset the retry's clock
-// and could replace its checkpoint with an older one.
+// onBeat records that a job is still alive, and where it has got to. A beat for
+// an unknown id, or from a superseded attempt, is ignored: crediting the latter
+// would reset the retry's clock and could roll its checkpoint back.
 func (c *Cluster) onBeat(b beatEnvelope) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1307,9 +1063,8 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 		return
 	}
 	now := time.Now()
-	// Any beat says the job is running, not only the one that says so: a
-	// worker's first report can go missing like any other, and a job that is
-	// visibly making progress must not stay exempt from its bounds for it.
+	// Any beat marks the job started: the first report can go missing, and a
+	// visibly progressing job must not stay exempt from its bounds.
 	if p.started.IsZero() {
 		p.started = now
 	}
@@ -1381,15 +1136,12 @@ func (c *Cluster) sweep(now time.Time) {
 		isStuck, isSlow := p.overdue(now)
 		switch {
 		case isSlow:
-			// Checked first. A job that has blown its total bound is over
-			// whether or not it was also quiet, and moving it would only spend
-			// the same time again somewhere else.
+			// Before isStuck: a job over its total bound is failed, not moved to
+			// spend the same time again elsewhere.
 			slow = append(slow, p)
 		case isStuck:
-			// Named under the lock, since which bound it was depends on state
-			// only the lock guards. The two are different complaints: one is
-			// about a job that went quiet, the other about a worker that never
-			// began it.
+			// The reason is named under the lock, since which bound it hit
+			// depends on state the lock guards.
 			why := fmt.Sprintf("no heartbeat for %s", p.bounds.Heartbeat)
 			if p.started.IsZero() {
 				why = fmt.Sprintf("not started within %s", p.bounds.Start)
@@ -1431,10 +1183,8 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	if wake != nil {
 		c.wake(wake, "the thread it was waiting for failed")
 	}
-	// A job failed for taking too long is usually still taking it. The worker
-	// enforces the same bound itself, but only the bound it knows. Off this
-	// goroutine, which is the watchdog's: every caller of this is counted in
-	// the group, so the count cannot be zero here.
+	// A job failed for taking too long is usually still running it; tell the
+	// worker to stop. Off the watchdog's goroutine, on the wait group.
 	c.wg.Go(func() {
 		c.stopOn(w, p.job.ID, attempt, err.Error())
 	})
@@ -1445,13 +1195,9 @@ func (c *Cluster) failPending(p *pendingJob, err error) {
 	p.settle(resultEnvelope{ID: p.job.ID, Error: err.Error()})
 }
 
-// stopOn tells a worker to stop an attempt nobody wants the answer to.
-//
-// Best effort, and cheap to be wrong about: a worker that is gone, or one too
-// old to read the control stream, simply runs the attempt to its end as it
-// always did, and the result is dropped as it always was. What this buys when
-// it works is the slot — a worker credited back for a job it is still running
-// is a worker the picker overloads and the scaler may retire mid-job.
+// stopOn tells a worker to stop an attempt nobody wants the answer to. Best
+// effort: a worker that cannot hear runs the attempt out and its result is
+// dropped. When it works it reclaims the slot the attempt was holding.
 func (c *Cluster) stopOn(w *workerConn, job string, attempt int, why string) {
 	if w == nil || w.control == nil || w.dead.Load() {
 		return
@@ -1467,13 +1213,8 @@ func (c *Cluster) stopOn(w *workerConn, job string, attempt int, why string) {
 // Call with mu held.
 func (c *Cluster) pick() *workerConn { return c.pickBut(nil) }
 
-// pickBut is pick, preferring anywhere but one worker.
-//
-// A job being moved is usually being moved BECAUSE of where it was — a machine
-// that stopped answering, or one whose clock says it is stuck — and sending it
-// straight back there wastes the whole timeout again. The old worker is still
-// the answer when it is the only one, since a retry on a busy worker beats no
-// retry at all.
+// pickBut is pick, preferring anywhere but one worker — a job is usually moved
+// because of where it was. The avoided worker is still used when it is the only one.
 func (c *Cluster) pickBut(avoid *workerConn) *workerConn {
 	var best, fallback *workerConn
 	for _, w := range c.workers {
@@ -1501,27 +1242,19 @@ func (c *Cluster) submit(ctx context.Context, fnName string, payload []byte) (*p
 	return c.submitJob(ctx, jobEnvelope{Func: fnName, Payload: payload})
 }
 
-// submitJob is submit for a job already described: a function on its input,
-// or a thread of run code by its lineage. Everything but what the job does
-// is filled in here.
+// submitJob is submit for a job already described: a function on its input, or a
+// thread of run code by its lineage. Everything but what the job does is filled in here.
 func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, error) {
 	job.ID = c.epoch + "-" + strconv.FormatUint(c.nextID.Add(1), 36)
-	// The fleet's capacity travels with every job, so a thread that fans out on
-	// a worker reads the cluster's parallelism and not the worker's own. Stamped
-	// here, the one place every dispatch passes through.
+	// The fleet's capacity travels with the job, so a thread that fans out reads
+	// the cluster's parallelism, not one worker's.
 	job.Capacity = c.maxParallelism()
 	p := &pendingJob{
 		job:    job,
 		done:   make(chan struct{}),
 		bounds: boundsOf(job.Func),
-		// Read off the context rather than passed in: only a workflow sets it,
-		// and threading a parameter nobody else supplies through every caller
-		// would make the ordinary case pay for the special one.
 		origin: flow.OriginFrom(ctx),
 	}
-	// The job is the thread the origin names, and the worker runs it as
-	// that. Where it goes on the worker follows from what it is, not from a
-	// parameter: a thread whose parent is itself a job on a worker is nested.
 	job.Run, job.Thread = p.origin.Run, p.origin.Thread
 
 	key := p.origin.Key()
@@ -1533,16 +1266,13 @@ func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, 
 	}
 	job.Nested = c.parentJobLocked(p.origin) != nil
 	p.job = job
-	// A workflow attempt that replays a call its predecessor had not finished
-	// rejoins that job instead of dispatching a second one. Two copies of an
-	// hour of work would be a waste on their own; worse, the copy starts from
-	// nothing while the original is most of the way through, holding the
-	// checkpoint and the steps that make it cheap to move.
+	// A replayed call whose predecessor had not finished rejoins that job rather
+	// than dispatching a second copy of the same work.
 	if key != "" {
 		if live, ok := c.byOrigin[key]; ok {
 			live.waiters++
-			// A job a restarted coordinator recovered has been waiting for
-			// exactly this: the fork that carries its input.
+			// A recovered job has been held waiting for exactly this fork, which
+			// carries its input.
 			place := live.complete(job)
 			c.mu.Unlock()
 			c.journal.record(journalEntry{
@@ -1557,11 +1287,9 @@ func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, 
 	}
 	w := c.pick()
 	if w == nil {
-		// No worker right now — every machine gone at once, or the fleet
-		// still being replaced. The fleet is kept at its size, so one is
-		// coming; the job is held until adopt places it, and the caller's
-		// own context bounds the wait. Refusing here made a call that landed
-		// in the gap between a preemption and its replacement fail outright.
+		// No worker right now. The fleet is kept at size, so one is coming; the
+		// job is held until adopt places it, bounded by the caller's context,
+		// rather than failed outright.
 		p.waiters = 1
 		p.ran = map[int]*workerConn{}
 		c.pending[job.ID] = p
@@ -1588,20 +1316,16 @@ func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, 
 	c.charge(w)
 	c.mu.Unlock()
 
-	// A thread of run code is reached through its ancestors, whose
-	// histories the worker must have before the job: see lineage.go.
+	// A thread of run code is reached through its ancestors, whose histories the
+	// worker must have before the job: see lineage.go.
 	err := c.hydrateLineage(ctx, w, job)
 	if err == nil {
 		err = c.send(ctx, w, job)
 	}
 	if err != nil {
-		// The worker, not the work: it was picked a moment ago and does not
-		// answer now — dying, as a rule, its jobs about to be moved off it
-		// — so this job is moved off it too, rather than failed, which
-		// made a fork that landed on a machine in its last second the
-		// thread's own failure: one its parent, waiting on a channel the
-		// thread was to feed, never saw. Counted against the job, so that
-		// one nothing can be handed to fails rather than loops.
+		// The worker is failing, not the job: it was picked a moment ago and no
+		// longer answers. Move the job rather than fail it, but counted, so a job
+		// nothing can ever be handed to fails rather than loops.
 		c.log.Warn("wings: could not hand a job to a worker; moving it",
 			"job", job.ID, "worker", w.id, "err", err)
 		c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true)
@@ -1627,20 +1351,16 @@ func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, err
 		return p.res, nil
 
 	case <-ctx.Done():
-		// Abandoned only by the LAST caller still interested. A workflow that
-		// is retried has one attempt giving up while the next has already
-		// rejoined, and dropping the job there would throw away the work the
-		// retry is counting on.
+		// Abandoned only by the last caller still interested: a retried workflow
+		// can have one attempt give up while the next has already rejoined.
 		c.mu.Lock()
 		p.waiters--
 		if p.waiters <= 0 {
 			if cur, ok := c.pending[p.job.ID]; ok && cur == p {
 				c.forget(p)
 				c.release(p.worker)
-				// The worker was just credited back for a job it is still
-				// running. Tell it to stop, off this goroutine — the caller is
-				// leaving — and only if Stop is not already waiting on the
-				// group, which closed says under this same lock.
+				// Just credited back a job the worker may still be running; tell
+				// it to stop. Off this goroutine, and not once Stop is waiting.
 				if w := p.worker; w != nil && !c.closed {
 					job, attempt := p.job.ID, p.job.Attempt
 					c.wg.Go(func() {
@@ -1656,15 +1376,13 @@ func (c *Cluster) await(ctx context.Context, p *pendingJob) (resultEnvelope, err
 		c.mu.Lock()
 		p.waiters--
 		c.mu.Unlock()
-		// A context error, because that is what it is to the run waiting:
-		// an interruption, to be resumed by the next coordinator, and not
-		// the job's answer.
+		// A context error, not the job's answer: to the waiting run this is an
+		// interruption, to be resumed by the next coordinator.
 		return resultEnvelope{}, fmt.Errorf("wings: cluster stopped while waiting for a result: %w", context.Canceled)
 	}
 }
 
-// Workers reports how many workers are currently in service. Useful when
-// autoscaling is on and the count is not something the caller chose.
+// Workers reports how many workers are currently in service.
 func (c *Cluster) Workers() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1685,11 +1403,9 @@ func (c *Cluster) Outstanding() int {
 	return len(c.pending)
 }
 
-// Stop shuts the workers down and releases everything the cluster provisioned.
-//
-// Machines are destroyed. That is the point of provisioning them, but it means
-// a cluster you forgot to Stop is one you are still paying for — call it in a
-// defer.
+// Stop shuts the workers down and releases everything the cluster provisioned,
+// destroying any machines it created. Call it in a defer: an un-stopped cluster
+// keeps billing.
 func (c *Cluster) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
@@ -1697,26 +1413,17 @@ func (c *Cluster) Stop(ctx context.Context) error {
 		return nil
 	}
 	c.closed = true
-	// A copy, not the slice: a worker that dies from here on is deleted
-	// from c.workers in place, which clears the slot it left at the end of
-	// the array this would otherwise still be reading.
+	// A copy: a worker that dies from here on is deleted from c.workers in place.
 	workers := slices.Clone(c.workers)
 	c.mu.Unlock()
 
 	c.journal.record(journalEntry{Kind: journalClusterStop})
 
-	// Before the mirror is cancelled: what a job wrote in its last moments may
-	// still be on its way. Its result arrived and its caller has the handle,
-	// and the machine that holds the rest is about to be destroyed. Cancelling
-	// first left a persistent Dir holding the front of a file whose handle
-	// promised the whole of it. All at once, since each is bounded on its own
-	// and a fleet's worth of bounds in a row would be a long Stop.
-	//
-	// The workers are still in c.workers for this, and must be: the fleet the
-	// mirror follows IS c.workers, and a worker taken out of it has its copies
-	// cancelled and stops being a source the mirror will answer for. Nothing
-	// new reaches them meanwhile — closed is set, so submit refuses — and the
-	// scaler declines to run on a closing cluster.
+	// Drain each worker's outputs before the mirror is cancelled and its machine
+	// destroyed, or a persistent Dir would keep only the front of a file whose
+	// handle promised the whole of it. The workers must still be in c.workers
+	// here, since that is the fleet the mirror answers for. All at once, or a
+	// fleet's worth of bounded drains in a row would make Stop slow.
 	var drains sync.WaitGroup
 	for _, w := range workers {
 		drains.Go(func() {
@@ -1732,9 +1439,8 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	c.cancel()
 	c.wg.Wait()
 
-	// All at once. Releasing a cloud machine is a delete the API takes most
-	// of a minute to confirm, and one after another made Stop on a fleet of
-	// sixteen a ten-minute wait — every one of them billing until its turn.
+	// All at once: releasing a cloud machine can take most of a minute, and a
+	// whole fleet in sequence would make Stop a long, still-billing wait.
 	errs := make([]error, len(workers))
 	var releases sync.WaitGroup
 	for i, w := range workers {
@@ -1743,12 +1449,10 @@ func (c *Cluster) Stop(ctx context.Context) error {
 		})
 	}
 	releases.Wait()
-	// The journal writes through the shared instance, so it must be drained
-	// before that instance goes away — and it is drained last, so the entries
-	// for the workers just closed are in it.
+	// The journal writes through the shared instance, so drain it before that
+	// instance goes away, and after the workers so their closing entries are in it.
 	c.journal.close()
-	// Last: the in-process workers read through it, and every one of them has
-	// now stopped.
+	// Last: the in-process workers read through the shared instance.
 	errs = append(errs, c.closeShared())
 	c.cleanupDir()
 	return errors.Join(errs...)
@@ -1773,20 +1477,16 @@ func (w *workerConn) close(ctx context.Context) error {
 		errs = append(errs, w.client.Close())
 	}
 	if w.proc != nil {
-		// Kill's error is deliberately dropped. The process may already be gone
-		// — killed by a test, preempted, or crashed — and on Windows killing an
-		// exited-but-unreaped process fails with "Access is denied", which would
-		// turn every ordinary shutdown after a worker loss into a Stop error.
+		// Kill's error is dropped: the process may already be gone, and on Windows
+		// killing an exited-but-unreaped process fails, which would make every
+		// shutdown after a worker loss a Stop error.
 		_ = w.proc.Kill()
-		// The watcher goroutine owns Wait, so this waits for IT rather than
-		// calling Wait a second time: two concurrent waits on one process is not
-		// something os/exec promises anything about.
+		// The watcher goroutine owns Wait; wait for it, since two concurrent Waits
+		// on one process is undefined.
 		if w.exited != nil {
 			select {
 			case <-w.exited:
 			case <-time.After(10 * time.Second):
-				// Bounded rather than indefinite. A process that will not die
-				// should cost a leaked handle, not a shutdown that never ends.
 			}
 		}
 	}
@@ -1796,23 +1496,10 @@ func (w *workerConn) close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// tailBeats follows one worker's progress reports.
-//
-// A loop of its own rather than a second case in tail: results and beats are
-// different streams with different meanings, and a beat is only useful while the
-// job it describes is still running — waiting for the result stream to produce
-// something before noticing one would defeat the point entirely.
-//
-// Beats are read from the END of the stream, not from the beginning. Whatever a
-// previous coordinator's jobs reported is about jobs that are no longer
-// outstanding, and a checkpoint is a position rather than a record: only the
-// latest is ever wanted, and old ones name jobs nobody is waiting for.
-//
-// Where the end is was found by adopt, before the worker could be given a job:
-// found here, after, the first beats of a job dispatched in between were behind
-// the starting point and never read. A job whose start was missed that way had
-// no clock running on it, and one that then went quiet was never moved — the
-// step-replay test hung on exactly that under a loaded suite.
+// tailBeats follows one worker's progress reports. Beats are read from the end
+// of the stream (only the latest checkpoint is wanted), from the offset adopt
+// captured before the worker could be given any job — captured here instead, the
+// first beats of a job dispatched in between would fall behind the start and be missed.
 func (c *Cluster) tailBeats(w *workerConn) {
 	from := w.beatsFrom
 
@@ -1828,10 +1515,8 @@ func (c *Cluster) tailBeats(w *workerConn) {
 			if w.ctx.Err() != nil {
 				return
 			}
-			// Nothing here declares a worker dead. That is the result tail's
-			// job, and it has the reconnect window and the exit signal to do it
-			// with; two goroutines racing to reach the same verdict would only
-			// make the verdict harder to reason about.
+			// Nothing here declares a worker dead: that is the result tail's job,
+			// and two goroutines racing to the same verdict only muddy it.
 			if !expired {
 				select {
 				case <-w.ctx.Done():
@@ -1844,10 +1529,8 @@ func (c *Cluster) tailBeats(w *workerConn) {
 		for _, r := range recs {
 			from = r.Offset + 1
 			if r.Record.Leaving {
-				// The one verdict this loop does reach: not a guess about a
-				// silent worker, but the worker itself saying its machine is
-				// being taken back. Same path as a death, so what it owed is
-				// moved and the machine released.
+				// The worker itself saying its machine is being taken back — not a
+				// guess. Same path as a death: what it owed is moved, the machine released.
 				c.log.Warn("wings: worker is leaving; its machine is being taken back", "worker", w.id)
 				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "preempted"})
 				w.dead.Store(true)

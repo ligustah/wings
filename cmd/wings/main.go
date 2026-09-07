@@ -1,63 +1,21 @@
-// Command wings builds a self-contained coordinator with its worker inside it.
+// Command wings builds a self-contained coordinator with its worker embedded.
 //
 //	go run github.com/ligustah/wings/cmd/wings build -pkg ./job -worker linux/amd64 -o myapp
 //
-// # What you write
+// You write a library package — work functions declared with flow.Define and a
+// root marked with flow.Main — not a main. build generates two mains into a
+// scratch directory under the module root and compiles them:
 //
-// A LIBRARY package — not a main — holding your work functions and the
-// coordinator body:
-//
-//	package job
-//
-//	var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) { … })
-//
-//	// A root is run as a flow once the cluster is up.
-//	var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
-//		imgs, err := ctx.Map(Render, job.Frames)
-//		…
-//	})
-//	var _ = flow.Main(Frames)
-//
-// The names are inferred from the variables — Render, Frames — so flow.WithName
-// is only for overriding that. WHERE the work runs is not in it: -providers links clouds into
-// the coordinator, and -target and -provider choose between them at run time.
-//
-// For a cloud wings does not ship you may instead export
-// `func Provisioner() wings.Provisioner`, which takes precedence over -provider
-// — the one thing that puts a cloud back into your own source.
-//
-// # What this builds
-//
-// TWO programs, from two mains generated into a scratch directory under your
-// module root (.wings-build/) which is removed afterwards. It has to be inside
-// the module so the generated code can import your package by its normal path;
-// no file of yours is touched, and nothing is left behind by a build that is
-// not killed outright.
-//
-//	worker       imports your package for its Define calls, and calls
-//	             wings.WorkerMain. It carries no provisioner, no coordinator
-//	             body, and no embedded binary of its own. Cross-compiled for the
-//	             machines it will run on.
-//
+//	worker       imports your package for its Define calls and runs
+//	             wings.WorkerMain; cross-compiled for -worker.
 //	coordinator  imports your package, embeds the worker with //go:embed, and
-//	             calls wings.CoordinatorMain. Built for the machine YOU will run
-//	             it on — natively, so nothing about the coordinator is
-//	             cross-compiled.
+//	             runs wings.CoordinatorMain; built for -coordinator (default: this machine).
 //
-// Splitting them is why the coordinator's platform and the worker's are
-// independent, and why the worker does not have to contain the cloud SDK it is
-// deployed by.
-//
-// # Keeping workers small
-//
-// Providers are linked into the coordinator only, so a worker never carries the
-// cloud SDK that deployed it — dropping the example's worker from 28 MB to 15 MB
-// when its provisioner moved to a flag.
-//
-// Both mains do import the package named by -pkg, so anything IT pulls in lands
-// in the worker too. Pass -coordinator-pkg to split them: -pkg holds the work
-// functions both halves need, -coordinator-pkg holds the workflows and is
-// linked only into the coordinator.
+// Providers named by -providers are linked into the coordinator only, so a
+// worker never carries a cloud SDK. A package that exports
+// func Provisioner() wings.Provisioner overrides -provider. Split the work and
+// coordinator packages with -coordinator-pkg to keep coordinator-only
+// dependencies out of the worker.
 package main
 
 import (
@@ -197,9 +155,8 @@ func build(args []string) error {
 		return err
 	}
 	if coordinate.Dir != work.Dir {
-		// A split build: the work package holds Define calls the coordinator
-		// dispatches against and the worker runs, so its inferred names — and
-		// possibly its workflows — belong in both mains too.
+		// Split build: the work package's Define calls and inferred names belong
+		// in both mains too.
 		workAPI, err := inspectAPI(work.Dir)
 		if err != nil {
 			return err
@@ -224,11 +181,8 @@ func build(args []string) error {
 		return err
 	}
 
-	// The scratch tree lives INSIDE the module so the generated mains can import
-	// the user's package by its normal path, with the module graph already
-	// correct. A directory elsewhere would need a synthesised go.mod and a
-	// replace, which is a second, worse copy of information the module already
-	// has.
+	// Inside the module so the generated mains can import the user's package by
+	// its normal path, with the module graph already correct.
 	scratch, cleanup, err := scratchDir(work.Module.Dir)
 	if err != nil {
 		return err
@@ -314,9 +268,8 @@ func build(args []string) error {
 	return nil
 }
 
-// pkgInfo is the part of `go list -json` we need.
-// providerImports turns the -providers list into import paths. A bare name is
-// one of the providers wings ships; anything with a slash is somebody else's.
+// providerImports turns the -providers list into import paths. A bare name is a
+// provider wings ships; anything with a slash is an import path.
 func providerImports(list string) []string {
 	var out []string
 	for name := range strings.SplitSeq(list, ",") {
@@ -361,22 +314,13 @@ func describe(pkg string) (pkgInfo, error) {
 type pkgAPI struct {
 	definesWorkflow bool
 	hasProvisioner  bool
-	// names is the call site → inferred name table for nameless Define calls:
-	// "<file>:<line>" to the variable the definition is assigned to. It is what
-	// flow.RegisterCallSiteNames is given, so a Define needs no WithName. A
-	// Define that already has a WithName, or is assigned to _, contributes
-	// nothing.
+	// names maps "<file>:<line>" of each nameless Define to the variable it is
+	// assigned to, for flow.RegisterCallSiteNames.
 	names map[string]string
 }
 
-// inspectAPI looks for the function the generated main may call, for the
-// flow.Main call that gives the coordinator a root to run, and for the names of
-// the variables nameless Define calls are assigned to.
-//
-// Parsed rather than probed by compiling: a missing root should be one clear
-// sentence naming the call to add, not a compile error inside generated code
-// the user never wrote and cannot see — or worse, a binary that builds and then
-// refuses to start.
+// inspectAPI parses dir for an exported Provisioner, a flow.Main call, and the
+// inferred names of nameless Define calls.
 func inspectAPI(dir string) (pkgAPI, error) {
 	api := pkgAPI{names: map[string]string{}}
 	fset := token.NewFileSet()
@@ -395,9 +339,6 @@ func inspectAPI(dir string) (pkgAPI, error) {
 						api.hasProvisioner = true
 					}
 				case *ast.GenDecl:
-					// Package-scope vars only: a workflow defined inside a
-					// function is not in the registry when the coordinator
-					// looks, and it is better to say so here.
 					ast.Inspect(d, func(n ast.Node) bool {
 						call, ok := n.(*ast.CallExpr)
 						if !ok {
@@ -420,8 +361,8 @@ func inspectAPI(dir string) (pkgAPI, error) {
 	return api, nil
 }
 
-// callName is the selector name of a call to flow, e.g. "Define" for
-// flow.Define(…) and for a dot-imported Define(…); "" for anything else.
+// callName is the selector name of a call, e.g. "Define" for flow.Define(…) or
+// a dot-imported Define(…); "" for anything else.
 func callName(call *ast.CallExpr) string {
 	switch fn := call.Fun.(type) {
 	case *ast.SelectorExpr:
@@ -432,10 +373,9 @@ func callName(call *ast.CallExpr) string {
 	return ""
 }
 
-// collectNames records, for each `var X = flow.Define(…)` with no WithName in
-// the GenDecl, the call site → X. The site is the base file name and the line
-// the Define call is written on, which is what Define reads off the call stack
-// at run time; the base name alone so it matches a -trimpath build.
+// collectNames records, for each `var X = flow.Define(…)` with no WithName, the
+// site "<base file>:<line>" → X. The base name matches what Define reads off the
+// call stack under a -trimpath build.
 func collectNames(fset *token.FileSet, d *ast.GenDecl, names map[string]string) error {
 	for _, spec := range d.Specs {
 		vs, ok := spec.(*ast.ValueSpec)
@@ -449,7 +389,6 @@ func collectNames(fset *token.FileSet, d *ast.GenDecl, names map[string]string) 
 			}
 			name := vs.Names[i].Name
 			if name == "_" || hasWithName(call) {
-				// No name to infer, or one already given: nothing to record.
 				continue
 			}
 			pos := fset.Position(call.Pos())
@@ -464,8 +403,7 @@ func collectNames(fset *token.FileSet, d *ast.GenDecl, names map[string]string) 
 	return nil
 }
 
-// hasWithName reports whether a Define call already carries a flow.WithName
-// option, in which case nothing is inferred for it.
+// hasWithName reports whether a Define call already carries a flow.WithName.
 func hasWithName(call *ast.CallExpr) bool {
 	for _, arg := range call.Args {
 		if inner, ok := arg.(*ast.CallExpr); ok && callName(inner) == "WithName" {
@@ -486,9 +424,8 @@ func scratchDir(moduleDir string) (string, func(), error) {
 	}
 	return dir, func() {
 		_ = os.RemoveAll(dir)
-		// Remove the parent too when nothing else is using it, so a clean build
-		// leaves no trace.
-		_ = os.Remove(base)
+		_ = os.Remove(base) // parent too, if now empty
+
 	}, nil
 }
 
@@ -500,8 +437,6 @@ type buildOpts struct {
 }
 
 func goBuild(out, dir string, p platform, o buildOpts) error {
-	// Stripped and trimmed: these are shipped, not debugged in place, and the
-	// worker is uploaded once per machine.
 	ld := "-s -w"
 	if o.keepDebug {
 		ld = ""
@@ -521,9 +456,7 @@ func goBuild(out, dir string, p platform, o buildOpts) error {
 
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
-	// CGO off so a cross build needs no target C toolchain, and so the worker is
-	// static — the VM image it lands on need not have the same libc as the
-	// machine that built it.
+	// CGO off: a cross build needs no C toolchain, and the worker stays static.
 	cmd.Env = append(os.Environ(), "GOOS="+p.os, "GOARCH="+p.arch, "CGO_ENABLED=0")
 
 	if o.verbose {

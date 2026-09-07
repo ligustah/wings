@@ -2,28 +2,15 @@ package flow
 
 import "sync"
 
-// A shared channel gives each value to ONE receiver, as a channel between
-// threads does, and the receivers are on machines that cannot see each other.
-// So a receive across runs is a request — a WANT, the receiver's nth on the
-// channel — and the host answers it with a GRANT naming the value that
-// receiver gets. The host decides; nobody else can. The rule it decides by is
-// this file, so that every host decides the same way: values in the order
-// they reached the host, wants in the order they reached the host, each
-// value to the earliest want still open.
-//
-// A want is idempotent. A receiver that asks again — its attempt ended while
-// it waited, and the replay has reached the same receive — is asking for the
-// grant it may already have, and gets nothing new; the grant is on the
-// channel's record where the replay reads it. That is what lets a receive be
-// abandoned and resumed anywhere without a value being given twice.
+// A shared channel gives each value to one receiver. A cross-run receive is a
+// want; the host answers with a grant naming the value that receiver gets. The
+// rule, applied by every host alike: each value to the earliest still-open want,
+// both in the order they reached the host. A want is idempotent, so a receive
+// can be abandoned and resumed without granting a value twice.
 
-// Arbiter applies the rule a host follows to hand out a shared channel's
-// values. A host keeps one per channel and appends to the channel's record
-// exactly what Offer returns.
-//
-// Not safe for concurrent use from more than one goroutine without a lock of
-// the host's own; a host's record is written by one writer, and that writer
-// holds the arbiter.
+// Arbiter applies that rule. A host keeps one per channel and appends to the
+// channel's record exactly what Offer returns. Not safe for concurrent use
+// without the host's own lock.
 type Arbiter struct {
 	mu     sync.Mutex
 	seen   map[string]bool // values on the record, by sender#seq
@@ -104,8 +91,7 @@ func has(items []ChannelItem, from string, seq uint64) bool {
 	return false
 }
 
-// admit takes a value, want or close into the arbiter's state and reports
-// whether it was new. Call with mu held.
+// admit takes a value, want or close into state and reports whether it was new.
 func (a *Arbiter) admit(it ChannelItem) bool {
 	switch {
 	case it.Closed:
@@ -131,8 +117,7 @@ func (a *Arbiter) admit(it ChannelItem) bool {
 	return true
 }
 
-// match pairs values with wants, earliest with earliest, and returns the
-// grants. Call with mu held.
+// match pairs values with wants, earliest with earliest, and returns the grants.
 func (a *Arbiter) match() []ChannelItem {
 	var grants []ChannelItem
 	for len(a.values) > 0 && len(a.wants) > 0 {

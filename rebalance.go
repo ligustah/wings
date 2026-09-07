@@ -6,25 +6,9 @@ import (
 	"time"
 )
 
-// Moving queued work to a worker that arrived after it was queued.
-//
-// A job is placed on the least loaded worker AT SUBMIT, and from then on it is
-// that worker's: its queue is a stream, and the worker takes from it in order.
-// That is what makes a worker's death survivable — the queue is still there —
-// but it also means a worker that arrives later, or frees up sooner, finds
-// nothing addressed to it. A Map over sixty jobs onto two workers put thirty on
-// each; when one of them was preempted and replaced, the replacement sat idle
-// while the survivor worked through both halves, because every job had already
-// been given a home.
-//
-// So the watchdog looks, once a tick, for exactly that shape: a worker with
-// jobs waiting unstarted on its queue while another has clearly less to do,
-// and moves the waiting ones over until the two are within a job of each
-// other. The move is the same move a lost worker's jobs get — a new attempt on
-// a new worker, and a word to the old one to skip it when its turn comes —
-// except that it does not count against the job, since nothing ran.
-
-// rebalance evens out queued work between workers. Runs on the watchdog.
+// rebalance moves jobs waiting unstarted on one worker's queue to a worker with
+// less to do, so a worker that joined after submit is not left idle. Runs on the
+// watchdog; a moved job does not count against its attempts.
 func (c *Cluster) rebalance(now time.Time) {
 	type move struct {
 		p        *pendingJob
@@ -33,10 +17,8 @@ func (c *Cluster) rebalance(now time.Time) {
 	var moves []move
 
 	c.mu.Lock()
-	// What could be moved: jobs on a worker that has not begun them, and has
-	// had a tick to. Deepest in the queue first, since the job appended last
-	// is the one furthest from being taken up — moving the head of a queue
-	// races the worker for it.
+	// Movable: jobs unstarted for at least a tick. Deepest in the queue first —
+	// moving the head races the worker for it.
 	queued := map[*workerConn][]*pendingJob{}
 	for _, p := range c.pending {
 		if p.worker == nil || !p.started.IsZero() || now.Sub(p.since) < rebalanceAfter {
@@ -48,10 +30,8 @@ func (c *Cluster) rebalance(now time.Time) {
 		slices.SortFunc(q, func(a, b *pendingJob) int { return b.since.Compare(a.since) })
 	}
 
-	// Greedy, on a copy of the loads: take from the fullest worker that has
-	// something movable and give to the emptiest, while the two are more than
-	// a job apart. The counts are what the picker uses, so the destination is
-	// the one the move will choose for itself.
+	// Greedy on a copy of the loads: fullest movable worker to emptiest, while
+	// the two are more than a job apart.
 	load := map[*workerConn]int{}
 	for _, w := range c.workers {
 		if w.available() {

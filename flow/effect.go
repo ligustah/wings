@@ -9,25 +9,13 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// Effect calls f once and records what it returned, so a replay hands back the
-// same outcome without calling f again.
-//
-// It is the wrapper for the things a run body needs from the outside world
-// that would answer differently each time: the host's name, a random number, a
-// fresh identifier, a read of a file that may since have changed. Written bare,
-// such a call makes the run's history contradict its next attempt; written as
-// an effect, the answer is part of the history.
+// Effect calls f once and records its result (error included), so a replay
+// returns the same outcome without calling f again. Use it for the
+// nondeterministic reads a run body needs — the clock, a random number, a
+// hostname, a file that may change. f must not use the run's context, and T
+// must be round-trippable by the codec.
 //
 //	host, err := ctx.Effect(os.Hostname)
-//
-// An error from f is recorded too, and replayed: the effect failed, and that is
-// what happened. Retry inside f if a transient failure should not settle the
-// matter. f itself must not use the run's context — it is not a thread of the
-// run, and nothing it does is recorded but its result.
-//
-// T is encoded the way a function's result is, so it must be a value the
-// codec can round-trip: a plain value, a struct with exported fields, or a
-// pointer to one.
 func (c Context) Effect[T any](f func() (T, error)) (T, error) {
 	var zero T
 	t := threadFrom(c)

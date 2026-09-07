@@ -11,14 +11,8 @@ import (
 	"time"
 )
 
-// buildWorker cross-compiles the worker binary for a remote machine.
-//
-// The running process cannot ship itself: a Windows .exe is not a Linux worker,
-// and even on Linux the coordinator's architecture need not be the VM's. So
-// wings compiles the same package for the target and sends that.
-//
-// This means a remote run needs a Go toolchain and the module source on the
-// coordinator. That is a real constraint and it is stated in [BuildConfig].
+// buildWorker cross-compiles the worker for goos/goarch. It needs a Go toolchain
+// and the module source on the coordinator.
 func buildWorker(ctx context.Context, cfg BuildConfig, outDir string, log *slog.Logger) (string, error) {
 	pkg := cfg.Package
 	if pkg == "" {
@@ -37,9 +31,7 @@ func buildWorker(ctx context.Context, cfg BuildConfig, outDir string, log *slog.
 	}
 	out := filepath.Join(outDir, "wings-worker")
 
-	// Stripped and trimmed: this binary is uploaded once per machine and only
-	// ever runs as a worker, so the debug info is bandwidth spent on something
-	// nobody will attach a debugger to. It is most of the size.
+	// -s -w strips debug info, which is most of the upload size.
 	args := []string{"build", "-trimpath", "-ldflags", "-s -w", "-o", out}
 	if cfg.Tags != "" {
 		args = append(args, "-tags", cfg.Tags)
@@ -47,9 +39,7 @@ func buildWorker(ctx context.Context, cfg BuildConfig, outDir string, log *slog.
 	args = append(args, pkg)
 
 	cmd := exec.CommandContext(ctx, "go", args...)
-	// CGO_ENABLED=0 first so cfg.Env can override it. Cross-compiling with cgo
-	// needs a target C toolchain the coordinator almost certainly lacks, and
-	// the resulting error names a C compiler rather than the real cause.
+	// CGO_ENABLED=0 before cfg.Env so the caller can override it.
 	cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
 	cmd.Env = append(cmd.Env, cfg.Env...)
 

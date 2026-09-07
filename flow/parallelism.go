@@ -7,32 +7,20 @@ import (
 )
 
 // MaxParallelism reports how many calls can run at once where this run's work
-// goes: for a cluster, the largest the worker fleet may grow to times how many
-// each worker runs; for an in-process run, the process's own parallelism. Use
-// it to size a fan-out — how many inputs to have in flight before waiting on
-// one — without wiring the executor's shape into the work.
+// goes — the fleet's capacity for a cluster, GOMAXPROCS in process — to size a
+// fan-out without wiring the executor's shape into the work. It is a capacity,
+// not a limit: more may be forked, and the surplus queues. Read once and
+// recorded, so every attempt sees the same value.
 //
 //	n, err := ctx.MaxParallelism()
-//	if err != nil {
-//		return err
-//	}
 //	for chunk := range chunks(work, n) {
 //		results, err := ctx.Map(Digest, chunk)
 //		...
 //	}
-//
-// The number is read once and recorded, so every attempt of the thread sees
-// the same value even if the fleet has since grown or shrunk — a replay that
-// decided differently would contradict its own history. It is a capacity, not
-// a limit the run must respect: more work than this may be forked, and the
-// surplus queues until a slot frees.
 func (c Context) MaxParallelism() (int, error) {
 	if threadFrom(c) == nil {
 		return 0, errors.New("flow: MaxParallelism called outside a Run")
 	}
-	// Recorded through Effect, because the fleet's capacity is exactly the kind
-	// of outside answer that changes between attempts and must be pinned to the
-	// history's first read.
 	n := maxParallelismFrom(c)
 	return c.Effect(func() (int, error) { return n, nil })
 }

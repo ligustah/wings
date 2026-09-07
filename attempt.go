@@ -16,86 +16,64 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// attemptWorkloadPrefix begins an attempt's transactional id: the job's
-// stream part and the attempt number follow. The coordinator's puller
-// reads it back to tell whose transaction it is offered.
+// attemptWorkloadPrefix begins an attempt's transactional id; job stream part
+// and attempt number follow.
 const attemptWorkloadPrefix = "wings.job."
 
-// One attempt of one job, on the worker running it, writes several streams:
-// the history of the run it executes as, the recordings it opens, the files
-// it produces. They are written under ONE transactional producer, and they
-// become visible together.
-//
-// That is what makes a moved job's leftovers consistent. A retry is handed
-// what its predecessor wrote, and the predecessor's history says which
-// recordings it had made by the point it reached; if the two could disagree —
-// a recording copied further than the history that explains it — the retry
-// would resume from one and replay the other. Committing them as one
-// transaction, and copying them home by whole transactions, is what removes
-// that. The copy is the mirror's business; this file is the commit.
-//
-// A transaction is committed at the points that mean something: before every
-// heartbeat and step report (so what the coordinator is told about progress
-// is never ahead of what it can copy), when the function returns, and — as a
-// net under a function that reports nothing for a long time — when the open
-// transaction is older than half its budget, since a transaction the backend
-// times out takes everything in it along.
+// Everything one attempt writes — its run history, recordings, byte streams —
+// goes under one transactional producer and becomes visible together, so a
+// moved job's leftovers cannot disagree. Committed at each heartbeat and step
+// (so progress the coordinator is told is never ahead of what it can copy), on
+// return, and by age before the backend times the transaction out.
 
-// historyPrefix is the history of the run an attempt executes as. See
-// attemptOutputs and the worker's runOne. Its Name part is always "history".
+// historyPrefix is the history of the run an attempt executes as; its Name part
+// is always "history".
 const historyPrefix = "wings.history."
 
-// historyName is the stream a job attempt's history is kept on, on the worker
-// that runs it and on the coordinator alike.
+// historyName is the stream a job attempt's history is kept on.
 func historyName(job string, attempt int) string {
 	return outputName{Prefix: historyPrefix, Job: job, Attempt: attempt, Name: "history"}.String()
 }
 
-// attemptOutputs is one attempt's transactional producer and the transaction
-// currently open on it.
+// attemptOutputs is one attempt's transactional producer and its open transaction.
 type attemptOutputs struct {
 	node    *workerNode
 	job     string
 	attempt int
-	// budget is how long one transaction may stay open. Zero takes the
-	// backend's default, read once the producer exists.
+	// budget is how long one transaction may stay open; zero takes the backend default.
 	budget time.Duration
 
 	mu       sync.Mutex
 	producer dsclient.Producer
 	tx       dsclient.Tx
 	opened   time.Time
-	// err is sticky: once a commit has failed, what was in it is gone, and
-	// letting the attempt carry on writing would produce a record with a hole
-	// in it. The attempt fails instead, and its retry resumes from the last
-	// commit that took.
+	// err is sticky: after a failed commit the attempt fails rather than write a
+	// record with a hole, and its retry resumes from the last commit that took.
 	err error
 
-	// flushers are the writers holding records in memory — a Recorder's
-	// batch — which a commit point has to push out first, or the boundary
-	// falls in the middle of what the function considers written.
+	// flushers hold records in memory (a Recorder's batch) that a commit must
+	// push out first.
 	flushers map[int]func() error
 	nextFl   int
 }
 
 func newAttemptOutputs(n *workerNode, job jobEnvelope) *attemptOutputs {
 	a := &attemptOutputs{node: n, job: job.ID, attempt: job.Attempt}
-	// A function that must heartbeat every H has a commit every H, so a
-	// transaction that may live 2H is never reaped under it.
+	// Budget of 2H keeps a transaction from being reaped under a function that
+	// heartbeats every H.
 	if bounds, ok := flow.BoundsOf(job.Func); ok && bounds.Heartbeat > 0 {
 		a.budget = 2 * bounds.Heartbeat
 	}
 	return a
 }
 
-// producerID names the attempt's transactional identity. Per attempt, so a
-// job moved while its old attempt is still alive does not fence it: the old
-// one's open transaction is abandoned and reaped, and never becomes visible.
+// producerID is per attempt, so a job moved while its old attempt still lives
+// does not fence the new one; the old transaction is abandoned and reaped.
 func (a *attemptOutputs) producerID() string {
 	return attemptWorkloadPrefix + streamPart(a.job) + "." + strconv.Itoa(a.attempt)
 }
 
-// begin opens a transaction if none is open. Called with mu held.
+// begin opens a transaction if none is open. Call with mu held.
 func (a *attemptOutputs) begin(ctx context.Context) error {
 	if a.err != nil {
 		return a.err
@@ -134,8 +112,7 @@ func (a *attemptOutputs) append[T any](ctx context.Context, s *dsclient.Stream[T
 		a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
 		return a.err
 	}
-	// Committed by age rather than left to the backend's timeout, which would
-	// abort it — and everything in it — instead.
+	// Commit by age, so the backend does not time the transaction out and abort it.
 	if time.Since(a.opened) > a.budget/2 {
 		return a.commitLocked(ctx)
 	}
@@ -155,14 +132,12 @@ func (a *attemptOutputs) commitLocked(ctx context.Context) error {
 	return nil
 }
 
-// commit pushes out what every writer is holding and commits the open
-// transaction: a point at which everything the attempt has written is visible
-// together, and nothing after it is.
+// commit flushes every writer's held records and commits the open transaction.
 func (a *attemptOutputs) commit(ctx context.Context) error {
 	a.mu.Lock()
 	flushers := slices.Collect(maps.Values(a.flushers))
 	a.mu.Unlock()
-	// Outside the lock: a flush appends, and appending takes it.
+	// Outside the lock: a flush appends, which takes it.
 	for _, flush := range flushers {
 		if err := flush(); err != nil {
 			return err
@@ -173,8 +148,7 @@ func (a *attemptOutputs) commit(ctx context.Context) error {
 	return a.commitLocked(ctx)
 }
 
-// register adds a writer whose held records a commit must push out first, and
-// returns how to take it off again.
+// register adds a writer a commit must flush first and returns how to remove it.
 func (a *attemptOutputs) register(flush func() error) func() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -191,30 +165,19 @@ func (a *attemptOutputs) register(flush func() error) func() {
 	}
 }
 
-// finish commits whatever is left once the function has returned, whether it
-// succeeded or not: a failed attempt's record is exactly what its retry
-// resumes from.
-//
-// Not on the attempt's context, which by now may be the reason it stopped;
-// bounded on its own instead.
+// finish commits what is left once the function returns, on its own bounded
+// context rather than the attempt's, which may be why it stopped.
 func (a *attemptOutputs) finish(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), outputAppend)
 	defer cancel()
 	return a.commit(ctx)
 }
 
-// historyStore is the [flow.Store] an attempt's run is kept on: the history
-// stream for this attempt, written inside the attempt's transaction.
-//
-// Reading is the coordinator's copy of the PREVIOUS attempt's history, put on
-// this worker under this attempt's name before the job arrived (see
-// hydrateHistory) — so a moved job replays to where its predecessor got, and
-// carries on from there under its own name.
+// historyStore is the [flow.Store] an attempt's run is kept on. Reading returns
+// the previous attempt's history, hydrated onto this worker under this attempt's
+// name (see hydrateHistory), so a moved job replays to where its predecessor got.
 type historyStore struct {
-	a *attemptOutputs
-	// name is the stream, chosen by the attempt rather than by the run: the
-	// run is named for the job and every attempt of it is the same run, but
-	// each attempt writes its own stream.
+	a    *attemptOutputs
 	name string
 }
 
@@ -229,8 +192,7 @@ func (h *historyStore) stream(ctx context.Context) (*dsclient.Stream[*protos.Eve
 }
 
 // Events reads one thread's events out of the attempt's stream, which holds
-// every thread of the job's run: the run's threads share a worker and a
-// transaction, and one stream is what keeps their events in one order.
+// every thread of the run in one order.
 func (h *historyStore) Events(ctx context.Context, _, thread string) ([]*protos.Event, error) {
 	run := h.name
 	ok, err := h.a.node.client.StreamExists(ctx, run)
@@ -267,18 +229,13 @@ func (h *historyStore) Sink(ctx context.Context, _, _ string) (flow.Sink, error)
 	return &historySink{h: h}, nil
 }
 
-// Drop is nothing here: a joined thread's events stay in the attempt's
-// stream, which goes as a whole when the job settles.
+// Drop is a no-op: a joined thread's events stay in the attempt's stream, which
+// goes as a whole when the job settles.
 func (h *historyStore) Drop(ctx context.Context, _, _ string) error { return nil }
 
-// historySink appends a run's events inside the attempt's transaction.
-//
-// It stands the stream up LAZILY, on the first event that belongs to a
-// thread. A function that forks nothing, sleeps never and calls nothing
-// produces a history of two markers — started, finished — which says nothing
-// a retry needs, and creating a stream and a producer for every such job
-// would charge the common case for the rare one. The markers are held until
-// something worth keeping comes, and dropped if nothing does.
+// historySink appends a run's events inside the attempt's transaction, standing
+// the stream up lazily on the first event that belongs to a thread — so a
+// function that forks, sleeps and calls nothing leaves nothing behind.
 type historySink struct {
 	h *historyStore
 
@@ -293,14 +250,11 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 
 	if s.stream == nil {
 		if ev.GetRunStart() != nil || ev.GetRunEnd() != nil {
-			// An attempt marker: held until the run records something
-			// worth a stream, so a function that records nothing leaves
-			// nothing behind.
+			// Hold the attempt markers until something worth a stream arrives.
 			s.held = append(s.held, ev)
 			return nil
 		}
-		// Not the attempt's context: a stream half-made when a deadline
-		// expires is the next attempt's problem.
+		// Not the attempt's context: a half-made stream is the next attempt's problem.
 		if err := ensureStream(context.WithoutCancel(ctx), s.h.a.node.client, s.h.name); err != nil {
 			return err
 		}

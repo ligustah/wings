@@ -13,51 +13,33 @@ import (
 	"github.com/ligustah/durable_streams/dswire"
 )
 
-// Func is a callable handle to a named function.
-//
-// It is a function type, so you call it: `out, err := Digest(ctx, in)`. Where
-// that runs is decided by the context, not by the call. Inside a [Run] the call
-// is recorded in the run's history and handed to the run's [Executor]; a replay
-// of that run returns the recorded answer without running anything. On a
-// context bound to an executor with [Bind] and no run around it, the call is
-// handed straight to the executor. The definition and the call site are the
-// same in both, which is the point.
-//
-// Create one with [Define] at package scope.
+// Func is a callable handle to a named function: out, err := Digest(ctx, in).
+// Where the call runs is decided by the context. Inside a [Run] it is recorded
+// and handed to the run's [Executor], and a replay returns the recorded answer;
+// on a context bound with [Bind], it goes straight to the executor. Create one
+// with [Define] at package scope.
 type Func[In, Out any] func(ctx Context, in In) (Out, error)
 
-// def is everything a Func needs that a function value cannot carry: its name,
-// its bounds and its codecs.
-//
-// The Func closes over one of these and the registry holds the same pointer,
-// so nothing ever has to recover metadata FROM a function value.
+// def is everything a Func needs that a function value cannot carry. The Func
+// closes over one and the registry holds the same pointer.
 type def[In, Out any] struct {
 	name   string
 	fn     func(Context, In) (Out, error)
 	bounds Bounds
 
-	// callSite is the "<file>:<line>" this def was defined on, kept when no
-	// name was given so the build step's table can supply one later. See
-	// names.go.
+	// callSite is the "<file>:<line>" a nameless def was defined on, for the
+	// build step's table to name later. See names.go.
 	callSite string
 
 	inCodec  dswire.Codec[In]
 	outCodec dswire.Codec[Out]
 }
 
-// Bounds are the properties of a function that are not its code: how long one
-// call may take, how often it must report progress, how long it may wait to
-// be started.
-//
-// Declared per function rather than per executor because a bound on how long
-// something may take is a fact about the work, not about the machines running
-// it: one function is a millisecond of arithmetic and another an hour of
-// transcoding, and a single global number is either useless to one or fatal to
-// the other. An executor reads them with [BoundsOf]; what it does about them is
-// its business. Zero means no bound.
+// Bounds are the timing properties of a function, declared per function because
+// they are facts about the work, not the machines. An executor reads them with
+// [BoundsOf]. Zero means no bound.
 type Bounds struct {
-	// Timeout bounds one call, from the moment it starts to the moment it
-	// returns. See [WithTimeout].
+	// Timeout bounds one call, start to return. See [WithTimeout].
 	Timeout time.Duration
 	// Heartbeat is how often a running call must report progress. See
 	// [WithHeartbeatTimeout].
@@ -67,8 +49,7 @@ type Bounds struct {
 	Start time.Duration
 }
 
-// definition is what an [Option] configures at [Define] time: the name a
-// function is registered under and its bounds.
+// definition is what an [Option] configures at [Define] time.
 type definition struct {
 	name   string
 	bounds Bounds
@@ -77,77 +58,45 @@ type definition struct {
 // Option configures a function at [Define] time.
 type Option func(*definition)
 
-// WithName sets the name a function is registered and recorded under.
-//
-// The name identifies the function everywhere but the source — in a run's
-// history, on the wire to an executor — so renaming the variable is free and
-// changing this string is a change to every history that mentions it. The
-// `wings` build step infers the name from the variable a definition is assigned
-// to, so most code needs this only to override that, or when the name cannot be
-// inferred.
+// WithName sets the name a function is registered and recorded under, overriding
+// the name the wings build step infers from the variable. Changing it changes
+// every history that mentions the function.
 func WithName(name string) Option {
 	return func(d *definition) { d.name = name }
 }
 
-// WithTimeout bounds one call of this function, from the moment an executor
-// starts it to the moment it returns.
-//
-// A call that exceeds it FAILS rather than being retried. Exceeding a bound on
-// total duration is a statement about the work — it is too slow, or it is stuck
-// on something no other machine would be luckier with — and retrying it would
-// spend the same time again to reach the same answer. Use [WithHeartbeatTimeout]
-// for the case where the machine is the suspect.
+// WithTimeout bounds one call, start to return. A call that exceeds it fails
+// rather than retrying: the work is too slow or stuck, and another attempt would
+// spend the same time. Use [WithHeartbeatTimeout] when the machine is the suspect.
 func WithTimeout(d time.Duration) Option {
 	return func(def *definition) { def.bounds.Timeout = d }
 }
 
 // WithHeartbeatTimeout requires this function to report progress at least this
-// often, using [Context.Heartbeat].
-//
-// A call that goes quiet for longer is presumed stuck rather than slow, and an
-// executor that can do so runs it again elsewhere — carrying the last
-// checkpoint it reported, so the retry resumes rather than starting over. That
-// is the difference from [WithTimeout]: here the suspicion falls on the
-// machine, and moving is the remedy.
-//
-// The clock starts when the call starts, so a function that declares this must
-// heartbeat; one that never does will be moved on every machine in turn.
+// often with [Context.Heartbeat]. A call that goes quiet longer is moved to
+// another worker, carrying its last checkpoint. A function that declares this
+// must heartbeat, or it is moved on every machine in turn.
 func WithHeartbeatTimeout(d time.Duration) Option {
 	return func(def *definition) { def.bounds.Heartbeat = d }
 }
 
-// WithStartTimeout bounds how long a call may wait in an executor's queue
-// before it begins.
-//
-// The other two bounds are about the work and run only once it has started;
-// this one is about the wait in front of it. Nothing is lost by moving a call
-// that has not begun. Zero, the default, means a call waits as long as it
-// must — the right answer for a saturated cluster, where every queue is long
-// and moving a call only puts it at the back of another.
+// WithStartTimeout bounds how long a call may wait in a queue before it begins;
+// past it the call is moved. Zero, the default, waits as long as it must.
 func WithStartTimeout(d time.Duration) Option {
 	return func(def *definition) { def.bounds.Start = d }
 }
 
-// Define registers a function and returns a callable handle. The closure is
-// the only fixed argument; everything else, the name included, is an [Option].
+// Define registers a function and returns a callable handle. Call it in a
+// package-scope var, so an executor in another process can resolve the call.
 //
-// Call it in a package-scope var. An executor that runs functions in another
-// process resolves calls through the registry Define populates, and a function
-// defined inside main's body exists only in the process that ran main.
+// The name comes from [WithName], or from the wings build step, which infers it
+// from the variable this is assigned to; failing both it falls back to the call
+// site "<file>:<line>".
 //
-// The name comes from [WithName], or from the `wings` build step, which infers
-// it from the variable this is assigned to. Failing both — the flow package used
-// without that build step and with no explicit name — a function falls back to
-// its own call site, "<file>:<line>", so it still works, identified by where it
-// was written. The name is what identifies the function everywhere but the
-// source — in a run's history, on the wire to an executor — so renaming the
-// variable is free and changing the name is a change to every history that
-// mentions it.
-//
-// Panics if the function is nil, or if the name — once known — is already
-// defined. A missing name is not a panic here: it may be filled in by the
-// build step's table after all definitions have run (see names.go), and only
-// a call to a function that never got one fails, naming the call site.
+// Panics if fn is nil, or if the name — once known — is already defined. A
+// missing name is not a panic: the build step's table may fill it in after all
+// definitions run (see names.go), and only a call to a function that never got
+// one fails.
 func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func[In, Out] {
 	if fn == nil {
 		panic("flow: Define requires a non-nil function")
@@ -166,9 +115,7 @@ func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func
 	if cfg.name != "" {
 		register(d)
 	} else {
-		// No explicit name: record where this was written and wait for the
-		// build step's table to name it. runtime.Caller(1) is the flow.Define
-		// call itself.
+		// runtime.Caller(1) is the flow.Define call itself.
 		d.callSite = callSite(1)
 		deferName(d.callSite, func(name string) {
 			d.name = name
@@ -181,14 +128,9 @@ func Define[In, Out any](fn func(Context, In) (Out, error), opts ...Option) Func
 	}
 }
 
-// capture is how [Context.Go] learns which function a Func is without
-// running it: it calls the Func on a context carrying one of these, and
-// dispatch, finding it, writes down the name and the encoded input and
-// returns without doing anything.
-//
-// The alternative — recovering the definition from the function value — has
-// nothing to hold on to: a Func is a closure, and Go gives closures no
-// identity worth comparing.
+// capture lets [Context.Go] learn a Func's name without running it: it calls the
+// Func on a context carrying one of these, and dispatch fills it in and returns.
+// A Func is a closure, with no identity to recover a definition from.
 type capture struct {
 	taken   bool
 	name    string
@@ -200,8 +142,7 @@ type capture struct {
 
 type captureKey struct{}
 
-// describe calls f on a context that captures the call rather than making
-// it, and reports what f would have dispatched.
+// describe calls f on a capturing context and reports what f would have dispatched.
 func describe[In, Out any](ctx Context, f Func[In, Out], in In) (*capture, error) {
 	if f == nil {
 		return nil, errors.New("flow: Go requires a function made by Define, and was given nil")
@@ -215,8 +156,8 @@ func describe[In, Out any](ctx Context, f Func[In, Out], in In) (*capture, error
 	return cap, cap.err
 }
 
-// encodeInput encodes a call's input as the calling thread's, when there is
-// one: a channel in the input is shared on that thread's behalf.
+// encodeInput encodes a call's input on the calling thread when there is one, so
+// a channel in the input is shared on that thread's behalf.
 func (d *def[In, Out]) encodeInput(ctx context.Context, in In) ([]byte, error) {
 	encode := func() ([]byte, error) { return dswire.EncodeRecord(d.inCodec, in) }
 	var payload []byte
@@ -237,18 +178,15 @@ func (d *def[In, Out]) dispatch(ctx Context, in In) (Out, error) {
 	var zero Out
 
 	if cap, ok := ctx.Value(captureKey{}).(*capture); ok && !cap.taken {
-		// Asked what this call would be, not to make it. See capture. The
-		// handler goes too, so a caller that describes a still-nameless
-		// definition can read its name once the build step's table resolves it.
+		// Asked what this call would be, not to make it. See capture.
 		cap.taken, cap.name, cap.codec, cap.handler = true, d.name, d.outCodec, d
 		cap.payload, cap.err = d.encodeInput(ctx, in)
 		return zero, nil
 	}
 
 	if d.name == "" {
-		// Deferred and not yet resolved: no WithName, and no table entry has
-		// arrived. This is the last moment names can be settled, so settle them,
-		// defaulting this one to its call site if nothing named it.
+		// Deferred and unresolved: last moment to settle names, defaulting this
+		// one to its call site.
 		ensureNamesResolved()
 	}
 
@@ -263,10 +201,6 @@ func (d *def[In, Out]) dispatch(ctx Context, in In) (Out, error) {
 	} else if e := executorFrom(ctx); e != nil {
 		out, err = e.Invoke(ctx, d.name, payload)
 	} else {
-		// Deliberately an error rather than a quiet local call. Running the
-		// work here would be the wrong kind of convenience: a whole program's
-		// work would silently execute in one process, at the speed of one
-		// machine, and nothing would look broken.
 		return zero, fmt.Errorf("flow: %s was called on a context that is not inside a Run "+
 			"and not bound to an executor; use the Context the run's body was given, or Bind", d.name)
 	}
@@ -290,10 +224,7 @@ func (d *def[In, Out]) Name() string { return d.name }
 
 func (d *def[In, Out]) limits() Bounds { return d.bounds }
 
-// invoke decodes a payload, runs the function, and encodes its result.
-//
-// This is the type-erased entry point an executor uses. Everything above it
-// deals in []byte and a name; In and Out stop here.
+// invoke is the type-erased entry point an executor uses: decode, run, encode.
 func (d *def[In, Out]) invoke(ctx context.Context, payload []byte) ([]byte, error) {
 	in, err := dswire.DecodeRecord(d.inCodec, payload)
 	if err != nil {
@@ -317,8 +248,8 @@ func (d *def[In, Out]) invoke(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 // handler is the non-generic boundary that lets differently-typed definitions
-// live in one registry. invoke is unexported, so nothing outside this package
-// can satisfy it — the set of handlers is exactly the set of defined functions.
+// share one registry. invoke is unexported, so the set of handlers is exactly
+// the set of defined functions.
 type handler interface {
 	Name() string
 	limits() Bounds
@@ -339,8 +270,7 @@ func register(h handler) {
 	registry[h.Name()] = h
 }
 
-// deferredDef is a definition waiting for the build step's table to name it:
-// where it was written, and what to do once the name is known.
+// deferredDef is a definition waiting for the build step's table to name it.
 type deferredDef struct {
 	site  string
 	apply func(name string)
@@ -351,10 +281,8 @@ var (
 	pendingDefs []deferredDef
 )
 
-// deferName records a nameless definition and tries at once to resolve it from
-// the table, in case that is already in — which it is not during package init,
-// but is for a Define reached after [RegisterCallSiteNames] has run. It does
-// not default here: a name may still arrive.
+// deferName records a nameless definition and tries to resolve it now, in case
+// [RegisterCallSiteNames] has already run. It does not default here.
 func deferName(site string, apply func(name string)) {
 	pendingMu.Lock()
 	pendingDefs = append(pendingDefs, deferredDef{site: site, apply: apply})
@@ -363,10 +291,8 @@ func deferName(site string, apply func(name string)) {
 }
 
 // resolvePendingDefs names and registers deferred definitions. With defaulting
-// off it takes only those the table covers, leaving the rest for later; with it
-// on — once no more names can arrive, at first use — every remaining definition
-// takes its own call site as its name, so a definition with no WithName and no
-// table entry still works, identified by where it was written.
+// off it takes only those the table covers; with it on, at first use, every
+// remaining definition takes its call site as its name.
 func resolvePendingDefs(defaulting bool) {
 	pendingMu.Lock()
 	defer pendingMu.Unlock()
@@ -392,11 +318,8 @@ func lookup(name string) (handler, bool) {
 	return h, ok
 }
 
-// BoundsOf returns the bounds declared for a function, and whether the
-// function is defined in this process at all.
-//
-// For executors: a cluster dispatching to a worker built from the same source
-// sees the same answer the worker will.
+// BoundsOf returns the bounds declared for a function, and whether it is defined
+// in this process. For executors.
 func BoundsOf(name string) (Bounds, bool) {
 	h, ok := lookup(name)
 	if !ok {
@@ -405,14 +328,9 @@ func BoundsOf(name string) (Bounds, bool) {
 	return h.limits(), true
 }
 
-// Execute runs the function called name, here, on an encoded input, and
-// returns its encoded output.
-//
-// This is what an executor calls once a call has reached the process that is
-// to run it: the other end of [Executor.Invoke]. A function that is not
-// defined in this process is reported with the names that are — nearly always
-// the process was built from different source than the one that made the call,
-// and naming what it DOES have is what makes that visible.
+// Execute runs the function called name here on an encoded input and returns its
+// encoded output — the other end of [Executor.Invoke]. A function not defined in
+// this process is reported with the names that are.
 func Execute(ctx context.Context, name string, payload []byte) ([]byte, error) {
 	h, ok := lookup(name)
 	if !ok {
@@ -434,26 +352,17 @@ func defined() []string {
 	return names
 }
 
-// Executor is somewhere calls go.
-//
-// It deals in a name and encoded bytes, deliberately: this is the erasure
-// boundary. A Func knows In and Out and does the encoding; everything past this
-// interface is a name and a payload, which is what lets one executor carry
-// calls to a dozen differently-typed functions, and what lets it be a process
-// on another machine.
-//
-// The one in this package, [Local], runs the function in the calling process.
-// A cluster is another: its Invoke sends the call to a worker and waits for
-// what comes back. A function that failed is reported as an error here, not as
-// an empty result.
+// Executor is somewhere calls go. It deals in a name and encoded bytes — the
+// erasure boundary that lets one executor carry calls to differently-typed
+// functions, on another machine. [Local] runs them in the calling process; a
+// cluster's Invoke sends them to a worker. A failed call is an error here.
 type Executor interface {
 	Invoke(ctx context.Context, name string, payload []byte) ([]byte, error)
 }
 
-// Local runs every call in the calling process, in the calling goroutine. It
-// is the executor a [Run] uses when given no other, and the one an executor
-// that has carried a call to another process installs there, so that calls
-// made from inside the running function run where it runs.
+// Local runs every call in the calling process and goroutine. It is the default
+// executor, and the one carried to another process so calls made inside a
+// running function run where it runs.
 func Local() Executor { return local{} }
 
 type local struct{}
@@ -464,12 +373,9 @@ func (local) Invoke(ctx context.Context, name string, payload []byte) ([]byte, e
 
 type executorKey struct{}
 
-// Bind returns a context on which calls go to e.
-//
-// Inside a [Run] the run's executor is used and this is not needed. Bind is
-// for a call made outside any run — a script, a test, a function running on a
-// worker that calls another — which is dispatched and not recorded: nothing
-// replays it, because there is no history for it to be in.
+// Bind returns a context on which calls go to e. For calls outside any run,
+// which are dispatched and not recorded; inside a [Run] the run's executor is
+// used instead.
 func Bind(ctx context.Context, e Executor) Context {
 	return Context{context.WithValue(ctx, executorKey{}, e)}
 }
@@ -479,23 +385,15 @@ func executorFrom(ctx context.Context) Executor {
 	return e
 }
 
-// Origin says which run a call belongs to, and where in it.
-//
-// A call made outside a run has no origin and needs none. The same call inside
-// a run does: an executor's record of what it ran where is far more useful if
-// it can say WHICH RUN each call was a step of, and the run is the only thing
-// that knows. So the run stamps it on the context before handing the call to
-// its executor, and the executor reads it back with [OriginFrom] when it
-// writes the call down.
-//
-// Purely for the executor's own record. A function's behaviour must not depend
-// on who called it, or the same input stops meaning the same thing.
+// Origin says which run a call belongs to, and where in it, for an executor's
+// own record. A run stamps it on the context before handing a call to its
+// executor, which reads it back with [OriginFrom]. A function's behaviour must
+// not depend on it.
 type Origin struct {
 	// Run is the name of the run the call belongs to. Empty for a call made
 	// outside any run.
 	Run string
-	// Thread and Step locate the call within that run, which is what makes an
-	// executor's record line up with a position in the run's history.
+	// Thread and Step locate the call within that run.
 	Thread  string
 	Step    uint64
 	Attempt uint64
@@ -504,13 +402,9 @@ type Origin struct {
 // Zero reports whether o names nothing.
 func (o Origin) Zero() bool { return o.Run == "" }
 
-// Key identifies one call of one run, stably across attempts of that run.
-//
-// Attempt is deliberately not part of it. The whole use of this key is to
-// recognise, on a later attempt, the call the previous attempt was making — and
-// a key that changed with the attempt could never do that. Everything else in
-// it is deterministic: replay puts the same call at the same position of the
-// same thread every time.
+// Key identifies one call of one run, stably across attempts — so a later
+// attempt recognises the call the previous one was making. Attempt is
+// deliberately not part of it.
 func (o Origin) Key() string {
 	if o.Zero() {
 		return ""
@@ -532,11 +426,7 @@ func OriginFrom(ctx context.Context) Origin {
 }
 
 // allocator returns a factory for T when T is a pointer type, and nil
-// otherwise.
-//
-// dswire.ReflectCodec needs one to decode into a pointer — it has no way to
-// allocate the pointed-to value itself — and needs nothing for a value type.
-// Users never see this; it is the price of accepting an arbitrary T.
+// otherwise; dswire.ReflectCodec needs one to decode into a pointer.
 func allocator[T any]() func() T {
 	var zero T
 	rt := reflect.TypeOf(&zero).Elem()

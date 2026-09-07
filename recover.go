@@ -9,32 +9,10 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// A coordinator that restarts over the same Dir resumes its workflow from
-// the workflow's own history, and the threads the workflow had forked are
-// still running on the workers it left behind. Each of those threads is a
-// job the previous coordinator dispatched, and the replay will fork it
-// again; what must not happen is that the fork becomes a SECOND job. So
-// before any worker is adopted, the coordinator reads its journal for the
-// jobs its predecessors left outstanding — which job, which thread of which
-// run, which worker, which attempt — and puts them back in pending under the
-// same origins. The replay's fork then rejoins the job the way a retried
-// workflow rejoins a call: by origin, as though nothing had happened.
-//
-// What the journal does not hold is the input. It does not need to: the
-// replay brings it, at the fork, and until then a recovered job is
-// INCOMPLETE — it can be waited for, its result kept, its children answered,
-// but it cannot be sent anywhere. One whose worker is gone is held until
-// the replay names it, and one that finishes before the replay reaches its
-// fork keeps its result, unclaimed, for the fork to find.
-//
-// The journal is written off the hot path, so its last lines can be missing
-// after a crash: a job it shows outstanding may have finished. The results
-// the predecessor saw are on its mirrors, which are read for that; a job
-// whose result is there is recovered settled. A job it shows nothing about
-// at all is forked afresh by the replay, which is the one way a thread can
-// run twice — rare, and the worst of it is work done twice.
-
-// recoveredJob is what the journal says about one job left outstanding.
+// recoveredJob is what the journal says about one job left outstanding. Its
+// input is not recorded there; the workflow's replay brings it at the fork,
+// which rejoins the job by origin. Until then the job is incomplete: waitable,
+// but not dispatchable.
 type recoveredJob struct {
 	job    jobEnvelope
 	origin flow.Origin
@@ -44,10 +22,9 @@ type recoveredJob struct {
 	held   bool
 }
 
-// recoverJobs rebuilds the jobs previous coordinators left outstanding, from
-// the journal, and attaches them to the workers among workers that are
-// running them. Call before any worker is adopted, so that a result which
-// arrives finds its job.
+// recoverJobs rebuilds the jobs previous coordinators left outstanding from the
+// journal and attaches them to the workers still running them. Call before any
+// worker is adopted, so an arriving result finds its job.
 func (c *Cluster) recoverJobs(ctx context.Context, workers []*workerConn) error {
 	left, err := c.outstandingInJournal(ctx)
 	if err != nil {
@@ -100,8 +77,7 @@ func (c *Cluster) recoverJobs(ctx context.Context, workers []*workerConn) error 
 			}
 		}
 		if res, ok := settled[p.job.ID]; ok {
-			// Finished before the predecessor died, and it knew: the
-			// result is on its mirror. Nobody is waiting for it yet.
+			// Finished before the predecessor died; its result is on the mirror.
 			if p.worker != nil {
 				c.release(p.worker)
 				p.worker = nil
@@ -119,14 +95,11 @@ func (c *Cluster) recoverJobs(ctx context.Context, workers []*workerConn) error 
 			Worker: workerID(p.worker), Attempt: p.job.Attempt, Err: where,
 		}.from(p.origin))
 	}
-	// Whether a job is nested — its parent is a job too — depends on the
-	// parent being recovered, so it is settled once every job is.
+	// Nested depends on the parent being recovered, so it is set once all are.
 	for _, p := range c.pending {
 		if p.recovered {
 			p.job.Nested = c.parentJobLocked(p.origin) != nil
 			if p.worker != nil {
-				// Running, so its history is being written and copied home:
-				// follow it for the threads it forks, as a beat would.
 				c.followHistory(p, p.job.Attempt)
 			}
 		}
@@ -140,9 +113,8 @@ func (c *Cluster) recoverJobs(ctx context.Context, workers []*workerConn) error 
 	return nil
 }
 
-// outstandingInJournal reads the journal for the jobs previous runs of the
-// coordinator dispatched and never saw settle, in the order they were first
-// seen.
+// outstandingInJournal reads the journal for jobs previous coordinators
+// dispatched and never saw settle, in the order first seen.
 func (c *Cluster) outstandingInJournal(ctx context.Context) ([]*recoveredJob, error) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -200,9 +172,8 @@ func (c *Cluster) outstandingInJournal(ctx context.Context) ([]*recoveredJob, er
 	}
 	var out []*recoveredJob
 	for _, id := range order {
-		// A job is a function on an input, or a thread of run code reached
-		// by its lineage, which has no function and is known by its thread.
-		// An entry with neither is not a job the journal can describe.
+		// A job has a function, or a thread (run-code reached by lineage); an
+		// entry with neither is not one the journal can describe.
 		if r, ok := jobs[id]; ok && (r.job.Func != "" || r.job.Thread != "") {
 			out = append(out, r)
 		}
@@ -210,9 +181,8 @@ func (c *Cluster) outstandingInJournal(ctx context.Context) ([]*recoveredJob, er
 	return out, nil
 }
 
-// mirroredResults reads every result previous coordinators wrote to their
-// mirrors, by job. A result that was mirrored was delivered, or about to
-// be; either way the job is over.
+// mirroredResults reads every result previous coordinators mirrored, by job. A
+// mirrored result means the job is over.
 func (c *Cluster) mirroredResults(ctx context.Context) (map[string]resultEnvelope, error) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -250,9 +220,8 @@ func (c *Cluster) mirroredResults(ctx context.Context) (map[string]resultEnvelop
 	return out, nil
 }
 
-// complete gives a recovered job the envelope the replay forked it with,
-// and reports whether it now needs placing: it was held for want of one.
-// Call with mu held.
+// complete gives a recovered job the envelope the replay forked it with, and
+// reports whether it now needs placing. Call with mu held.
 func (p *pendingJob) complete(job jobEnvelope) (place bool) {
 	if !p.incomplete {
 		return false

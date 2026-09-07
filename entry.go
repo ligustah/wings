@@ -15,35 +15,20 @@ import (
 )
 
 // CoordinatorOptions is what a generated coordinator main hands to
-// [CoordinatorMain]. You do not construct one; `wings build` writes the code
-// that does.
+// [CoordinatorMain]; `wings build` writes the code that constructs it.
 type CoordinatorOptions struct {
 	// Worker is the gzipped worker binary, embedded by the generated main.
 	Worker []byte
 	// WorkerOS and WorkerArch are the platform Worker was compiled for.
 	WorkerOS, WorkerArch string
 
-	// Provisioner supplies machines for the remote target. Nil means this
-	// program was built without one, and -target=remote is refused rather than
-	// failing later with something less obvious.
+	// Provisioner supplies machines for the remote target. Nil refuses
+	// -target=remote unless a provider is linked in.
 	Provisioner Provisioner
 }
 
-// Your code is not in CoordinatorOptions: it is whatever the linked packages
-// declared as roots with [flow.Main]. A program that declares one root
-// runs it; one that declares several is told which by -workflow. Either way it
-// runs as a durable run on a cluster that is already up — see
-// [Cluster.RunWorkflow] — under its own name in Dir, so a second start over
-// the same directory is that run resuming, and the cluster is torn down when
-// it returns.
-
-// WorkerMain is the entire worker binary.
-//
-// The generated worker main is this call and an import of your package, whose
-// flow.Define calls register the work. A worker needs nothing else: it never
-// provisions, never dispatches, and never runs a workflow.
-//
-// It does not return.
+// WorkerMain is the entire worker binary: a call to this plus an import of the
+// package whose [flow.Define] calls register the work. It does not return.
 func WorkerMain() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -64,9 +49,7 @@ func WorkerMain() {
 }
 
 // CoordinatorMain is the entire coordinator binary: it parses the standard
-// flags, brings a cluster up, runs the chosen workflow, and takes the cluster
-// down again.
-//
+// flags, brings a cluster up, runs the chosen workflow, and takes it down again.
 // It does not return.
 func CoordinatorMain(opts CoordinatorOptions) {
 	if len(opts.Worker) > 0 {
@@ -84,9 +67,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
 		input       = flag.String("input", "", "the workflow's input as JSON, or @file to read it from a file; leave off to resume a run already in -dir")
 
-		// Autoscaling. Off unless -max-workers is set, and expressed only in
-		// jobs and durations — nothing here names a target, so the same numbers
-		// mean the same thing whether a worker is a goroutine or a VM.
+		// Autoscaling, off unless -max-workers is set.
 		maxWorkers    = flag.Int("max-workers", 0, "autoscale up to this many workers; 0 keeps the count fixed")
 		minWorkers    = flag.Int("min-workers", 0, "when autoscaling, never drop below this many workers")
 		jobsPerWorker = flag.Int("jobs-per-worker", 0, "when autoscaling, how much backlog one worker should carry; 0 means -concurrency, or 1 if that is unset")
@@ -94,16 +75,11 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		scaleInterval = flag.Duration("scale-interval", 0, "when autoscaling, how often the policy is evaluated")
 		maxScaleStep  = flag.Int("max-scale-step", 0, "when autoscaling, the most workers one decision may add")
 	)
-	// Every linked-in provider's flags, before parsing — which provider is
-	// selected is itself a parsed flag, so they all have to be declared first.
 	registerProviderFlags(flag.CommandLine)
 	flag.Parse()
 
-	// Which workflow, and with what: a coordinator's question, settled
-	// before any machine is paid for. A worker is this same binary with the
-	// same flags and no workflow to run, so it must not be asked — with two
-	// defined and no -workflow it would refuse to start, and the coordinator
-	// would wait for a worker that had exited.
+	// A worker is this same binary with no workflow to run, so it must not be
+	// asked to choose one.
 	var (
 		w       flow.WorkflowInfo
 		payload []byte
@@ -149,10 +125,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	case "local", "localprocess":
 		cfg.Target = LocalProcess()
 	case "remote", "cloud":
-		// A provisioner supplied in code wins: it is the escape hatch for a
-		// cloud wings does not ship, and someone who wrote one meant it.
-		// Otherwise the choice comes off the command line, which is what keeps
-		// the program itself free of any mention of where it runs.
+		// A provisioner supplied in code wins; otherwise -provider chooses.
 		prov := opts.Provisioner
 		if prov == nil {
 			var err error
@@ -167,9 +140,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		os.Exit(2)
 	}
 
-	// Interrupt cancels the work, but teardown gets a fresh context: machines
-	// still have to be deleted, and doing it with a cancelled context would
-	// leave them running and billing.
+	// Teardown gets a fresh context so an interrupt still deletes machines.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -179,12 +150,6 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		os.Exit(1)
 	}
 
-	// As a run, not a call: every function called inside the workflow goes to
-	// this cluster's workers and into a history under Dir, so a coordinator
-	// started again in the same directory carries on from where the last one
-	// stopped. That is the whole reason a function is callable rather than
-	// something you pass to a method: the context already knows where work
-	// goes, and what has already been done.
 	runErr := c.runWorkflow(ctx, w.Name, payload)
 	stopErr := c.Stop(context.Background())
 
@@ -201,12 +166,8 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	}
 }
 
-// chooseWorkflow picks which of the defined workflows this coordinator runs.
-//
-// With one defined, that one — a program that is about one thing should not
-// have to say so. With several, the name is required and a missing or unknown
-// one is answered with the list, since the list is the only thing the caller
-// needs to fix the command line.
+// chooseWorkflow picks which defined workflow to run: the only one, or the one
+// -workflow names when there are several.
 func chooseWorkflow(name string, defined []flow.WorkflowInfo) (flow.WorkflowInfo, error) {
 	if len(defined) == 0 {
 		return flow.WorkflowInfo{}, errors.New("no root is declared in this program; " +
@@ -236,12 +197,8 @@ func workflowNames(ws []flow.WorkflowInfo) string {
 	return strings.Join(names, ", ")
 }
 
-// readInput turns the -input flag into the workflow's input as JSON: the
-// text itself, or the contents of a file named with a leading @. Empty is nil,
-// which flow reads as "none given" — fine for a workflow that takes none, and
-// for resuming a run whose input is already recorded; what a fresh run of a
-// workflow that takes input makes of it is flow's error to give, with the
-// shape it wants.
+// readInput turns the -input flag into the workflow's input JSON: the text
+// itself, or the contents of a file named with a leading @. Empty is nil.
 func readInput(flagValue string, w flow.WorkflowInfo) ([]byte, error) {
 	if flagValue == "" {
 		return nil, nil

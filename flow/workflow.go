@@ -12,45 +12,32 @@ import (
 	"github.com/ligustah/durable_streams/dswire"
 )
 
-// None is the input type of a function that takes no input.
+// None is the input type of a function that takes no input. A program hosting
+// such a root does not ask for input, and refuses any.
 //
 //	var Main = flow.Define(func(ctx flow.Context, _ flow.None) (flow.None, error) { … })
 //	var _ = flow.Main(Main)
-//
-// A program hosting such a root does not ask for input, and refuses any.
 type None = struct{}
 
-// Main marks a defined function as a root the program can be asked to run — the
-// outer piece of code a run is about, what used to be a "workflow".
+// Main marks a defined function as a root the program can be asked to run: a
+// [Func] run as the main thread of a run on the process that starts it, rather
+// than dispatched. Call it at package scope next to the definition. The name is
+// the definition's. A program may Main several functions and a host picks one by
+// name.
 //
 //	var Ingest = flow.Define(func(ctx flow.Context, in Job) (flow.None, error) { … })
 //	var _ = flow.Main(Ingest)
 //
-// A root is nothing but a function run as the main thread of a run, on the
-// process that starts it (a coordinator), rather than dispatched: everything it
-// calls goes to the run's executor, everything it forks to the placer. There is
-// no separate workflow type — a root is a [Func] like any other, and Main only
-// records that this one may be started by name.
-//
-// A program may Main several functions; a host that runs one is told which by
-// name (nothing to say when there is exactly one). Call it at package scope,
-// next to the definition:
-//
-//	var _ = flow.Main(Ingest)
-//
-// The name is recovered from the function, so it is whatever [WithName] or the
-// build step gave the definition. Panics if f was not made by [Define], or if a
-// function of that name is already a root. Returns a zero value only so it can
-// sit in a package-scope `var _ =`.
+// Panics if f was not made by [Define], or if a function of that name is already
+// a root. Returns a zero value only so it can sit in a package-scope var _ =.
 func Main[In, Out any](f Func[In, Out]) struct{} {
 	cap, err := describe(Context{context.Background()}, f, *new(In))
 	if err != nil {
 		panic("flow: Main requires a function made by flow.Define: " + err.Error())
 	}
 	codec := dswire.ReflectCodec[In]{New: allocator[In]()}
-	// The encoded zero input, so a root taking [None] has a valid recorded input
-	// rather than a nil one — nil does not decode, and a None root is given no
-	// input to record otherwise.
+	// The encoded zero input, so a [None] root records a valid input rather than a
+	// nil one, which does not decode.
 	empty, err := dswire.EncodeRecord(codec, *new(In))
 	if err != nil {
 		panic("flow: Main: encode the zero input of a root: " + err.Error())
@@ -67,16 +54,14 @@ func Main[In, Out any](f Func[In, Out]) struct{} {
 			return dswire.EncodeRecord(codec, in)
 		},
 	}
-	// The name may not be known yet: like the function it marks, a root declared
-	// with a nameless Define at package scope is named later by the build step's
-	// table. registerMain takes it now if the name is in, and holds it against
-	// the function's resolution if it is not. See names.go.
+	// The name may not be known until the build step's table resolves the
+	// function; registerMain holds the root until then. See names.go.
 	registerMain(cap.handler, m)
 	return struct{}{}
 }
 
-// registerMain records a root: at once when its name is known, or against its
-// function's later resolution when it is not.
+// registerMain records a root now if its name is known, or against its function's
+// later resolution when it is not.
 func registerMain(h handler, m mainHandler) {
 	workflowsMu.Lock()
 	defer workflowsMu.Unlock()
@@ -87,7 +72,7 @@ func registerMain(h handler, m mainHandler) {
 	pendingMains = append(pendingMains, pendingMain{h: h, m: m})
 }
 
-// addWorkflowLocked inserts a named root, panicking on a duplicate. Called with
+// addWorkflowLocked inserts a named root, panicking on a duplicate. Call with
 // workflowsMu held.
 func addWorkflowLocked(m mainHandler) {
 	if _, dup := workflows[m.name]; dup {
@@ -96,8 +81,7 @@ func addWorkflowLocked(m mainHandler) {
 	workflows[m.name] = m
 }
 
-// pendingMain is a root whose function had no name when [Main] ran: the
-// function, to read its name once resolved, and the handler built from it.
+// pendingMain is a root whose function had no name when [Main] ran.
 type pendingMain struct {
 	h handler
 	m mainHandler
@@ -106,8 +90,7 @@ type pendingMain struct {
 var pendingMains []pendingMain
 
 // resolvePendingMains registers every held root whose function has since been
-// named. Called by [RegisterCallSiteNames] after the functions are resolved,
-// so their names are in place to be read here.
+// named. Called by [RegisterCallSiteNames].
 func resolvePendingMains() {
 	workflowsMu.Lock()
 	defer workflowsMu.Unlock()
@@ -124,30 +107,24 @@ func resolvePendingMains() {
 	pendingMains = kept
 }
 
-// mainHandler is a function registered as a root: enough to start it by name
-// with input given as JSON, and to replay it as the body of a lineage's root
-// thread.
+// mainHandler is a function registered as a root: enough to start it by name with
+// JSON input, and to replay it as a lineage's root thread.
 type mainHandler struct {
 	name   string
 	inType reflect.Type
-	// emptyInput is the encoded zero input, used when the root takes [None] so
-	// its recorded input is a valid encoded None{} rather than nil.
+	// emptyInput is the encoded zero input, used for a [None] root.
 	emptyInput []byte
-	// decode turns input given as JSON into the function's recorded input form.
+	// decode turns JSON input into the function's recorded input form.
 	decode func(input []byte) ([]byte, error)
 }
 
 func (m mainHandler) Name() string            { return m.name }
 func (m mainHandler) inputType() reflect.Type { return m.inType }
 
-// threadBody runs the registered function as the body of its main thread,
-// reading the input the run recorded — for the live root and for a process
-// replaying it from history (see lineage.go).
-//
-// Execute directly, not functionBody: a root has no caller to hand a failure
-// to, so its error must reach the run's own classify/retry as itself — a
-// transient failure retries, as a workflow body always has — rather than being
-// wrapped as the call failure a called function's is.
+// threadBody runs the registered function as its main thread's body. It calls
+// [Execute] directly, not functionBody: a root has no caller to hand a failure
+// to, so its error reaches the run's own retry as itself rather than wrapped as a
+// call failure.
 func (m mainHandler) threadBody() func(ctx Context) ([]byte, error) {
 	name := m.name
 	return func(ctx Context) ([]byte, error) {
@@ -168,14 +145,11 @@ func (m mainHandler) runJSON(ctx context.Context, input []byte, opts []RunOption
 	return m.run(ctx, payload, opts)
 }
 
-// run executes the root as a durable run named after it, to completion. The
-// input is already in its recorded form, or nil when the caller gave none and
-// expects a recorded one (a resume).
+// run executes the root as a durable run named after it. payload is already in
+// recorded form, or nil for a resume.
 func (m mainHandler) run(ctx context.Context, payload []byte, opts []RunOption) error {
 	if m.inType == nil {
-		// A root taking None is always given None{}: never a nil payload, which
-		// does not decode, and never a resume that reads a different input.
-		payload = m.emptyInput
+		payload = m.emptyInput // a None root is always given None{}
 	}
 	all := make([]RunOption, 0, len(opts)+2)
 	all = append(all, opts...)
@@ -187,14 +161,10 @@ func (m mainHandler) run(ctx context.Context, payload []byte, opts []RunOption) 
 	}, all...)
 }
 
-// RunMain runs the root function f on in as a durable run named after it, to
-// completion — the typed counterpart of [RunWorkflow], for a caller that has
-// the function and a value rather than a name and JSON.
-//
-// f must have been registered with [Main]. As with any run, the name is the
-// identity in the store: run it again on the same store and it resumes, with
-// the input the first attempt recorded — passing a different one is an error,
-// not a quiet restart.
+// RunMain runs the root function f on in as a durable run named after it — the
+// typed counterpart of [RunWorkflow]. f must be registered with [Main]. The name
+// is the identity in the store: run it again and it resumes with the recorded
+// input, and a different input is an error.
 func RunMain[In, Out any](ctx context.Context, f Func[In, Out], in In, opts ...RunOption) error {
 	ensureNamesResolved()
 	cap, err := describe(Context{context.Background()}, f, in)
@@ -221,7 +191,7 @@ func inputTypeFor[In any]() reflect.Type {
 }
 
 // workflowHandler is the non-generic boundary that lets differently-typed roots
-// live in one registry, the way handler does for functions.
+// share one registry.
 type workflowHandler interface {
 	Name() string
 	inputType() reflect.Type
@@ -244,10 +214,7 @@ type WorkflowInfo struct {
 }
 
 // Workflows lists every root declared with [Main] in this process, sorted by
-// name.
-//
-// For a program that hosts roots and must say which it can run — or, when
-// exactly one is declared, run that without being told.
+// name, for a program that hosts roots.
 func Workflows() []WorkflowInfo {
 	ensureNamesResolved()
 	workflowsMu.RLock()
@@ -261,14 +228,9 @@ func Workflows() []WorkflowInfo {
 }
 
 // RunWorkflow runs the root declared under name on input given as JSON — the
-// other end of [Workflows], for a program that has the name and the input as
-// text off a command line rather than as values in its own code.
-//
-// input is decoded as the root's input type, so its shape is the type's JSON
-// shape. Nil input means none was given: right for a root that takes [None],
-// and for resuming a run whose input is already recorded; a fresh run of a root
-// that takes input is refused with an example of what it wants. The error for
-// an unknown name lists the names there are.
+// other end of [Workflows]. Nil input means none was given, right for a [None]
+// root or a resume; a fresh run of a root that takes input is refused with an
+// example. The error for an unknown name lists the names there are.
 func RunWorkflow(ctx context.Context, name string, input []byte, opts ...RunOption) error {
 	ensureNamesResolved()
 	workflowsMu.RLock()
@@ -292,9 +254,8 @@ func definedWorkflows() string {
 	return names
 }
 
-// exampleInput renders the zero value of t as JSON, which is the shape an
-// input has to take. For an error message, so a caller who left the input off
-// is told what it looks like rather than where to read about it.
+// exampleInput renders the zero value of t as JSON, for an error that tells a
+// caller what an input looks like.
 func exampleInput(t reflect.Type) string {
 	if t == nil {
 		return "nothing"

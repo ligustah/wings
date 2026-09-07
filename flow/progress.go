@@ -8,27 +8,11 @@ import (
 	"github.com/ligustah/durable_streams/dswire"
 )
 
-// Heartbeat reports that a call is still making progress, and records where it
-// has got to.
-//
-// Two jobs in one call, and both matter. It is the liveness signal that
-// [WithHeartbeatTimeout] measures — a call that stops beating is presumed stuck
-// on its machine rather than slow, and an executor that can do so moves it to
-// another. And progress is the checkpoint that makes moving it cheap: whatever
-// was last passed here is handed to the next attempt, which reads it with
-// [Context.Checkpoint] and carries on from there instead of starting over.
-//
-// Only the LATEST value survives. This is a position, not a log: the point is
-// for a retry to know where to resume, and every earlier answer to that
-// question is wrong.
-//
-// It is best-effort about delivery and deliberately so. A beat that does not
-// reach the executor costs a retry that redoes a little work; a beat that
-// blocked the function to guarantee delivery would cost the work itself.
-//
-// Cheap to call, but not free — each one is a report — so call it per unit of
-// real progress rather than per loop iteration. Outside a running call it is
-// an error: there is no attempt to report on.
+// Heartbeat reports that a call is still progressing and records where it has
+// reached. It is the liveness signal [WithHeartbeatTimeout] measures, and the
+// checkpoint the next attempt reads with [Context.Checkpoint] to resume rather
+// than restart. Only the latest value survives. Best-effort; call it per unit of
+// real progress, not per loop iteration.
 func (c Context) Heartbeat[T any](progress T) error {
 	ctx := c
 	if t := threadFrom(ctx); t != nil && t.readonly {
@@ -49,17 +33,10 @@ func (c Context) Heartbeat[T any](progress T) error {
 	return st.sink.Heartbeat(ctx, b)
 }
 
-// Checkpoint returns the progress a previous attempt of this call reported,
-// and whether there was one.
-//
-// False on the first attempt, and on any attempt whose predecessor never
-// heartbeated — so the zero value must be a sensible place to start. That is
-// the whole contract: a function that reads its checkpoint and resumes from it
-// is idempotent in the only sense that matters here, since an executor that
-// moves calls delivers at least once and a retry is always possible.
-//
-// T must be what [Context.Heartbeat] was called with. A mismatch is reported as a
-// decode error rather than a wrong answer.
+// Checkpoint returns the progress a previous attempt reported, and whether there
+// was one. False on the first attempt and when the predecessor never
+// heartbeated, so the zero value must be a usable starting point. T must match
+// what [Context.Heartbeat] was called with.
 func (c Context) Checkpoint[T any]() (T, bool, error) {
 	var zero T
 
@@ -77,11 +54,8 @@ func (c Context) Checkpoint[T any]() (T, bool, error) {
 	return v, true, nil
 }
 
-// Attempt reports how many times this call has been started before, counting
-// from zero.
-//
-// A function that resumes rather than restarting wants to know; without this
-// a retry looks exactly like a first run. Zero outside a running call.
+// Attempt reports how many times this call has been started before, from zero.
+// Zero outside a running call.
 func (c Context) Attempt() int {
 	st := progressFrom(c)
 	if st == nil {
@@ -90,40 +64,30 @@ func (c Context) Attempt() int {
 	return st.resume.Attempt
 }
 
-// Progress is where a running function's reports go. An executor that runs
-// functions somewhere they can be lost implements one and installs it with
-// [WithProgress] around each call it starts; [Context.Heartbeat] finds it on
-// the context.
+// Progress is where a running function's heartbeats go. An executor implements
+// one and installs it with [WithProgress] around each call it starts.
 type Progress interface {
 	// Heartbeat delivers one checkpoint: the latest position, encoded.
 	Heartbeat(ctx context.Context, checkpoint []byte) error
 }
 
-// Resume is what an executor hands a retry: which attempt this is, and what
-// the attempts before it reported.
+// Resume is what an executor hands a retry: which attempt this is, and what the
+// attempts before it reported.
 type Resume struct {
 	// Attempt counts prior starts of this call, from zero.
 	Attempt int
-	// Checkpoint is the last progress a previous attempt reported through
-	// [Context.Heartbeat]. Empty on a first attempt, and on a retry of something that
-	// never heartbeated.
+	// Checkpoint is the last progress a previous attempt reported. Empty on a
+	// first attempt, and on a retry of something that never heartbeated.
 	Checkpoint []byte
 }
 
 // WithProgress returns a context on which [Context.Heartbeat],
-// [Context.Checkpoint] and [Context.Attempt] work: reports go to p, and r is
-// what a previous attempt left.
-//
-// For executors. Install it for every call rather than only for functions
-// that declare a heartbeat bound: calling Heartbeat is always allowed, and it
-// is the checkpoint that makes a retry cheap whether or not anything is
-// watching the clock.
+// [Context.Checkpoint] and [Context.Attempt] work: heartbeats go to p, and r is
+// what a previous attempt left. For executors; install it for every call.
 func WithProgress(ctx context.Context, p Progress, r Resume) context.Context {
 	return context.WithValue(ctx, progressKey{}, &progressState{sink: p, resume: r})
 }
 
-// progressState is what a running call needs to report progress: somewhere to
-// send, and whatever the last attempt left behind.
 type progressState struct {
 	sink   Progress
 	resume Resume

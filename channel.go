@@ -13,65 +13,36 @@ import (
 )
 
 // A channel shared between runs on different machines is a durable stream
-// relayed through the coordinator. See the flow package's ChannelHost for
-// the seam; this is what carries the bytes, and the coordinator is the host
-// that decides who takes what.
-//
-// Every run that uses a shared channel has an OUTBOX for it: a stream of
-// what that run sent and asked for, named for the run and the channel like
-// any other output — wings.chanout.<job>.<attempt>.<channel> — so on a
-// worker it is copied home by the same mirror as a recording. It is not
-// written inside the attempt's transaction, though, because it does not
-// need to be: a value or a want is named by its sender and sequence, and one
-// that reaches the coordinator without the history event that explains it
-// is sent again by the replay and dropped as a copy. What it needs instead
-// is to be SEEN AT ONCE, since a run on another machine is waiting on it.
-// The coordinator's RELAY merges every outbox of a channel into one
-// canonical stream, wings.chan.<channel>, in arrival order, by the rule in
-// flow.Arbiter: each value or want once, and a grant of each value to the
-// earliest want still open. A run receives by reading the canonical stream:
-// the coordinator its own, a worker a copy the coordinator PUSHES onto it.
-//
-// Nothing asks for the push. A worker that uses a channel creates its outbox
-// first, whether or not it ever sends, and the output mirror discovering that
-// outbox is what subscribes the worker to the channel. Discovery is live on a
-// healthy connection; the listing interval is the fallback.
-//
-// The canonical stream is never dropped: a coordinator that restarts replays
-// its workflow, and the workflow's receives replay from it, and it reads the
-// stream back to find what it had granted. A worker's outbox goes with the
-// attempt that wrote it, like its other outputs; what an abandoned attempt
-// wrote to its outbox is merged as soon as the copy arrives, well before the
-// job settles and the outbox is dropped.
+// relayed through the coordinator (the flow package's ChannelHost is the seam).
+// Each run has an outbox per channel — wings.chanout.<job>.<attempt>.<channel> —
+// copied home by the same mirror as a recording, but written outside the
+// attempt's transaction: a value or want is named by sender and sequence, so a
+// duplicate from a replay is dropped, and what it needs is to be seen at once.
+// The coordinator's relay merges every outbox into one canonical stream,
+// wings.chan.<channel>, by the rule in [flow.Arbiter]. A run receives by reading
+// the canonical stream — its own on the coordinator, a pushed copy on a worker.
+// Creating an outbox is also the subscription; the canonical stream is never
+// dropped, so a restarted coordinator replays receives from it.
 
 const (
-	// chanoutPrefix is a run's outbox for one shared channel. An output
-	// family: parseOutput knows it, the mirror copies it, and it goes with
-	// the attempt that wrote it.
 	chanoutPrefix = "wings.chanout."
-	// chanPrefix is the canonical stream of a shared channel: on the
-	// coordinator, and pushed to every worker using the channel. Not an
-	// output family — the copy on a worker must not be mirrored back.
+	// chanPrefix is the canonical stream, pushed to workers; not an output
+	// family, so a worker's copy is not mirrored back.
 	chanPrefix = "wings.chan."
 
-	// relayInterval is how often the relay looks for outboxes it has not
-	// seen, between pokes.
 	relayInterval = 500 * time.Millisecond
 )
 
-// chanStreamFor is a channel's canonical stream, from the sanitised id an
-// outbox name carries.
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
-// outboxFor is one run's outbox for one channel.
 func outboxFor(run string, attempt int, id string) string {
 	return outputName{Prefix: chanoutPrefix, Job: run, Attempt: attempt, Name: id}.String()
 }
 
 // --- relay, on the coordinator ---
 
-// relayChannel is the relay's state for one channel: the canonical stream
-// and the arbiter that says what goes on it.
+// relayChannel is the relay's state for one channel: the canonical stream and
+// the arbiter that decides what goes on it.
 type relayChannel struct {
 	stream *dsclient.Stream[flow.ChannelItem]
 
@@ -79,9 +50,8 @@ type relayChannel struct {
 	arbiter *flow.Arbiter
 }
 
-// merge puts a record from an outbox through the arbiter and appends what
-// it says — the record if it is new, and any grants — to the canonical
-// stream, returning what it appended. Nothing for a copy.
+// merge puts a record through the arbiter and appends what it says — the record
+// if new, plus any grants — returning what it appended. Nothing for a duplicate.
 func (rc *relayChannel) merge(ctx context.Context, it flow.ChannelItem) ([]flow.ChannelItem, error) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -95,7 +65,6 @@ func (rc *relayChannel) merge(ctx context.Context, it flow.ChannelItem) ([]flow.
 	return recs, nil
 }
 
-// channelRelay is the coordinator's side of every shared channel.
 type channelRelay struct {
 	poke chan struct{}
 
@@ -113,7 +82,6 @@ func (c *Cluster) startChannelRelay() {
 	c.wg.Go(c.runChannelRelay)
 }
 
-// pokeRelay asks the relay to look for new outboxes now.
 func (c *Cluster) pokeRelay() {
 	if c.relay == nil {
 		return
@@ -124,9 +92,8 @@ func (c *Cluster) pokeRelay() {
 	}
 }
 
-// runChannelRelay finds outboxes on the coordinator's storage — a worker's
-// copied home, or written there by an in-process worker or the workflow —
-// and reads each into its channel's canonical stream.
+// runChannelRelay finds outboxes on the coordinator's storage and reads each
+// into its channel's canonical stream.
 func (c *Cluster) runChannelRelay() {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -157,8 +124,8 @@ func (c *Cluster) runChannelRelay() {
 }
 
 // relayFor returns the relay's state for a channel, creating the canonical
-// stream and reading what is already on it — a coordinator that restarted
-// must not append what its predecessor did.
+// stream and replaying what is on it so a restarted coordinator does not append
+// what its predecessor did, and grants what the predecessor admitted but never granted.
 func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, error) {
 	canonical := chanStreamFor(id)
 	r := c.relay
@@ -191,7 +158,6 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 			rc.arbiter.Restore(rec.Record)
 		}
 	}
-	// What the predecessor admitted and did not live to grant.
 	if owed := rc.arbiter.Grants(); len(owed) > 0 {
 		if _, err := st.Append(c.ctx, owed); err != nil {
 			return nil, fmt.Errorf("wings: grant what was owed on %s: %w", canonical, err)
@@ -226,15 +192,10 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 		}
 		var from int64
 		for c.ctx.Err() == nil {
-			// The handle is re-opened every pass, not held for the life of the
-			// loop. The coordinator's copy of an outbox is made by the output
-			// mirror, which creates the stream; a handle opened in the window
-			// before the mirror's first append is bound to the empty stream and
-			// never sees what the mirror writes after — so it would wait here
-			// forever while the records sit unread, and whoever waits on those
-			// values hangs. A moved attempt's outbox is exactly that window: it
-			// is discovered and tailed the moment it appears, before it is fed.
-			// A fresh handle each pass sees what is there now.
+			// Re-opened each pass: a handle opened before the mirror's first
+			// append binds to the empty stream and never sees later writes — a
+			// moved attempt's outbox is exactly that window. A fresh handle sees
+			// what is there now.
 			st, err := eventStream[flow.ChannelItem](client, name)
 			if err != nil {
 				if c.ctx.Err() != nil || c.wasDropped(name) {
@@ -257,8 +218,6 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 					return
 				}
 				if !expired {
-					// Gone — dropped with the attempt that wrote it — or
-					// unreadable. Either way, done with it.
 					if c.wasDropped(name) {
 						return
 					}
@@ -291,8 +250,7 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 }
 
 // subscribeChannel starts pushing a channel's canonical stream onto a worker
-// that uses it, once. Called by the output mirror when it finds the worker's
-// outbox for the channel.
+// that uses it, once. Called by the output mirror when it finds the worker's outbox.
 func (c *Cluster) subscribeChannel(workerID, id string) {
 	shared, err := c.sharedClient()
 	if err != nil {
@@ -336,8 +294,7 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 
 // --- hosts ---
 
-// clusterChannels is the [flow.ChannelHost] of runs on the coordinator: the
-// workflow, and anything run with [Cluster.Run].
+// clusterChannels is the [flow.ChannelHost] for runs on the coordinator.
 type clusterChannels struct{ c *Cluster }
 
 func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.ChannelLink, error) {
@@ -364,7 +321,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 	}, nil
 }
 
-// nodeChannels is the [flow.ChannelHost] of a job's run on a worker.
+// nodeChannels is the [flow.ChannelHost] for a job's run on a worker.
 type nodeChannels struct {
 	n   *workerNode
 	job *jobState
@@ -372,9 +329,8 @@ type nodeChannels struct {
 
 func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.ChannelLink, error) {
 	out := outboxFor(h.job.id, h.job.attempt, id)
-	// Not the attempt's context: an outbox half-made when a deadline expires
-	// is the next attempt's problem. Created whether or not anything is ever
-	// sent, since it is also the subscription.
+	// Not the attempt's context: a half-made outbox is the next attempt's
+	// problem. Created whether or not anything is sent, since it is the subscription.
 	if err := ensureStream(context.WithoutCancel(ctx), h.n.client, out); err != nil {
 		return nil, err
 	}
@@ -382,8 +338,6 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 	if err != nil {
 		return nil, err
 	}
-	// Outside the attempt's transaction, on purpose: see the top of the
-	// file. A record is on its way home the moment it is written.
 	return &channelLink{
 		send: func(ctx context.Context, it flow.ChannelItem) error {
 			_, err := outbox.Append(ctx, []flow.ChannelItem{it})
@@ -394,9 +348,8 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 	}, nil
 }
 
-// channelLink is a run's connection to one shared channel: sends go to the
-// run's outbox, items come from the canonical stream where this run can
-// read it.
+// channelLink is a run's connection to one shared channel: sends go to the run's
+// outbox, items come from the canonical stream.
 type channelLink struct {
 	send   func(context.Context, flow.ChannelItem) error
 	client *dsclient.Client
@@ -406,9 +359,8 @@ type channelLink struct {
 func (l *channelLink) Send(ctx context.Context, it flow.ChannelItem) error { return l.send(ctx, it) }
 
 func (l *channelLink) Items(ctx context.Context, yield func(flow.ChannelItem) bool) error {
-	// The canonical stream appears when the relay has something for it, or
-	// when the push reaches this worker. Until then there is nothing to
-	// read, and nothing to do but look again.
+	// The canonical stream appears when the relay has something for it, or the
+	// push reaches this worker; until then, look again.
 	var st *dsclient.Stream[flow.ChannelItem]
 	var from int64
 	for ctx.Err() == nil {

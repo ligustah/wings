@@ -1,9 +1,5 @@
-// Package sshx is the SSH machinery wings uses to deploy a worker onto a
-// machine: copy a file, start a process, and open a tunnel back.
-//
-// It is cloud-agnostic on purpose. A [wings.Provisioner] for a new cloud has to
-// create a VM and hand back an address and a credential; everything after that
-// is the same everywhere, and lives here.
+// Package sshx is the cloud-agnostic SSH machinery wings uses to deploy a worker
+// onto a machine: copy a file, start a process, and open a tunnel back.
 package sshx
 
 import (
@@ -26,11 +22,9 @@ type Config struct {
 	// Addr is host:port. Port defaults to 22 when absent.
 	Addr string
 	User string
-	// Signer authenticates us. wings generates an ephemeral key per run and
-	// installs its public half on the machine it creates.
+	// Signer authenticates us.
 	Signer ssh.Signer
-	// HostKey verifies the machine. Nil means accept any key — see
-	// [InsecureIgnoreHostKey] for why that is not simply fine.
+	// HostKey verifies the machine. Nil accepts any key — see [InsecureIgnoreHostKey].
 	HostKey ssh.HostKeyCallback
 	Timeout time.Duration
 }
@@ -44,21 +38,14 @@ type Client struct {
 	closed    bool
 }
 
-// InsecureIgnoreHostKey accepts whatever host key is offered.
-//
-// It is the default for a freshly provisioned VM because there is nothing to
-// compare against: the machine did not exist a minute ago and no trusted record
-// of its key exists yet. The exposure is a machine-in-the-middle on the path to
-// the cloud provider, who would see the job payloads and could return forged
-// results. Where that matters, read the host key from the provider's guest
-// attributes and supply a real callback in Config.HostKey.
+// InsecureIgnoreHostKey accepts whatever host key is offered — the default for a
+// freshly provisioned VM, which has no trusted key record yet. It exposes the
+// connection to a machine-in-the-middle on the path to the cloud; supply a real
+// [Config.HostKey] where that matters.
 func InsecureIgnoreHostKey() ssh.HostKeyCallback { return ssh.InsecureIgnoreHostKey() }
 
-// Dial connects, retrying until ctx expires.
-//
-// Retrying is not a nicety here: a VM reports RUNNING well before sshd accepts
-// a connection, so the first several attempts failing is the normal path rather
-// than a problem.
+// Dial connects, retrying until ctx expires — a VM reports RUNNING before sshd
+// accepts connections, so early failures are normal.
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	addr := cfg.Addr
 	if !strings.Contains(addr, ":") {
@@ -102,25 +89,15 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 }
 
-// Upload streams size bytes from src to remotePath, creating parent
-// directories and marking the result executable.
+// Upload streams size bytes from src to remotePath, creating parent directories
+// and marking the result executable.
 //
-// It speaks the scp source protocol over an ordinary exec channel, which is
-// what scp itself has always done on the wire: run `scp -t <path>` on the far
-// side and hand it a header and the bytes. That is deliberate rather than
-// nostalgic — SFTP is a SUBSYSTEM, and an SSH server is under no obligation to
-// offer it. Plenty do not: a hardened image with `Subsystem sftp` commented
-// out, a container running dropbear, anything minimal. Every one of those still
-// runs commands, which is a capability wings depends on anyway to start the
-// worker at all. So this asks for nothing the rest of the deployment does not
-// already need.
-//
-// The size is required because the protocol sends it in the header, and that
-// is a feature: the far end knows exactly how many bytes to expect, so a
-// connection that dies mid-copy is an error here instead of a truncated
-// executable that fails confusingly later.
+// It speaks the scp source protocol over an exec channel rather than SFTP, which
+// is a subsystem an SSH server need not offer; running commands is a capability
+// wings already depends on. size is required: the protocol sends it in the
+// header, so a copy that dies mid-transfer fails here rather than silently
+// truncating.
 func (c *Client) Upload(ctx context.Context, src io.Reader, size int64, remotePath string) error {
-	// scp -t does not create directories. Cheap, and it needs only the shell.
 	if dir := path.Dir(remotePath); dir != "." && dir != "/" {
 		if _, err := c.Run(ctx, "mkdir -p "+shellQuote(dir)); err != nil {
 			return fmt.Errorf("ssh upload: mkdir %s: %w", dir, err)
@@ -141,8 +118,7 @@ func (c *Client) Upload(ctx context.Context, src io.Reader, size int64, remotePa
 	if err != nil {
 		return fmt.Errorf("ssh upload: stdout: %w", err)
 	}
-	// The sink reports trouble on stdout as a protocol ack; stderr is where the
-	// remote scp puts anything it could not say that way, such as not existing.
+	// Protocol acks come on stdout; scp's own errors on stderr.
 	var stderr strings.Builder
 	sess.Stderr = &stderr
 
@@ -182,21 +158,16 @@ func (c *Client) Upload(ctx context.Context, src io.Reader, size int64, remotePa
 	return nil
 }
 
-// scpSend is the protocol itself, with the session plumbing left outside.
-//
-// Separated so it can be tested against a fake sink. A wire protocol that only
-// runs when a real VM is on the other end is a protocol that is never tested,
-// and this one has an ordering that is easy to get subtly wrong.
+// scpSend is the protocol itself, separated from the session plumbing so it can
+// be tested against a fake sink.
 func scpSend(w io.Writer, acks io.Reader, src io.Reader, size int64, name string) error {
 	ack := bufio.NewReader(acks)
 
-	// The sink acks first, to say it is ready for a header.
 	if err := readAck(ack); err != nil {
 		return err
 	}
 
-	// C<mode> <size> <name>. The name matters only when the remote path turns
-	// out to be a directory; otherwise the sink writes to the path it was given.
+	// C<mode> <size> <name>.
 	if _, err := fmt.Fprintf(w, "C0755 %d %s\n", size, name); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
@@ -204,8 +175,7 @@ func scpSend(w io.Writer, acks io.Reader, src io.Reader, size int64, name string
 		return err
 	}
 
-	// CopyN, not Copy: sending fewer bytes than the header promised would leave
-	// the sink waiting, and sending more would desynchronise the protocol.
+	// CopyN, not Copy: the header promised exactly size bytes.
 	if n, err := io.CopyN(w, src, size); err != nil {
 		return fmt.Errorf("write body after %d of %d bytes: %w", n, size, err)
 	}
@@ -216,11 +186,8 @@ func scpSend(w io.Writer, acks io.Reader, src io.Reader, size int64, name string
 	return readAck(ack)
 }
 
-// readAck reads one scp protocol acknowledgement.
-//
-// 0 is success. 1 is a warning and 2 is fatal, each followed by a message
-// terminated by a newline — and we treat both as failures, because the only
-// thing being uploaded is the binary the whole machine exists to run.
+// readAck reads one scp acknowledgement: 0 is success; 1 and 2 are a
+// newline-terminated message, both treated as failures.
 func readAck(r *bufio.Reader) error {
 	code, err := r.ReadByte()
 	if err != nil {
@@ -264,11 +231,8 @@ func (c *Client) Run(ctx context.Context, cmd string) (string, error) {
 	return string(out), nil
 }
 
-// Start launches cmd detached and returns once it is running.
-//
-// setsid plus a redirect to a log file is what makes it survive this session
-// closing; without it the worker dies with the connection that started it, and
-// the failure looks like a worker that was never reachable.
+// Start launches cmd detached and returns once it is running. setsid and a log
+// redirect keep it alive after this session closes.
 func (c *Client) Start(ctx context.Context, cmd string, env map[string]string, logPath string) error {
 	var b strings.Builder
 	for k, v := range env {
@@ -282,12 +246,9 @@ func (c *Client) Start(ctx context.Context, cmd string, env map[string]string, l
 }
 
 // Forward opens a loopback listener here that proxies to remotePort on the
-// machine, and returns the local address to dial.
-//
-// This is how the coordinator reaches a worker's broker. The broker binds
-// loopback on the VM and is reachable no other way, so the tunnel is not only
-// convenient — it is the access control, since the broker itself speaks no
-// authentication.
+// machine, and returns the local address to dial. It is how the coordinator
+// reaches a worker's broker, which binds loopback and speaks no authentication —
+// so the tunnel is the access control.
 func (c *Client) Forward(ctx context.Context, remotePort int) (string, error) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

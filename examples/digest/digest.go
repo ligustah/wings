@@ -1,18 +1,12 @@
-// Package digest is a complete wings program: work functions, a workflow,
-// and an optional provisioner.
-//
-// It is a LIBRARY, not a main. `wings build` generates both mains — one for the
-// coordinator, one for the worker — and imports this package into each:
+// Package digest is a complete wings program — work functions and workflows in
+// a library package, with no cloud, Target, or provisioner in the code; where
+// the work runs is chosen on the command line:
 //
 //	go run github.com/ligustah/wings/cmd/wings build -pkg ./examples/digest -o digest
 //
 //	./digest -target inprocess -input '{"jobs":32}'
 //	./digest -target local -workers 4 -input '{"jobs":32}'
 //	./digest -target remote -workers 4 -input @params.json -gcp.project my-project -gcp.zone europe-west1-b
-//
-// Note what is NOT in this file: no cloud, no SDK, no Target, no provisioner.
-// Where the work runs is chosen entirely on the command line, and this package
-// cannot tell the difference.
 package digest
 
 import (
@@ -27,9 +21,7 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// Params is the workflow's input. It arrives as JSON from -input, and is part
-// of the run: a coordinator restarted over the same -dir is given what the
-// first start recorded, not whatever is on the new command line.
+// Params is the workflow's input, supplied as JSON via -input.
 type Params struct {
 	// Jobs is how many seeds to digest. Default 32.
 	Jobs int `json:"jobs"`
@@ -43,21 +35,15 @@ type Work struct {
 	Rounds int    `json:"rounds"`
 }
 
-// Result is what a worker sends back. Host is here so the output shows which
-// machine actually did the work.
+// Result is what a worker sends back; Host shows which machine did the work.
 type Result struct {
 	Seed   string `json:"seed"`
 	Digest string `json:"digest"`
 	Host   string `json:"host"`
 }
 
-// Digest is the work: hash a seed repeatedly, so the machine it runs on is
-// doing something a network round trip cannot hide.
-//
-// Defined at PACKAGE SCOPE, which is what puts it in the registry of every
-// process that links this package — including a worker, which never runs
-// the workflow. Nothing here mentions wings: a work function is a flow function,
-// and wings is one place it can be sent to run.
+// Digest hashes a seed repeatedly. A package-scope flow.Define, so every process
+// that links this package — including a worker — has it in its registry.
 var Digest = flow.Define(func(ctx flow.Context, in Work) (Result, error) {
 
 	host, err := ctx.Effect(os.Hostname)
@@ -75,12 +61,8 @@ var Digest = flow.Define(func(ctx flow.Context, in Work) (Result, error) {
 	return Result{Seed: in.Seed, Digest: hex.EncodeToString(sum[:]), Host: host}, nil
 }, flow.WithName("digest"))
 
-// Main is the workflow: what this program is about. wings runs it as a flow
-// once the cluster is up, and tears the cluster down when it returns. Because
-// it is a flow, a coordinator restarted over the same -dir replays what this
-// already did rather than doing it again. It is the only workflow defined, so
-// the binary runs it without being told; a program that defines several takes
-// -workflow.
+// Main is the workflow: it maps Digest over a batch of seeds and prints where
+// each ran. With several roots defined, -workflow picks one.
 var Main = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	work := make([]Work, jobs)
@@ -111,11 +93,8 @@ var Main = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 
 var _ = flow.Main(Main)
 
-// Batch is a work function that does its work by calling another: it digests
-// a batch of seeds through Digest — calls the cluster places like any other,
-// so a batch on one worker fans out across the fleet — and reports each
-// result on the channel it was handed as it comes, rather than all at once
-// when it returns.
+// Batch digests seeds through Digest and reports each result on the channel it
+// was handed as it arrives. Its own Digest calls fan out across the fleet.
 type Batch struct {
 	Work    []Work                `json:"work"`
 	Results *flow.Channel[Result] `json:"results"`
@@ -134,19 +113,10 @@ var DigestBatch = flow.Define(func(ctx flow.Context, in Batch) (int, error) {
 	return len(results), nil
 }, flow.WithName("digestBatch"))
 
-// Fanout is a second workflow, chosen with -workflow fanout. It splits the
-// work into batches, hands each batch a channel to report on, and prints
-// results as they arrive from wherever they were computed. The channel
-// crosses machines: the workflow reads it on the coordinator, the batches
-// write it on their workers.
-//
-// The batches leave the coordinator two ways, to show both. The even ones
-// are threads that run a function, sent to a worker by the function's name.
-// The odd ones are threads of RUN CODE — closures — which no worker can be
-// handed; they are sent as a lineage instead, and the worker replays this
-// workflow from its history to the fork that made the closure, then runs
-// it. The closure calls DigestBatch directly, which runs where the closure
-// does. Either way the batch's own calls fan out across the fleet.
+// Fanout (-workflow fanout) splits the work into batches, each reporting on a
+// shared channel the workflow reads on the coordinator while the batches write
+// it on their workers. Even batches are dispatched by function name (Go); odd
+// ones are run-code closures shipped as a lineage (Spawn) — both fan out.
 var Fanout = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	const batches = 4

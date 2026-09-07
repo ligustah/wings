@@ -29,14 +29,9 @@ type machineRecord struct {
 	Err    string    `json:"err,omitempty"`
 }
 
-// machineLog is the write-ahead record of provisioned machines.
-//
-// Write-ahead is the whole point, and it is why the coordinator mints the
-// identity rather than the cloud: the intent is written BEFORE anything is
-// created, so a coordinator that dies mid-creation still left a note saying
-// what it was about to do. The alternative — record the machine once the API
-// returns — has a window in which a billed VM exists that nothing on earth
-// knows about, and that window is exactly the one a crash likes.
+// machineLog is the write-ahead record of provisioned machines: the intent is
+// written before creation, so a coordinator that dies mid-creation still left a
+// note naming the machine it was about to make.
 type machineLog struct {
 	stream *dsclient.Stream[machineRecord]
 }
@@ -62,11 +57,8 @@ func (c *Cluster) openMachineLog(ctx context.Context) (*machineLog, error) {
 	return &machineLog{stream: stream}, nil
 }
 
-// write appends one record.
-//
-// Synchronous and its error returned, unlike the journal's fire-and-forget: an
-// intent that was not written down is an intent that must not be acted on, so
-// the caller has to be able to refuse.
+// write appends one record synchronously and returns its error: an intent that
+// was not recorded must not be acted on.
 func (l *machineLog) write(ctx context.Context, rec machineRecord) error {
 	if l == nil {
 		return nil
@@ -79,20 +71,14 @@ func (l *machineLog) write(ctx context.Context, rec machineRecord) error {
 }
 
 // outstanding returns the leases that may still name a live machine, oldest
-// first.
-//
-// "May" is doing real work there. A lease with an intent and nothing after it
-// is the interesting case: the machine might exist, might have half-existed, or
-// might never have been created — the record cannot say, because the crash it
-// is designed for happens precisely in that gap. Resolving it means asking the
-// cloud, which is what reattachment does.
+// first. A lease with an intent and nothing after it may or may not have been
+// created; only reattachment, by asking the cloud, can say.
 func (l *machineLog) outstanding(ctx context.Context) ([]string, error) {
 	if l == nil {
 		return nil, nil
 	}
 
-	// Ordered, because a lease's last word is what counts and a stream gives
-	// them in order.
+	// A lease's last word counts; the stream gives them in order.
 	var order []string
 	state := map[string]string{}
 
@@ -124,10 +110,8 @@ func (l *machineLog) outstanding(ctx context.Context) ([]string, error) {
 	return live, nil
 }
 
-// workerFor returns the worker id last recorded as running on a lease.
-//
-// Empty when the record never got that far, which is exactly the case where the
-// machine exists and has nothing useful on it.
+// workerFor returns the worker id last recorded as running on a lease, or empty
+// if none got that far.
 func (l *machineLog) workerFor(ctx context.Context, lease string) (string, error) {
 	if l == nil {
 		return "", nil
@@ -154,19 +138,10 @@ func (l *machineLog) workerFor(ctx context.Context, lease string) (string, error
 func newLease() string { return newToken(10) }
 
 // newEpoch mints an identity for one run of the coordinator.
-//
-// Shorter than a lease because it is a prefix on names people read, and its job
-// is only to differ from the last run rather than to be globally unique.
 func newEpoch() string { return newToken(6) }
 
-// newToken returns n random lowercase alphanumeric characters, beginning with a
-// letter.
-//
-// Lowercase alphanumeric because a token has to survive being embedded in
-// whatever a cloud calls a machine name — GCE wants RFC1035, and the provider
-// is the one that knows that, so what it gets handed must be safe everywhere.
-// A leading letter for the same reason: several clouds refuse a name that
-// starts with a digit.
+// newToken returns n random lowercase alphanumeric characters beginning with a
+// letter, so it is safe to embed in any cloud's machine name.
 func newToken(n int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)

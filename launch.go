@@ -14,20 +14,13 @@ import (
 	"time"
 )
 
-// readyTimeout bounds how long we wait for a worker to announce its address.
-// Generous, because a cold machine may still be unpacking a binary, and a
-// wrong answer here looks like a hang rather than a failure.
+// readyTimeout bounds how long we wait for a worker to announce its address; a
+// cold machine may still be unpacking its binary.
 const readyTimeout = 2 * time.Minute
 
 // launchInProcess runs workers as goroutines on the cluster's own embedded
-// durable-streams instance.
-//
-// All of them on ONE instance, and the coordinator on the same one: there is no
-// socket to cross and nothing to dial, because both halves are this process.
-// What keeps that from being a special case is that they still talk through
-// dsclient over their per-worker streams — the same loop, the same envelopes and
-// the same encoding as a worker on a machine in another country. Only the
-// backend under the client differs.
+// instance. They still talk through dsclient over per-worker streams, the same
+// as a remote worker; only the backend differs.
 func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, error) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -42,16 +35,14 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 			return nil, closePartial(ctx, out, err)
 		}
 
-		// ownsClient is false: the engine belongs to the cluster and outlives
-		// any one worker, so a retired worker must not close it.
+		// ownsClient false: the engine outlives any one worker.
 		w, err := c.connect(id, client, false)
 		if err != nil {
 			return nil, closePartial(ctx, out, err)
 		}
 		w.node = node
 
-		// Bound to the WORKER's context, so retiring one ends only its loop —
-		// and w.close waits for it before releasing anything it reads through.
+		// Bound to the worker's context, so retiring one ends only its loop.
 		w.wg.Go(func() {
 			if err := node.run(w.ctx); err != nil && w.ctx.Err() == nil && !node.leaving.Load() {
 				c.log.Error("wings: in-process worker stopped", "worker", id, "err", err)
@@ -63,11 +54,9 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 	return out, nil
 }
 
-// launchLocalProcess runs each worker as a child copy of this binary.
-//
-// No cross-compilation: the child is this exact executable on this exact
-// machine, which is the whole reason this target is the cheap way to test the
-// process boundary.
+// launchLocalProcess runs each worker as a child copy of this binary — no
+// cross-compilation, which is what makes this the cheap way to test the process
+// boundary.
 func (c *Cluster) launchLocalProcess(ctx context.Context, n int) ([]*workerConn, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -123,8 +112,7 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 	w.proc = cmd.Process
 	w.dir = dir
 	w.exited = make(chan struct{})
-	// One owner for Wait, so the tail can ask whether this worker is gone
-	// without racing anyone for the answer.
+	// One owner for Wait, so the tail can ask whether this worker is gone.
 	go func() {
 		_, _ = cmd.Process.Wait()
 		close(w.exited)
@@ -134,7 +122,8 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 	return w, nil
 }
 
-// workerEnv is the whole coordinator-to-worker contract.
+// workerEnv is the whole coordinator-to-worker contract, carried explicitly
+// because a worker process shares nothing with the Config that set it.
 func workerEnv(id, listen, dir string, concurrency int, jobTimeout time.Duration) []string {
 	env := []string{
 		envMode + "=" + modeWorker,
@@ -145,10 +134,6 @@ func workerEnv(id, listen, dir string, concurrency int, jobTimeout time.Duration
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))
 	}
-	// Carried explicitly, because a worker in another process shares nothing
-	// with the Config that set it. Leaving it out was a real bug: JobTimeout
-	// bound in-process jobs and silently did nothing anywhere else, so the
-	// guarantee changed with the target.
 	if jobTimeout > 0 {
 		env = append(env, envJobTimeout+"="+jobTimeout.String())
 	}
@@ -170,8 +155,6 @@ func awaitReady(ctx context.Context, stdout io.ReadCloser, id string) (string, e
 			line := scanner.Text()
 			if addr, ok := strings.CutPrefix(line, readyPrefix); ok {
 				ch <- result{addr: strings.TrimSpace(addr)}
-				// Keep the pipe moving; the worker logs to stdout for the rest
-				// of its life.
 				go func() { _, _ = io.Copy(io.Discard, stdout) }()
 				return
 			}
@@ -201,7 +184,7 @@ func awaitReady(ctx context.Context, stdout io.ReadCloser, id string) (string, e
 }
 
 // closePartial releases workers already brought up when a later one fails, so a
-// half-built cluster never leaks a process or a machine.
+// half-built cluster never leaks a process or machine.
 func closePartial(ctx context.Context, ws []*workerConn, cause error) error {
 	for _, w := range ws {
 		_ = w.close(ctx)

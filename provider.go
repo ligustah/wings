@@ -9,32 +9,23 @@ import (
 	"sync"
 )
 
-// Provider builds a [Provisioner] from command-line flags.
-//
-// It exists so that WHERE work runs is chosen when a program is run, not when
-// it is written. A program's own code names no cloud, imports no SDK and holds
-// no credentials; it defines work and a [Cluster.Map] over it, and `-target
-// remote -provider gcp` is what decides the rest.
-//
-// Register one from a package's init, the way a database driver does, and the
-// generated coordinator imports that package for effect:
+// Provider builds a [Provisioner] from command-line flags, so a program names no
+// cloud and `-target remote -provider gcp` decides at runtime. Register one from
+// init like a database driver:
 //
 //	func init() { wings.RegisterProvider(&provider{}) }
 //
-// A provider's flags are exposed with its name as a prefix — a Flags method
-// registering "project" becomes -gcp.project — so two providers can be linked
-// in at once without colliding.
+// Each provider's flags are prefixed with its name (a "project" flag becomes
+// -gcp.project), so several can be linked in at once.
 type Provider interface {
 	// Name is how -provider selects this one. Lowercase, no dots.
 	Name() string
 
-	// Flags registers the provider's options on fs. The set is its own, and
-	// wings prefixes every flag with Name before parsing.
+	// Flags registers the provider's options on fs; wings prefixes each with Name.
 	Flags(fs *flag.FlagSet)
 
-	// New builds the provisioner once the flags are parsed. Return an error
-	// naming the missing flag when the configuration is incomplete; it is
-	// reported to the user as-is.
+	// New builds the provisioner once flags are parsed, returning an error naming
+	// any missing flag.
 	New() (Provisioner, error)
 }
 
@@ -43,10 +34,8 @@ var (
 	providers  = map[string]Provider{}
 )
 
-// RegisterProvider makes p selectable with -provider.
-//
-// Panics on a duplicate or an empty name, both of which are programming errors
-// visible at init.
+// RegisterProvider makes p selectable with -provider. Call it from init. Panics
+// on a duplicate or empty name.
 func RegisterProvider(p Provider) {
 	name := p.Name()
 	if name == "" {
@@ -72,8 +61,6 @@ func ProviderNames() []string {
 	return names
 }
 
-// providerUsage describes -provider using what is actually linked in, so the
-// help text of a binary built without any cloud does not advertise one.
 func providerUsage() string {
 	names := ProviderNames()
 	if len(names) == 0 {
@@ -89,13 +76,8 @@ func lookupProvider(name string) (Provider, bool) {
 	return p, ok
 }
 
-// registerProviderFlags exposes every registered provider's flags on fs,
-// prefixed with the provider's name.
-//
-// All of them, not just the selected one: flags have to be registered before
-// parsing, and which provider is selected is itself a parsed flag. Sharing the
-// flag.Value means parsing -gcp.project writes straight into the provider's own
-// field, so nothing has to be copied back afterwards.
+// registerProviderFlags exposes every provider's flags on fs, prefixed with its
+// name — all of them, since which provider is selected is itself a parsed flag.
 func registerProviderFlags(fs *flag.FlagSet) {
 	providerMu.RLock()
 	defer providerMu.RUnlock()
@@ -110,7 +92,6 @@ func registerProviderFlags(fs *flag.FlagSet) {
 	}
 }
 
-// resolveProvider picks the provisioner for -target remote.
 func resolveProvider(name string) (Provisioner, error) {
 	names := ProviderNames()
 
@@ -120,7 +101,6 @@ func resolveProvider(name string) (Provisioner, error) {
 			"Build with `wings build -providers gcp`, or export " +
 			"`func Provisioner() wings.Provisioner` from your package for a cloud wings does not ship")
 	case name == "" && len(names) == 1:
-		// Unambiguous: one provider linked in, so naming it would be ceremony.
 		name = names[0]
 	case name == "":
 		return nil, fmt.Errorf("-provider is required: %s are linked in", strings.Join(names, ", "))

@@ -1,9 +1,7 @@
-// Package stress is a set of workflows that lean on the thread model from
-// every side at once: pipelines of threads joined by bounded channels, many
-// receivers on one channel, failures of every kind, lineages several deep,
-// effects recorded before a fork and replayed on the worker that reaches it,
-// hundreds of threads, and the things that are refused. Each workflow prints
-// what it saw and ends with "OK <name>", or returns an error.
+// Package stress is a set of workflows that exercise the thread model from every
+// side: pipelines, fan-in/fan-out, failures, deep lineages, recorded effects,
+// many threads, and the things that are refused. Each prints what it saw and
+// ends with "OK <name>", or returns an error.
 //
 //	go run github.com/ligustah/wings/cmd/wings build -pkg ./examples/stress -o stress
 //
@@ -26,17 +24,13 @@ import (
 
 // Params is every workflow's input; each reads what it needs.
 type Params struct {
-	// N is a count: values through a pipeline, per producer, threads.
-	N int `json:"n"`
-	// Depth is how deep the deep workflow nests.
+	N     int `json:"n"`
 	Depth int `json:"depth"`
-	// Long makes the sleepy workflow sleep past what a worker keeps in
-	// memory, so waits are unloaded and woken by the coordinator.
+	// Long makes sleepy nap past ShortSleep, so waits unload to the coordinator.
 	Long bool `json:"long"`
 }
 
-// pid is where a thread is running, as an effect: different on every
-// worker, the same on replay.
+// pid is the worker's pid, as an effect: different per worker, stable on replay.
 func pid(ctx flow.Context) (int, error) {
 	return ctx.Effect(func() (int, error) { return os.Getpid(), nil })
 }
@@ -230,8 +224,7 @@ var Square = flow.Define(func(ctx flow.Context, in int) (int, error) {
 }, flow.WithName("square"))
 
 var Flaky = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
-	// A function that fails: the error comes back through Await, and the
-	// workflow goes on.
+	// A function that fails: the error comes back through Await.
 	if _, err := ctx.Go(Fails, 1).Await(ctx); err == nil || !strings.Contains(err.Error(), "expected failure") {
 		return flow.None{}, fmt.Errorf("flaky: Fails returned %v, want the expected failure", err)
 	}
@@ -298,9 +291,8 @@ type Level struct {
 	Back  *flow.Channel[int] `json:"back"`
 }
 
-// descend is a thread of run code that forks another like it, until depth
-// runs out. Each level makes a channel its child reports on, and the last
-// makes one it hands back UP through its result.
+// descend forks another copy of itself until depth runs out; the deepest hands
+// a channel back up through its result.
 func descend(ctx flow.Context, depth, max int) (Level, error) {
 	p, err := pid(ctx)
 	if err != nil {
@@ -386,8 +378,7 @@ var Effects = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	if err := ctx.Sleep(50 * time.Millisecond); err != nil {
 		return flow.None{}, err
 	}
-	// A function called directly, on this thread, before the fork: replayed
-	// from the history by the worker that reaches the closure.
+	// Called directly, before the fork: replayed from history on the worker.
 	sq, err := Square(ctx, 12)
 	if err != nil {
 		return flow.None{}, err
@@ -400,8 +391,7 @@ var Effects = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 		Host string
 	}
 	v, err := ctx.Spawn(func(ctx flow.Context) (view, error) {
-		// The closure captured what the workflow computed; a worker
-		// replaying the workflow to this fork must arrive at the same.
+		// The closure must see what the workflow computed, via replay.
 		p, err := pid(ctx)
 		if err != nil {
 			return view{}, err
@@ -483,9 +473,7 @@ var _ = flow.Main(Wide)
 var Sleepy = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	naps := []time.Duration{300 * time.Millisecond, 600 * time.Millisecond, 900 * time.Millisecond}
 	if in.Long {
-		// Past flow.ShortSleep: a worker hands the thread back and the
-		// coordinator wakes it. And a thread waiting on that one waits past
-		// what a worker keeps in memory, so it is unloaded and woken too.
+		// Past flow.ShortSleep: the thread unloads and the coordinator wakes it.
 		naps = append(naps, 65*time.Second)
 	}
 	start := time.Now()
@@ -547,8 +535,7 @@ var Panicky = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	if err == nil || !strings.Contains(err.Error(), "permanently wrong") {
 		return flow.None{}, fmt.Errorf("panicky: the permanent failure returned %v", err)
 	}
-	// A closure that fails on its first attempt only is retried where it
-	// is, by the thread's own retry, and succeeds.
+	// A closure that succeeds after a retry in place.
 	v, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		n, err := ctx.Effect(func() (int, error) { return 0, nil })
 		if err != nil {
@@ -613,8 +600,7 @@ var _ = flow.Main(Bulky)
 // where it runs on another machine, and the workflow going on ---
 
 var Cancelled = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
-	// A timeout on the wait, not on the thread: the thread is sleeping on
-	// some worker and the parent stops waiting for it.
+	// A timeout on the wait, not the thread: the parent stops waiting.
 	tctx, cancel := ctx.WithTimeout(500 * time.Millisecond)
 	slow := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		if err := ctx.Sleep(5 * time.Second); err != nil {
@@ -695,8 +681,7 @@ var Orphaned = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) 
 	if err != nil || !more || v != 1 {
 		return flow.None{}, fmt.Errorf("orphaned: the first receive got %d, %v, %v", v, more, err)
 	}
-	// Nobody will ever send or close: a receive would wait forever, so the
-	// wait is bounded, and reports the bound.
+	// Nobody will send or close, so the receive is bounded and reports the bound.
 	tctx, cancel := ctx.WithTimeout(500 * time.Millisecond)
 	_, _, err = values.Recv(tctx)
 	cancel()
@@ -791,12 +776,7 @@ var Crossed = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 
 var _ = flow.Main(Crossed)
 
-// --- mapped: a wide fan-out with Context.Map, results kept in order ---
-//
-// Map is a fork per input joined in order; a worker kill mid-Map redispatches
-// the children that were on it, and this checks the results still come back
-// complete, in order, and each computed exactly once — a value out of place or
-// missing is a redispatch that lost or reordered a result.
+// --- mapped: a wide Context.Map, results complete and in order ---
 var Mapped = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 50)
 	ins := make([]int, n)

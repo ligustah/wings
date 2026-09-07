@@ -10,23 +10,12 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// ShortSleep is the longest a thread will simply wait in place. Beyond it, a
-// sleep suspends the thread instead.
-//
-// The threshold exists because the two are not the same trade. Waiting in place
-// keeps the thread's state in memory and its goroutine alive, which is cheap
-// for a second and absurd for a day; suspending writes the wake-up time down
-// and ends the attempt, which costs a replay when it resumes. A minute is
-// where the replay stops being the expensive half. A variable so a process
-// that would rather be told about every sleep — a worker whose coordinator
-// schedules them — can lower it.
+// ShortSleep is the longest a thread waits in place; a longer [Context.Sleep]
+// suspends the thread instead.
 var ShortSleep = time.Minute
 
-// Now returns the current time, recorded so that a replay sees the same instant.
-//
-// Use it instead of time.Now inside a run. A run that reads the real
-// clock decides something different on every attempt, and the first retry then
-// contradicts its own history.
+// Now returns the current time, recorded so a replay sees the same instant. Use
+// it instead of time.Now inside a run.
 func (c Context) Now() (time.Time, error) {
 	t := threadFrom(c)
 	if t == nil {
@@ -46,13 +35,9 @@ func (c Context) Now() (time.Time, error) {
 	return now, t.err()
 }
 
-// Sleep pauses the run for d.
-//
-// A short sleep waits in place. A long one suspends the run: the attempt ends,
-// its history stays on disk, and the next attempt replays to this point and
-// carries on. Either way the sleep is recorded, so it is not served twice — a
-// run that slept an hour and then failed does not sleep another hour on
-// its retry.
+// Sleep pauses the run for d. A short sleep waits in place; a longer one
+// suspends the run and resumes on a later attempt. Recorded, so it is not
+// served twice.
 func (c Context) Sleep(d time.Duration) error {
 	ctx := c
 	t := threadFrom(ctx)
@@ -60,8 +45,8 @@ func (c Context) Sleep(d time.Duration) error {
 		return errors.New("flow: Sleep called outside a Run")
 	}
 
-	// The recorded event's timestamp is when the sleep STARTED, which is what
-	// makes the deadline stable across attempts.
+	// The recorded timestamp is when the sleep started, so the deadline holds
+	// across attempts.
 	start := time.Now()
 
 	ev := t.peek()

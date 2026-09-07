@@ -7,11 +7,8 @@ type Wait struct {
 	Run, Thread string
 	// On is what the thread waits on: one of the Wait constants.
 	On string
-	// Channel names the channel, for a wait on one: the run's name and the
-	// channel's, as [ChannelHost] knows it. Seq is the thread's number for
-	// the receive or send it waits on — the name of its want, or of its
-	// value, on the channel's record — so that whoever holds the thread can
-	// see whether the wait has been answered.
+	// Channel names the channel for a wait on one, and Seq the thread's receive
+	// or send number, so a holder can tell whether the wait has been answered.
 	Channel string
 	Seq     uint64
 }
@@ -24,20 +21,12 @@ const (
 	WaitSleep = "sleep" // the clock, in [Context.Sleep]
 )
 
-// Parker is told when a thread stops running and when it wants to run
-// again.
-//
-// A thread that waits — for a thread it forked, for a channel, for the clock
-// — holds nothing the run needs while it waits, and a process that bounds
-// how many threads it runs at once has no reason to count it. Park is called
-// as the thread is about to wait, and returns at once; the resume it gives
-// back is called when the wait is over, and returns when the thread may run
-// again, which is where such a process makes the thread take its turn. A
-// run given no Parker parks nothing.
-//
-// Both are called on the thread's own goroutine, so a resume that blocks
-// blocks the thread, which is the point; it must honour its context, since
-// that is how a thread that is no longer wanted is let go.
+// Parker is told when a thread waits and when its wait is over, so an executor
+// can stop counting a waiting thread against its concurrency. Park is called as
+// the thread waits and returns at once; the resume it returns is called when the
+// wait ends and blocks until the thread may run again. Both run on the thread's
+// own goroutine and must honour their context. A run given no Parker parks
+// nothing.
 type Parker interface {
 	Park(ctx context.Context, w Wait) (resume func(ctx context.Context) error)
 }
@@ -45,14 +34,10 @@ type Parker interface {
 // WithParker installs p to be told when this run's threads wait.
 func WithParker(p Parker) RunOption { return func(o *runOptions) { o.parker = p } }
 
-// park tells the run's parker this thread is about to wait, and returns what
-// to call when it is done. Never nil.
 func (t *threadState) park(ctx context.Context, on string) func(ctx context.Context) error {
 	return t.parkOn(ctx, on, "", 0)
 }
 
-// parkOn is park for a wait on a channel, which names it and the receive or
-// send waited on.
 func (t *threadState) parkOn(ctx context.Context, on, channel string, seq uint64) func(ctx context.Context) error {
 	if t.run.parker == nil || t.readonly {
 		return noResume

@@ -5,52 +5,23 @@ import (
 	"io"
 )
 
-// Bytes is a chunk of raw bytes carried on a channel.
-//
-// A Channel[Bytes] is how a run streams opaque output — a render, an archive, a
-// core dump — from one thread to another: its values are recorded and relayed
-// like any channel's, so a moved thread replays the same bytes in the same
-// order, and everything the sending attempt writes is committed with it. A
-// Bytes rides the wire as its own bytes rather than the base64 a []byte would
-// cost in JSON — the codec waterfall takes a BinaryMarshaler ahead of JSON — so
-// a stream of them is the size of the data and not a third more.
-//
-// Pair it with a [ByteWriter] and a [ByteReader] to treat the channel as an
-// ordinary io.Writer and io.Reader. This is what a job that once returned a
-// file does now: it streams the bytes over a channel the workflow handed it,
-// and the workflow reads them wherever it runs.
+// Bytes is a chunk of raw bytes carried on a channel. It marshals as its own
+// bytes rather than the base64 a []byte costs in JSON.
 type Bytes []byte
 
-// MarshalBinary puts a Bytes on the wire verbatim.
 func (b Bytes) MarshalBinary() ([]byte, error) { return b, nil }
 
-// UnmarshalBinary reads one back, copying so the value does not alias the
-// decoder's buffer.
 func (b *Bytes) UnmarshalBinary(p []byte) error {
 	*b = append((*b)[:0], p...)
 	return nil
 }
 
-// ByteChunk is the most a [ByteWriter] puts in one value, and so the largest
-// record a byte stream makes.
-//
-// A stream of bytes has no natural unit the way a log of events does, so one is
-// picked: large enough that a hundred megabytes is a few hundred values, small
-// enough that neither end holds much at a time.
+// ByteChunk is the most a [ByteWriter] puts in one value.
 const ByteChunk = 256 << 10
 
-// ByteWriter streams bytes onto a channel. It is an [io.WriteCloser].
-//
-// Each ByteChunk that fills becomes one value sent on the channel — recorded in
-// the run's history and committed with the sending attempt, like any send — and
-// [ByteWriter.Close] sends what is left and closes the channel, which is what
-// tells a [ByteReader] the stream has ended. Writes are buffered and sent in
-// chunks, so a job that produces a hundred megabytes never holds a hundred
-// megabytes: what is in memory at any moment is one chunk, however large the
-// slice handed to Write.
-//
-// Give it a buffered channel ([Context.NewBufferedChannel]): on an unbuffered
-// one every chunk waits for the reader to take it, a round trip apiece.
+// ByteWriter streams bytes onto a channel as an [io.WriteCloser], one [ByteChunk]
+// value per full chunk. Close sends the remainder and closes the channel. Use a
+// buffered channel.
 type ByteWriter struct {
 	ctx Context
 	ch  *Channel[Bytes]
@@ -60,17 +31,10 @@ type ByteWriter struct {
 	err    error
 }
 
-// NewByteWriter returns a ByteWriter that sends onto ch.
 func NewByteWriter(ctx Context, ch *Channel[Bytes]) *ByteWriter {
 	return &ByteWriter{ctx: ctx, ch: ch}
 }
 
-// Write buffers p, sending whole chunks as they fill.
-//
-// A slice at least a chunk long is sent straight from the caller's memory rather
-// than copied into the buffer first: [Channel.Send] encodes the value before it
-// returns and the channel keeps its own copy, so the caller's slice is free to
-// reuse the moment Write does.
 func (w *ByteWriter) Write(p []byte) (int, error) {
 	if w.closed {
 		return 0, errors.New("flow: write to a closed byte stream")
@@ -108,10 +72,7 @@ func (w *ByteWriter) send(b []byte) error {
 	return nil
 }
 
-// Close sends what is buffered and closes the channel.
-//
-// Safe to call twice: the second call returns what the first did, so a deferred
-// Close beside an explicit one does not close the channel again.
+// Close sends what is buffered and closes the channel. Safe to call twice.
 func (w *ByteWriter) Close() error {
 	if w.closed {
 		return w.err
@@ -133,13 +94,8 @@ func (w *ByteWriter) Close() error {
 	return nil
 }
 
-// ByteReader streams bytes off a channel. It is an [io.Reader], and a no-op
-// Closer so it drops in wherever an io.ReadCloser is wanted.
-//
-// Read yields the bytes the channel's values carry, in order, and returns
-// [io.EOF] once the channel is closed and every value has been drained — exactly
-// when the [ByteWriter] on the other end has closed and its last chunk has
-// arrived.
+// ByteReader streams bytes off a channel as an [io.Reader], returning [io.EOF]
+// once the channel is closed and drained. Its Close is a no-op.
 type ByteReader struct {
 	ctx  Context
 	ch   *Channel[Bytes]
@@ -148,13 +104,10 @@ type ByteReader struct {
 	done bool
 }
 
-// NewByteReader returns a ByteReader that receives from ch.
 func NewByteReader(ctx Context, ch *Channel[Bytes]) *ByteReader {
 	return &ByteReader{ctx: ctx, ch: ch}
 }
 
-// Read fills p from the current chunk, taking the next value off the channel
-// when it runs out.
 func (r *ByteReader) Read(p []byte) (int, error) {
 	for r.pos >= len(r.buf) {
 		if r.done {
@@ -175,6 +128,4 @@ func (r *ByteReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Close does nothing; a ByteReader owns no resource of its own. It is here so a
-// ByteReader satisfies io.ReadCloser.
 func (r *ByteReader) Close() error { return nil }

@@ -5,22 +5,14 @@ import (
 	"errors"
 )
 
-// Putting jobs onto a worker's queue, many at a time.
-//
-// A Map over a large input dispatches every element at once, each from a
-// goroutine of its own, and each used to be one append to the worker's jobs
-// stream: one round trip through the engine, or over the network, per job.
-// Those goroutines all arrive within microseconds of each other, so the
-// submissions that queue up while one append is in flight are sent together in
-// the next. A single call sees no batching and pays no waiting: the batcher
-// takes what is already there and never holds a job back for company.
+// One worker's job submissions are batched into shared appends: whatever queued
+// while the last append was in flight goes together in the next. No job is held
+// back for company.
 
 const (
 	// submitBatch is the most jobs one append carries.
 	submitBatch = 256
-	// submitBytes bounds the payload in one append. A job's payload is the
-	// caller's, and a batch of large ones would otherwise be a message the
-	// transport will not carry.
+	// submitBytes bounds one append's payload, below the transport's message limit.
 	submitBytes = 8 << 20
 )
 
@@ -31,11 +23,9 @@ type submission struct {
 	done chan error
 }
 
-// send puts one job on a worker's queue and waits for it to be there.
-//
-// The wait is on the worker rather than on the caller's context: once queued
-// the job is going to be appended, and a caller told otherwise would credit the
-// worker back for a job that is about to run there.
+// send puts one job on a worker's queue and waits for it to be there. Once
+// queued the wait follows the worker, not the caller's context: the job is going
+// to be appended regardless.
 func (c *Cluster) send(ctx context.Context, w *workerConn, job jobEnvelope) error {
 	s := submission{job: job, done: make(chan error, 1)}
 	select {
@@ -53,12 +43,10 @@ func (c *Cluster) send(ctx context.Context, w *workerConn, job jobEnvelope) erro
 	}
 }
 
-// submitter is one worker's batcher. It runs until the worker stops, and
-// answers everything still waiting when it does.
+// submitter is one worker's batcher. It runs until the worker stops, failing
+// everything still waiting when it does.
 func (c *Cluster) submitter(w *workerConn) {
 	defer func() {
-		// Whoever was still waiting is told; nothing is left blocked on a
-		// worker that has stopped taking anything.
 		for {
 			select {
 			case s := <-w.submits:
@@ -82,7 +70,7 @@ func (c *Cluster) submitter(w *workerConn) {
 		batch = append(batch[:0], first)
 		size := len(first.job.Payload)
 
-		// Everything that arrived meanwhile, without waiting for more.
+		// Whatever else is already queued, without waiting for more.
 		for len(batch) < submitBatch && size < submitBytes {
 			select {
 			case s := <-w.submits:
@@ -94,8 +82,8 @@ func (c *Cluster) submitter(w *workerConn) {
 			break
 		}
 
-		// Two queues, one batcher: what a job called goes on the nested queue,
-		// which the worker reads without waiting for a slot on the other.
+		// Nested jobs go on their own queue, which the worker reads without
+		// waiting for a slot.
 		jobs, nested := jobs[:0], nested[:0]
 		for _, s := range batch {
 			if s.job.Nested {
