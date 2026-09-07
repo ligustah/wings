@@ -376,8 +376,5 @@ func (c *Cluster) workerImage(ctx context.Context) (*workerImage, error) {
 }
 
 func (c *Cluster) buildDir() string {
-	if c.tmpDir != "" {
-		return filepath.Join(c.tmpDir, "build")
-	}
-	return filepath.Join(c.cfg.Dir, "build")
+	return filepath.Join(c.dir, "build")
 }

@@ -34,8 +34,7 @@ type Cluster struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	dir    string
-	tmpDir string
+	dir string
 
 	// shared is the cluster's own embedded durable-streams instance (no broker,
 	// no port), where the coordinator keeps its journal whatever the target. The
@@ -301,32 +300,28 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 
 	c.dir = cfg.Dir
 	if c.dir == "" {
-		var err error
-		if c.dir, err = os.MkdirTemp("", "wings-*"); err != nil {
-			cancel()
-			return nil, fmt.Errorf("wings: data dir: %w", err)
-		}
-		c.tmpDir = c.dir
+		c.dir = defaultDataDir
+	}
+	if err := os.MkdirAll(c.dir, 0o755); err != nil {
+		cancel()
+		return nil, fmt.Errorf("wings: data dir: %w", err)
 	}
 
 	// Opened before any worker exists, so the record starts at the run's start.
 	client, err := c.sharedClient()
 	if err != nil {
 		cancel()
-		c.cleanupDir()
 		return nil, err
 	}
 	if c.journal, err = openJournal(ctx, client, log, c.epoch); err != nil {
 		cancel()
 		_ = c.closeShared()
-		c.cleanupDir()
 		return nil, err
 	}
 	if c.machines, err = c.openMachineLog(ctx); err != nil {
 		cancel()
 		c.journal.close()
 		_ = c.closeShared()
-		c.cleanupDir()
 		return nil, err
 	}
 
@@ -343,7 +338,6 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 		c.wg.Wait()
 		c.journal.close()
 		_ = c.closeShared()
-		c.cleanupDir()
 		return nil, err
 	}
 
@@ -1454,14 +1448,7 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	c.journal.close()
 	// Last: the in-process workers read through the shared instance.
 	errs = append(errs, c.closeShared())
-	c.cleanupDir()
 	return errors.Join(errs...)
-}
-
-func (c *Cluster) cleanupDir() {
-	if c.tmpDir != "" {
-		_ = os.RemoveAll(c.tmpDir)
-	}
 }
 
 func (w *workerConn) close(ctx context.Context) error {

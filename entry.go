@@ -61,7 +61,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		provider    = flag.String("provider", "", providerUsage())
 		workers     = flag.Int("workers", 0, "number of workers; 0 uses the default for the target")
 		concurrency = flag.Int("concurrency", 0, "jobs in flight per worker; 0 lets each worker decide")
-		dir         = flag.String("dir", "", "data directory; empty uses a temporary one that is removed on exit")
+		dir         = flag.String("dir", "", "data directory; empty uses ./wings-data")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
 		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")

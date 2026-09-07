@@ -557,10 +557,11 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 
 	dir := os.Getenv(envDir)
 	if dir == "" {
-		var err error
-		if dir, err = os.MkdirTemp("", "wings-worker-*"); err != nil {
-			return fmt.Errorf("wings: worker data dir: %w", err)
-		}
+		// Only when started by hand: the coordinator always sets WINGS_DIR.
+		dir = defaultWorkerDataDir
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("wings: worker data dir: %w", err)
 	}
 	listen := os.Getenv(envListen)
 	if listen == "" {

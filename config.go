@@ -48,6 +48,16 @@ const (
 
 	// defaultRemotePort is the loopback port a remote worker's broker binds.
 	defaultRemotePort = 9440
+
+	// defaultDataDir is a coordinator's data directory when Config.Dir is unset:
+	// a directory in the working directory, kept — a durable run's state belongs
+	// somewhere it survives, which a temp dir is not.
+	defaultDataDir = "wings-data"
+
+	// defaultWorkerDataDir is a worker's data directory when it is started by hand
+	// without WINGS_DIR; a coordinator always sets one. Named apart from
+	// defaultDataDir so a worker and a coordinator in one directory do not clash.
+	defaultWorkerDataDir = "wings-worker-data"
 )
 
 // pollInterval bounds one blocking read of a worker's results, beats or
@@ -73,8 +83,9 @@ type Config struct {
 	// does not count. Zero lets each worker decide from its own CPU count.
 	Concurrency int
 
-	// Dir is where broker data lives. Empty uses a temporary directory removed
-	// on [Cluster.Stop]; set it to keep a worker's queue across a restart.
+	// Dir is where the coordinator keeps its durable data. Empty uses
+	// ./wings-data in the working directory, kept across restarts so a run
+	// resumes; set it to put that state somewhere else.
 	Dir string
 
 	// JobTimeout bounds a single work function call. Zero means no limit.
