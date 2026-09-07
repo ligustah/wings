@@ -16,6 +16,11 @@
 # Broker data, if a Config.Dir is pointed here rather than at a temp directory.
 /data/
 
+# Default data directories (unset Config.Dir / WINGS_DIR) created in the
+# working directory.
+/wings-data/
+/wings-worker-data/
+
 # Local editor and tooling state.
 .claude/settings.local.json
 .idea/

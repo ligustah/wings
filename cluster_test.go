@@ -514,7 +514,13 @@ func ExampleDefine() {
 		return "hello, " + name, nil
 	}, flow.WithName("example.greet"))
 
-	c, err := Start(context.Background(), Config{Target: InProcess()})
+	dir, err := os.MkdirTemp("", "wings-example-*")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+
+	c, err := Start(context.Background(), Config{Target: InProcess(), Dir: dir})
 	if err != nil {
 		panic(err)
 	}
