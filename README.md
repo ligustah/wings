@@ -184,6 +184,28 @@ if err := rec.Close(); err != nil { return Result{}, err }
 return Result{Replay: rec.Recording()}, nil    // a handle, not the events
 ```
 
+## Inspecting a run
+
+`-ui 127.0.0.1:8080` serves a read-only web UI and JSON API on the coordinator: the
+cluster's workers and pending queue, the runs it has recorded, and each run's threads
+with their decoded event timeline.
+
+```
+./myapp -target local -workers 4 -ui 127.0.0.1:8080
+```
+
+To look at a run that has already stopped, point `-inspect` at its `-dir` — it serves
+the same UI over the recorded history and runs no workflow:
+
+```
+./myapp -inspect ./wings-data -ui 127.0.0.1:8080
+```
+
+The API is the same data the UI draws: `GET /api/runs`, `/api/runs/{run}`,
+`/api/workers`, `/api/pending`, `/api/status`. Histories are complete in the
+coordinator's engine for the in-process and `-local-shared-broker` targets; for a
+target where each worker keeps its own data, `-inspect` that directory instead.
+
 ## Autoscaling
 
 Set `-max-workers` (or `Config.Scaling`) and wings sizes the fleet from the queue:
