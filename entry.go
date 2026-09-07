@@ -64,6 +64,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		dir         = flag.String("dir", "", "data directory; empty uses ./wings-data")
 		localShared = flag.Bool("local-shared-broker", false, "for -target local: workers share the coordinator's broker instead of each keeping its own data")
 		ui          = flag.String("ui", "", "serve a read-only inspection UI and API at this address (e.g. 127.0.0.1:8080); empty is off")
+		inspect     = flag.String("inspect", "", "serve the inspection UI over an existing data directory and exit; does not run a workflow")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
 		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
@@ -79,6 +80,29 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	)
 	registerProviderFlags(flag.CommandLine)
 	flag.Parse()
+
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(log)
+
+	// -inspect serves the UI over a stopped run's data directory and runs no
+	// workflow, so it short-circuits the rest.
+	if *inspect != "" {
+		addr := *ui
+		if addr == "" {
+			addr = "127.0.0.1:8080"
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		if err := Inspect(ctx, *inspect, addr, log); err != nil {
+			log.Error("wings: inspect", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// A worker is this same binary with no workflow to run, so it must not be
 	// asked to choose one.
@@ -97,13 +121,6 @@ func CoordinatorMain(opts CoordinatorOptions) {
 			os.Exit(2)
 		}
 	}
-
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	slog.SetDefault(log)
 
 	cfg := Config{
 		Workers:           *workers,

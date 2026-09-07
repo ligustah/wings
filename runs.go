@@ -6,18 +6,21 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// The run-inspection half of the UI API: the recorded histories in the
-// coordinator's engine, decoded by flow. Read-only. Run histories live in the
-// engine for the in-process and shared-broker targets; for targets where a
-// worker keeps its own data, use -inspect against that data directory instead.
+// The run-inspection half of the UI API: the recorded histories in an engine,
+// decoded by flow. Read-only, and shared by the live coordinator and the
+// -inspect post-mortem mode — both supply a store, differing only in where its
+// engine comes from. Histories are complete in the engine for the in-process
+// and shared-broker targets; for targets where a worker keeps its own data, use
+// -inspect against that data directory.
 
-// inspectStore returns a read-only view of the engine's recorded histories.
-func (c *Cluster) inspectStore() (flow.Store, error) {
-	client, err := c.sharedClient()
-	if err != nil {
-		return nil, err
-	}
-	return flow.NewStore(client), nil
+// runAPI serves the recorded-run endpoints off whatever store it is given.
+type runAPI struct {
+	store func() (flow.Store, error)
+}
+
+func (a runAPI) register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/runs", a.handleRuns)
+	mux.HandleFunc("GET /api/runs/{run}", a.handleRun)
 }
 
 type runView struct {
@@ -25,8 +28,8 @@ type runView struct {
 	Status string `json:"status"`
 }
 
-func (c *Cluster) handleRuns(w http.ResponseWriter, r *http.Request) {
-	store, err := c.inspectStore()
+func (a runAPI) handleRuns(w http.ResponseWriter, r *http.Request) {
+	store, err := a.store()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -47,13 +50,13 @@ func (c *Cluster) handleRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-func (c *Cluster) handleRun(w http.ResponseWriter, r *http.Request) {
+func (a runAPI) handleRun(w http.ResponseWriter, r *http.Request) {
 	run := r.PathValue("run")
 	if run == "" {
 		http.Error(w, "missing run", http.StatusBadRequest)
 		return
 	}
-	store, err := c.inspectStore()
+	store, err := a.store()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -68,4 +71,13 @@ func (c *Cluster) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, snap)
+}
+
+// inspectStore returns a read-only view of the engine's recorded histories.
+func (c *Cluster) inspectStore() (flow.Store, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	return flow.NewStore(client), nil
 }

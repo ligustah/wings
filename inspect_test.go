@@ -1,8 +1,10 @@
 package wings
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -116,5 +118,49 @@ func TestInspectionAPIServesRunHistory(t *testing.T) {
 	}
 	if !main {
 		t.Fatalf("no completed main thread in %+v", snap.Threads)
+	}
+}
+
+// THE POINT: -inspect serves a stopped run's recorded history from its data
+// directory, with no cluster orchestrating.
+func TestInspectModeServesStoppedRun(t *testing.T) {
+	dir := t.TempDir()
+	name := "test-postmortem-" + strconv.FormatUint(runSeq.Add(1), 36)
+
+	c, err := Start(t.Context(), Config{Target: InProcess(), Dir: dir})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		return ctx.Sleep(0)
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	srv, err := serveInspector(dir, "127.0.0.1:0", slog.Default())
+	if err != nil {
+		t.Fatalf("serveInspector: %v", err)
+	}
+	defer srv.close()
+
+	var st statusView
+	getJSON(t, "http://"+srv.addr+"/api/status", &st)
+	if st.Target != "inspect" {
+		t.Fatalf("status target %q, want inspect", st.Target)
+	}
+
+	var snap flow.Snapshot
+	getJSON(t, "http://"+srv.addr+"/api/runs/"+name, &snap)
+	completed := false
+	for _, th := range snap.Threads {
+		if th.ID == "main" && th.Status == "completed" {
+			completed = true
+		}
+	}
+	if !completed {
+		t.Fatalf("post-mortem did not recover a completed main thread: %+v", snap.Threads)
 	}
 }
