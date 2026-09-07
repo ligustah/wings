@@ -175,6 +175,12 @@ coordinator per item — a want, a park, and a wake. For a high-volume channel, 
 it on the run's own thread (or a thread that stays on the coordinator) rather than
 forking the draining loop onto a worker.
 
+`NewUnboundedChannel` has no capacity limit: `Send` never blocks and a sender is
+never parked. A parked sender can be *unloaded* — its attempt cancelled and its
+whole job replayed on the next one — so when the receiver is guaranteed to drain
+the channel, an unbounded channel avoids that cost. It can grow without limit if
+the receiver falls behind, so use it only where the drain keeps up.
+
 ## Recordings
 
 A long job's progress is often a sequence of events. `Record` keeps one on a durable
