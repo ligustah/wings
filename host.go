@@ -22,7 +22,11 @@ func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Conte
 	}
 	ctx, done := c.hosting(ctx)
 	defer done()
-	return flow.Run(ctx, name, body, all...)
+	err = flow.Run(ctx, name, body, all...)
+	if err == nil {
+		c.forgetRun(name)
+	}
+	return err
 }
 
 // RunWorkflow runs root function f on in, under f's own name, so a coordinator
@@ -35,7 +39,13 @@ func (c *Cluster) RunWorkflow[In, Out any](ctx context.Context, f flow.Func[In, 
 	}
 	ctx, done := c.hosting(ctx)
 	defer done()
-	return flow.RunMain(ctx, f, in, all...)
+	if err = flow.RunMain(ctx, f, in, all...); err != nil {
+		return err
+	}
+	if name, nerr := flow.NameOf(f); nerr == nil {
+		c.forgetRun(name)
+	}
+	return nil
 }
 
 // Signal delivers a typed event to a running workflow by name: the run named
@@ -52,7 +62,11 @@ func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) er
 	}
 	ctx, done := c.hosting(ctx)
 	defer done()
-	return flow.RunWorkflow(ctx, name, input, all...)
+	err = flow.RunWorkflow(ctx, name, input, all...)
+	if err == nil {
+		c.forgetRun(name)
+	}
+	return err
 }
 
 func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -880,6 +881,23 @@ func (c *Cluster) forget(p *pendingJob) {
 			// A later thread of run code descending from this call replays
 			// through its history; ranAs remembers which job to ask. See threadHistory.
 			c.ranAs[key] = p.job.ID
+		}
+	}
+}
+
+// forgetRun releases the in-memory lineage index for a run that has finished for
+// good, so ranAs does not grow without bound over a coordinator's life. Its
+// entries are keyed by origin (run/thread#step), and every thread of a run
+// carries that run's name, so the run's entries are exactly those under "run/".
+// Safe only once the whole run is done: while it runs, a later thread of run
+// code still replays through an ancestor's history via ranAs (see threadHistory).
+func (c *Cluster) forgetRun(run string) {
+	prefix := run + "/"
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key := range c.ranAs {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.ranAs, key)
 		}
 	}
 }

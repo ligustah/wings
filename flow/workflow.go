@@ -180,6 +180,19 @@ func RunMain[In, Out any](ctx context.Context, f Func[In, Out], in In, opts ...R
 	return h.run(ctx, cap.payload, opts)
 }
 
+// NameOf returns the durable-run name of a root function made by [Define] — the
+// same name [RunMain] runs it under. For a caller that has the function but not
+// its name as a string.
+func NameOf[In, Out any](f Func[In, Out]) (string, error) {
+	ensureNamesResolved()
+	var zero In
+	cap, err := describe(Context{context.Background()}, f, zero)
+	if err != nil {
+		return "", fmt.Errorf("flow: NameOf requires a function made by flow.Define: %w", err)
+	}
+	return cap.name, nil
+}
+
 // inputTypeFor is In, or nil for [None].
 func inputTypeFor[In any]() reflect.Type {
 	var zero In
