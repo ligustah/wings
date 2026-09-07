@@ -24,6 +24,43 @@ func (s *discardStore) Events(context.Context, string, string) ([]*protos.Event,
 }
 func (s *discardStore) Drop(context.Context, string, string) error { return nil }
 
+// THE POINT: an unbounded channel's Send never blocks, so a sender is never
+// parked (and so never unloaded, which would replay its whole job). One thread
+// sends many values before receiving any — on a bounded or unbuffered channel
+// the first send would block forever.
+func TestUnboundedChannelSendNeverBlocks(t *testing.T) {
+	const n = 5000
+	err := Run(context.Background(), "unbounded", func(c Context) error {
+		ch := c.NewUnboundedChannel[int]()
+		for i := 0; i < n; i++ {
+			if err := ch.Send(c, i); err != nil {
+				return err
+			}
+		}
+		if err := ch.Close(c); err != nil {
+			return err
+		}
+		sum := 0
+		for {
+			v, ok, err := ch.Recv(c)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			sum += v
+		}
+		if want := n * (n - 1) / 2; sum != want {
+			t.Errorf("drained sum %d, want %d", sum, want)
+		}
+		return nil
+	}, WithStore(NewMemStore()))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
 // THE POINT: a consumed channel item drops its value, so a drained channel does
 // not hold its whole traffic in memory (the second in-memory copy).
 func TestChanStateConsumeDropsItemData(t *testing.T) {

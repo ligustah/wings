@@ -39,6 +39,19 @@ func (c Context) NewChannel[T any]() *Channel[T] {
 	return newChannel[T](c, 0)
 }
 
+// unbounded is the capacity of a channel a send never waits on. Negative so it
+// cannot be reached by a count of queued items.
+const unbounded = -1
+
+// NewUnboundedChannel returns a channel a send never blocks on: it has no
+// capacity limit, so Send always completes at once and no sender is ever parked
+// (and so never unloaded, which would replay its whole job). Use it when the
+// receiver is guaranteed to drain the channel and backpressure is unwanted. It
+// can grow without limit if the receiver falls behind.
+func (c Context) NewUnboundedChannel[T any]() *Channel[T] {
+	return newChannel[T](c, unbounded)
+}
+
 // NewBufferedChannel returns a channel that accepts capacity values before a
 // send has to wait for a receive.
 func (c Context) NewBufferedChannel[T any](capacity int) *Channel[T] {
@@ -627,6 +640,9 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 // come to fewer than the capacity. Senders ahead count because they are owed a
 // place first. Call with mu held.
 func (cs *chanState) roomFor(item *chanItem) bool {
+	if cs.capacity < 0 {
+		return true // unbounded: a send never waits for room
+	}
 	used := 0
 	for _, it := range cs.items {
 		if it == item {
