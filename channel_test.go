@@ -2,6 +2,7 @@ package wings
 
 import (
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,6 +41,69 @@ var counts = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	}
 	return in.Count, in.Values.Close(ctx)
 }, flow.WithName("test.counts"))
+
+// THE POINT: a settled job's shared-channel outbox is dropped once its output is
+// home and merged, rather than tailed for the cluster's life. The canonical
+// stream stays, so a resume can still replay receives from it.
+func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 2, Concurrency: 1})
+
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		producer := ctx.Go(counts, feed{Values: ch, Count: 5})
+		consumer := ctx.Go(sums, feed{Values: ch})
+		if _, err := producer.Await(ctx); err != nil {
+			return err
+		}
+		var err error
+		got, err = consumer.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("consumer summed %d, want 15", got)
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatalf("shared client: %v", err)
+	}
+
+	// The two forked jobs' outboxes are dropped; only the workflow's own export
+	// outbox may remain. The canonical stream must survive.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		names, err := client.ListStreams(t.Context())
+		if err != nil {
+			t.Fatalf("list streams: %v", err)
+		}
+		outboxes, canonical := 0, 0
+		for _, n := range names {
+			if o, ok := parseOutput(n); ok && o.Prefix == chanoutPrefix {
+				outboxes++
+			}
+			if strings.HasPrefix(n, chanPrefix) {
+				canonical++
+			}
+		}
+		if outboxes <= 1 {
+			if canonical == 0 {
+				t.Fatal("the canonical channel stream was dropped; a resume could not replay")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d channel outboxes still present after settle; the forked jobs' were not dropped", outboxes)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
 
 // THE POINT: a channel is shared by handing it to a call. The workflow on the
 // coordinator and the function on a worker — or two functions on two workers

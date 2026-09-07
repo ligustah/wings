@@ -875,6 +875,15 @@ func (c *Cluster) forget(p *pendingJob) {
 			c.dropOutputsOf(job, keep, writers)
 		})
 	}
+	// A job done for good will send no more on its shared channels, so its
+	// outboxes can be merged home and dropped rather than tailed for the cluster's
+	// life. Only chased for a job the relay actually tailed an outbox for.
+	if !c.closed && c.hadOutbox(streamPart(p.job.ID)) {
+		job, w := p.job.ID, p.ran[p.job.Attempt]
+		c.wg.Go(func() {
+			c.finishChannels(job, w)
+		})
+	}
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
 			delete(c.byOrigin, key)

@@ -71,15 +71,41 @@ type channelRelay struct {
 	mu       sync.Mutex
 	channels map[string]*relayChannel // by canonical stream
 	tailed   map[string]bool          // outboxes being read
+	// finalJob names jobs that have settled and whose output is fully home, so
+	// their outboxes are complete: once its tail has merged the last of one into
+	// the canonical stream it drops it and stops. Keyed by streamPart(job).
+	finalJob map[string]bool
+	// outboxJobs names jobs the relay has ever tailed an outbox for, so a settled
+	// job with no shared channel is not chased. Keyed by streamPart(job).
+	outboxJobs map[string]bool
 }
 
 func (c *Cluster) startChannelRelay() {
 	c.relay = &channelRelay{
-		poke:     make(chan struct{}, 1),
-		channels: map[string]*relayChannel{},
-		tailed:   map[string]bool{},
+		poke:       make(chan struct{}, 1),
+		channels:   map[string]*relayChannel{},
+		tailed:     map[string]bool{},
+		finalJob:   map[string]bool{},
+		outboxJobs: map[string]bool{},
 	}
 	c.wg.Go(c.runChannelRelay)
+}
+
+func (r *channelRelay) jobFinal(job string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.finalJob[job]
+}
+
+// hadOutbox reports whether the relay has ever tailed an outbox for a job, so
+// only such a job's settle chases its channel outboxes.
+func (c *Cluster) hadOutbox(job string) bool {
+	if c.relay == nil {
+		return false
+	}
+	c.relay.mu.Lock()
+	defer c.relay.mu.Unlock()
+	return c.relay.outboxJobs[job]
 }
 
 func (c *Cluster) pokeRelay() {
@@ -175,6 +201,9 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 
 // tailOutbox starts reading one outbox into its channel, once.
 func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
+	o, _ := parseOutput(name)
+	job := o.Job
+
 	r := c.relay
 	r.mu.Lock()
 	if r.tailed[name] || c.closed {
@@ -182,6 +211,7 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 		return
 	}
 	r.tailed[name] = true
+	r.outboxJobs[job] = true
 	r.mu.Unlock()
 
 	c.wg.Go(func() {
@@ -217,16 +247,25 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 				if c.ctx.Err() != nil {
 					return
 				}
-				if !expired {
-					if c.wasDropped(name) {
+				if expired {
+					// Caught up (nothing new before the poll timed out). If the job
+					// has settled and its output is home, everything it ever wrote is
+					// merged into the canonical stream now, so drop the outbox and
+					// stop — the canonical stream stays for a resume to replay from.
+					if c.relay.jobFinal(job) {
+						c.dropOutbox(name)
 						return
 					}
-					if ok, _ := client.StreamExists(c.ctx, name); !ok {
-						return
-					}
-					if pause(c.ctx, time.Second) != nil {
-						return
-					}
+					continue
+				}
+				if c.wasDropped(name) {
+					return
+				}
+				if ok, _ := client.StreamExists(c.ctx, name); !ok {
+					return
+				}
+				if pause(c.ctx, time.Second) != nil {
+					return
 				}
 				continue
 			}
@@ -247,6 +286,68 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 			}
 		}
 	})
+}
+
+// finishChannels marks a settled job's shared-channel outboxes for the relay to
+// drop, but only once the job's output is fully home, so the relay has all of
+// each outbox to merge into the canonical stream before it goes. In-process work
+// writes straight to shared storage, so there is nothing to wait for. Called off
+// the settle path for a job the relay has tailed an outbox for.
+func (c *Cluster) finishChannels(job string, w *workerConn) {
+	if c.relay == nil {
+		return
+	}
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	if w != nil && w.client != client && c.outputs != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), outputDrain)
+		caught := false
+		for !caught {
+			done, err := c.outputs.CaughtUp(ctx, w.id)
+			if err != nil {
+				break // not a source of the set; cannot confirm the copy is home
+			}
+			if done {
+				caught = true
+				break
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(outputPoll):
+				continue
+			}
+			break
+		}
+		cancel()
+		if !caught {
+			// Leave the outbox rather than risk dropping sends still on their way
+			// home; a resume still reads them, and this only forgoes the cleanup.
+			return
+		}
+	}
+	r := c.relay
+	r.mu.Lock()
+	r.finalJob[streamPart(job)] = true
+	r.mu.Unlock()
+	c.pokeRelay()
+}
+
+// dropOutbox deletes a settled channel's outbox and lets its tail stop. The
+// canonical stream is left alone, so a resume still replays receives from it.
+// tailed keeps the name, so no discovery pass starts a fresh tail on the gone
+// stream.
+func (c *Cluster) dropOutbox(name string) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	c.markDropped([]string{name})
+	if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
+		c.log.Warn("wings: could not drop a settled channel outbox", "stream", name, "err", err)
+	}
+	c.unmarkDropped([]string{name})
 }
 
 // subscribeChannel starts pushing a channel's canonical stream onto a worker
