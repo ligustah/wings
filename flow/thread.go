@@ -119,7 +119,11 @@ type threadState struct {
 	// prefix (nothing this attempt records is added to either).
 	events  []*protos.Event
 	offsets []int64
-	serial  uint64
+	// values caches received values read ahead of the cursor by offset, so a
+	// resume does not reopen and reread the stream once per receive. Filled and
+	// drained only by this thread's own replay goroutine, so it needs no lock.
+	values map[int64][]byte
+	serial uint64
 
 	sink    Sink
 	sinkErr error // the first persistence failure, if any
@@ -236,23 +240,53 @@ func (t *threadState) expect[E protos.Events]() (E, error) {
 	return payload, nil
 }
 
+// valuePrefetch is how many events a value read pulls in at once. Receives
+// replay in ascending offset order, so a windowed read amortises the stream open
+// and read over the receives that follow; the cache holds at most this many
+// values, drained as replay reaches them.
+const valuePrefetch = 64
+
 // recordedValue reads back the channel value dropped at load from the event
 // replayed at position pos, from this thread's own stream by the offset load
 // kept. Called only while replaying a recorded receive, whose value the body is
 // owed. The thread's own stream is not dropped while it replays, so the value is
-// there to be read.
+// there to be read. Values ahead of pos are cached, so a run of receives reads
+// the stream in windows rather than one open and read each.
 func (t *threadState) recordedValue(ctx context.Context, pos uint64) ([]byte, error) {
 	t.run.mu.Lock()
 	off := t.offsets[pos]
 	t.run.mu.Unlock()
-	batch, err := t.run.store.Read(ctx, t.run.name, t.id, off, 1)
+
+	if data, ok := t.values[off]; ok {
+		delete(t.values, off)
+		return data, nil
+	}
+
+	batch, err := t.run.store.Read(ctx, t.run.name, t.id, off, valuePrefetch)
 	if err != nil {
 		return nil, err
 	}
-	if len(batch) == 0 || batch[0].Offset != off {
+	var found []byte
+	got := false
+	for _, ea := range batch {
+		v := ea.Event.GetChannelRecv().GetValue().GetSerialized()
+		if v == nil {
+			continue
+		}
+		switch {
+		case ea.Offset == off:
+			found, got = v, true
+		case ea.Offset > off:
+			if t.values == nil {
+				t.values = map[int64][]byte{}
+			}
+			t.values[ea.Offset] = v
+		}
+	}
+	if !got {
 		return nil, fmt.Errorf("flow: the recorded value at offset %d of thread %q is gone", off, t.id)
 	}
-	return batch[0].Event.GetChannelRecv().GetValue().GetSerialized(), nil
+	return found, nil
 }
 
 // record appends an event to this thread and hands it to the sink. A sink
