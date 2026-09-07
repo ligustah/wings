@@ -4,19 +4,6 @@ go 1.27
 
 toolchain go1.27.0
 
-// durable_streams is not published to the module proxy, so every module of it
-// is resolved from the working copy beside this one.
-replace (
-	github.com/ligustah/durable_streams => ../durable_streams
-	github.com/ligustah/durable_streams/blobstore => ../durable_streams/blobstore
-	github.com/ligustah/durable_streams/broker => ../durable_streams/broker
-	github.com/ligustah/durable_streams/broker/client => ../durable_streams/broker/client
-	github.com/ligustah/durable_streams/broker/protos => ../durable_streams/broker/protos
-	github.com/ligustah/durable_streams/dsclient => ../durable_streams/dsclient
-	github.com/ligustah/durable_streams/dsembedded => ../durable_streams/dsembedded
-	github.com/ligustah/durable_streams/dswire => ../durable_streams/dswire
-)
-
 require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
