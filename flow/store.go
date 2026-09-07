@@ -54,6 +54,40 @@ type streamStore struct {
 // NewStore returns a Store backed by a durable-streams client.
 func NewStore(client *dsclient.Client) Store { return &streamStore{client: client} }
 
+// ListRuns implements [Lister] by reading the broker's stream catalog.
+func (s *streamStore) ListRuns(ctx context.Context) ([]string, error) {
+	names, err := s.client.ListStreams(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("flow: list streams: %w", err)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, name := range names {
+		if run, _, ok := ParseThreadStream(name); ok && !seen[run] {
+			seen[run] = true
+			out = append(out, run)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// ListThreads implements [Lister] by reading the broker's stream catalog.
+func (s *streamStore) ListThreads(ctx context.Context, run string) ([]string, error) {
+	names, err := s.client.ListStreams(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("flow: list streams: %w", err)
+	}
+	var out []string
+	for _, name := range names {
+		if r, thread, ok := ParseThreadStream(name); ok && r == run {
+			out = append(out, thread)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 func (s *streamStore) open(ctx context.Context, name string, create bool) (*dsclient.Stream[*protos.Event], error) {
 	ok, err := s.client.StreamExists(ctx, name)
 	if err != nil {
@@ -193,6 +227,23 @@ func (m *MemStore) Threads(run string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// ListRuns implements [Lister].
+func (m *MemStore) ListRuns(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for run := range m.events {
+		out = append(out, run)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// ListThreads implements [Lister].
+func (m *MemStore) ListThreads(ctx context.Context, run string) ([]string, error) {
+	return m.Threads(run), nil
 }
 
 type sinkFunc func(ctx context.Context, ev *protos.Event) error

@@ -3,7 +3,10 @@ package wings
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"testing"
+
+	"github.com/ligustah/wings/flow"
 )
 
 func getJSON(t *testing.T, url string, into any) {
@@ -51,5 +54,48 @@ func TestInspectionAPIReportsLiveState(t *testing.T) {
 	getJSON(t, "http://"+c.uiAddr+"/api/pending", &pending)
 	if len(pending) != 0 {
 		t.Fatalf("pending returned %d with no work submitted, want 0", len(pending))
+	}
+}
+
+// THE POINT: after a run completes, the API lists it and serves its decoded
+// history.
+func TestInspectionAPIServesRunHistory(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), UI: "127.0.0.1:0"})
+	name := "test-inspect-" + strconv.FormatUint(runSeq.Add(1), 36)
+
+	if err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		return ctx.Sleep(0)
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var runs []runView
+	getJSON(t, "http://"+c.uiAddr+"/api/runs", &runs)
+	var found *runView
+	for i := range runs {
+		if runs[i].Run == name {
+			found = &runs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("run %q not listed in %+v", name, runs)
+	}
+	if found.Status != "completed" {
+		t.Fatalf("run status %q, want completed", found.Status)
+	}
+
+	var snap flow.Snapshot
+	getJSON(t, "http://"+c.uiAddr+"/api/runs/"+name, &snap)
+	if snap.Run != name {
+		t.Fatalf("snapshot run %q, want %q", snap.Run, name)
+	}
+	main := false
+	for _, th := range snap.Threads {
+		if th.ID == "main" && th.Status == "completed" {
+			main = true
+		}
+	}
+	if !main {
+		t.Fatalf("no completed main thread in %+v", snap.Threads)
 	}
 }

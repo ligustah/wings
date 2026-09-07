@@ -37,6 +37,8 @@ func (c *Cluster) uiHandler() http.Handler {
 	mux.HandleFunc("GET /api/status", c.handleStatus)
 	mux.HandleFunc("GET /api/workers", c.handleWorkers)
 	mux.HandleFunc("GET /api/pending", c.handlePending)
+	mux.HandleFunc("GET /api/runs", c.handleRuns)
+	mux.HandleFunc("GET /api/runs/{run}", c.handleRun)
 	return mux
 }
 
