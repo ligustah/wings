@@ -15,10 +15,11 @@ type Wait struct {
 
 // What a thread can wait on.
 const (
-	WaitJoin  = "join"  // another thread, in [Future.Await]
-	WaitRecv  = "recv"  // a value on a channel
-	WaitSend  = "send"  // room on a channel, or a receiver
-	WaitSleep = "sleep" // the clock, in [Context.Sleep]
+	WaitJoin   = "join"   // another thread, in [Future.Await]
+	WaitRecv   = "recv"   // a value on a channel
+	WaitSend   = "send"   // room on a channel, or a receiver
+	WaitSleep  = "sleep"  // the clock, in [Context.Sleep]
+	WaitSelect = "select" // the first of several cases, in [Selector.Do]
 )
 
 // Parker is told when a thread waits and when its wait is over, so an executor

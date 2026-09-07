@@ -17,7 +17,7 @@ func init() {
 type Events interface {
 	*CallEvent | *ForkEvent | *JoinEvent | *ReturnEvent | *SleepEvent | *GetTimeEvent |
 		*RunStartEvent | *RunEndEvent | *ChannelSendEvent | *ChannelRecvEvent | *EffectEvent |
-		*WaitInterruptedEvent
+		*WaitInterruptedEvent | *SelectEvent
 }
 
 // PackEventPayload wraps a payload in its oneof case.
@@ -47,6 +47,8 @@ func PackEventPayload[EVENT Events](event EVENT) isEvent_Payload {
 		return &Event_Effect{Effect: e}
 	case *WaitInterruptedEvent:
 		return &Event_Interrupted{Interrupted: e}
+	case *SelectEvent:
+		return &Event_Select{Select: e}
 	default:
 		panic(fmt.Sprintf("unknown event type: %T", event))
 	}

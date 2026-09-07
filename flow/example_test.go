@@ -91,6 +91,24 @@ func ExampleChannel() {
 	// Output: [1 2 3]
 }
 
+func ExampleContext_Select() {
+	var got int
+	err := flow.Run(context.Background(), flow.NewName(), func(ctx flow.Context) error {
+		a := ctx.Go(exDouble, 5)
+		b := ctx.Go(exDouble, 6)
+		// Take whichever finishes first; the loser keeps running.
+		_, v, err := flow.AwaitAny(ctx, a, b)
+		got = v
+		return err
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// One of the two doublings won the race.
+	fmt.Println(got == 10 || got == 12)
+	// Output: true
+}
+
 func ExampleByteWriter() {
 	var n int
 	err := flow.Run(context.Background(), flow.NewName(), func(ctx flow.Context) error {

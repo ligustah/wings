@@ -50,6 +50,7 @@ message Event {
     ChannelRecvEvent channel_recv = 29;
     EffectEvent effect = 30;
     WaitInterruptedEvent interrupted = 31;
+    SelectEvent select = 32;
   }
 }
 
@@ -118,6 +119,14 @@ enum InterruptCause {
   INTERRUPT_CAUSE_UNKNOWN = 0;
   INTERRUPT_CAUSE_CANCELED = 1;
   INTERRUPT_CAUSE_DEADLINE_EXCEEDED = 2;
+}
+
+// SelectEvent records which case of a Context.Select won the race, so a replay
+// takes the same one rather than whatever is ready first. The chosen case's own
+// operation — a join, a receive — records separately, right after this.
+message SelectEvent {
+  // The winning case, indexed in the order the cases were added.
+  uint64 chosen = 1;
 }
 
 message EffectEvent {

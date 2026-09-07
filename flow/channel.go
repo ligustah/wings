@@ -633,3 +633,20 @@ func (cs *chanState) pending() bool {
 	}
 	return false
 }
+
+// readable reports whether a receive would return without blocking: an item is
+// waiting, or the channel is closed. For a [Context.Select] recv case over the
+// run's own channels.
+func (cs *chanState) readable() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.closed || cs.pending()
+}
+
+// changedChan is the channel that closes on the next change, for a waiter to
+// block on and re-check.
+func (cs *chanState) changedChan() <-chan struct{} {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.changed
+}
