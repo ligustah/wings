@@ -7,24 +7,23 @@ var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
 })
 
-// A root, marked with flow.Main, is run as a flow once the cluster is up.
+// A root, marked with flow.Main, runs as a flow once the cluster is up.
 var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
     images, err := ctx.Map(Render, job.Frames)   // runs wherever the workers are
-    ...
+    if err != nil {
+        return flow.None{}, err
+    }
+    return flow.None{}, write(images, job.Out)
 })
 var _ = flow.Main(Frames)
 ```
 
-That is the whole API. There is no separate kind for the two: both are plain
-functions declared with `flow.Define`. One called or forked is what another
-language would call an activity; one marked `flow.Main` and run as the root is
-what it would call a workflow. Same declaration, same replay, same durability. The functions and the body are written against
-[`flow`](flow), a durable-execution framework that knows nothing about
-clusters; wings is where a flow's calls go to run. The context they are given
-is a `flow.Context` — a `context.Context`, so it goes anywhere one is wanted,
-with everything flow can do for that code as methods on it. Where that is — goroutines
-here, child processes on this machine, or GCP VMs provisioned on demand — is a
-flag at run time, not a change to the code.
+Both are plain functions declared with `flow.Define`: one called or forked is what
+another system would call an activity; one marked `flow.Main` is what it would call
+a workflow. Same declaration, same replay, same durability. They are written against
+[`flow`](flow), a durable-execution package that knows nothing about clusters; wings
+is where a flow's calls go to run. Where that is — goroutines here, child processes,
+or cloud VMs provisioned on demand — is a flag at run time, not a change to the code:
 
 ```sh
 ./myapp -target inprocess          # goroutines in this process
@@ -33,73 +32,29 @@ flag at run time, not a change to the code.
         -gcp.project my-proj -gcp.zone europe-west1-b
 ```
 
-The worker count can follow the queue instead of being chosen:
+Or let the worker count follow the queue:
 
 ```sh
 ./myapp -target remote -min-workers 2 -max-workers 16 -jobs-per-worker 4 \
         -provider gcp -gcp.project my-proj -gcp.zone europe-west1-b
 ```
 
-Your program names no cloud, imports no SDK and holds no credentials. It cannot
-tell which of those three it is running under — `oblivious_test.go` parses the
-example and fails the build if it ever gains a `Target`, a provisioner or a
-cloud import.
-
-## Build
-
-`wings build` compiles your program twice and embeds the worker in the
-coordinator, so the coordinator is self-contained: no Go toolchain, no source
-tree, nothing to copy alongside it.
-
-```sh
-go run github.com/ligustah/wings/cmd/wings build \
-    -pkg ./job \
-    -coordinator windows/amd64 \
-    -worker linux/amd64 \
-    -o myapp.exe
-```
-
-```
-worker       linux/amd64      15.2 MB
-embedded     linux/amd64       5.9 MB (gzipped)
-coordinator  windows/amd64    38.1 MB
-```
-
-The two halves are separate programs generated into a scratch directory (your
-source tree is not written to):
-
-| | contains | built for |
-|---|---|---|
-| **worker** | your work functions, the worker loop | the machines it will run on |
-| **coordinator** | your work functions, your workflows, the providers, the embedded worker | the machine *you* run it on |
-
-Because they are separate, **the coordinator is never cross-compiled** — only
-the worker is — and the worker does not link the cloud SDK that deploys it. That
-split is worth 13 MB on the example's worker.
-
-`-providers` picks which clouds the coordinator can reach (default `gcp`, empty
-links none); `-coordinator-pkg` splits your own package if it too should stay out
-of the worker.
+Your program names no cloud, imports no SDK, and holds no credentials.
 
 ## What you write
 
-A **library** package, not a `main`. `wings build` generates both mains and
-imports your package into each.
+A **library** package, not a `main`. `wings build` generates both mains and imports
+your package into each.
 
 ```go
 package job
 
 import "github.com/ligustah/wings/flow"
 
-// Work functions are package-scope vars, so a worker process — which never runs
-// a root — still has them registered.
 var Render = flow.Define(func(ctx flow.Context, f Frame) (Image, error) {
     return render(f)
 })
 
-// A root, marked with flow.Main, is run as a flow once the cluster is up. A
-// coordinator restarted over the same -dir replays what it already did rather
-// than doing it again.
 var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
     images, err := ctx.Map(Render, job.Frames)
     if err != nil {
@@ -110,266 +65,64 @@ var Frames = flow.Define(func(ctx flow.Context, job Job) (flow.None, error) {
 var _ = flow.Main(Frames)
 ```
 
-That is the whole file. No cloud appears in it — and no cluster either. The
-cluster reaches the body through its context: every thread a flow forks —
-`ctx.Map`, `ctx.Go` — goes to the placer bound there, which for the
-coordinator is the cluster's workers. A function called directly runs where
-the call is made, on the thread that made it.
+A definition's name is inferred from the variable it is assigned to — `Render`,
+`Frames` — so `flow.WithName("…")` is needed only to override it. The name identifies
+the function in a run's history and on the wire.
 
-Neither function is named. `wings build` reads the variable each `flow.Define`
-is assigned to and compiles the name in — `Render`, `Frames` — so a definition
-needs `flow.WithName("…")` only to override that. The name identifies the
-function in a run's history and on the wire, so renaming the variable is free
-while changing an explicit name rewrites what every history refers to.
-
-A package that marks one root with `flow.Main` is a binary that runs it. Mark
-several and the binary takes `-workflow <name>`; leave it off and it lists them.
-Each runs under its own name in `-dir`, so two roots over one directory keep
-separate histories.
-
-The workflow's input is a typed value, given on the command line as JSON:
+Mark one root with `flow.Main` and the binary runs it; mark several and it takes
+`-workflow <name>`. The input is a typed value given as JSON, and is part of the run's
+history — a coordinator restarted over the same `-dir` replays the recorded input:
 
 ```sh
 ./myapp -target local -input '{"frames":["a.blend","b.blend"],"out":"./frames"}'
 ./myapp -target local -input @job.json
 ```
 
-Start a fresh run without it and the binary shows the shape it wants. A
-root that takes nothing declares `flow.None`. The input is part of the
-run's history: a coordinator restarted over the same `-dir` is given what the
-first start recorded, and one restarted with a different `-input` is refused
-rather than quietly replaying one input's history against another.
+## Build
 
-Flags you register in that package are parsed too — `CoordinatorMain` calls
-`flag.Parse()` on the default set, so your own flags sit beside `-target` and
-`-workers` without wings knowing about them.
+`wings build` compiles your program twice and embeds the worker in the coordinator,
+so the coordinator is self-contained — no Go toolchain, no source tree.
 
-## Autoscaling
-
-Set `-max-workers` (or `Config.Scaling`) and wings sizes the cluster from the
-queue: workers wanted is outstanding jobs ÷ `-jobs-per-worker`, rounded up and
-clamped between `-min-workers` and `-max-workers`. A worker idle for longer than
-`-idle-timeout` is retired.
-
-The policy names no provider — it is jobs and durations only — so the same
-numbers add goroutines, child processes or VMs depending on nothing but
-`-target`. Which means a policy you tuned locally means the same thing in
-production.
-
-A plain `-workers N` is the same policy with the floor and the ceiling both at
-N: there is one loop that keeps the fleet at its size, however the size was
-asked for. So a fixed fleet is *maintained*, not launched once — a worker that
-dies or is preempted is replaced on the next tick, and a job with nowhere to go
-in the meantime waits for the replacement rather than failing. The caller's own
-context bounds that wait.
-
-A worker that arrives is also *given something to do*. A job is placed on the
-least loaded worker when it is submitted, so without more a replacement — or a
-scale-up — would find every queued job already addressed to somebody else and
-sit idle while the survivor worked through a queue built for two. So once a
-tick the watchdog moves jobs still waiting unstarted on one worker's queue to
-a worker with clearly less to do, until the two are within a job of each
-other. Such a move does not count against the job's attempts: nothing ran.
-
-Scaling down never drops work: a worker is retired only while idle, and idle is
-decided under the same lock that assigns jobs, so nothing can be sent to a worker
-already on its way out. Failing to provision is not fatal — the cluster keeps
-running at its current size and tries again on the next tick, because a quota
-refusal should cost throughput, not the run.
-
-| flag | meaning |
-|---|---|
-| `-max-workers` | ceiling; setting it is what turns autoscaling on. A spend limit as much as a capacity one |
-| `-min-workers` | floor, held even with an empty queue (at least 1) |
-| `-jobs-per-worker` | backlog one worker is expected to carry (default: `-concurrency` if set, else 1) |
-| `-idle-timeout` | how long a worker must have had nothing to do (default 60s) |
-| `-scale-interval` | how often the policy is evaluated (default 2s) |
-| `-max-scale-step` | most workers one decision may add — lower it when provisioning is rate-limited |
-
-`-idle-timeout` is the one to think about, because the right value is dominated
-by what a *replacement* costs. A goroutine is free to recreate; a VM is minutes
-of boot plus an upload, so a timeout that looks thrifty locally can leave a
-remote cluster permanently rebuilding itself.
-
-## How it works
-
-Every worker owns a pair of [durable-streams](../durable_streams) streams,
-`wings.jobs.<worker>` and `wings.results.<worker>`. The coordinator writes jobs
-to a chosen worker and tails that worker's results. **Workers never talk to each
-other**, and the coordinator only ever dials outward — so it works from a laptop
-behind NAT.
-
-The coordinator speaks only `dsclient`. What sits under that client is the sole
-difference between the three targets:
-
-```
-Coordinator ──dsclient.Client──> dswire.Backend
-                                   ├─ the cluster's own embedded engine  (goroutine workers)
-                                   ├─ gRPC on 127.0.0.1                  (child process)
-                                   └─ gRPC through an SSH tunnel         (cloud VM)
+```sh
+go run github.com/ligustah/wings/cmd/wings build \
+    -pkg ./job -coordinator windows/amd64 -worker linux/amd64 -o myapp.exe
 ```
 
-In process there is nothing to serve and nothing to dial, because both halves
-are the same program: coordinator and *all* its workers meet on one embedded
-engine, opening the same streams from either side. Out of process each worker
-stands up a single-node broker for itself and the coordinator reaches it over
-gRPC.
+| | contains | built for |
+|---|---|---|
+| **worker** | your work functions, the worker loop | the machines it runs on |
+| **coordinator** | your functions, your workflows, the providers, the embedded worker | the machine you run it on |
 
-One seam, three constructors. The worker loop, the encoding and the dispatch are
-identical in all three, which is why a bug that only shows up on a cloud VM is a
-bug in the transport rather than in your work.
+Only the worker is cross-compiled, and it does not link the cloud SDK that deploys
+it. `-providers` picks which clouds the coordinator can reach (default `gcp`).
 
-Streams, offsets, brokers and clients appear nowhere in the public API.
+## Delivery and processing
 
-### The coordinator's own record
+Delivery is **at-least-once**: a worker owns its queue, so when it dies the
+coordinator redispatches whatever it had not heard back about, and a job interrupted
+late may run twice. Processing is **exactly-once**: a call's result is recorded and
+replayed, so a workflow observes it a single time however many times the job
+physically ran. Make side-effecting work functions idempotent, and independent of the
+coordinator's machine — a worker shares no filesystem, globals, or handles with it.
 
-On that same embedded engine — broker-less, no listener, no port — the
-coordinator keeps a stream of what it decided: every job accepted and **which
-node it was sent to**, every result that came back, every redispatch after a
-worker was lost, every worker that entered or left service. Nothing reads it
-during the run. Its value is that it outlives the process, so a coordinator that
-died has still left an account of what it had done.
-
-When the job was a thread of a flow run — which on a coordinator every job is,
-since the workflow itself is one — the entry says so: the run and the thread.
-That is what makes the record answerable at the level anyone actually asks
-at: not "job 3f went to remote-2" but "thread main.1 of order-77 went to
-remote-2 and never came back". Only the run knows which run a thread belongs
-to, so it stamps it on the dispatch and the coordinator writes it down. A bare
-call made on `Cluster.Bind` belongs to nothing larger and leaves those columns
-empty.
-
-Writes go through a buffered channel drained by one goroutine and batched, so
-recording never becomes backpressure on the work. A full buffer drops entries
-rather than blocking a submit — and counts them, so a gap in the record is
-reported rather than silent.
-
-Every entry names the **coordinator run** that wrote it. The record is
-append-only and survives the process, so several runs share it, and a reader who
-cannot tell them apart cannot tell a job that is still outstanding from one a
-previous run finished. For the same reason every name a coordinator mints —
-worker ids, job ids — carries that run's short identifier: names outlive the
-process that chose them (a worker's mirror stream is named after the worker and
-sits on a persistent `Dir`), so a counter restarting at zero would hand a new
-worker a name whose stream already has a read position, and every job sent to it
-would go unanswered. That identifier is deliberately *not* stored: its whole
-purpose is to differ from last time.
-
-### Machines outlive the coordinator
-
-A cloud machine does not stop existing because the process that asked for it
-died, and it does not stop billing either. So before wings asks a cloud for
-anything it mints a **lease** — an identity of its own — and writes an *intent*
-record to a second stream on that same embedded engine. Only then does it call
-`Provision`. The machine is recorded as ready once a worker is running on it,
-and released when it is destroyed.
-
-Write-ahead is the whole point. Recording a machine once the API returned would
-leave a window in which a billed VM exists that nothing on earth knows about,
-and that window is exactly the one a crash finds. A failure to write the intent
-refuses the launch outright, for the same reason.
-
-On startup, before it provisions anything, a coordinator reads that record and
-offers every unreleased lease to the provisioner. What comes back is still out
-there: a machine whose worker is alive is picked up where it left off — tunnel
-reopened, queue and results intact, no upload and no restart, because the worker
-was launched detached precisely so it outlives the session that started it — and
-one that cannot be resumed is destroyed rather than left running. Leases nothing
-came back for are closed, so no later start hunts for a machine that is already
-gone. Recovered machines count towards the worker target, so a restart provisions
-only the difference.
-
-### What a coordinator restart keeps
-
-Be precise about which half may die. A **worker** may: its queue is on its own
-streams, and the coordinator redispatches what it had not heard back about. A
-**machine** may lose its coordinator: the lease record above brings it back.
-The **coordinator itself** may not, for a bare call: the goroutine that was
-waiting for the answer died with the process, and nobody collects the result.
-
-What does survive a coordinator restart is a **flow run** ([`flow`](flow)), and
-a workflow is one: its history is kept under `-dir`, and a coordinator started
-again over the same directory replays it to where it stopped. The threads it
-had forked are **rejoined, not forked again**: before the new coordinator reads
-a single worker, it reads its own journal for the jobs its predecessor left
-outstanding — which thread of which run, on which machine, which attempt —
-and puts them back under the same names, so the replay's fork finds the job
-that is already running, exactly as a retried workflow rejoins a call. A thread
-that finished while no coordinator was listening has its result kept for the
-fork; one whose machine is gone waits for the fork, which brings its input, and
-is placed then; one that was sleeping or waiting is woken by what it waited
-for. The journal is written off the hot path, so a crash can lose its last
-lines: a thread the record does not mention is forked afresh, and that is the
-one way a thread runs twice. Work functions are idempotent for exactly this
-reason. A workflow that already finished does nothing at all on a restart.
-
-### Remote deployment
-
-For `-target remote`, per machine: provision → wait for SSH → upload the
-embedded worker → start it bound to **loopback only** → open an SSH port-forward
-→ dial the broker through it.
-
-The broker speaks no authentication, so the tunnel *is* the access control.
-Nothing wings starts is reachable from the internet, and no firewall rule is
-needed. An ephemeral ed25519 keypair is minted per run and installed via
-instance metadata; nothing wings creates outlives the cluster.
-
-**Spot instances** (`-gcp.spot`) are the cheap option and a real one: a
-preempted worker is a lost worker, its jobs are moved and the scaler replaces
-the machine. Google announces a preemption thirty seconds ahead, and the worker
-uses them: it tells the coordinator, which moves its jobs then and there, and
-stops taking new ones. A preempted instance deletes itself rather than
-stopping, and for a worker that simply stops answering the coordinator asks the
-cloud whether it still exists, so a preemption costs seconds rather than the
-whole reconnect window either way. Idempotent work is the price.
-
-The worker goes up **straight from memory** — it is decompressed once and each
-machine's upload reads from that one copy, so nothing is written to the
-coordinator's disk merely to have a path to hand to something. The transfer
-speaks the scp source protocol over an ordinary exec channel rather than using
-SFTP, because SFTP is a *subsystem* an SSH server need not offer, while running
-a command is a capability wings already depends on to start the worker at all.
-The protocol carries the size, so a connection that dies mid-copy is an error
-rather than a truncated executable that fails confusingly later.
-
-## Delivery semantics
-
-**At-least-once.** A worker owns the queue of work assigned to it, so when one
-dies the coordinator re-dispatches whatever it had not yet heard back about —
-which means a job interrupted late may run twice.
-
-**Work functions must be idempotent.** They should also be pure with respect to
-the coordinator's machine: a worker may be on another continent and shares no
-filesystem, no globals and no open handles with the caller.
-
-A work function that returns an error is a normal result, not a transport
-failure; the error is re-raised on the coordinator as a plain error (the value
-does not survive the trip, only the message). A work function that panics costs
-one job, not the worker.
+A work function that returns an error is a normal result (the message crosses the
+boundary, not the error value). One that panics costs one job, not the worker.
 
 ## Long jobs
 
-Two different bounds, because "too slow" and "stuck" deserve different answers,
-and both are declared beside the work rather than on the cluster — one function
-is a millisecond of arithmetic and another an hour of transcoding, and a single
-cluster-wide number is either useless to one or fatal to the other.
+Two bounds, declared beside the work, because "too slow" and "stuck" deserve
+different answers:
 
 ```go
 var Transcode = flow.Define(transcode,
-    flow.WithTimeout(2*time.Hour),             // total: exceeding it FAILS
-    flow.WithHeartbeatTimeout(30*time.Second), // quiet: exceeding it MOVES
+    flow.WithTimeout(2*time.Hour),             // total: exceeding it FAILS the call
+    flow.WithHeartbeatTimeout(30*time.Second), // quiet: exceeding it MOVES it
 )
 ```
 
-`WithTimeout` bounds one call end to end. A call that blows it fails and is not
-retried: exceeding a bound on total duration says the work is too slow or stuck
-on something no other machine would be luckier with, and retrying would spend
-the same time again to reach the same answer. The worker enforces it locally, so
-the error names the function and the bound.
-
-`WithHeartbeatTimeout` says the opposite: the machine is the suspect. A job that
-goes quiet for longer is moved to another worker. Moving it is affordable
-because the job reports where it has got to as it goes:
+`WithTimeout` fails a call that runs too long (retrying would spend the same time for
+the same answer). `WithHeartbeatTimeout` moves a job that goes quiet to another
+worker. Moving is affordable because a job reports where it got to:
 
 ```go
 func transcode(ctx flow.Context, in Job) (Out, error) {
@@ -379,199 +132,48 @@ func transcode(ctx flow.Context, in Job) (Out, error) {
     }
     for i := from; i < in.Frames; i++ {
         // ... one frame ...
-        ctx.Heartbeat(i+1)
+        ctx.Heartbeat(i + 1)
     }
 }
 ```
 
-Only the latest heartbeat survives — this is a position, not a log — and it is
-handed to the next attempt, which resumes from it instead of starting over. Beats
-ride a stream of their own per worker rather than the result stream, which is
-transactional and would not make them visible until the job finished, which is
-exactly too late. Delivery is best-effort by design: a beat that goes missing
-costs a retry a little redone work, while a beat that blocked the work function
-to guarantee delivery would cost the work.
+Only the latest heartbeat survives — a position, not a log — and the next attempt
+resumes from it. A job whose phases are expensive breaks them into calls to other
+functions: each call's result is recorded, so a move replays the phases that finished
+and runs the rest.
 
-Both clocks start when the worker begins the job, not when it was sent: a job can
-wait behind others on a busy worker for longer than its own bound, and none of
-that is the work's fault. The heartbeat clock then runs from that start, so a
-function that declares one must actually beat. A third bound, `WithStartTimeout`,
-is for the wait itself — how long a job may sit unstarted on a worker's queue
-before it is moved — and is off unless asked for, because on a saturated cluster
-moving a queued job only puts it at the back of another queue.
+## Channels
 
-### Phases
+A `flow.Channel` travels in a call's input like any other value; two functions on two
+workers can share one. On the wire it is a durable stream relayed through the
+coordinator: each value goes to one receiver, capacity holds across machines, and
+receives replay in the recorded order.
 
-A long job whose phases are expensive breaks them into calls to other
-functions. There is no special phase primitive: a call is recorded, so a move
-replays the phases that finished and runs the rest.
-
-```go
-var Restore = flow.Define(func(ctx flow.Context, in Backup) (Report, error) {
-    snap, err := Snapshot(ctx, in.Source)      // twenty minutes, recorded
-    if err != nil {
-        return Report{}, err
-    }
-    return RestoreInto(ctx, Restoration{snap, in.Target}) // another forty
-})
-```
-
-A job moved after `Snapshot` finished replays its result — a decode, not twenty
-minutes — and starts `RestoreInto` on the new worker. The phase that was
-actually in flight is paid for twice, and that cost is irreducible: nobody can
-say whether it finished. A phase called directly runs on the same worker; fork
-it with `ctx.Go` when the point is to place it elsewhere. Use calls for coarse
-phases and `Heartbeat` for a position inside a loop.
-
-### Inside a run
-
-A work function checkpoints the same way whatever called it — `Heartbeat` does
-not know or care which run it is part of. What the run adds
-is a second way to be interrupted: the run itself can fail and be retried while
-the thread is still running. The retry **rejoins** the thread already in
-flight instead of dispatching a second copy, so the progress that copy would
-have thrown away is kept. The coordinator recognises it by the run and the
-thread's name, which replay gives it again on every attempt.
-
-### The thread is the unit
-
-A flow run is made of **threads**: the body is the main thread, and every
-`ctx.Go`, `ctx.Map` and `ctx.Spawn` forks another. Each thread has a history
-of its own, on a stream of its own. The fork in the parent's history says what
-the thread is to do — the function and its input, or that it is a closure of
-the run's own code — and the join says what it produced; a replay of the
-parent that finds the join never runs the thread again, and one that finds
-only the fork starts the thread, which replays *its* history and carries on.
-That is the whole reason a thread is what the cluster hands to a machine: its
-stream is all that has to travel — or, for a closure, its stream and its
-ancestors', which is how a worker holding the same code reaches the closure.
-
-So what goes to a worker is a thread, and it runs there as a **flow run of
-its own**, with its history on the worker's storage. A work
-function may do everything a workflow body may — fork with `ctx.Go` and
-`ctx.Spawn`, use a channel between its threads, `ctx.Map` over other
-functions, read `ctx.Now`, `ctx.Sleep`, wrap an outside answer in
-`ctx.Effect` — and a retry **replays** all of it from the history instead of
-doing it again. A thread it forked before it was moved is answered from the
-record; the one it was waiting on is rejoined. The same determinism rules
-apply as to any run body, and a function that uses none of those primitives
-records nothing and behaves exactly as before.
-
-A function called **directly** — `Digest(ctx, w)` rather than
-`ctx.Go(Digest, w)` — runs on the calling thread, wherever that is: on the
-coordinator in a workflow body, on the worker inside a work function. It
-blocks its caller either way, so sending it elsewhere would move the CPU while
-the caller's slot sat idle. It is recorded and replayed like any call; it is
-just not placed. Fan out with `Map` or `Go` when the point is other machines.
-
-Everything an attempt writes on its worker — that history, its recordings, its
-files — goes into **one transaction**, committed at the points that mean
-something: before every heartbeat report, when the function returns,
-and by age as a net under a function that reports nothing for a long time. The
-coordinator's copy is made **transaction by transaction**: its engine
-subscribes to each worker's finished transactions and applies every one
-whole, in commit order, with a durable cursor and a mark per writer, so a
-coordinator that restarts resumes where it was and nothing is applied twice.
-What the coordinator is told about progress is therefore never ahead of what
-it holds, and what a retry is handed is consistent across all of it: the
-history that says which recordings were made and the recordings themselves
-were committed together, and arrived together.
-
-A worker runs as many threads at once as its concurrency says, and **a thread
-that waits is not running**: waiting for a thread it forked, for a channel or
-for the clock, it gives its slot up, and takes one back — ahead of any job
-still queued — when the wait is over. A wait that lasts is reported, so the
-coordinator neither moves the job for silence nor counts it against the
-worker's load. One worker with one slot can therefore run a job and the
-thread that job is waiting on.
-
-A thread a work function forks is **the cluster's to place**, like any other.
-There is no request message: the coordinator keeps a copy of every attempt's
-history, reads the forks out of it, runs each where the load is lowest and
-sends the result back on the worker's control stream. Forking is therefore a
-commit point on the worker. The run is named for the job, not the attempt, so
-a retry that replays a fork presents the same thread, and the coordinator
-hands back the result it kept — or lets the retry rejoin the thread still in
-flight — rather than running it twice. A job waiting on a thread it forked is
-not moved for silence, however long the thread takes; its total timeout still
-runs. A thread of run code — `ctx.Spawn` — is sent as its **lineage**: the
-path of threads from one a worker can start by name (a workflow, or a
-function on its input) down to the thread itself, with their histories. The
-worker replays each ancestor from its history to the fork of the next, which
-hands it the closure, and runs the last for real, sharing the run's channels
-with the threads that stayed home. What an ancestor computes between the
-events of its history it computes again, so the code before a `Spawn` should
-be the replayable kind. A thread of a bare `Run` — one with a body and no
-name — has no root a worker could start from, and stays where its parent is.
-
-A wait that lasts is **unloaded**. A thread parked for a minute — on a join, a
-receive, a send — has its attempt ended where it stands, history committed,
-and the job handed back to the coordinator with a note of what it was waiting
-for; a sleep past `flow.ShortSleep` is handed back at once, with the wake-up
-time. The coordinator keeps the job off every worker until the condition
-holds — the deadline passes, the thread it was joining finishes, something
-arrives on the channel — then dispatches it afresh to whichever worker is
-least loaded, history first, and it replays to the wait and finds what it was
-waiting for. A worker keeps nothing of a thread that is waiting for tomorrow.
-
-### Channels across machines
-
-A `flow.Channel` **travels in a call's input** like any other value. The
-workflow creates one and hands it to a function; the function sends into it or
-receives from it; two functions on two workers can share one the same way. A
-thread of run code sent to a worker may use any channel of the run, so every
-channel is shared when one leaves. On
-the wire a shared channel is a durable stream relayed through the coordinator:
-every run that uses it has an outbox — on a worker, written outside the
-attempt's transaction so it is seen at once, and copied home by a stream
-mirror — and the coordinator merges the outboxes into one canonical stream
-and pushes it to every worker using the channel. A worker subscribes by
-creating its outbox, which the mirror discovers; nothing asks.
-
-It behaves as a channel between threads does. **Each value goes to one
-receiver**, wherever that receiver runs: a receive is a request the coordinator
-answers by granting it a value, values in the order they arrived to requests in
-the order they arrived, and two functions receiving from one channel split what
-is sent between them. **Capacity holds across machines**: a send with no room
-waits for a receive somewhere to make some. Receives replay exactly as they do
-between threads: a moved function is handed the same values in the same order
-from the channel's record, on a worker that never saw the sender, and a receive
-abandoned mid-wait asks again under the same name and gets the grant already
-made for it.
-
-### Streaming raw bytes
-
-A result travels whole in one record, so output measured in megabytes — a
-render, an archive, a core dump — does not belong in one. **Stream it over a
-channel** of `flow.Bytes`, which a `flow.ByteWriter` and `flow.ByteReader` turn
-into an ordinary `io.Writer` and `io.Reader`:
+Large output does not belong in a result. Stream it over a channel of `flow.Bytes`,
+which `flow.ByteWriter` and `flow.ByteReader` turn into an `io.Writer` and
+`io.Reader`:
 
 ```go
 var Render = flow.Define(func(ctx flow.Context, in RenderIn) (flow.None, error) {
     w := flow.NewByteWriter(ctx, in.Out)   // an ordinary io.Writer
-    defer w.Close()                        // flushes and closes the channel
+    defer w.Close()
     return flow.None{}, encode(w)
 })
 
-// The workflow makes the channel, forks the render, and reads the bytes back
-// wherever it runs.
+// The workflow makes the channel, forks the render, and reads the bytes back.
 out := ctx.NewBufferedChannel[flow.Bytes](8)
 done := ctx.Go(Render, RenderIn{Out: out})
 _, err := io.Copy(dst, flow.NewByteReader(ctx, out))
 ```
 
-The writer splits large writes into `flow.ByteChunk` values so neither end ever
-holds the whole thing, and a `flow.Bytes` rides the wire as its own bytes rather
-than the base64 a `[]byte` would cost. The chunks are recorded and relayed like
-any channel's values — committed with the attempt that sends them, and replayed
-in the same order onto a worker that never saw the sender — so a moved job gets
-back exactly what it streamed.
+Chunks are `flow.ByteChunk` in size, recorded and replayed like any channel value, so
+a moved job gets back exactly what it streamed.
 
 ## Recordings
 
-A long job's progress is usually a **sequence of events** — a simulation's ticks,
-a solver's moves, a crawl's fetches. wings can keep that sequence for you, and
-give it back to the job when the job has to start again somewhere else.
+A long job's progress is often a sequence of events. `Record` keeps one on a durable
+stream copied to the coordinator; a moved attempt is handed what its predecessors
+wrote, through `Priors`, and replays it to catch up.
 
 ```go
 rec, err := wings.Record[Event](ctx, "replay")
@@ -582,103 +184,75 @@ if err := rec.Close(); err != nil { return Result{}, err }
 return Result{Replay: rec.Recording()}, nil    // a handle, not the events
 ```
 
-and on the coordinator:
+## Autoscaling
 
-```go
-for ev, err := range wings.Replay[Event](ctx, played.Replay) {
-    if err != nil { return err }
-    ...
-}
+Set `-max-workers` (or `Config.Scaling`) and wings sizes the fleet from the queue:
+workers wanted is outstanding jobs ÷ `-jobs-per-worker`, clamped to
+`[-min-workers, -max-workers]`. The policy names no provider, so the same numbers add
+goroutines, child processes, or VMs depending only on `-target`.
+
+| flag | meaning |
+|---|---|
+| `-max-workers` | ceiling; setting it turns autoscaling on |
+| `-min-workers` | floor, held even with an empty queue (at least 1) |
+| `-jobs-per-worker` | backlog one worker should carry (default: `-concurrency`, else 1) |
+| `-idle-timeout` | how long a worker must sit idle before retirement (default 60s) |
+| `-scale-interval` | how often the policy runs (default 2s) |
+| `-max-scale-step` | most workers one decision may add |
+
+A plain `-workers N` is the same policy with floor and ceiling at N — a fixed fleet is
+*maintained*, so a worker that dies or is preempted is replaced.
+
+## How it works
+
+Every worker owns a pair of [durable-streams](https://github.com/ligustah/durable_streams)
+streams for its jobs and results. The coordinator writes jobs to a chosen worker and
+tails its results; **workers never talk to each other**, and the coordinator only
+dials outward, so it runs from a laptop behind NAT. The coordinator speaks only
+`dsclient`; what sits under it is the only difference between targets:
+
+```
+Coordinator ──dsclient──> ├─ the cluster's own embedded engine   (in process)
+                          ├─ gRPC on 127.0.0.1                    (child process)
+                          └─ gRPC through an SSH tunnel           (cloud VM)
 ```
 
-**One event is one record.** They go onto a durable stream of their own on the
-worker, become visible at the job's commit points — every heartbeat, its return — are copied onto the coordinator's own storage as they are
-committed, and come back out one at a time in the order they went in. Neither end ever holds the log:
-a reader takes as many as it wants and pays for no more, and breaking out of the
-range stops the reading.
+Durability rests on a few guarantees:
 
-**A retry gets handed what its predecessor wrote.** This is the part that makes
-it worth doing at all. A simulation that streams a hundred megabytes of events
-and dies at minute fifty is no use if the retry starts from zero.
+- **A flow run survives a coordinator restart.** Its history lives under `-dir`; a
+  coordinator started again over the same directory replays it to where it stopped
+  and **rejoins** the threads it had forked rather than forking them again.
+- **A cloud machine outlives the process that made it.** wings writes a lease down
+  *before* it provisions, and on startup offers every unreleased lease back to the
+  provisioner — a live machine is resumed, a dead one destroyed.
+- **A worker's output is copied off it while it is up.** What an attempt commits comes
+  home as its transactions; a shared channel's outbox is mirrored continuously.
 
-```go
-if priors := wings.Priors(ctx); len(priors) > 0 {
-    for ev, err := range wings.Replay[Event](ctx, priors[len(priors)-1]) {
-        if err != nil { break }    // a log nobody closed stops early; that is fine
-        sim.Apply(ev)
-    }
-}
-```
-
-Each prior is a **prefix** of the same work, not a continuation — attempt 0 and
-attempt 1 both start from the beginning — so replay one of them, not all. None is
-`Complete` and none reports its `Events`, because the attempt that would have
-counted them did not survive to. A truncated log is precisely a record of how far
-the work got, and `Replay` reads one to whatever end it has.
-
-This is durability for the job's **own** state, deliberately outside the durable
-execution wings does for the job itself. `Heartbeat` is for resuming a job; a
-recording is for describing what it did. wings stores the events and
-gives them back, and never reads one.
-
-**Cleaning up.** A recording lives on the coordinator's `Dir` until
-`rec.Discard(ctx)` — only the caller knows when it has been read. The recordings
-of attempts that were abandoned are removed without being asked once the job
-settles: nobody holds a handle to those.
-
-## What cannot be moved
-
-The running goroutine. Its stack, its locals, its open sockets and half-filled
-buffers are on that machine and stay there — Go cannot serialise a running
-goroutine, and much of what one holds is not serialisable at anyone's hands. So
-the only thing that can cross a machine boundary is a value the work function
-made explicit, which is what a heartbeat and a checkpoint are. Everything else the
-coordinator has — the pending set, the mirrored results, the queue — it already
-holds, and none of it is what a half-finished job knows.
+For `-target remote`, per machine: provision → upload the embedded worker → start it
+bound to loopback → open an SSH tunnel → dial the broker through it. The broker speaks
+no authentication; the tunnel is the access control, and nothing wings starts is
+reachable from the internet. Spot instances (`-gcp.spot`) are supported: a
+preemption's 30-second notice is used to move the worker's jobs before it dies.
 
 ## Configuration
 
-Used directly rather than through `wings build`:
+Used directly, without `wings build`:
 
 ```go
 c, err := wings.Start(ctx, wings.Config{
     Target:      wings.Remote(gcp.New(gcp.Config{Project: "p", Zone: "z"})),
-    Workers:     8,               // or a Scaling policy instead
+    Workers:     8,               // or a Scaling policy
     Concurrency: 4,               // running threads per worker; 0 = the worker decides
     JobTimeout:  5 * time.Minute,
 })
-defer c.Stop(ctx)
+defer c.Stop(ctx)   // deletes provisioned machines — they bill until it runs
 ```
-
-`Stop` deletes provisioned machines. They are billed until it runs — call it in
-a defer.
-
-A coordinator built with plain `go build` carries no worker and cross-compiles
-one at dispatch time instead, which needs a Go toolchain and the module source.
-`wings build` is what removes that requirement.
 
 ## Other clouds
 
-Two ways, depending on whether the choice should be a flag.
-
-**A flag-selectable provider.** Implement `Provider` and register it from an
-init, the way a database driver does. `wings build -providers you/cloud` links it
-into the coordinator, and it becomes `-provider yourcloud` with its flags
-prefixed `-yourcloud.*`.
-
-```go
-type Provider interface {
-    Name() string
-    Flags(fs *flag.FlagSet)
-    New() (wings.Provisioner, error)
-}
-```
-
-**One baked in.** Export `func Provisioner() wings.Provisioner` from your
-package; it takes precedence over `-provider`. This is the escape hatch, and it
-is the one thing that puts a cloud back into your source.
-
-Either way the SSH deployment, tunnelling and worker protocol are shared:
+Implement `Provider` and register it from an `init`, the way a database driver does;
+`wings build -providers you/cloud` links it in as `-provider yourcloud`. Or export
+`func Provisioner() wings.Provisioner` from your package to bake one in.
 
 ```go
 type Provisioner interface {
@@ -694,37 +268,18 @@ type Machine interface {
 }
 ```
 
-The **leases** are identities wings minted, not names the cloud chose, and that
-direction is the point: the coordinator writes down what it is about to create
-*before* it creates it. Your implementation must make each machine findable by
-its lease afterwards — as its name, a tag, a label, whatever the cloud offers —
-and `ID()` must return it. A lease is ten lowercase alphanumeric characters
-starting with a letter, so it is safe to embed in any cloud's naming rules.
-
-Implement `Reattacher` too if the cloud can look a machine up, which is nearly
-all of them:
-
-```go
-type Reattacher interface {
-    Provisioner
-    Reattach(ctx context.Context, leases []string) ([]Machine, error)
-}
-```
-
-Return only the machines that still exist; say nothing about the rest and wings
-closes them out. Without it a restarted coordinator can only destroy what it
-finds, which is safe and wastes everything those machines had done.
+Leases are identities wings mints before it creates anything; your implementation
+makes each machine findable by its lease, and `ID()` returns it. Implement
+`Reattacher` too so a restarted coordinator can recover running machines.
 
 ## Requirements
 
-- Go 1.27+ (generic methods; inherited from durable_streams)
-- `../durable_streams` beside this repo — it is not published, so `go.mod`
-  resolves it by `replace`
+- Go 1.27+ (generic methods)
 
 ## Example
 
-[`examples/digest`](examples/digest) is a complete program — one work function
-and a coordinator body, naming no cloud — that runs on all three targets.
+[`examples/digest`](examples/digest) is a complete program — one work function and a
+coordinator body, naming no cloud — that runs on all three targets.
 
 ```sh
 go run ./cmd/wings build -pkg ./examples/digest -o digest
