@@ -3,6 +3,7 @@ package flow_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -52,6 +53,49 @@ func allEvents(store *flow.MemStore, run string) ([]*protos.Event, error) {
 		all = append(all, evs...)
 	}
 	return all, nil
+}
+
+// A send records no value: only the receiver's copy is read back on replay, so
+// storing the sender's too kept every value on disk twice.
+func TestSendRecordsNoValue(t *testing.T) {
+	store := flow.NewMemStore()
+	err := flow.Run(context.Background(), "sendval", func(c flow.Context) error {
+		ch := c.NewBufferedChannel[int](4)
+		if err := ch.Send(c, 7); err != nil {
+			return err
+		}
+		v, ok, err := ch.Recv(c)
+		if err != nil || !ok || v != 7 {
+			return fmt.Errorf("recv %d %v %v", v, ok, err)
+		}
+		return nil
+	}, flow.WithStore(store))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	evs, err := allEvents(store, "sendval")
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	var sends, recvs int
+	for _, ev := range evs {
+		if s := ev.GetChannelSend(); s != nil && !s.GetClosed() && !s.GetRefused() {
+			sends++
+			if s.GetValue() != nil {
+				t.Errorf("send %s#%d recorded a value; sends should carry none", s.GetChannel(), s.GetSeq())
+			}
+		}
+		if r := ev.GetChannelRecv(); r != nil && !r.GetClosed() {
+			recvs++
+			if r.GetValue().GetSerialized() == nil {
+				t.Errorf("recv from %s#%d recorded no value; the receiver's copy is read back on replay",
+					r.GetFromThreadId(), r.GetFromSeq())
+			}
+		}
+	}
+	if sends != 1 || recvs != 1 {
+		t.Fatalf("got %d sends, %d recvs; want 1 each", sends, recvs)
+	}
 }
 
 // countEvents tallies a run's history by payload kind.

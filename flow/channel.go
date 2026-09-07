@@ -213,11 +213,11 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		}
 		return err
 	}
-	t.record(&protos.ChannelSendEvent{
-		Channel: c.name,
-		Seq:     seq,
-		Value:   &protos.Data{Serialized: data},
-	})
+	// The value is not recorded: a replayed send re-encodes it from the body, and
+	// a shared channel delivers through the relay, so a sender's own copy is never
+	// read back. Only the receiver's copy is (see Recv), so recording it here just
+	// stored every value a second time.
+	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq})
 	return t.err()
 }
 
