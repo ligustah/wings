@@ -89,6 +89,32 @@ func Run(ctx context.Context, name string, body func(ctx Context) error, opts ..
 	return err
 }
 
+// Replay re-runs body against the recorded history of run name, doing no new
+// work and writing nothing. It returns a continuity error if the body diverges
+// from what was recorded, so a completed run that replays clean is proof the
+// body is deterministic. For tests; see package
+// [github.com/ligustah/wings/flow/flowtest].
+func Replay(ctx context.Context, name string, body func(ctx Context) error, opts ...RunOption) error {
+	if body == nil {
+		return errors.New("flow: Replay requires a body")
+	}
+	ensureNamesResolved()
+	ro := newRunOptions(opts)
+	if name == "" {
+		return errors.New("flow: Replay requires a run name")
+	}
+	if ro.store == nil {
+		return errors.New("flow: Replay requires a Store")
+	}
+	ro.rootID = mainThread
+	r := &threadRunner{
+		name: name, id: mainThread, opts: ro, top: true, readonly: true, replay: true,
+		body: func(ctx Context) ([]byte, error) { return nil, body(ctx) },
+	}
+	_, err := r.execute(ctx)
+	return err
+}
+
 // RunCall executes the function defined under fn, on payload, as a durable run
 // named name, and returns its encoded output — [Execute] made durable, replayed
 // rather than repeated on a retry. For executors that have storage of their own.
@@ -169,9 +195,12 @@ type threadRunner struct {
 	inputType reflect.Type
 
 	// top says this is the thread the process was asked to run, the one [Once] is
-	// about. readonly says the thread is replayed only; see lineage.go.
+	// about. readonly says the thread is replayed only; see lineage.go. replay is
+	// a readonly pass over a finished thread's whole history, to check it; see
+	// [Replay].
 	top      bool
 	readonly bool
+	replay   bool
 }
 
 // execute runs the thread to completion, attempt after attempt over its history.
@@ -200,14 +229,19 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	// A finished thread is finished; what it produced is on record and is the
 	// answer.
 	if done, result, ok := finished(history); ok {
-		if r.readonly {
+		switch {
+		case r.replay:
+			// Re-run read-only over the whole history to check it replays; fall
+			// through to the attempt loop.
+		case r.readonly:
 			return nil, fmt.Errorf("flow: %s has already finished; there is nothing left to fork", r.describe())
+		default:
+			out, err := unpackResult(result)
+			if done == protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED {
+				return out, nil
+			}
+			return nil, fmt.Errorf("flow: %s already failed permanently: %w", r.describe(), err)
 		}
-		out, err := unpackResult(result)
-		if done == protos.WorkflowStatus_WORKFLOW_STATUS_COMPLETED {
-			return out, nil
-		}
-		return nil, fmt.Errorf("flow: %s already failed permanently: %w", r.describe(), err)
 	}
 
 	var sink Sink
@@ -243,7 +277,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 				return nil, runErr // somebody else decides when to resume; see IsSuspended
 			}
 			_, until := IsSuspended(runErr)
-			if err := wait(ctx, time.Until(until)); err != nil {
+			if err := wait(ctx, r.opts.clock, until.Sub(r.opts.clock.Now())); err != nil {
 				return nil, err
 			}
 
@@ -254,7 +288,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 			if attempt >= uint64(r.opts.maxAttempts) {
 				return nil, fmt.Errorf("flow: %s failed after %d attempts: %w", r.describe(), attempt, runErr)
 			}
-			if err := wait(ctx, r.backoff(attempt)); err != nil {
+			if err := wait(ctx, r.opts.clock, r.backoff(attempt)); err != nil {
 				return nil, err
 			}
 		}
@@ -558,14 +592,12 @@ func lastAttempt(history []*protos.Event) uint64 {
 	return n
 }
 
-func wait(ctx context.Context, d time.Duration) error {
+func wait(ctx context.Context, clk Clock, d time.Duration) error {
 	if d <= 0 {
 		return nil
 	}
-	t := time.NewTimer(d)
-	defer t.Stop()
 	select {
-	case <-t.C:
+	case <-clk.After(d):
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

@@ -30,7 +30,7 @@ func (c Context) Now() (time.Time, error) {
 		return ev.GetTime().AsTime(), nil
 	}
 
-	now := time.Now().Truncate(time.Microsecond)
+	now := t.run.clock.Now().Truncate(time.Microsecond)
 	t.record(&protos.GetTimeEvent{Time: timestamppb.New(now)})
 	return now, t.err()
 }
@@ -47,7 +47,7 @@ func (c Context) Sleep(d time.Duration) error {
 
 	// The recorded timestamp is when the sleep started, so the deadline holds
 	// across attempts.
-	start := time.Now()
+	start := t.run.clock.Now()
 
 	ev := t.peek()
 	recorded, err := t.expect[*protos.SleepEvent]()
@@ -71,13 +71,13 @@ func (c Context) Sleep(d time.Duration) error {
 	}
 
 	until := start.Add(d)
-	remaining := time.Until(until)
+	remaining := until.Sub(t.run.clock.Now())
 	switch {
 	case remaining <= 0:
 		return nil
 	case remaining < ShortSleep:
 		resume := t.park(ctx, WaitSleep)
-		if err := wait(ctx, remaining); err != nil {
+		if err := wait(ctx, t.run.clock, remaining); err != nil {
 			_ = resume(t.base())
 			return t.interrupt("sleep", err)
 		}

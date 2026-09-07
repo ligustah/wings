@@ -12,6 +12,7 @@ type runOptions struct {
 	placer   Placer
 	parker   Parker
 	host     ChannelHost
+	clock    Clock
 
 	version      int
 	maxAttempts  int
@@ -41,6 +42,7 @@ func newRunOptions(fns []RunOption) runOptions {
 	o := runOptions{
 		executor:     Local(),
 		placer:       InProcess(),
+		clock:        systemClock{},
 		version:      1,
 		maxAttempts:  10,
 		initialDelay: time.Second,

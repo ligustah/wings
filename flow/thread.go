@@ -26,6 +26,7 @@ type runState struct {
 	exec   Executor
 	placer Placer
 	parker Parker
+	clock  Clock
 	opts   runOptions
 	// host carries channels to and from other runs; nil when none are shared.
 	// linkCtx bounds the links and ends with the attempt.
@@ -58,6 +59,7 @@ func newRunState(name string, opts runOptions) *runState {
 		exec:   opts.executor,
 		placer: opts.placer,
 		parker: opts.parker,
+		clock:  opts.clock,
 		opts:   opts,
 		host:   opts.host,
 	}
@@ -238,7 +240,7 @@ func (t *threadState) record[E protos.Events](payload E) *protos.Event {
 	defer t.run.mu.Unlock()
 
 	ev := &protos.Event{
-		Timestamp: timestamppb.New(time.Now().Truncate(time.Microsecond)),
+		Timestamp: timestamppb.New(t.run.clock.Now().Truncate(time.Microsecond)),
 		Serial:    t.serial,
 		Attempt:   t.attempt,
 		ThreadId:  t.id,
@@ -257,7 +259,7 @@ func (t *threadState) marker[E protos.Events](payload E) {
 	t.run.mu.Lock()
 	defer t.run.mu.Unlock()
 	t.persistLocked(&protos.Event{
-		Timestamp: timestamppb.New(time.Now().Truncate(time.Microsecond)),
+		Timestamp: timestamppb.New(t.run.clock.Now().Truncate(time.Microsecond)),
 		Attempt:   t.attempt,
 		ThreadId:  t.id,
 		Payload:   protos.PackEventPayload(payload),
