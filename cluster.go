@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -53,6 +54,11 @@ type Cluster struct {
 	engineErr  error
 	engineSrv  *grpc.Server
 	engineAddr string
+
+	// uiSrv serves the inspection API and web UI when Config.UI is set; uiAddr is
+	// the address it bound, resolved from Config.UI (which may ask for port 0).
+	uiSrv  *http.Server
+	uiAddr string
 
 	// journal is the coordinator's own durable record, on that same instance.
 	// It is the one thing the coordinator keeps for itself rather than for a
@@ -376,6 +382,12 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	}
 	for _, w := range workers {
 		c.adopt(w)
+	}
+
+	if cfg.UI != "" {
+		if err := c.startUI(cfg.UI); err != nil {
+			return fail(err, workers)
+		}
 	}
 
 	c.wg.Go(c.watchdog)
@@ -1437,6 +1449,11 @@ func (c *Cluster) Stop(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.journal.record(journalEntry{Kind: journalClusterStop})
+
+	// Stop serving the UI first: it only reads, so nothing depends on it.
+	if c.uiSrv != nil {
+		_ = c.uiSrv.Shutdown(ctx)
+	}
 
 	// Drain each worker's outputs before the mirror is cancelled and its machine
 	// destroyed, or a persistent Dir would keep only the front of a file whose

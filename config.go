@@ -89,6 +89,10 @@ type Config struct {
 	// resumes; set it to put that state somewhere else.
 	Dir string
 
+	// UI, when set to a listen address (e.g. "127.0.0.1:8080"), serves a
+	// read-only inspection API and web UI for the cluster. Empty leaves it off.
+	UI string
+
 	// LocalSharedBroker, for the [LocalProcess] target, has the worker child
 	// processes write into the coordinator's own broker instead of each running
 	// its own — no per-worker data and no output copied between brokers, at the

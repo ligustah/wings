@@ -63,6 +63,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		concurrency = flag.Int("concurrency", 0, "jobs in flight per worker; 0 lets each worker decide")
 		dir         = flag.String("dir", "", "data directory; empty uses ./wings-data")
 		localShared = flag.Bool("local-shared-broker", false, "for -target local: workers share the coordinator's broker instead of each keeping its own data")
+		ui          = flag.String("ui", "", "serve a read-only inspection UI and API at this address (e.g. 127.0.0.1:8080); empty is off")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
 		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
@@ -109,6 +110,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		Concurrency:       *concurrency,
 		Dir:               *dir,
 		LocalSharedBroker: *localShared,
+		UI:                *ui,
 		JobTimeout:        *jobTimeout,
 		Logger:            log,
 		Scaling: Scaling{
