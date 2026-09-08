@@ -91,7 +91,14 @@ type Config struct {
 
 	// UI, when set to a listen address (e.g. "127.0.0.1:8080"), serves a
 	// read-only inspection API and web UI for the cluster. Empty leaves it off.
+	// A bare port or ":port" or "0.0.0.0:port" binds every interface.
 	UI string
+
+	// RetainHistory keeps a forked thread's history after it is joined, instead
+	// of dropping it, so a finished run's whole thread tree stays inspectable in
+	// the UI. Applies to threads that run in the coordinator's own process; work
+	// placed on workers keeps its job history regardless. Off by default.
+	RetainHistory bool
 
 	// LocalSharedBroker, for the [LocalProcess] target, has the worker child
 	// processes write into the coordinator's own broker instead of each running

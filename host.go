@@ -74,11 +74,15 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(append([]flow.RunOption{}, opts...),
+	all := append(append([]flow.RunOption{}, opts...),
 		flow.WithStore(flow.NewStore(client)),
 		flow.WithPlacer(clusterPlacer{c}),
 		flow.WithChannelHost(clusterChannels{c}),
-	), nil
+	)
+	if c.cfg.RetainHistory {
+		all = append(all, flow.RetainHistory())
+	}
+	return all, nil
 }
 
 // Bind returns a context on which defined functions are dispatched to this

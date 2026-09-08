@@ -113,8 +113,9 @@ func (f *Future[Out]) Await(ctx Context) (Out, error) {
 	if err != nil {
 		return zero, err
 	}
-	if !replaying {
-		// The result is the parent's now; drop the thread's own history.
+	if !replaying && !f.parent.run.opts.retainHistory {
+		// The result is the parent's now; drop the thread's own history unless the
+		// run asked to keep its whole thread tree for inspection.
 		_ = f.parent.run.store.Drop(context.WithoutCancel(ctx), f.thread.Run, f.thread.ID)
 	}
 	if callErr != nil {

@@ -64,6 +64,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		dir         = flag.String("dir", "", "data directory; empty uses ./wings-data")
 		localShared = flag.Bool("local-shared-broker", false, "for -target local: workers share the coordinator's broker instead of each keeping its own data")
 		ui          = flag.String("ui", "", "serve a read-only inspection UI and API at this address; a bare port or :PORT or 0.0.0.0:PORT binds every interface (reachable over e.g. Tailscale), 127.0.0.1:PORT stays local; empty is off")
+		keepHistory = flag.Bool("keep-history", false, "keep forked threads' histories after they are joined, so a finished run's whole thread tree stays inspectable (coordinator-process threads only)")
 		inspect     = flag.String("inspect", "", "serve the inspection UI over an existing data directory and exit; does not run a workflow")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
@@ -128,6 +129,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		Dir:               *dir,
 		LocalSharedBroker: *localShared,
 		UI:                listenAddr(*ui),
+		RetainHistory:     *keepHistory,
 		JobTimeout:        *jobTimeout,
 		Logger:            log,
 		Scaling: Scaling{

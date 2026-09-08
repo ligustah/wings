@@ -57,6 +57,26 @@ func TestAJoinedThreadIsNotRunAgainOnReplay(t *testing.T) {
 	}
 }
 
+// THE POINT: RetainHistory keeps a joined thread's history instead of dropping
+// it, so a finished run's whole thread tree stays inspectable.
+func TestRetainHistoryKeepsJoinedThreads(t *testing.T) {
+	store := flow.NewMemStore()
+	name := flow.NewName()
+
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
+		fut := ctx.Spawn(func(ctx flow.Context) (int, error) { return 21, nil })
+		_, err := fut.Await(ctx)
+		return err
+	}, flow.WithStore(store), flow.RetainHistory())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	threads := store.Threads(name)
+	if !slices.Contains(threads, "main") || len(threads) < 2 {
+		t.Fatalf("with RetainHistory the joined child should survive; threads = %v", threads)
+	}
+}
+
 // THE POINT: each thread has a history of its own. A thread in flight when
 // the parent fails is started again by the retry and replays what IT did —
 // which is what would let it run on another machine.

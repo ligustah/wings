@@ -14,12 +14,13 @@ type runOptions struct {
 	host     ChannelHost
 	clock    Clock
 
-	version      int
-	maxAttempts  int
-	initialDelay time.Duration
-	maxDelay     time.Duration
-	permanent    []error
-	once         bool
+	version       int
+	maxAttempts   int
+	initialDelay  time.Duration
+	maxDelay      time.Duration
+	permanent     []error
+	once          bool
+	retainHistory bool
 
 	// input is the run body's input, recorded; inputType what it expects. Set
 	// by a [Workflow], not by callers.
@@ -70,6 +71,12 @@ func Version(v int) RunOption { return func(o *runOptions) { o.version = v } }
 
 // MaxAttempts caps how many times a failing run is retried. Default 10.
 func MaxAttempts(n int) RunOption { return func(o *runOptions) { o.maxAttempts = n } }
+
+// RetainHistory keeps a forked thread's recorded history after it is joined,
+// instead of dropping it once its result is in the parent. Off by default (a
+// joined thread's history is not needed to replay the run); turn it on so a run's
+// full thread tree stays inspectable after it finishes.
+func RetainHistory() RunOption { return func(o *runOptions) { o.retainHistory = true } }
 
 // Once gives the run's main thread a single attempt and returns the body's error
 // unwrapped, without backoff — for a process running a thread on another's
