@@ -113,11 +113,12 @@ func (a runAPI) handleThreadEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, page)
 }
 
-// inspectStore returns a read-only view of the engine's recorded histories.
+// inspectStore returns a read-only view of the engine's recorded histories,
+// including the threads that ran as jobs on workers (inspect_store.go).
 func (c *Cluster) inspectStore() (flow.Store, error) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return nil, err
 	}
-	return flow.NewStore(client), nil
+	return newInspectionStore(client), nil
 }

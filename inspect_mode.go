@@ -49,7 +49,7 @@ func serveInspector(dir, addr string, log *slog.Logger) (*inspectServer, error) 
 	if err != nil {
 		return nil, fmt.Errorf("wings: open engine in %s: %w", engineDir, err)
 	}
-	store := flow.NewStore(dsclient.Wrap(b.Client()))
+	store := newInspectionStore(dsclient.Wrap(b.Client()))
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
