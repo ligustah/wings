@@ -69,27 +69,118 @@ type Tailer interface {
 // window catches it; a running thread has none and reads as running.
 const statusWindow = 8
 
+// headWindow is how many events from the head InspectThread reads to find the
+// RunStart that names a thread's function. The first attempt's RunStart is the
+// thread's first event, so a small window catches it.
+const headWindow = 4
+
 // Status reports a thread's current status — the status of its last RunEnd, or
 // "running" if it has not ended — reading only the tail when store is a [Tailer]
 // and the whole history otherwise. For a run list that needs each run's status
 // but not its events.
 func Status(ctx context.Context, store Store, run, thread string) (string, error) {
-	if t, ok := store.(Tailer); ok {
-		tail, err := t.Tail(ctx, run, thread, statusWindow)
-		if err != nil {
-			return "", fmt.Errorf("flow: tail thread %s of run %s: %w", thread, run, err)
-		}
-		events := make([]*protos.Event, len(tail))
-		for i, e := range tail {
-			events[i] = e.Event
-		}
-		return statusFromEvents(events), nil
-	}
-	events, err := store.Events(ctx, run, thread)
+	tail, err := tailEvents(ctx, store, run, thread, statusWindow)
 	if err != nil {
-		return "", fmt.Errorf("flow: read thread %s of run %s: %w", thread, run, err)
+		return "", err
 	}
-	return statusFromEvents(events), nil
+	return statusFromEvents(tail), nil
+}
+
+// ThreadInfo is a thread's header without its events: what it runs and how it
+// stands, read from the ends of its history rather than the whole of it.
+type ThreadInfo struct {
+	ID       string `json:"id"`
+	Parent   string `json:"parent,omitempty"`
+	Fn       string `json:"fn,omitempty"`
+	Status   string `json:"status"`
+	Attempts uint64 `json:"attempts"`
+}
+
+// EventPage is a window of a thread's decoded events, with a cursor to the next.
+// Done is set once the window reached the end of the history.
+type EventPage struct {
+	Events []EventView `json:"events"`
+	Next   int64       `json:"next"`
+	Done   bool        `json:"done"`
+}
+
+// InspectThread reads a thread's header — what it runs and its status — from the
+// head and tail of its history, without decoding all of it. Its function comes
+// from the first RunStart, its status from the last RunEnd, and its attempt count
+// from the last event (attempts only ever climb). For a run view that lists a
+// run's threads and pages their events with [ReadEvents] rather than holding them.
+func InspectThread(ctx context.Context, store Store, run, thread string) (ThreadInfo, error) {
+	info := ThreadInfo{ID: thread, Status: "running"}
+	if i := strings.LastIndex(thread, "."); i >= 0 {
+		info.Parent = thread[:i]
+	}
+	head, err := headEvents(ctx, store, run, thread, headWindow)
+	if err != nil {
+		return ThreadInfo{}, err
+	}
+	for _, ev := range head {
+		if start := ev.GetRunStart(); start != nil && start.GetFunction() != "" {
+			info.Fn = start.GetFunction()
+			break
+		}
+	}
+	tail, err := tailEvents(ctx, store, run, thread, statusWindow)
+	if err != nil {
+		return ThreadInfo{}, err
+	}
+	info.Status = statusFromEvents(tail)
+	for _, ev := range tail {
+		if a := ev.GetAttempt(); a > info.Attempts {
+			info.Attempts = a
+		}
+	}
+	return info, nil
+}
+
+// InspectRunHeaders lists a run's threads with their headers but not their
+// events, reading only the ends of each thread's history. The store must
+// implement [Lister].
+func InspectRunHeaders(ctx context.Context, store Store, run string) ([]ThreadInfo, error) {
+	l, ok := store.(Lister)
+	if !ok {
+		return nil, fmt.Errorf("flow: store %T cannot enumerate threads", store)
+	}
+	threads, err := l.ListThreads(ctx, run)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ThreadInfo, 0, len(threads))
+	for _, th := range threads {
+		info, err := InspectThread(ctx, store, run, th)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// ReadEvents returns a page of a thread's decoded events starting at offset from,
+// with a cursor (Next) to the page after it. A run's start and end are markers,
+// not events: they are skipped but still advance the cursor. Read pages until
+// the returned page has Done set.
+func ReadEvents(ctx context.Context, store Store, run, thread string, from int64, limit int) (EventPage, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	batch, err := store.Read(ctx, run, thread, from, limit)
+	if err != nil {
+		return EventPage{}, fmt.Errorf("flow: read thread %s of run %s at %d: %w", thread, run, from, err)
+	}
+	page := EventPage{Next: from, Done: len(batch) < limit}
+	for _, e := range batch {
+		page.Next = e.Offset + 1
+		if e.Event.GetRunStart() != nil || e.Event.GetRunEnd() != nil {
+			continue // markers are not events; skip them but advance the cursor
+		}
+		page.Events = append(page.Events, eventView(e.Event))
+	}
+	return page, nil
 }
 
 // statusFromEvents returns the status the last RunEnd names, or "running" when
@@ -104,6 +195,43 @@ func statusFromEvents(events []*protos.Event) string {
 		}
 	}
 	return status
+}
+
+// headEvents returns up to the first n events of a thread.
+func headEvents(ctx context.Context, store Store, run, thread string, n int) ([]*protos.Event, error) {
+	batch, err := store.Read(ctx, run, thread, 0, n)
+	if err != nil {
+		return nil, fmt.Errorf("flow: read head of thread %s of run %s: %w", thread, run, err)
+	}
+	out := make([]*protos.Event, len(batch))
+	for i, e := range batch {
+		out[i] = e.Event
+	}
+	return out, nil
+}
+
+// tailEvents returns up to the last n events of a thread, from the [Tailer]
+// capability when the store has it and the whole history sliced otherwise.
+func tailEvents(ctx context.Context, store Store, run, thread string, n int) ([]*protos.Event, error) {
+	if t, ok := store.(Tailer); ok {
+		batch, err := t.Tail(ctx, run, thread, n)
+		if err != nil {
+			return nil, fmt.Errorf("flow: tail thread %s of run %s: %w", thread, run, err)
+		}
+		out := make([]*protos.Event, len(batch))
+		for i, e := range batch {
+			out[i] = e.Event
+		}
+		return out, nil
+	}
+	events, err := store.Events(ctx, run, thread)
+	if err != nil {
+		return nil, fmt.Errorf("flow: read thread %s of run %s: %w", thread, run, err)
+	}
+	if len(events) > n {
+		events = events[len(events)-n:]
+	}
+	return events, nil
 }
 
 // ListRuns names the runs with recorded history in store, which must implement

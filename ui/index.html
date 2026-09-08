@@ -60,6 +60,11 @@
   .hint { color: var(--muted); font-size: 13px; }
   .dead { color: var(--bad); }
   .draining { color: var(--warn); }
+  .more { margin: 6px 12px 10px; background: var(--bg); color: var(--accent);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+    cursor: pointer; font: inherit; font-size: 12px; }
+  .more:hover { border-color: var(--accent); }
+  .more:disabled { color: var(--muted); cursor: default; border-color: var(--border); }
 </style>
 </head>
 <body>
@@ -88,7 +93,10 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const PAGE = 500;
 let selected = null;
+let threads = [];   // current thread ids in the detail, in order
+const cursor = {};  // thread id -> { next, done, terminal, loaded, loading, attempts }
 
 async function getJSON(path) {
   const r = await fetch(path);
@@ -147,39 +155,118 @@ async function refreshRuns() {
 
 async function selectRun(run) {
   selected = run;
+  threads = [];
+  for (const k in cursor) delete cursor[k];
   for (const tr of $("runs").querySelectorAll("tr.run")) {
     tr.classList.toggle("sel", tr.dataset.run === run);
   }
-  await refreshDetail();
+  await buildDetail();
 }
 
-async function refreshDetail() {
+function isTerminal(s) { return s === "completed" || s === "failed"; }
+
+function threadShell(t) {
+  return `<div class="thread" data-thread="${esc(t.id)}">
+    <div class="thread-head">
+      <span class="id">${esc(t.id)}</span>
+      ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
+      <span class="st">${statusEl(t.status)}</span>
+      <span class="meta"></span>
+    </div>
+    <div class="events"></div>
+    <div class="more-wrap"></div>
+  </div>`;
+}
+
+function threadEl(id) {
+  return $("detail").querySelector(`.thread[data-thread="${CSS.escape(id)}"]`);
+}
+
+function evRow(ev) {
+  return `<div class="ev">
+    <span class="seq">${ev.seq}</span>
+    <span class="kind ${esc(ev.kind)}">${esc(ev.kind)}</span>
+    <span class="detail">${esc(ev.detail)}${ev.error ? ` <span class="err">${esc(ev.error)}</span>` : ""}</span>
+  </div>`;
+}
+
+// The whole history is never held: each thread pages its events from an offset
+// cursor, and the timeline extends only as far as the reader asks.
+async function buildDetail() {
   if (!selected) return;
-  let snap;
+  let detail;
   try {
-    snap = await getJSON("api/runs/" + encodeURIComponent(selected));
+    detail = await getJSON("api/runs/" + encodeURIComponent(selected));
   } catch (e) {
     $("detail").innerHTML = `<p class="hint">Could not load ${esc(selected)}: ${esc(e.message)}</p>`;
     return;
   }
-  const threads = (snap.threads || []).map(t => `<div class="thread">
-    <div class="thread-head">
-      <span class="id">${esc(t.id)}</span>
-      ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
-      ${statusEl(t.status)}
-      <span class="meta">${(t.events || []).length} events${t.attempts > 1 ? " · attempt " + t.attempts : ""}</span>
-    </div>
-    <div class="events">${(t.events || []).map(ev => `<div class="ev">
-      <span class="seq">${ev.seq}</span>
-      <span class="kind ${esc(ev.kind)}">${esc(ev.kind)}</span>
-      <span class="detail">${esc(ev.detail)}${ev.error ? ` <span class="err">${esc(ev.error)}</span>` : ""}</span>
-    </div>`).join("") || '<div class="ev"><span class="seq"></span><span></span><span class="hint">no events</span></div>'}</div>
-  </div>`).join("");
-  $("detail").innerHTML = `<h2 class="mono" style="margin:0 0 14px">${esc(snap.run)}</h2>${threads}`;
+  const ts = detail.threads || [];
+  threads = ts.map(t => t.id);
+  $("detail").innerHTML = `<h2 class="mono" style="margin:0 0 14px">${esc(detail.run)}</h2>` + ts.map(threadShell).join("");
+  for (const t of ts) {
+    cursor[t.id] = { next: 0, done: false, terminal: isTerminal(t.status), loaded: 0, loading: false, attempts: t.attempts };
+    setMore(t.id);
+    await loadMore(t.id);
+  }
+}
+
+async function loadMore(id) {
+  const c = cursor[id];
+  if (!c || c.loading || (c.done && c.terminal)) return;
+  c.loading = true;
+  try {
+    const page = await getJSON(`api/runs/${encodeURIComponent(selected)}/threads/${encodeURIComponent(id)}?from=${c.next}&limit=${PAGE}`);
+    const evs = page.events || [];
+    const el = threadEl(id);
+    if (el && evs.length) el.querySelector(".events").insertAdjacentHTML("beforeend", evs.map(evRow).join(""));
+    c.next = page.next; c.done = page.done; c.loaded += evs.length;
+  } catch (e) { /* transient */ }
+  finally { c.loading = false; setMore(id); }
+}
+
+function setMore(id) {
+  const el = threadEl(id);
+  if (!el) return;
+  const c = cursor[id];
+  const meta = el.querySelector(".meta");
+  if (meta) meta.textContent = `${c.loaded} events${c.done ? "" : "+"}${c.attempts > 1 ? " · attempt " + c.attempts : ""}`;
+  const wrap = el.querySelector(".more-wrap");
+  if (!wrap) return;
+  if (c.done && c.terminal) {
+    wrap.innerHTML = c.loaded === 0 ? `<div class="ev"><span class="seq"></span><span></span><span class="hint">no events</span></div>` : "";
+    return;
+  }
+  wrap.innerHTML = `<button class="more">${c.done ? "Load newer" : "Load more"}</button>`;
+  wrap.querySelector("button").onclick = () => loadMore(id);
+}
+
+// A tick updates the selected run's thread statuses without re-reading the events
+// already loaded; it rebuilds only when the thread set itself changed (a fork).
+async function refreshHeads() {
+  if (!selected) return;
+  let detail;
+  try {
+    detail = await getJSON("api/runs/" + encodeURIComponent(selected));
+  } catch (e) { return; }
+  const ts = detail.threads || [];
+  const ids = ts.map(t => t.id);
+  if (ids.length !== threads.length || ids.some((v, i) => v !== threads[i])) {
+    await buildDetail();
+    return;
+  }
+  for (const t of ts) {
+    const el = threadEl(t.id);
+    if (!el) continue;
+    const st = el.querySelector(".st");
+    if (st) st.innerHTML = statusEl(t.status);
+    const c = cursor[t.id];
+    if (c) { c.terminal = isTerminal(t.status); c.attempts = t.attempts; setMore(t.id); }
+  }
 }
 
 async function tick() {
-  await Promise.all([refreshCluster(), refreshRuns(), refreshDetail()]);
+  await Promise.all([refreshCluster(), refreshRuns(), refreshHeads()]);
 }
 tick();
 setInterval(tick, 2000);

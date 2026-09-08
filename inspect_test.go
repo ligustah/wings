@@ -105,20 +105,39 @@ func TestInspectionAPIServesRunHistory(t *testing.T) {
 		t.Fatalf("run status %q, want completed", found.Status)
 	}
 
-	var snap flow.Snapshot
-	getJSON(t, "http://"+c.uiAddr+"/api/runs/"+name, &snap)
-	if snap.Run != name {
-		t.Fatalf("snapshot run %q, want %q", snap.Run, name)
+	var detail runDetail
+	getJSON(t, "http://"+c.uiAddr+"/api/runs/"+name, &detail)
+	if detail.Run != name {
+		t.Fatalf("detail run %q, want %q", detail.Run, name)
 	}
 	main := false
-	for _, th := range snap.Threads {
+	for _, th := range detail.Threads {
 		if th.ID == "main" && th.Status == "completed" {
 			main = true
 		}
 	}
 	if !main {
-		t.Fatalf("no completed main thread in %+v", snap.Threads)
+		t.Fatalf("no completed main thread in %+v", detail.Threads)
 	}
+
+	// The events come from the paged endpoint, not the run detail.
+	var page flow.EventPage
+	getJSON(t, "http://"+c.uiAddr+"/api/runs/"+name+"/threads/main?from=0&limit=100", &page)
+	if !page.Done {
+		t.Fatalf("a small run's first page should be the last: %+v", page)
+	}
+	if !hasEventKind(page.Events, "sleep") {
+		t.Fatalf("main's events missing the recorded sleep: %+v", page.Events)
+	}
+}
+
+func hasEventKind(events []flow.EventView, kind string) bool {
+	for _, e := range events {
+		if e.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // THE POINT: -inspect serves a stopped run's recorded history from its data
@@ -152,15 +171,15 @@ func TestInspectModeServesStoppedRun(t *testing.T) {
 		t.Fatalf("status target %q, want inspect", st.Target)
 	}
 
-	var snap flow.Snapshot
-	getJSON(t, "http://"+srv.addr+"/api/runs/"+name, &snap)
+	var detail runDetail
+	getJSON(t, "http://"+srv.addr+"/api/runs/"+name, &detail)
 	completed := false
-	for _, th := range snap.Threads {
+	for _, th := range detail.Threads {
 		if th.ID == "main" && th.Status == "completed" {
 			completed = true
 		}
 	}
 	if !completed {
-		t.Fatalf("post-mortem did not recover a completed main thread: %+v", snap.Threads)
+		t.Fatalf("post-mortem did not recover a completed main thread: %+v", detail.Threads)
 	}
 }

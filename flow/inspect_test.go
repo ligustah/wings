@@ -165,6 +165,68 @@ func TestStatusDoesNotReadTheWholeHistory(t *testing.T) {
 	}
 }
 
+// THE POINT: a thread's events are read a page at a time from an offset cursor,
+// and its header (status, attempts) comes from the ends of its history — never
+// the whole of it — so the run view need not hold a whole thread in RAM.
+func TestReadEventsPagesAThread(t *testing.T) {
+	store := NewMemStore()
+	ctx := context.Background()
+	const n = 250
+	err := Run(ctx, "paged", func(c Context) error {
+		for i := 0; i < n; i++ {
+			if _, err := c.Effect(func() ([]byte, error) { return []byte{byte(i)}, nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, WithStore(store))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	cs := &countingStore{Store: store}
+	info, err := InspectThread(ctx, cs, "paged", "main")
+	if err != nil {
+		t.Fatalf("InspectThread: %v", err)
+	}
+	if info.Status != "completed" {
+		t.Fatalf("status %q, want completed", info.Status)
+	}
+	if cs.whole != 0 {
+		t.Fatalf("InspectThread decoded %d events via the whole-history path; it should read the ends", cs.whole)
+	}
+
+	var got, pages int
+	for from := int64(0); ; {
+		page, err := ReadEvents(ctx, store, "paged", "main", from, 100)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		pages++
+		if len(page.Events) > 100 {
+			t.Fatalf("page of %d exceeds the limit", len(page.Events))
+		}
+		for _, ev := range page.Events {
+			if ev.Kind == "effect" {
+				got++
+			}
+		}
+		if page.Done {
+			break
+		}
+		if page.Next <= from {
+			t.Fatalf("cursor did not advance past %d", from)
+		}
+		from = page.Next
+	}
+	if got != n {
+		t.Fatalf("paged %d effect events, want %d", got, n)
+	}
+	if pages < 2 {
+		t.Fatalf("expected more than one page, got %d", pages)
+	}
+}
+
 func findThread(s Snapshot, id string) *ThreadView {
 	for i := range s.Threads {
 		if s.Threads[i].ID == id {
