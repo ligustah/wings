@@ -63,7 +63,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		concurrency = flag.Int("concurrency", 0, "jobs in flight per worker; 0 lets each worker decide")
 		dir         = flag.String("dir", "", "data directory; empty uses ./wings-data")
 		localShared = flag.Bool("local-shared-broker", false, "for -target local: workers share the coordinator's broker instead of each keeping its own data")
-		ui          = flag.String("ui", "", "serve a read-only inspection UI and API at this address (e.g. 127.0.0.1:8080); empty is off")
+		ui          = flag.String("ui", "", "serve a read-only inspection UI and API at this address; a bare port or :PORT or 0.0.0.0:PORT binds every interface (reachable over e.g. Tailscale), 127.0.0.1:PORT stays local; empty is off")
 		inspect     = flag.String("inspect", "", "serve the inspection UI over an existing data directory and exit; does not run a workflow")
 		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		verbose     = flag.Bool("v", false, "log at debug level")
@@ -91,7 +91,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	// -inspect serves the UI over a stopped run's data directory and runs no
 	// workflow, so it short-circuits the rest.
 	if *inspect != "" {
-		addr := *ui
+		addr := listenAddr(*ui)
 		if addr == "" {
 			addr = "127.0.0.1:8080"
 		}
@@ -127,7 +127,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		Concurrency:       *concurrency,
 		Dir:               *dir,
 		LocalSharedBroker: *localShared,
-		UI:                *ui,
+		UI:                listenAddr(*ui),
 		JobTimeout:        *jobTimeout,
 		Logger:            log,
 		Scaling: Scaling{
@@ -185,6 +185,17 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		log.Error("wings: stop", "err", stopErr)
 		os.Exit(1)
 	}
+}
+
+// listenAddr normalizes a UI/inspect listen address so it is easy to expose: a
+// bare port ("8080") becomes ":8080", which binds every interface — reachable
+// over Tailscale or a LAN — as does ":8080" or "0.0.0.0:8080". A host-qualified
+// address like "127.0.0.1:8080" is left alone and stays local. Empty is empty.
+func listenAddr(s string) string {
+	if s == "" || strings.Contains(s, ":") {
+		return s
+	}
+	return ":" + s
 }
 
 // chooseWorkflow picks which defined workflow to run: the only one, or the one

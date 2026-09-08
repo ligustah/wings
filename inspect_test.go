@@ -3,9 +3,11 @@ package wings
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -128,6 +130,55 @@ func TestInspectionAPIServesRunHistory(t *testing.T) {
 	}
 	if !hasEventKind(page.Events, "sleep") {
 		t.Fatalf("main's events missing the recorded sleep: %+v", page.Events)
+	}
+}
+
+// THE POINT: the paged events endpoint walks a long thread to the end over
+// several pages — each page advancing the cursor — and terminates. The UI's
+// "Load more" depends on this.
+func TestRunEventsPaginateToTheEnd(t *testing.T) {
+	mem := flow.NewMemStore()
+	const n = 1200
+	err := flow.Run(t.Context(), "big", func(c flow.Context) error {
+		for i := 0; i < n; i++ {
+			if _, err := c.Effect(func() ([]byte, error) { return []byte{byte(i)}, nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, flow.WithStore(mem))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	srv := httptest.NewServer(inspectHandler("", mem))
+	defer srv.Close()
+
+	got, pages, from := 0, 0, int64(0)
+	for {
+		var page flow.EventPage
+		getJSON(t, fmt.Sprintf("%s/api/runs/big/threads/main?from=%d&limit=500", srv.URL, from), &page)
+		pages++
+		for _, ev := range page.Events {
+			if ev.Kind == "effect" {
+				got++
+			}
+		}
+		if page.Done {
+			break
+		}
+		if page.Next <= from {
+			t.Fatalf("cursor stuck at %d (page %d)", from, pages)
+		}
+		from = page.Next
+		if pages > 50 {
+			t.Fatalf("pagination did not terminate after %d pages", pages)
+		}
+	}
+	if got != n {
+		t.Fatalf("paged %d effect events across %d pages, want %d", got, pages, n)
+	}
+	if pages < 3 {
+		t.Fatalf("expected several pages for %d events, got %d", n, pages)
 	}
 }
 
