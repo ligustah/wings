@@ -415,11 +415,12 @@ type chanState struct {
 	// they are taken on arrival.
 	claimed map[string]bool
 	// link is set once the channel is shared with other runs. From then the
-	// host decides who takes what: asked is the wants this attempt has sent,
-	// and grants maps a want key to the item key the host gave it.
-	link   ChannelLink
-	asked  map[string]bool
-	grants map[string]string
+	// host decides who takes what: asked is the wants this attempt has sent, and
+	// granted maps a want key to the item the host gave it, so a receive finds its
+	// value without scanning the backlog.
+	link    ChannelLink
+	asked   map[string]bool
+	granted map[string]*chanItem
 }
 
 func newChanState(capacity int) *chanState {
@@ -501,13 +502,15 @@ func (cs *chanState) claim(from string, seq uint64) {
 func (cs *chanState) grant(g ChannelItem) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if it := cs.find(g.From, g.Seq); it != nil {
-		it.taken = true
+	it := cs.find(g.From, g.Seq)
+	if it == nil {
+		return // impossible: the value precedes its grant on the record
 	}
-	if cs.grants == nil {
-		cs.grants = map[string]string{}
+	it.taken = true
+	if cs.granted == nil {
+		cs.granted = map[string]*chanItem{}
 	}
-	cs.grants[itemKey(g.To, g.ToSeq)] = itemKey(g.From, g.Seq)
+	cs.granted[itemKey(g.To, g.ToSeq)] = it
 	cs.broadcast()
 }
 
@@ -641,13 +644,10 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 				}
 			}
 		} else {
-			if key, ok := cs.grants[want]; ok {
-				for _, it := range cs.items {
-					if itemKey(it.from, it.seq) == key {
-						cs.mu.Unlock()
-						return it, resume(ctx)
-					}
-				}
+			if it := cs.granted[want]; it != nil {
+				delete(cs.granted, want)
+				cs.mu.Unlock()
+				return it, resume(ctx)
 			}
 			if !cs.asked[want] {
 				if cs.asked == nil {
