@@ -8,7 +8,8 @@
   :root {
     --bg: #0e1116; --panel: #161b22; --border: #262c36; --fg: #d7dde5;
     --muted: #8b949e; --accent: #4c9aff; --good: #3fb950; --bad: #f85149;
-    --warn: #d29922; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --warn: #d29922; --fork: #c778dd;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
@@ -20,13 +21,13 @@
   .chip { background: var(--bg); border: 1px solid var(--border); border-radius: 999px;
     padding: 2px 10px; font-size: 12px; color: var(--muted); }
   .chip b { color: var(--fg); font-weight: 600; }
-  main { display: grid; grid-template-columns: 320px 1fr; gap: 0; height: calc(100vh - 53px); }
+  main { display: grid; grid-template-columns: 300px 1fr; gap: 0; height: calc(100vh - 53px); }
   .side { border-right: 1px solid var(--border); overflow-y: auto; }
-  .detail { overflow-y: auto; padding: 16px; }
+  .detail { overflow: hidden; display: flex; flex-direction: column; }
   section { margin: 0; }
   .sec-title { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
     color: var(--muted); padding: 12px 16px 6px; position: sticky; top: 0;
-    background: var(--bg); }
+    background: var(--bg); z-index: 2; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 5px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
@@ -34,50 +35,100 @@
   tr.run:hover { background: var(--panel); }
   tr.run.sel { background: #1c2530; }
   .mono { font-family: var(--mono); }
-  .status { font-size: 11px; padding: 1px 7px; border-radius: 4px; border: 1px solid var(--border); }
+  .status { font-size: 11px; padding: 1px 7px; border-radius: 4px; border: 1px solid var(--border); white-space: nowrap; }
   .status.completed { color: var(--good); border-color: #1f4428; }
   .status.failed { color: var(--bad); border-color: #5a2321; }
   .status.running, .status.suspended, .status.backoff { color: var(--warn); border-color: #5a4620; }
   .empty { color: var(--muted); padding: 16px; font-style: italic; }
-  .thread { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--panel); }
-  .thread-head { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
-    border-bottom: 1px solid var(--border); }
-  .thread-head .id { font-family: var(--mono); font-weight: 600; }
-  .thread-head .fn { color: var(--muted); font-size: 12px; }
-  .thread-head .meta { margin-left: auto; color: var(--muted); font-size: 12px; }
-  .events { padding: 4px 0; }
-  .ev { display: grid; grid-template-columns: 44px 90px 1fr; gap: 10px; padding: 3px 12px;
-    font-size: 12.5px; align-items: baseline; }
+  .hint { color: var(--muted); font-size: 13px; }
+  .dead { color: var(--bad); }
+  .draining { color: var(--warn); }
+
+  /* Detail: a top-down fork diagram over a selected thread's timeline. */
+  .diagram-title { display: flex; align-items: baseline; gap: 12px; padding: 12px 16px 4px; }
+  .diagram-title h2 { font-size: 15px; margin: 0; }
+  .diagram-title .sub { color: var(--muted); font-size: 12px; }
+  .diagram { overflow: auto; padding: 8px 16px 20px; border-bottom: 1px solid var(--border);
+    flex: 0 0 auto; max-height: 52%; }
+
+  /* CSS fork tree: parent above, children below, connected by lines. */
+  .tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+  .tree { display: flex; justify-content: flex-start; min-width: max-content; }
+  .tree ul { display: flex; padding-top: 22px; position: relative; }
+  .tree li { position: relative; padding: 22px 10px 0; display: flex;
+    flex-direction: column; align-items: center; }
+  .tree li::before, .tree li::after { content: ""; position: absolute; top: 0;
+    height: 22px; border-top: 2px solid var(--border); width: 50%; }
+  .tree li::before { right: 50%; }
+  .tree li::after { left: 50%; border-left: 2px solid var(--border); }
+  .tree li:only-child::after, .tree li:only-child::before { display: none; }
+  .tree li:first-child::before, .tree li:last-child::after { border: 0 none; }
+  .tree li:last-child::before { border-right: 2px solid var(--border); }
+  .tree ul::before { content: ""; position: absolute; top: 0; left: 50%;
+    border-left: 2px solid var(--border); width: 0; height: 22px; }
+  .tree > li { padding-top: 0; }
+  .tree > li::before, .tree > li::after { display: none; }
+
+  .box { border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+    padding: 7px 11px; min-width: 130px; cursor: pointer; text-align: left;
+    border-top: 3px solid var(--border); transition: border-color .1s, background .1s; }
+  .box:hover { background: #1c2330; }
+  .box.sel { background: #1c2530; border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .box.completed { border-top-color: var(--good); }
+  .box.failed { border-top-color: var(--bad); }
+  .box.running, .box.suspended, .box.backoff { border-top-color: var(--warn); }
+  .box .id { font-family: var(--mono); font-weight: 600; font-size: 12.5px; }
+  .box .fn { color: var(--muted); font-size: 11.5px; }
+  .box .row2 { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+  .box .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+  .box.completed .dot { background: var(--good); }
+  .box.failed .dot { background: var(--bad); }
+  .box.running .dot, .box.suspended .dot, .box.backoff .dot { background: var(--warn); }
+  .box .att { color: var(--warn); font-size: 11px; }
+
+  .cluster { border-style: dashed; }
+  .cluster .count { font-weight: 700; }
+  .cluster .bars { display: flex; gap: 2px; margin-top: 4px; }
+  .cluster .bar { height: 4px; border-radius: 2px; }
+  .cluster .bar.good { background: var(--good); }
+  .cluster .bar.bad { background: var(--bad); }
+  .cluster .bar.warn { background: var(--warn); }
+  .cluster-collapse { font-size: 11px; color: var(--muted); cursor: pointer;
+    border: 1px dashed var(--border); border-radius: 6px; padding: 3px 8px; background: var(--panel); }
+  .cluster-collapse:hover { color: var(--fg); border-color: var(--fork); }
+
+  /* Timeline of the selected thread. */
+  .timeline { flex: 1 1 auto; overflow-y: auto; padding: 10px 16px 24px; }
+  .tl-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .tl-head .id { font-family: var(--mono); font-weight: 600; font-size: 14px; }
+  .tl-head .fn { color: var(--muted); }
+  .summary { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted);
+    font-size: 11.5px; font-family: var(--mono); margin-left: auto; }
+  .summary .n { color: var(--fg); }
+  .events { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); overflow: hidden; }
+  .ev { display: grid; grid-template-columns: 70px 96px 1fr; gap: 10px; padding: 3px 12px;
+    font-size: 12.5px; align-items: baseline; border-bottom: 1px solid var(--border); }
+  .ev:last-child { border-bottom: 0; }
   .ev:hover { background: var(--bg); }
   .ev .seq { color: var(--muted); font-family: var(--mono); text-align: right; }
   .ev .kind { font-family: var(--mono); }
   .ev .kind.call, .ev .kind.effect { color: var(--accent); }
-  .ev .kind.fork, .ev .kind.join { color: #c778dd; }
+  .ev .kind.fork, .ev .kind.join { color: var(--fork); }
   .ev .kind.send, .ev .kind.recv, .ev .kind.select { color: var(--good); }
   .ev .kind.interrupted { color: var(--warn); }
   .ev .detail { color: var(--fg); font-family: var(--mono); word-break: break-word; }
   .ev .err { color: var(--bad); }
-  .hint { color: var(--muted); font-size: 13px; }
-  .dead { color: var(--bad); }
-  .draining { color: var(--warn); }
-  .more { margin: 6px 12px 10px; background: var(--bg); color: var(--accent);
-    border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
-    cursor: pointer; font: inherit; font-size: 12px; }
-  .more:hover { border-color: var(--accent); }
-  .more:disabled { color: var(--muted); cursor: default; border-color: var(--border); }
-  .summary { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 4px 12px 6px;
-    border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--muted);
-    font-family: var(--mono); }
-  .summary .n { color: var(--fg); }
   .grp-head { cursor: pointer; }
   .grp-head:hover { background: var(--bg); }
   .grp-head .kind { font-weight: 600; }
-  .grp-body { border-left: 2px solid var(--border); }
-  .node.child { border-left: 1px solid var(--border); padding-left: 12px; }
-  .thread-head { cursor: pointer; }
-  .thread-head .tog { color: var(--muted); font-family: var(--mono); width: 12px; }
-  .fork-link { color: #c778dd; cursor: pointer; text-decoration: none; border-bottom: 1px dotted #c778dd; }
+  .grp-body { background: var(--bg); }
+  .fork-link { color: var(--fork); cursor: pointer; text-decoration: none; border-bottom: 1px dotted var(--fork); }
   .fork-link:hover { color: var(--fg); }
+  .more { margin: 8px 0 0; background: var(--bg); color: var(--accent);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px;
+    cursor: pointer; font: inherit; font-size: 12px; }
+  .more:hover { border-color: var(--accent); }
+  .more:disabled { color: var(--muted); cursor: default; border-color: var(--border); }
 </style>
 </head>
 <body>
@@ -101,53 +152,52 @@
     </section>
   </div>
   <div class="detail" id="detail">
-    <p class="hint">Select a run to see its threads and event timeline.</p>
+    <p class="hint" style="padding:16px">Select a run to see its fork tree and thread timelines.</p>
   </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 const PAGE = 500;
-let selected = null;
-let threads = [];   // current thread ids in the detail, in order
-const cursor = {};  // thread id -> { next, done, terminal, loaded, loading, attempts }
+// A parent with more children than this collapses same-function siblings into a
+// cluster, so a fan-out of hundreds reads as one node with a count.
+const CLUSTER_OVER = 8;
+const CLUSTER_MIN = 3;
+
+let selected = null;      // selected run
+let infos = [];           // thread headers for the selected run
+let selThread = null;     // thread whose timeline is shown
+const openClusters = new Set();   // "parent|fn" clusters expanded in the diagram
+const cursor = {};        // thread id -> paging/render state for the timeline
 
 async function getJSON(path) {
   const r = await fetch(path);
   if (!r.ok) throw new Error(path + ": " + r.status);
   return r.json();
 }
-
 function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
-
-function statusEl(s) {
-  return `<span class="status ${esc(s)}">${esc(s)}</span>`;
-}
+function statusEl(s) { return `<span class="status ${esc(s)}">${esc(s)}</span>`; }
+function isTerminal(s) { return s === "completed" || s === "failed"; }
 
 async function refreshCluster() {
   try {
     const st = await getJSON("api/status");
     $("chips").innerHTML = [
-      ["target", st.target], ["workers", st.workers], ["outstanding", st.outstanding],
-      ["dir", st.dir],
+      ["target", st.target], ["workers", st.workers], ["outstanding", st.outstanding], ["dir", st.dir],
     ].map(([k, v]) => `<span class="chip">${k} <b>${esc(v)}</b></span>`).join("");
-  } catch (e) { /* transient */ }
-
+  } catch (e) {}
   try {
     const ws = await getJSON("api/workers");
     $("workers").innerHTML = ws.length ? ws.map(w => `<tr>
-      <td class="mono">${esc(w.id)}</td>
-      <td>${esc(w.kind)}</td>
+      <td class="mono">${esc(w.id)}</td><td>${esc(w.kind)}</td>
       <td>${w.dead ? '<span class="dead">dead</span>' : w.draining ? '<span class="draining">draining</span>' : "load " + w.load}</td>
     </tr>`).join("") : `<tr><td class="empty" colspan="3">none</td></tr>`;
   } catch (e) {}
-
   try {
     const ps = await getJSON("api/pending");
     $("pending").innerHTML = ps.length ? ps.map(p => `<tr>
-      <td class="mono">${esc(p.run || p.id)}</td>
-      <td>${esc(p.fn || "")}</td>
+      <td class="mono">${esc(p.run || p.id)}</td><td>${esc(p.fn || "")}</td>
       <td>${p.blocked ? "blocked" : p.placed ? "placed" : "queued"}</td>
     </tr>`).join("") : `<tr><td class="empty" colspan="3">none</td></tr>`;
   } catch (e) {}
@@ -157,129 +207,169 @@ async function refreshRuns() {
   try {
     const runs = await getJSON("api/runs");
     $("runs").innerHTML = runs.length ? runs.map(r => `<tr class="run ${r.run === selected ? "sel" : ""}" data-run="${esc(r.run)}">
-      <td class="mono">${esc(r.run)}</td>
-      <td>${statusEl(r.status)}</td>
+      <td class="mono">${esc(r.run)}</td><td>${statusEl(r.status)}</td>
     </tr>`).join("") : `<tr><td class="empty" colspan="2">no runs recorded</td></tr>`;
-    for (const tr of $("runs").querySelectorAll("tr.run")) {
-      tr.onclick = () => selectRun(tr.dataset.run);
-    }
+    for (const tr of $("runs").querySelectorAll("tr.run")) tr.onclick = () => selectRun(tr.dataset.run);
   } catch (e) {}
 }
 
 async function selectRun(run) {
   selected = run;
-  threads = [];
+  selThread = null;
+  infos = [];
+  openClusters.clear();
   for (const k in cursor) delete cursor[k];
-  for (const tr of $("runs").querySelectorAll("tr.run")) {
-    tr.classList.toggle("sel", tr.dataset.run === run);
-  }
-  await buildDetail();
+  for (const tr of $("runs").querySelectorAll("tr.run")) tr.classList.toggle("sel", tr.dataset.run === run);
+  await loadHeaders();
+  // Open the run on its root thread's timeline.
+  const root = infos.find(t => !t.parent || !infos.some(o => o.id === t.parent)) || infos[0];
+  if (root) selectThread(root.id);
+  else renderDetail();
 }
 
-function isTerminal(s) { return s === "completed" || s === "failed"; }
+async function loadHeaders() {
+  try {
+    const detail = await getJSON("api/runs/" + encodeURIComponent(selected));
+    infos = detail.threads || [];
+  } catch (e) {
+    infos = [];
+    $("detail").innerHTML = `<p class="hint" style="padding:16px">Could not load ${esc(selected)}: ${esc(e.message)}</p>`;
+  }
+}
 
-// A thread's parent is the prefix before its last "." (main.3.1's is main.3), so
-// threads form a fork tree. Order it top-down, depth-first, roots first.
-function threadTree(infos) {
-  const byId = {}, kids = {}, roots = [];
+// --- fork tree ---
+
+function childrenOf() {
+  const byId = {}, kids = {};
   for (const t of infos) byId[t.id] = t;
   for (const t of infos) {
-    if (t.parent && byId[t.parent]) (kids[t.parent] = kids[t.parent] || []).push(t.id);
-    else roots.push(t.id);
+    const p = t.parent && byId[t.parent] ? t.parent : null;
+    if (p) (kids[p] = kids[p] || []).push(t.id);
   }
-  const order = [];
-  const walk = (id, depth) => {
-    order.push({ id, depth, info: byId[id] });
-    for (const k of (kids[id] || []).sort()) walk(k, depth + 1);
+  const roots = infos.filter(t => !(t.parent && byId[t.parent])).map(t => t.id);
+  return { byId, kids, roots };
+}
+
+// numeric-aware sort so main.2 precedes main.10.
+function sortIds(ids) {
+  return ids.slice().sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+function renderDetail() {
+  const done = infos.filter(t => t.status === "completed").length;
+  const failed = infos.filter(t => t.status === "failed").length;
+  const running = infos.length - done - failed;
+  const sub = infos.length
+    ? `${infos.length} threads · ${done} completed${failed ? " · " + failed + " failed" : ""}${running ? " · " + running + " running" : ""}`
+    : "no threads";
+  $("detail").innerHTML =
+    `<div class="diagram-title"><h2 class="mono">${esc(selected)}</h2><span class="sub">${esc(sub)}</span></div>
+     <div class="diagram" id="diagram"></div>
+     <div class="timeline" id="timeline"></div>`;
+  renderTree();
+  renderTimeline();
+}
+
+function renderTree() {
+  const { kids, roots } = childrenOf();
+  const html = `<ul class="tree">${sortIds(roots).map(id => renderNode(id, kids)).join("")}</ul>`;
+  $("diagram").innerHTML = html;
+  wireTree();
+}
+
+function renderNode(id, kids) {
+  const children = sortIds(kids[id] || []);
+  const items = clusterItems(id, children, kids);
+  const sub = items.length ? `<ul>${items.join("")}</ul>` : "";
+  return `<li>${box(id)}${sub}</li>`;
+}
+
+// clusterItems returns the <li> markup for a node's children: individual nodes
+// when few, or same-function clusters when a fan-out is wide. An expanded
+// cluster becomes its member nodes plus a collapse tab.
+function clusterItems(parent, children, kids) {
+  if (children.length <= CLUSTER_OVER) return children.map(id => renderNode(id, kids));
+  const byFn = {};
+  for (const id of children) {
+    const fn = (infos.find(t => t.id === id) || {}).fn || "";
+    (byFn[fn] = byFn[fn] || []).push(id);
+  }
+  const out = [];
+  for (const fn of Object.keys(byFn).sort()) {
+    const ids = byFn[fn];
+    const key = parent + "|" + fn;
+    if (ids.length < CLUSTER_MIN) { out.push(...ids.map(id => renderNode(id, kids))); continue; }
+    if (openClusters.has(key)) {
+      out.push(`<li><button class="cluster-collapse" data-cluster="${esc(key)}">▾ ${esc(fn || "thread")} ×${ids.length} — collapse</button></li>`);
+      out.push(...sortIds(ids).map(id => renderNode(id, kids)));
+    } else {
+      out.push(`<li>${clusterBox(key, fn, ids)}</li>`);
+    }
+  }
+  return out;
+}
+
+function box(id) {
+  const t = infos.find(x => x.id === id) || { id, status: "running" };
+  const sel = id === selThread ? " sel" : "";
+  const att = t.attempts > 1 ? `<span class="att">⟳${t.attempts}</span>` : "";
+  return `<button class="box ${esc(t.status)}${sel}" data-thread="${esc(id)}">
+    <div class="id">${esc(id)}</div>
+    ${t.fn ? `<div class="fn">${esc(t.fn)}</div>` : ""}
+    <div class="row2"><span class="dot"></span>${statusEl(t.status)}${att}</div>
+  </button>`;
+}
+
+function clusterBox(key, fn, ids) {
+  let good = 0, bad = 0, warn = 0;
+  for (const id of ids) {
+    const s = (infos.find(t => t.id === id) || {}).status;
+    if (s === "completed") good++; else if (s === "failed") bad++; else warn++;
+  }
+  const bar = (n, cls) => n ? `<span class="bar ${cls}" style="flex:${n}"></span>` : "";
+  const parts = [good && good + " ✓", bad && bad + " ✗", warn && warn + " …"].filter(Boolean).join("  ");
+  return `<button class="box cluster" data-cluster="${esc(key)}">
+    <div class="id"><span class="count">×${ids.length}</span> ${esc(fn || "threads")}</div>
+    <div class="fn">${esc(parts)}</div>
+    <div class="bars">${bar(good, "good")}${bar(warn, "warn")}${bar(bad, "bad")}</div>
+    <div class="fn" style="margin-top:3px">▸ expand</div>
+  </button>`;
+}
+
+function wireTree() {
+  const d = $("diagram");
+  for (const b of d.querySelectorAll(".box[data-thread]")) b.onclick = () => selectThread(b.dataset.thread);
+  for (const b of d.querySelectorAll("[data-cluster]")) b.onclick = () => {
+    const k = b.dataset.cluster;
+    if (openClusters.has(k)) openClusters.delete(k); else openClusters.add(k);
+    renderTree();
   };
-  for (const r of roots.sort()) walk(r, 0);
-  return order;
 }
 
-function nodeShell(n) {
-  const t = n.info;
-  return `<div class="node${n.depth ? " child" : ""}" data-thread="${esc(t.id)}" style="margin-left:${n.depth * 22}px">
-    <div class="thread">
-      <div class="thread-head">
-        <span class="tog">▾</span>
-        <span class="id">${esc(t.id)}</span>
-        ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
-        <span class="st">${statusEl(t.status)}</span>
-        <span class="meta"></span>
-      </div>
-      <div class="summary"></div>
-      <div class="body">
-        <div class="events"></div>
-        <div class="more-wrap"></div>
-      </div>
-    </div>
-  </div>`;
-}
+// --- selected thread timeline ---
 
-function threadEl(id) {
-  return $("detail").querySelector(`.node[data-thread="${CSS.escape(id)}"]`);
-}
-
-// The whole history is never held: each thread pages its events from an offset
-// cursor, forks nest as a tree, and long runs of one event kind collapse into a
-// single expandable row so a channel-heavy sweep reads as structure, not noise.
-async function buildDetail() {
-  if (!selected) return;
-  let detail;
-  try {
-    detail = await getJSON("api/runs/" + encodeURIComponent(selected));
-  } catch (e) {
-    $("detail").innerHTML = `<p class="hint">Could not load ${esc(selected)}: ${esc(e.message)}</p>`;
-    return;
+function selectThread(id) {
+  selThread = id;
+  if (!cursor[id]) {
+    const t = infos.find(x => x.id === id) || {};
+    cursor[id] = { next: 0, done: false, terminal: isTerminal(t.status), loaded: 0, loading: false,
+      attempts: t.attempts, events: [], expanded: new Set() };
   }
-  const infos = detail.threads || [];
-  threads = infos.map(t => t.id);
-  const order = threadTree(infos);
-  $("detail").innerHTML = `<h2 class="mono" style="margin:0 0 14px">${esc(detail.run)}</h2>` + order.map(nodeShell).join("");
-  for (const n of order) {
-    const t = n.info;
-    cursor[t.id] = { next: 0, done: false, terminal: isTerminal(t.status), loaded: 0, loading: false,
-      attempts: t.attempts, events: [], expanded: new Set(), open: n.depth === 0 };
-    wireNode(t.id);
-    applyOpen(t.id);
-    setMore(t.id);
-    if (cursor[t.id].open) await loadMore(t.id);
-  }
-}
-
-function wireNode(id) {
-  const el = threadEl(id);
-  if (!el) return;
-  el.querySelector(".thread-head").onclick = async () => {
-    const c = cursor[id];
-    c.open = !c.open;
-    applyOpen(id);
-    if (c.open && c.loaded === 0 && !c.done) await loadMore(id);
-  };
-}
-
-function applyOpen(id) {
-  const el = threadEl(id);
-  if (!el) return;
-  const c = cursor[id];
-  const body = el.querySelector(".body");
-  if (body) body.hidden = !c.open;
-  const tog = el.querySelector(".tog");
-  if (tog) tog.textContent = c.open ? "▾" : "▸";
+  renderDetail();
+  if (cursor[id].loaded === 0 && !cursor[id].done) loadMore(id);
 }
 
 async function loadMore(id) {
   const c = cursor[id];
   if (!c || c.loading || (c.done && c.terminal)) return;
   c.loading = true;
+  renderTimeline();
   try {
     const page = await getJSON(`api/runs/${encodeURIComponent(selected)}/threads/${encodeURIComponent(id)}?from=${c.next}&limit=${PAGE}`);
-    const evs = page.events || [];
-    for (const ev of evs) c.events.push(ev);
-    c.next = page.next; c.done = page.done; c.loaded += evs.length;
-    renderEvents(id);
-  } catch (e) { /* transient */ }
-  finally { c.loading = false; setMore(id); }
+    for (const ev of (page.events || [])) c.events.push(ev);
+    c.next = page.next; c.done = page.done; c.loaded += (page.events || []).length;
+  } catch (e) {}
+  finally { c.loading = false; if (id === selThread) renderTimeline(); }
 }
 
 function chanOf(ev) {
@@ -303,21 +393,23 @@ function evRow(ev) {
   </div>`;
 }
 
-// Consecutive events of one kind on one channel collapse into an expandable
-// group; an event with an error stays its own row so a failure is never hidden.
-function renderEvents(id) {
-  const el = threadEl(id);
+function renderTimeline() {
+  const el = $("timeline");
   if (!el) return;
-  const c = cursor[id];
+  if (!selThread) { el.innerHTML = `<p class="hint">Select a thread in the diagram above to see its events.</p>`; return; }
+  const c = cursor[selThread];
+  const t = infos.find(x => x.id === selThread) || { id: selThread, status: "running" };
+
+  // Consecutive events of one kind on one channel collapse into an expandable
+  // group; an event with an error stays its own row so a failure is never hidden.
   const groups = [];
   for (const ev of c.events) {
     const key = ev.kind + "|" + chanOf(ev);
     const last = groups[groups.length - 1];
-    if (last && last.key === key && !ev.error && !last.items[0].error) last.items.push(ev);
+    if (last && last.key === key && !ev.error && !last.items[last.items.length - 1].error) last.items.push(ev);
     else groups.push({ key, kind: ev.kind, chan: chanOf(ev), gid: key + "|" + ev.seq, items: [ev] });
   }
-  const cont = el.querySelector(".events");
-  cont.innerHTML = groups.map(g => {
+  const rows = groups.map(g => {
     if (g.items.length === 1) return evRow(g.items[0]);
     const first = g.items[0], last = g.items[g.items.length - 1];
     const open = c.expanded.has(g.gid);
@@ -331,68 +423,74 @@ function renderEvents(id) {
       <div class="grp-body"${open ? "" : " hidden"}>${g.items.map(evRow).join("")}</div>
     </div>`;
   }).join("");
-  for (const gh of cont.querySelectorAll(".grp-head")) {
-    gh.onclick = () => {
-      const gid = gh.parentElement.dataset.gid;
-      if (c.expanded.has(gid)) c.expanded.delete(gid); else c.expanded.add(gid);
-      renderEvents(id);
-    };
+
+  const counts = {};
+  for (const ev of c.events) counts[ev.kind] = (counts[ev.kind] || 0) + 1;
+  const summary = Object.keys(counts).sort().map(k => `${esc(k)} <span class="n">${counts[k]}</span>`).join(" · ");
+
+  let more = "";
+  if (!(c.done && c.terminal)) {
+    more = `<button class="more" id="more"${c.loading ? " disabled" : ""}>${c.loading ? "Loading…" : c.done ? "Load newer" : "Load more"}</button>`;
+  } else if (c.loaded === 0) {
+    more = `<p class="hint">No events recorded on this thread.</p>`;
   }
-  for (const a of cont.querySelectorAll(".fork-link")) {
-    a.onclick = async () => {
-      const to = a.dataset.to, cc = cursor[to], tel = threadEl(to);
-      if (cc && !cc.open) { cc.open = true; applyOpen(to); if (cc.loaded === 0 && !cc.done) await loadMore(to); }
-      if (tel) tel.scrollIntoView({ behavior: "smooth", block: "start" });
-    };
-  }
-  const sum = el.querySelector(".summary");
-  if (sum) {
-    const counts = {};
-    for (const ev of c.events) counts[ev.kind] = (counts[ev.kind] || 0) + 1;
-    const parts = Object.keys(counts).sort().map(k => `${esc(k)} <span class="n">${counts[k]}</span>`);
-    sum.innerHTML = parts.length ? parts.join(" · ") + (c.done ? "" : " · …") : (c.done ? '<span class="hint">no events</span>' : "");
-  }
+
+  el.innerHTML = `<div class="tl-head">
+      <span class="id">${esc(t.id)}</span>
+      ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
+      ${statusEl(t.status)}
+      ${t.attempts > 1 ? `<span class="att" style="color:var(--warn)">⟳ attempt ${t.attempts}</span>` : ""}
+      <span class="summary">${c.loaded}${c.done ? "" : "+"} events${summary ? " · " + summary : ""}</span>
+    </div>
+    <div class="events">${rows || (c.loading ? '<div class="ev"><span></span><span></span><span class="hint">loading…</span></div>' : "")}</div>
+    ${more}`;
+
+  const cont = el.querySelector(".events");
+  for (const gh of cont.querySelectorAll(".grp-head")) gh.onclick = () => {
+    const gid = gh.parentElement.dataset.gid;
+    if (c.expanded.has(gid)) c.expanded.delete(gid); else c.expanded.add(gid);
+    renderTimeline();
+  };
+  for (const a of cont.querySelectorAll(".fork-link")) a.onclick = () => {
+    const to = a.dataset.to;
+    if (infos.some(t => t.id === to)) { revealInTree(to); selectThread(to); }
+  };
+  const mb = el.querySelector("#more");
+  if (mb) mb.onclick = () => loadMore(selThread);
 }
 
-function setMore(id) {
-  const el = threadEl(id);
-  if (!el) return;
-  const c = cursor[id];
-  const meta = el.querySelector(".meta");
-  if (meta) meta.textContent = `${c.loaded}${c.done ? "" : "+"} events${c.attempts > 1 ? " · attempt " + c.attempts : ""}`;
-  const wrap = el.querySelector(".more-wrap");
-  if (!wrap) return;
-  if (c.done && c.terminal) { wrap.innerHTML = ""; return; }
-  wrap.innerHTML = `<button class="more">${c.done ? "Load newer" : "Load more"}</button>`;
-  wrap.querySelector("button").onclick = () => loadMore(id);
+// revealInTree expands whatever cluster hides a thread, so selecting it from a
+// fork link (or search) shows it in the diagram.
+function revealInTree(id) {
+  const t = infos.find(x => x.id === id);
+  if (!t || !t.parent) return;
+  const key = t.parent + "|" + (t.fn || "");
+  const { kids } = childrenOf();
+  if ((kids[t.parent] || []).length > CLUSTER_OVER) openClusters.add(key);
 }
 
-// A tick updates the selected run's thread statuses without re-reading loaded
-// events; it rebuilds only when the thread set itself changed (a new fork).
-async function refreshHeads() {
-  if (!selected) return;
-  let detail;
-  try {
-    detail = await getJSON("api/runs/" + encodeURIComponent(selected));
-  } catch (e) { return; }
-  const infos = detail.threads || [];
-  const ids = infos.map(t => t.id);
-  if (ids.length !== threads.length || ids.some((v, i) => v !== threads[i])) {
-    await buildDetail();
-    return;
-  }
-  for (const t of infos) {
-    const el = threadEl(t.id);
-    if (!el) continue;
-    const st = el.querySelector(".st");
-    if (st) st.innerHTML = statusEl(t.status);
-    const c = cursor[t.id];
-    if (c) { c.terminal = isTerminal(t.status); c.attempts = t.attempts; setMore(t.id); }
-  }
-}
-
+// A tick refreshes the sidebar, and the diagram's statuses when the selected
+// run's thread set is unchanged; a new fork rebuilds it.
 async function tick() {
-  await Promise.all([refreshCluster(), refreshRuns(), refreshHeads()]);
+  await Promise.all([refreshCluster(), refreshRuns()]);
+  if (!selected) return;
+  let fresh = [];
+  try {
+    const detail = await getJSON("api/runs/" + encodeURIComponent(selected));
+    fresh = detail.threads || [];
+  } catch (e) { return; }
+  const ids = fresh.map(t => t.id), old = infos.map(t => t.id);
+  const changed = ids.length !== old.length || ids.some((v, i) => v !== old[i]);
+  infos = fresh;
+  if (changed) {
+    if (selThread && !infos.some(t => t.id === selThread)) selThread = null;
+    renderDetail();
+  } else {
+    // statuses may have advanced; refresh the diagram boxes and timeline head.
+    for (const t of infos) { const c = cursor[t.id]; if (c) { c.terminal = isTerminal(t.status); c.attempts = t.attempts; } }
+    renderTree();
+    renderTimeline();
+  }
 }
 tick();
 setInterval(tick, 2000);
