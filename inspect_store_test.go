@@ -8,6 +8,69 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
+// THE POINT: a job that is moved keeps a history per attempt; on settle the
+// abandoned attempts' histories go, and so would the kept one — but
+// RetainHistory keeps it, so a moved thread's execution is still inspectable.
+func TestRetainHistoryKeepsAMovedThreadsHistory(t *testing.T) {
+	movedRecv.attempts.Store(0)
+	movedRecv.release = make(chan struct{})
+	t.Cleanup(func() { close(movedRecv.release) })
+
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1, RetainHistory: true})
+	run := flow.NewName()
+	err := c.Run(t.Context(), run, func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		fut := ctx.Go(receivesThenStalls, feed{Values: ch})
+		for _, v := range []int{7, 8, 9, 10, 11} {
+			if err := ch.Send(ctx, v); err != nil {
+				return err
+			}
+		}
+		if err := ch.Close(ctx); err != nil {
+			return err
+		}
+		_, err := fut.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n := movedRecv.attempts.Load(); n != 2 {
+		t.Fatalf("the function ran %d times, want 2: once stalled, once moved", n)
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatalf("shared client: %v", err)
+	}
+	store := newInspectionStore(client)
+	ctx := context.Background()
+
+	info, err := flow.InspectThread(ctx, store, run, "main.0")
+	if err != nil {
+		t.Fatalf("InspectThread: %v", err)
+	}
+	if info.Fn != "test.receivesThenStalls" {
+		t.Fatalf("moved thread's history was not retained; fn=%q status=%q", info.Fn, info.Status)
+	}
+	if info.Attempts < 1 {
+		t.Fatalf("retained history is not the moved attempt's; attempts=%d, want >= 1", info.Attempts)
+	}
+	page, err := flow.ReadEvents(ctx, store, run, "main.0", 0, 100)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	recvs := 0
+	for _, e := range page.Events {
+		if e.Kind == "recv" {
+			recvs++
+		}
+	}
+	if recvs == 0 {
+		t.Fatalf("moved thread surfaced no recv events; got %d events", len(page.Events))
+	}
+}
+
 // THE POINT: a thread forked onto a worker keeps its history on a job stream,
 // not a coordinator flow.thread stream, so the plain store shows only main. The
 // inspection store reads the job histories back into the run's fork tree, so a

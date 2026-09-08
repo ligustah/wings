@@ -446,9 +446,10 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 		if !ok || o.Job != streamPart(job) {
 			continue
 		}
-		// The kept attempt's recordings stay; its history does not, since a
-		// history is for the next attempt and there is none.
-		if o.Attempt == keep && o.Prefix != historyPrefix {
+		// The kept attempt's recordings stay; its history is for a next attempt
+		// that will not come, so it goes too — unless RetainHistory keeps it, so
+		// the inspector can still show a moved thread's execution.
+		if o.Attempt == keep && (o.Prefix != historyPrefix || c.cfg.RetainHistory) {
 			continue
 		}
 		stale = append(stale, o)

@@ -96,8 +96,10 @@ type Config struct {
 
 	// RetainHistory keeps a forked thread's history after it is joined, instead
 	// of dropping it, so a finished run's whole thread tree stays inspectable in
-	// the UI. Applies to threads that run in the coordinator's own process; work
-	// placed on workers keeps its job history regardless. Off by default.
+	// the UI. It covers a thread that runs in the coordinator's own process, and
+	// the kept history of a job that was retried or moved (a job that succeeds on
+	// its first attempt keeps its history regardless, since nothing drops it). Off
+	// by default.
 	RetainHistory bool
 
 	// LocalSharedBroker, for the [LocalProcess] target, has the worker child
