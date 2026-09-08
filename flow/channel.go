@@ -415,9 +415,9 @@ type chanState struct {
 	// they are taken on arrival.
 	claimed map[string]bool
 	// link is set once the channel is shared with other runs. From then the
-	// host decides who takes what: asked is the wants this attempt has sent, and
-	// granted maps a want key to the item the host gave it, so a receive finds its
-	// value without scanning the backlog.
+	// host decides who takes what: asked is the wants this attempt has sent and not
+	// yet been granted, and granted maps a want key to the item the host gave it, so
+	// a receive finds its value without scanning the backlog.
 	link    ChannelLink
 	asked   map[string]bool
 	granted map[string]*chanItem
@@ -646,6 +646,7 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 		} else {
 			if it := cs.granted[want]; it != nil {
 				delete(cs.granted, want)
+				delete(cs.asked, want) // this recvSeq is done and never recurs; drop it, or a long drain holds an entry per receive
 				cs.mu.Unlock()
 				return it, resume(ctx)
 			}
