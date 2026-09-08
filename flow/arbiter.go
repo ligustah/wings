@@ -12,18 +12,65 @@ import "sync"
 // channel's record exactly what Offer returns. Not safe for concurrent use
 // without the host's own lock.
 type Arbiter struct {
-	mu     sync.Mutex
-	seen   map[string]bool // values on the record, by sender#seq
-	asked  map[string]bool // wants on the record, by receiver#seq
-	values []ChannelItem   // on the record and not yet granted, in order
-	wants  []ChannelItem   // on the record and not yet granted, in order
+	mu sync.Mutex
+	// seen and asked track, per sender and per receiver, which seqs are on the
+	// record, so a resend is dropped. A party's seqs mostly arrive in order, but a
+	// lost announcement (a worker that died between a send's record and its copy
+	// home) lets a later one arrive first, with the gap filled by the replay — so
+	// a plain high-water is not enough; see seqRun. One small entry per party
+	// rather than one per record ever.
+	seen   map[string]*seqRun
+	asked  map[string]*seqRun
+	values []ChannelItem // on the record and not yet granted, in order
+	wants  []ChannelItem // on the record and not yet granted, in order
 	closed bool
 }
 
 // NewArbiter returns the arbiter of an empty channel. For a channel with a
 // record already, Restore each of its records first.
 func NewArbiter() *Arbiter {
-	return &Arbiter{seen: map[string]bool{}, asked: map[string]bool{}}
+	return &Arbiter{seen: map[string]*seqRun{}, asked: map[string]*seqRun{}}
+}
+
+// seqRun is the set of seqs admitted from one party: a contiguous run [0, next)
+// plus any admitted above it out of order (ahead), which the run absorbs as the
+// gaps fill. Compact because in-order arrivals keep ahead empty and a lost
+// announcement opens only a brief gap.
+type seqRun struct {
+	next  uint64
+	ahead map[uint64]bool
+}
+
+func (r *seqRun) has(seq uint64) bool { return seq < r.next || r.ahead[seq] }
+
+func (r *seqRun) add(seq uint64) {
+	if r.has(seq) {
+		return
+	}
+	if seq > r.next {
+		if r.ahead == nil {
+			r.ahead = map[uint64]bool{}
+		}
+		r.ahead[seq] = true
+		return
+	}
+	for r.next = seq + 1; r.ahead[r.next]; r.next++ {
+		delete(r.ahead, r.next)
+	}
+}
+
+func admittedIn(marks map[string]*seqRun, from string, seq uint64) bool {
+	r := marks[from]
+	return r != nil && r.has(seq)
+}
+
+func markSeq(marks map[string]*seqRun, from string, seq uint64) {
+	r := marks[from]
+	if r == nil {
+		r = &seqRun{}
+		marks[from] = r
+	}
+	r.add(seq)
 }
 
 // Offer takes a record a run sent — a value, a want, a close — and returns
@@ -77,9 +124,9 @@ func (a *Arbiter) Settled(it ChannelItem) bool {
 		if a.closed {
 			return true
 		}
-		return a.asked[itemKey(it.From, it.Seq)] && !has(a.wants, it.From, it.Seq)
+		return admittedIn(a.asked, it.From, it.Seq) && !has(a.wants, it.From, it.Seq)
 	}
-	return a.seen[itemKey(it.From, it.Seq)] && !has(a.values, it.From, it.Seq)
+	return admittedIn(a.seen, it.From, it.Seq) && !has(a.values, it.From, it.Seq)
 }
 
 func has(items []ChannelItem, from string, seq uint64) bool {
@@ -100,18 +147,16 @@ func (a *Arbiter) admit(it ChannelItem) bool {
 		}
 		a.closed = true
 	case it.Want:
-		key := itemKey(it.From, it.Seq)
-		if a.asked[key] {
+		if admittedIn(a.asked, it.From, it.Seq) {
 			return false
 		}
-		a.asked[key] = true
+		markSeq(a.asked, it.From, it.Seq)
 		a.wants = append(a.wants, ChannelItem{From: it.From, Seq: it.Seq, Want: true})
 	default:
-		key := itemKey(it.From, it.Seq)
-		if a.seen[key] {
+		if admittedIn(a.seen, it.From, it.Seq) {
 			return false
 		}
-		a.seen[key] = true
+		markSeq(a.seen, it.From, it.Seq)
 		// Only the identity is kept: match, has, withoutItem and Settled read no
 		// more, and the value's bytes travel on in Offer's returned record. Storing
 		// the whole item held a wave's worth of relayed values on the coordinator.
