@@ -65,6 +65,19 @@
     cursor: pointer; font: inherit; font-size: 12px; }
   .more:hover { border-color: var(--accent); }
   .more:disabled { color: var(--muted); cursor: default; border-color: var(--border); }
+  .summary { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 4px 12px 6px;
+    border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--muted);
+    font-family: var(--mono); }
+  .summary .n { color: var(--fg); }
+  .grp-head { cursor: pointer; }
+  .grp-head:hover { background: var(--bg); }
+  .grp-head .kind { font-weight: 600; }
+  .grp-body { border-left: 2px solid var(--border); }
+  .node.child { border-left: 1px solid var(--border); padding-left: 12px; }
+  .thread-head { cursor: pointer; }
+  .thread-head .tog { color: var(--muted); font-family: var(--mono); width: 12px; }
+  .fork-link { color: #c778dd; cursor: pointer; text-decoration: none; border-bottom: 1px dotted #c778dd; }
+  .fork-link:hover { color: var(--fg); }
 </style>
 </head>
 <body>
@@ -165,33 +178,51 @@ async function selectRun(run) {
 
 function isTerminal(s) { return s === "completed" || s === "failed"; }
 
-function threadShell(t) {
-  return `<div class="thread" data-thread="${esc(t.id)}">
-    <div class="thread-head">
-      <span class="id">${esc(t.id)}</span>
-      ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
-      <span class="st">${statusEl(t.status)}</span>
-      <span class="meta"></span>
+// A thread's parent is the prefix before its last "." (main.3.1's is main.3), so
+// threads form a fork tree. Order it top-down, depth-first, roots first.
+function threadTree(infos) {
+  const byId = {}, kids = {}, roots = [];
+  for (const t of infos) byId[t.id] = t;
+  for (const t of infos) {
+    if (t.parent && byId[t.parent]) (kids[t.parent] = kids[t.parent] || []).push(t.id);
+    else roots.push(t.id);
+  }
+  const order = [];
+  const walk = (id, depth) => {
+    order.push({ id, depth, info: byId[id] });
+    for (const k of (kids[id] || []).sort()) walk(k, depth + 1);
+  };
+  for (const r of roots.sort()) walk(r, 0);
+  return order;
+}
+
+function nodeShell(n) {
+  const t = n.info;
+  return `<div class="node${n.depth ? " child" : ""}" data-thread="${esc(t.id)}" style="margin-left:${n.depth * 22}px">
+    <div class="thread">
+      <div class="thread-head">
+        <span class="tog">▾</span>
+        <span class="id">${esc(t.id)}</span>
+        ${t.fn ? `<span class="fn">${esc(t.fn)}</span>` : ""}
+        <span class="st">${statusEl(t.status)}</span>
+        <span class="meta"></span>
+      </div>
+      <div class="summary"></div>
+      <div class="body">
+        <div class="events"></div>
+        <div class="more-wrap"></div>
+      </div>
     </div>
-    <div class="events"></div>
-    <div class="more-wrap"></div>
   </div>`;
 }
 
 function threadEl(id) {
-  return $("detail").querySelector(`.thread[data-thread="${CSS.escape(id)}"]`);
-}
-
-function evRow(ev) {
-  return `<div class="ev">
-    <span class="seq">${ev.seq}</span>
-    <span class="kind ${esc(ev.kind)}">${esc(ev.kind)}</span>
-    <span class="detail">${esc(ev.detail)}${ev.error ? ` <span class="err">${esc(ev.error)}</span>` : ""}</span>
-  </div>`;
+  return $("detail").querySelector(`.node[data-thread="${CSS.escape(id)}"]`);
 }
 
 // The whole history is never held: each thread pages its events from an offset
-// cursor, and the timeline extends only as far as the reader asks.
+// cursor, forks nest as a tree, and long runs of one event kind collapse into a
+// single expandable row so a channel-heavy sweep reads as structure, not noise.
 async function buildDetail() {
   if (!selected) return;
   let detail;
@@ -201,14 +232,40 @@ async function buildDetail() {
     $("detail").innerHTML = `<p class="hint">Could not load ${esc(selected)}: ${esc(e.message)}</p>`;
     return;
   }
-  const ts = detail.threads || [];
-  threads = ts.map(t => t.id);
-  $("detail").innerHTML = `<h2 class="mono" style="margin:0 0 14px">${esc(detail.run)}</h2>` + ts.map(threadShell).join("");
-  for (const t of ts) {
-    cursor[t.id] = { next: 0, done: false, terminal: isTerminal(t.status), loaded: 0, loading: false, attempts: t.attempts };
+  const infos = detail.threads || [];
+  threads = infos.map(t => t.id);
+  const order = threadTree(infos);
+  $("detail").innerHTML = `<h2 class="mono" style="margin:0 0 14px">${esc(detail.run)}</h2>` + order.map(nodeShell).join("");
+  for (const n of order) {
+    const t = n.info;
+    cursor[t.id] = { next: 0, done: false, terminal: isTerminal(t.status), loaded: 0, loading: false,
+      attempts: t.attempts, events: [], expanded: new Set(), open: n.depth === 0 };
+    wireNode(t.id);
+    applyOpen(t.id);
     setMore(t.id);
-    await loadMore(t.id);
+    if (cursor[t.id].open) await loadMore(t.id);
   }
+}
+
+function wireNode(id) {
+  const el = threadEl(id);
+  if (!el) return;
+  el.querySelector(".thread-head").onclick = async () => {
+    const c = cursor[id];
+    c.open = !c.open;
+    applyOpen(id);
+    if (c.open && c.loaded === 0 && !c.done) await loadMore(id);
+  };
+}
+
+function applyOpen(id) {
+  const el = threadEl(id);
+  if (!el) return;
+  const c = cursor[id];
+  const body = el.querySelector(".body");
+  if (body) body.hidden = !c.open;
+  const tog = el.querySelector(".tog");
+  if (tog) tog.textContent = c.open ? "▾" : "▸";
 }
 
 async function loadMore(id) {
@@ -218,11 +275,83 @@ async function loadMore(id) {
   try {
     const page = await getJSON(`api/runs/${encodeURIComponent(selected)}/threads/${encodeURIComponent(id)}?from=${c.next}&limit=${PAGE}`);
     const evs = page.events || [];
-    const el = threadEl(id);
-    if (el && evs.length) el.querySelector(".events").insertAdjacentHTML("beforeend", evs.map(evRow).join(""));
+    for (const ev of evs) c.events.push(ev);
     c.next = page.next; c.done = page.done; c.loaded += evs.length;
+    renderEvents(id);
   } catch (e) { /* transient */ }
   finally { c.loading = false; setMore(id); }
+}
+
+function chanOf(ev) {
+  if (ev.kind === "send" || ev.kind === "recv") {
+    const m = /^(?:close\s+)?([^\s#]+)/.exec(ev.detail || "");
+    return m ? m[1] : "";
+  }
+  return "";
+}
+
+function evRow(ev) {
+  let detail = esc(ev.detail);
+  if (ev.kind === "fork") {
+    const child = (ev.detail || "").split(" ")[0];
+    detail = `<a class="fork-link" data-to="${esc(child)}">${esc(ev.detail)}</a>`;
+  }
+  return `<div class="ev">
+    <span class="seq">${ev.seq}</span>
+    <span class="kind ${esc(ev.kind)}">${esc(ev.kind)}</span>
+    <span class="detail">${detail}${ev.error ? ` <span class="err">${esc(ev.error)}</span>` : ""}</span>
+  </div>`;
+}
+
+// Consecutive events of one kind on one channel collapse into an expandable
+// group; an event with an error stays its own row so a failure is never hidden.
+function renderEvents(id) {
+  const el = threadEl(id);
+  if (!el) return;
+  const c = cursor[id];
+  const groups = [];
+  for (const ev of c.events) {
+    const key = ev.kind + "|" + chanOf(ev);
+    const last = groups[groups.length - 1];
+    if (last && last.key === key && !ev.error && !last.items[0].error) last.items.push(ev);
+    else groups.push({ key, kind: ev.kind, chan: chanOf(ev), gid: key + "|" + ev.seq, items: [ev] });
+  }
+  const cont = el.querySelector(".events");
+  cont.innerHTML = groups.map(g => {
+    if (g.items.length === 1) return evRow(g.items[0]);
+    const first = g.items[0], last = g.items[g.items.length - 1];
+    const open = c.expanded.has(g.gid);
+    const label = `${esc(g.kind)}${g.chan ? " " + esc(g.chan) : ""} ×${g.items.length}`;
+    return `<div class="grp" data-gid="${esc(g.gid)}">
+      <div class="ev grp-head">
+        <span class="seq">${first.seq}–${last.seq}</span>
+        <span class="kind ${esc(g.kind)}">${open ? "▾" : "▸"} ${label}</span>
+        <span class="detail hint">${esc(first.detail)} … ${esc(last.detail)}</span>
+      </div>
+      <div class="grp-body"${open ? "" : " hidden"}>${g.items.map(evRow).join("")}</div>
+    </div>`;
+  }).join("");
+  for (const gh of cont.querySelectorAll(".grp-head")) {
+    gh.onclick = () => {
+      const gid = gh.parentElement.dataset.gid;
+      if (c.expanded.has(gid)) c.expanded.delete(gid); else c.expanded.add(gid);
+      renderEvents(id);
+    };
+  }
+  for (const a of cont.querySelectorAll(".fork-link")) {
+    a.onclick = async () => {
+      const to = a.dataset.to, cc = cursor[to], tel = threadEl(to);
+      if (cc && !cc.open) { cc.open = true; applyOpen(to); if (cc.loaded === 0 && !cc.done) await loadMore(to); }
+      if (tel) tel.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+  }
+  const sum = el.querySelector(".summary");
+  if (sum) {
+    const counts = {};
+    for (const ev of c.events) counts[ev.kind] = (counts[ev.kind] || 0) + 1;
+    const parts = Object.keys(counts).sort().map(k => `${esc(k)} <span class="n">${counts[k]}</span>`);
+    sum.innerHTML = parts.length ? parts.join(" · ") + (c.done ? "" : " · …") : (c.done ? '<span class="hint">no events</span>' : "");
+  }
 }
 
 function setMore(id) {
@@ -230,32 +359,29 @@ function setMore(id) {
   if (!el) return;
   const c = cursor[id];
   const meta = el.querySelector(".meta");
-  if (meta) meta.textContent = `${c.loaded} events${c.done ? "" : "+"}${c.attempts > 1 ? " · attempt " + c.attempts : ""}`;
+  if (meta) meta.textContent = `${c.loaded}${c.done ? "" : "+"} events${c.attempts > 1 ? " · attempt " + c.attempts : ""}`;
   const wrap = el.querySelector(".more-wrap");
   if (!wrap) return;
-  if (c.done && c.terminal) {
-    wrap.innerHTML = c.loaded === 0 ? `<div class="ev"><span class="seq"></span><span></span><span class="hint">no events</span></div>` : "";
-    return;
-  }
+  if (c.done && c.terminal) { wrap.innerHTML = ""; return; }
   wrap.innerHTML = `<button class="more">${c.done ? "Load newer" : "Load more"}</button>`;
   wrap.querySelector("button").onclick = () => loadMore(id);
 }
 
-// A tick updates the selected run's thread statuses without re-reading the events
-// already loaded; it rebuilds only when the thread set itself changed (a fork).
+// A tick updates the selected run's thread statuses without re-reading loaded
+// events; it rebuilds only when the thread set itself changed (a new fork).
 async function refreshHeads() {
   if (!selected) return;
   let detail;
   try {
     detail = await getJSON("api/runs/" + encodeURIComponent(selected));
   } catch (e) { return; }
-  const ts = detail.threads || [];
-  const ids = ts.map(t => t.id);
+  const infos = detail.threads || [];
+  const ids = infos.map(t => t.id);
   if (ids.length !== threads.length || ids.some((v, i) => v !== threads[i])) {
     await buildDetail();
     return;
   }
-  for (const t of ts) {
+  for (const t of infos) {
     const el = threadEl(t.id);
     if (!el) continue;
     const st = el.querySelector(".st");
