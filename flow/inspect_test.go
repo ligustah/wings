@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 	"testing"
+
+	"github.com/ligustah/wings/flow/protos"
 )
 
 func TestParseThreadStream(t *testing.T) {
@@ -88,6 +90,78 @@ func TestInspectDecodesRunHistory(t *testing.T) {
 	}
 	if !hasEvent(main, "fork") {
 		t.Fatalf("main missing a fork event: %+v", main.Events)
+	}
+}
+
+// THE POINT: Status is the last RunEnd's status, or "running" when a thread has
+// not ended (or was never recorded).
+func TestStatusIsTheLastRunEnd(t *testing.T) {
+	store := NewMemStore()
+	ctx := context.Background()
+	if err := Run(ctx, "done", func(c Context) error { return nil }, WithStore(store)); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if s, err := Status(ctx, store, "done", "main"); err != nil {
+		t.Fatalf("status: %v", err)
+	} else if s != "completed" {
+		t.Fatalf("status = %q, want completed", s)
+	}
+	if s, err := Status(ctx, store, "never", "main"); err != nil {
+		t.Fatalf("status: %v", err)
+	} else if s != "running" {
+		t.Fatalf("status of an unrecorded run = %q, want running", s)
+	}
+}
+
+// countingStore counts how many events a read hands back, split by path, so a
+// test can prove Status reads the tail and not the whole history.
+type countingStore struct {
+	Store
+	whole int
+	tail  int
+}
+
+func (c *countingStore) Events(ctx context.Context, run, thread string) ([]*protos.Event, error) {
+	evs, err := c.Store.Events(ctx, run, thread)
+	c.whole += len(evs)
+	return evs, err
+}
+
+func (c *countingStore) Tail(ctx context.Context, run, thread string, n int) ([]EventAt, error) {
+	evs, err := c.Store.(Tailer).Tail(ctx, run, thread, n)
+	c.tail += len(evs)
+	return evs, err
+}
+
+// THE POINT: a run list reads each run's status from the tail, not by decoding
+// its whole main thread — the inspector's -inspect run list otherwise held a
+// wave's decisions in RAM per run just to print its status (the write-up's #7).
+func TestStatusDoesNotReadTheWholeHistory(t *testing.T) {
+	mem := NewMemStore()
+	ctx := context.Background()
+	const n = 500
+	err := Run(ctx, "big", func(c Context) error {
+		for i := 0; i < n; i++ {
+			if _, err := c.Effect(func() ([]byte, error) { return []byte{byte(i)}, nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, WithStore(mem))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	cs := &countingStore{Store: mem}
+	if s, err := Status(ctx, cs, "big", "main"); err != nil {
+		t.Fatalf("status: %v", err)
+	} else if s != "completed" {
+		t.Fatalf("status = %q, want completed", s)
+	}
+	if cs.whole != 0 {
+		t.Fatalf("Status decoded %d events via the whole-history path; it should read the tail", cs.whole)
+	}
+	if cs.tail > statusWindow {
+		t.Fatalf("Status read %d events from the tail, want <= %d", cs.tail, statusWindow)
 	}
 }
 

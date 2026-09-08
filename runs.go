@@ -42,8 +42,8 @@ func (a runAPI) handleRuns(w http.ResponseWriter, r *http.Request) {
 	out := make([]runView, 0, len(names))
 	for _, name := range names {
 		v := runView{Run: name, Status: "running"}
-		if snap, err := flow.Inspect(r.Context(), store, name, []string{"main"}); err == nil && len(snap.Threads) > 0 {
-			v.Status = snap.Threads[0].Status
+		if status, err := flow.Status(r.Context(), store, name, "main"); err == nil {
+			v.Status = status
 		}
 		out = append(out, v)
 	}

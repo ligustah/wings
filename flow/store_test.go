@@ -134,6 +134,38 @@ func TestStoredHistoryIsReadableAsEvents(t *testing.T) {
 	}
 }
 
+// THE POINT: over a real durable stream, Status reads a run's status from the
+// tail (streamStore.Tail via the stream's committed tail offset), so a run list
+// need not decode each run's whole history.
+func TestStatusReadsFromADurableTail(t *testing.T) {
+	client, _ := streams(t, filepath.Join(t.TempDir(), "engine"))
+	store := flow.NewStore(client)
+	name := flow.NewName()
+
+	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
+		for i := 0; i < 200; i++ {
+			if _, err := ctx.Effect(func() ([]byte, error) { return []byte{byte(i)}, nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, flow.WithStore(store))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if s, err := flow.Status(context.Background(), store, name, "main"); err != nil {
+		t.Fatalf("Status: %v", err)
+	} else if s != "completed" {
+		t.Fatalf("status = %q, want completed", s)
+	}
+	if s, err := flow.Status(context.Background(), store, flow.NewName(), "main"); err != nil {
+		t.Fatalf("Status of an unrecorded run: %v", err)
+	} else if s != "running" {
+		t.Fatalf("status of an unrecorded run = %q, want running", s)
+	}
+}
+
 // Two runs must not read each other's history, or a replay would resume
 // somebody else's run.
 func TestRunsAreIsolated(t *testing.T) {

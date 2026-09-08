@@ -149,6 +149,43 @@ func (s *streamStore) Read(ctx context.Context, run, thread string, offset int64
 	return out, nil
 }
 
+func (s *streamStore) Tail(ctx context.Context, run, thread string, n int) ([]EventAt, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	name := streamName(run, thread)
+	st, err := s.open(ctx, name, false)
+	if err != nil || st == nil {
+		return nil, err
+	}
+	info, err := st.Info(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("flow: info %s: %w", name, err)
+	}
+	if info.NewestCommitted < 0 {
+		return nil, nil
+	}
+	from := info.NewestCommitted - int64(n) + 1
+	if from < 0 {
+		from = 0
+	}
+	var out []EventAt
+	for from <= info.NewestCommitted {
+		recs, err := st.Read(ctx, from, n)
+		if err != nil {
+			return nil, fmt.Errorf("flow: read %s at %d: %w", name, from, err)
+		}
+		if len(recs) == 0 {
+			break
+		}
+		for _, r := range recs {
+			out = append(out, EventAt{Event: r.Record, Offset: r.Offset})
+			from = r.Offset + 1
+		}
+	}
+	return out, nil
+}
+
 func (s *streamStore) Events(ctx context.Context, run, thread string) ([]*protos.Event, error) {
 	var out []*protos.Event
 	for from := int64(0); ; {
@@ -239,6 +276,24 @@ func (m *MemStore) Read(ctx context.Context, run, thread string, offset int64, n
 	var out []EventAt
 	for i := offset; i < int64(len(evs)) && len(out) < n; i++ {
 		out = append(out, EventAt{Event: evs[i], Offset: i})
+	}
+	return out, nil
+}
+
+func (m *MemStore) Tail(ctx context.Context, run, thread string, n int) ([]EventAt, error) {
+	m.mu.Lock()
+	evs := m.events[run][thread]
+	m.mu.Unlock()
+	if n <= 0 || len(evs) == 0 {
+		return nil, nil
+	}
+	from := len(evs) - n
+	if from < 0 {
+		from = 0
+	}
+	out := make([]EventAt, 0, len(evs)-from)
+	for i := from; i < len(evs); i++ {
+		out = append(out, EventAt{Event: evs[i], Offset: int64(i)})
 	}
 	return out, nil
 }

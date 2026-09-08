@@ -54,6 +54,58 @@ type Lister interface {
 	ListThreads(ctx context.Context, run string) ([]string, error)
 }
 
+// Tailer is an optional [Store] capability: reading a thread's most recent
+// events without decoding its whole history. A status that lives at the tail —
+// the last RunEnd — is then cheap to read for every run in a list.
+type Tailer interface {
+	// Tail returns up to the last n events of a thread, oldest first, each with
+	// its offset. Fewer than n (including none) means the history is shorter.
+	Tail(ctx context.Context, run, thread string, n int) ([]EventAt, error)
+}
+
+// statusWindow is how many events from the tail Status reads to find the last
+// RunEnd. A thread's terminal or suspended RunEnd is its last recorded event
+// (nothing is appended after it until the next attempt's RunStart), so a small
+// window catches it; a running thread has none and reads as running.
+const statusWindow = 8
+
+// Status reports a thread's current status — the status of its last RunEnd, or
+// "running" if it has not ended — reading only the tail when store is a [Tailer]
+// and the whole history otherwise. For a run list that needs each run's status
+// but not its events.
+func Status(ctx context.Context, store Store, run, thread string) (string, error) {
+	if t, ok := store.(Tailer); ok {
+		tail, err := t.Tail(ctx, run, thread, statusWindow)
+		if err != nil {
+			return "", fmt.Errorf("flow: tail thread %s of run %s: %w", thread, run, err)
+		}
+		events := make([]*protos.Event, len(tail))
+		for i, e := range tail {
+			events[i] = e.Event
+		}
+		return statusFromEvents(events), nil
+	}
+	events, err := store.Events(ctx, run, thread)
+	if err != nil {
+		return "", fmt.Errorf("flow: read thread %s of run %s: %w", thread, run, err)
+	}
+	return statusFromEvents(events), nil
+}
+
+// statusFromEvents returns the status the last RunEnd names, or "running" when
+// none is present, matching how [threadView] decides a thread's status.
+func statusFromEvents(events []*protos.Event) string {
+	status := "running"
+	for _, ev := range events {
+		if end := ev.GetRunEnd(); end != nil {
+			if s := statusName(end.GetStatus()); s != "" {
+				status = s
+			}
+		}
+	}
+	return status
+}
+
 // ListRuns names the runs with recorded history in store, which must implement
 // [Lister].
 func ListRuns(ctx context.Context, store Store) ([]string, error) {
