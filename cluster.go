@@ -909,6 +909,14 @@ func (c *Cluster) forgetRun(run string) {
 			delete(c.ranAs, key)
 		}
 	}
+	// A run's own shared-channel outboxes (wings.chanout.<run>.0.<id>) are the
+	// coordinator's, not a placed job's, so the per-job settle path never
+	// finalizes them and they were tailed for the cluster's life. The run is over
+	// now — everything it sent is merged into the canonical streams — so mark them
+	// final and let the relay drop them. The canonical streams stay for a resume.
+	if !c.closed && c.hadOutbox(streamPart(run)) {
+		c.wg.Go(func() { c.finishChannels(run, nil) })
+	}
 }
 
 // settle publishes a job's outcome to everyone waiting on it, exactly once.

@@ -75,8 +75,9 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 		t.Fatalf("shared client: %v", err)
 	}
 
-	// The two forked jobs' outboxes are dropped; only the workflow's own export
-	// outbox may remain. The canonical stream must survive.
+	// Every outbox is dropped once the run settles: the two forked jobs' by the
+	// per-job settle path, and the workflow's own export outbox by forgetRun once
+	// the run completes. The canonical stream must survive for a resume.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		names, err := client.ListStreams(t.Context())
@@ -92,14 +93,14 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 				canonical++
 			}
 		}
-		if outboxes <= 1 {
+		if outboxes == 0 {
 			if canonical == 0 {
 				t.Fatal("the canonical channel stream was dropped; a resume could not replay")
 			}
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d channel outboxes still present after settle; the forked jobs' were not dropped", outboxes)
+			t.Fatalf("%d channel outboxes still present after the run settled; they were not all dropped", outboxes)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
