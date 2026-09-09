@@ -884,6 +884,14 @@ func (c *Cluster) forget(p *pendingJob) {
 			c.finishChannels(job, w)
 		})
 	}
+	// The activity has returned, so the channels it created hold nothing a replay
+	// needs — its result is recorded, and replay re-inserts it rather than running
+	// the activity again. Retire them mid-run, so a long run of short activities
+	// does not accumulate their channel data. Dropped as their last feeder leaves.
+	if !c.closed && p.origin.Run != "" && p.origin.Thread != "" {
+		run, thread := p.origin.Run, p.origin.Thread
+		c.wg.Go(func() { c.retireThreadChannels(run, thread) })
+	}
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
 			delete(c.byOrigin, key)

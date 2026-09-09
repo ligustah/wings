@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -424,8 +425,55 @@ func (c *Cluster) retireRunChannels(run string) {
 	}
 }
 
+// createdByThread reports whether canonical is the stream of a channel that
+// thread created. A channel's id is "<run>/<thread>.ch<n>", so its stream name
+// is the thread's channel prefix followed by the digits of n — and a sub-thread's
+// channel ("<thread>.<k>.ch<n>") has a digit, not "ch", after the prefix, so it
+// does not match its parent.
+func createdByThread(canonical, run, thread string) bool {
+	prefix := chanPrefix + streamPart(run) + "_" + streamPart(thread) + "_ch"
+	rest, ok := strings.CutPrefix(canonical, prefix)
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// retireThreadChannels marks the channels a completed activity created for
+// retirement: the activity has returned, so its result is recorded and its
+// channels' data is dead (replay re-inserts the result rather than re-entering
+// the activity). They are dropped as their last feeding outbox goes (dropOutbox),
+// so a channel still shared with a live sibling waits for it. Called when a job
+// settles, for the thread the job ran.
+func (c *Cluster) retireThreadChannels(run, thread string) {
+	r := c.relay
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	var drop []string
+	for canonical := range r.canonByRun[run] {
+		if !createdByThread(canonical, run, thread) {
+			continue
+		}
+		r.doneCanon[canonical] = true
+		if r.feeders[canonical] == 0 {
+			drop = append(drop, canonical)
+		}
+	}
+	r.mu.Unlock()
+	for _, canonical := range drop {
+		c.dropCanonical(canonical)
+	}
+}
+
 // dropCanonical deletes one canonical stream and forgets the relay's state for
-// it. Called when the channel's run has finished and its last outbox is gone.
+// it. Called when the channel's activity has finished and its last outbox is gone.
 func (c *Cluster) dropCanonical(canonical string) {
 	client, err := c.sharedClient()
 	if err != nil {

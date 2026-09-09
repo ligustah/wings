@@ -3,6 +3,7 @@ package wings
 import (
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,6 +118,92 @@ var fanSum = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
 	}
 	return consumer.Await(ctx)
 }, flow.WithName("test.fanSum"))
+
+// reclaimHold gates a workflow open after a forked activity has finished, so a
+// test can observe that activity's channel being reclaimed before the run ends.
+var reclaimHold struct{ release chan struct{} }
+
+var heldOpen = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
+	select {
+	case <-reclaimHold.release:
+	case <-ctx.Done():
+	}
+	return 0, nil
+}, flow.WithName("test.heldOpen"))
+
+// THE POINT: a channel is reclaimed when the activity that created it returns,
+// not only when the whole run ends — so a long run of short activities does not
+// accumulate their channel data. fanSum creates and drains a channel and
+// returns; its stream is gone while the run is still held open on another thread.
+func TestAnActivitysChannelIsReclaimedWhenItReturns(t *testing.T) {
+	reclaimHold.release = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(reclaimHold.release) }) }
+	t.Cleanup(release)
+
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4})
+
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatalf("shared client: %v", err)
+	}
+
+	var got int
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			var err error
+			if got, err = ctx.Go(fanSum, struct{}{}).Await(ctx); err != nil {
+				return err
+			}
+			// Hold the run open: fanSum has returned and its channel should be
+			// reclaimed while this waits.
+			_, err = ctx.Go(heldOpen, struct{}{}).Await(ctx)
+			return err
+		})
+	}()
+
+	canonicals := func() int {
+		names, err := client.ListStreams(t.Context())
+		if err != nil {
+			t.Fatalf("list streams: %v", err)
+		}
+		n := 0
+		for _, s := range names {
+			if strings.HasPrefix(s, chanPrefix) {
+				n++
+			}
+		}
+		return n
+	}
+
+	// fanSum's channel stream should be reclaimed while the run is still held open
+	// on heldOpen — proof the reclamation is per-activity, not only per-run.
+	deadline := time.Now().Add(30 * time.Second)
+	reclaimed := false
+	for time.Now().Before(deadline) {
+		if canonicals() == 0 {
+			reclaimed = true
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("run finished before the channel was seen reclaimed mid-run: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if !reclaimed {
+		t.Fatalf("fanSum's channel stream was not reclaimed while the run was still open")
+	}
+
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("fanSum returned %d, want 15", got)
+	}
+}
 
 // THE POINT: a channel a worker created (not the coordinator) is attributed to
 // its run through the job that owns it, so the run's completion reclaims its
