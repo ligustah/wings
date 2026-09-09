@@ -477,6 +477,12 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 		return
 	}
 	ctx := context.WithoutCancel(c.ctx)
+	// Let the coordinator's copy of the kept attempt catch up before deleting any
+	// of the job's streams on its worker: deleting one mid-transaction fails the
+	// pull for the whole worker, which would strand other jobs' output on it. The
+	// kept attempt's worker is the one still pulling; abandoned ones are drained or
+	// dead. (reclaimChannelData drains the same way.)
+	c.drainOutputs(ctx, writers[keep], job)
 	names, err := client.ListStreams(ctx)
 	if err != nil {
 		c.log.Warn("wings: could not look for abandoned output", "job", job, "err", err)

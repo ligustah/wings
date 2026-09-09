@@ -132,10 +132,7 @@ func TestAMovedReceiverReplaysItsRecordedValues(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")
 	}
-	// RetainHistory so the moved attempt's kept history is not dropped on settle:
-	// that drop racing the coordinator's pull is an unrelated, pre-existing stall,
-	// and this test is about replaying the received values, not history cleanup.
-	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 2, RetainHistory: true})
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 2})
 
 	var got int
 	done := make(chan error, 1)
