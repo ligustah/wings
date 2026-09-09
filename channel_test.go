@@ -106,6 +106,73 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 	}
 }
 
+// sumsSlow receives everything on its channel and returns the total, pausing
+// between receives so its worker can be killed while it is partway through —
+// leaving some receives recorded and the rest still to come.
+var sumsSlow = flow.Define(func(ctx flow.Context, in feed) (int, error) {
+	total := 0
+	for {
+		v, ok, err := in.Values.Recv(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return total, nil
+		}
+		total += v
+		time.Sleep(300 * time.Millisecond)
+	}
+}, flow.WithName("test.sumsSlow"))
+
+// THE POINT: received values live on a side stream apart from the history, and a
+// job that moves carries both — so a receiver killed partway through replays the
+// receives it had recorded by reading their values back from the side stream
+// hydrated onto the new worker, then takes the rest from the channel.
+func TestAMovedReceiverReplaysItsRecordedValues(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 2})
+
+	var got int
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			ch := ctx.NewChannel[int]()
+			producer := ctx.Go(counts, feed{Values: ch, Count: 5})
+			consumer := ctx.Go(sumsSlow, feed{Values: ch})
+			if _, err := producer.Await(ctx); err != nil {
+				return err
+			}
+			var err error
+			got, err = consumer.Await(ctx)
+			return err
+		})
+	}()
+
+	// Let the receiver record a couple of values, then kill the worker it is on.
+	time.Sleep(700 * time.Millisecond)
+	victim := firstWorker(t, c)
+	if victim.proc == nil {
+		t.Fatal("expected a local worker with a process to kill")
+	}
+	if err := victim.proc.Kill(); err != nil {
+		t.Fatalf("kill worker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the run never finished after the receiver's worker was killed; its recorded values were not replayed")
+	}
+	if got != 15 {
+		t.Fatalf("the moved receiver summed %d, want 15; a replay read the wrong values back", got)
+	}
+}
+
 // fanSum creates a channel of its own, hands it to a producer and a consumer it
 // forks, and returns the total. The channel is created on the worker running
 // fanSum, not the coordinator — a worker-created shared channel.

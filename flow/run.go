@@ -209,7 +209,7 @@ type threadRunner struct {
 func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	store := r.opts.store
 
-	history, offsets, err := r.load(ctx, store)
+	history, offsets, valueIdx, err := r.load(ctx, store)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +257,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	for {
 		attempt++
 
-		out, status, runErr := r.attempt(ctx, history, offsets, attempt, sink)
+		out, status, runErr := r.attempt(ctx, history, offsets, valueIdx, attempt, sink)
 
 		if r.readonly {
 			// One pass over the history is all a replay is.
@@ -296,7 +296,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 		}
 
 		// The next attempt replays everything recorded so far.
-		if history, offsets, err = r.load(ctx, store); err != nil {
+		if history, offsets, valueIdx, err = r.load(ctx, store); err != nil {
 			return nil, err
 		}
 	}
@@ -310,18 +310,28 @@ const loadBatch = 512
 // load reads the thread's history, dropping the big channel values so the replay
 // slice holds only metadata; each value is read back from its offset when replay
 // reaches it. The returned offsets align with the returned events.
-func (r *threadRunner) load(ctx context.Context, store Store) ([]*protos.Event, []int64, error) {
+func (r *threadRunner) load(ctx context.Context, store Store) ([]*protos.Event, []int64, []int64, error) {
 	var events []*protos.Event
-	var offsets []int64
+	var offsets, valueIdx []int64
+	var moved int64
 	for from := int64(0); ; {
 		batch, err := store.Read(ctx, r.name, r.id, from, loadBatch)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if len(batch) == 0 {
-			return events, offsets, nil
+			return events, offsets, valueIdx, nil
 		}
 		for _, ea := range batch {
+			// Decided from the raw event, before stripValue nils it: a non-closed
+			// receive with no inline value had its value moved to the side stream,
+			// and takes the next index there.
+			if rv := ea.Event.GetChannelRecv(); rv != nil && !rv.GetClosed() && rv.GetValue() == nil {
+				valueIdx = append(valueIdx, moved)
+				moved++
+			} else {
+				valueIdx = append(valueIdx, -1)
+			}
 			events = append(events, strippedEvent(ea.Event))
 			offsets = append(offsets, ea.Offset)
 			from = ea.Offset + 1
@@ -360,7 +370,7 @@ func (r *threadRunner) describe() string {
 
 // attempt runs the body once over the given history and returns what it produced
 // and what became of it.
-func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, offsets []int64, attempt uint64, sink Sink) ([]byte, protos.WorkflowStatus, error) {
+func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, offsets, valueIdx []int64, attempt uint64, sink Sink) ([]byte, protos.WorkflowStatus, error) {
 	run := r.run
 	if run == nil {
 		run = newRunState(r.name, r.opts)
@@ -371,13 +381,14 @@ func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, off
 		defer run.finish()
 		defer cancel()
 	}
-	events, evOffsets := replayable(history, offsets)
+	events, evOffsets, evValueIdx := replayable(history, offsets, valueIdx)
 	t := &threadState{
 		id:       r.id,
 		attempt:  attempt,
 		run:      run,
 		events:   events,
 		offsets:  evOffsets,
+		valueIdx: evValueIdx,
 		sink:     sink,
 		readonly: r.readonly,
 		ctx:      ctx,
@@ -587,16 +598,19 @@ func isMarker(ev *protos.Event) bool {
 // replayable is a thread's history without its attempt markers, with the stream
 // offset of each event kept alongside so a value dropped at load can be read
 // back. The two slices stay aligned.
-func replayable(history []*protos.Event, offsets []int64) ([]*protos.Event, []int64) {
+// replayable drops the markers, leaving the events replay consumes with their
+// offsets and value indices (see [threadRunner.load]), all three kept aligned.
+func replayable(history []*protos.Event, offsets, valueIdx []int64) ([]*protos.Event, []int64, []int64) {
 	var evs []*protos.Event
-	var offs []int64
+	var offs, vidx []int64
 	for i, ev := range history {
 		if !isMarker(ev) {
 			evs = append(evs, ev)
 			offs = append(offs, offsets[i])
+			vidx = append(vidx, valueIdx[i])
 		}
 	}
-	return evs, offs
+	return evs, offs, vidx
 }
 
 // finished reports the terminal outcome of a thread, if it reached one.

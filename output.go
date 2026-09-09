@@ -72,7 +72,7 @@ func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 
 // parseOutput takes a stream name apart and reports whether it is one of ours.
 func parseOutput(stream string) (outputName, bool) {
-	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
+	for _, prefix := range []string{recordingPrefix, historyPrefix, valuesPrefix, priorPrefix, chanoutPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {
 			continue
@@ -327,6 +327,48 @@ func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnve
 		StopWhenCaughtUp: true,
 		Batch:            recordBatch,
 	})
+}
+
+// hydrateValues copies a job's last attempt's value streams — one per thread —
+// onto the worker about to run the next attempt, under that attempt's names, so
+// the replay reads back the values its history names. A thread that received
+// nothing has no stream and is skipped.
+func (c *Cluster) hydrateValues(ctx context.Context, w *workerConn, job jobEnvelope) error {
+	client, err := c.sharedClient()
+	if err != nil {
+		return err
+	}
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		return fmt.Errorf("wings: look for the value streams of job %s: %w", job.ID, err)
+	}
+	prior := -1
+	for _, name := range names {
+		if o, ok := parseOutput(name); ok && o.Prefix == valuesPrefix && o.Job == streamPart(job.ID) && o.Attempt < job.Attempt && o.Attempt > prior {
+			prior = o.Attempt
+		}
+	}
+	if prior < 0 {
+		return nil
+	}
+	for _, name := range names {
+		o, ok := parseOutput(name)
+		if !ok || o.Prefix != valuesPrefix || o.Job != streamPart(job.ID) || o.Attempt != prior {
+			continue
+		}
+		dest := valuesName(job.ID, job.Attempt, o.Name)
+		if err := w.client.RunMirror(ctx, "wings.hydrate."+dest, dsclient.MirrorSpec{
+			From:             client,
+			Source:           name,
+			Dest:             dest,
+			Create:           true,
+			StopWhenCaughtUp: true,
+			Batch:            recordBatch,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lastHistory is the coordinator's copy of a job's last history from an attempt

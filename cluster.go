@@ -1130,6 +1130,12 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 			c.log.Warn("wings: could not give a retry its predecessor's history",
 				"job", job.ID, "worker", w.id, "err", err)
 		}
+		if err := c.hydrateValues(c.ctx, w, job); err != nil {
+			// A retry without its received values cannot replay the receives its
+			// history names; it fails and the next attempt is tried elsewhere.
+			c.log.Warn("wings: could not give a retry its predecessor's received values",
+				"job", job.ID, "worker", w.id, "err", err)
+		}
 		if err := c.hydrateLineage(c.ctx, w, job); err != nil {
 			// Not the same trade: a thread of run code without its ancestors
 			// cannot run at all, so the attempt fails and the next is tried elsewhere.

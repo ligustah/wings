@@ -18,6 +18,15 @@ type Sink interface {
 	Append(ctx context.Context, ev *protos.Event) error
 }
 
+// ValueReader is an optional [Store] capability: reading back the channel
+// receive values a store moved off the event stream onto a side stream, so the
+// event itself keeps only metadata. A store that records values inline in the
+// event does not implement it. index counts a thread's moved values in record
+// order from zero; a read returns up to n of them, oldest first.
+type ValueReader interface {
+	ReadValues(ctx context.Context, run, thread string, index int64, n int) ([][]byte, error)
+}
+
 // EventAt pairs an event with its offset on a thread's stream, so a value
 // dropped when the history was loaded can be read back by offset later.
 type EventAt struct {

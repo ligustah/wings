@@ -119,11 +119,18 @@ type threadState struct {
 	// prefix (nothing this attempt records is added to either).
 	events  []*protos.Event
 	offsets []int64
+	// valueIdx aligns with events: for a receive whose value lives on the side
+	// stream it is that value's index there; -1 otherwise (a receive that kept
+	// its value inline in the event, or a non-receive). See [replayable].
+	valueIdx []int64
 	// values caches received values read ahead of the cursor by offset, so a
 	// resume does not reopen and reread the stream once per receive. Filled and
 	// drained only by this thread's own replay goroutine, so it needs no lock.
 	values map[int64][]byte
-	serial uint64
+	// sideValues is the same cache for values read from the side stream, keyed by
+	// their index there rather than by a stream offset.
+	sideValues map[int64][]byte
+	serial     uint64
 
 	sink    Sink
 	sinkErr error // the first persistence failure, if any
@@ -255,7 +262,15 @@ const valuePrefetch = 64
 func (t *threadState) recordedValue(ctx context.Context, pos uint64) ([]byte, error) {
 	t.run.mu.Lock()
 	off := t.offsets[pos]
+	idx := int64(-1)
+	if pos < uint64(len(t.valueIdx)) {
+		idx = t.valueIdx[pos]
+	}
 	t.run.mu.Unlock()
+
+	if idx >= 0 {
+		return t.sideValue(ctx, idx)
+	}
 
 	if data, ok := t.values[off]; ok {
 		delete(t.values, off)
@@ -287,6 +302,35 @@ func (t *threadState) recordedValue(ctx context.Context, pos uint64) ([]byte, er
 		return nil, fmt.Errorf("flow: the recorded value at offset %d of thread %q is gone", off, t.id)
 	}
 	return found, nil
+}
+
+// sideValue reads a received value off the side stream by its index there, the
+// value having been moved off the event stream at record time (see
+// [ValueReader]). Values ahead of idx are cached, so a run of receives reads the
+// side stream in windows rather than once per receive.
+func (t *threadState) sideValue(ctx context.Context, idx int64) ([]byte, error) {
+	if data, ok := t.sideValues[idx]; ok {
+		delete(t.sideValues, idx)
+		return data, nil
+	}
+	reader, ok := t.run.store.(ValueReader)
+	if !ok {
+		return nil, fmt.Errorf("flow: thread %q has a value on a side stream but its store cannot read one back", t.id)
+	}
+	values, err := reader.ReadValues(ctx, t.run.name, t.id, idx, valuePrefetch)
+	if err != nil {
+		return nil, err
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("flow: the recorded value at index %d of thread %q is gone", idx, t.id)
+	}
+	for i, v := range values[1:] {
+		if t.sideValues == nil {
+			t.sideValues = map[int64][]byte{}
+		}
+		t.sideValues[idx+1+int64(i)] = v
+	}
+	return values[0], nil
 }
 
 // record appends an event to this thread and hands it to the sink. A sink
