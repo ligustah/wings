@@ -416,18 +416,13 @@ func (c *Cluster) retireRunChannels(run string) {
 		return
 	}
 	r.mu.Lock()
-	var drop []string
+	cs := make([]string, 0, len(r.canonByRun[run]))
 	for canonical := range r.canonByRun[run] {
-		r.doneCanon[canonical] = true
-		if r.feeders[canonical] == 0 {
-			drop = append(drop, canonical)
-		}
+		cs = append(cs, canonical)
 	}
 	delete(r.canonByRun, run)
 	r.mu.Unlock()
-	for _, canonical := range drop {
-		c.dropCanonical(canonical)
-	}
+	c.retireCanonicals(cs)
 }
 
 // createdByThread reports whether canonical is the stream of a channel that
@@ -449,40 +444,31 @@ func createdByThread(canonical, run, thread string) bool {
 	return true
 }
 
-// retireThreadChannels marks the channels a completed activity created for
-// retirement: the activity has returned, so its result is recorded and its
-// channels' data is dead (replay re-inserts the result rather than re-entering
-// the activity). They are dropped as their last feeding outbox goes (dropOutbox),
-// so a channel still shared with a live sibling waits for it. Called when a job
-// settles, for the thread the job ran.
+// retireThreadChannels retires the channels a forked activity created, found by
+// its thread's name. The remote activity has returned (its job settled), so its
+// result is recorded and its channels' data is dead — a replay re-inserts the
+// result rather than re-entering the activity. Selects for [retireCanonicals].
 func (c *Cluster) retireThreadChannels(run, thread string) {
 	r := c.relay
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
-	var drop []string
+	var cs []string
 	for canonical := range r.canonByRun[run] {
-		if !createdByThread(canonical, run, thread) {
-			continue
-		}
-		r.doneCanon[canonical] = true
-		if r.feeders[canonical] == 0 {
-			drop = append(drop, canonical)
+		if createdByThread(canonical, run, thread) {
+			cs = append(cs, canonical)
 		}
 	}
 	r.mu.Unlock()
-	for _, canonical := range drop {
-		c.dropCanonical(canonical)
-	}
+	c.retireCanonicals(cs)
 }
 
-// retireChannels marks the named coordinator-created channels of run for
-// retirement — an in-process activity call that created them has returned, so
-// their data is dead (its result is recorded; a replay re-inserts it rather than
-// re-entering the call). Each is dropped as its last feeding outbox goes, so one
-// still fed by a live sender waits. Like retireThreadChannels, but for channels
-// named by the returning call rather than found by a settled job's thread.
+// retireChannels retires channels named by their ids, for an in-process activity
+// call that created them and has now returned (see [flow.ChannelRetirer]) — the
+// same reclaim as a forked activity's, keyed by explicit id because a direct call
+// shares its caller's thread rather than getting one of its own. Selects for
+// [retireCanonicals].
 func (c *Cluster) retireChannels(run string, ids []string) {
 	r := c.relay
 	if r == nil {
@@ -490,12 +476,30 @@ func (c *Cluster) retireChannels(run string, ids []string) {
 	}
 	r.mu.Lock()
 	byRun := r.canonByRun[run]
-	var drop []string
+	var cs []string
 	for _, id := range ids {
-		canonical := chanStreamFor(id)
-		if !byRun[canonical] {
-			continue
+		if canonical := chanStreamFor(id); byRun[canonical] {
+			cs = append(cs, canonical)
 		}
+	}
+	r.mu.Unlock()
+	c.retireCanonicals(cs)
+}
+
+// retireCanonicals is the one way the relay retires a canonical stream: mark each
+// done and drop those with no feeding outbox left; the rest go as their last
+// feeder's outbox is dropped (dropOutbox), so a channel still fed by a live sender
+// waits for its data to arrive home. Every reclaim — a returned in-process call
+// ([Cluster.retireChannels]), a settled job's thread ([Cluster.retireThreadChannels]),
+// a finished run ([Cluster.retireRunChannels]) — selects its channels and calls this.
+func (c *Cluster) retireCanonicals(canonicals []string) {
+	r := c.relay
+	if r == nil || len(canonicals) == 0 {
+		return
+	}
+	r.mu.Lock()
+	var drop []string
+	for _, canonical := range canonicals {
 		r.doneCanon[canonical] = true
 		if r.feeders[canonical] == 0 {
 			drop = append(drop, canonical)
