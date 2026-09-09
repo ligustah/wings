@@ -105,6 +105,67 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 	}
 }
 
+// fanSum creates a channel of its own, hands it to a producer and a consumer it
+// forks, and returns the total. The channel is created on the worker running
+// fanSum, not the coordinator — a worker-created shared channel.
+var fanSum = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
+	ch := ctx.NewChannel[int]()
+	producer := ctx.Go(counts, feed{Values: ch, Count: 5})
+	consumer := ctx.Go(sums, feed{Values: ch})
+	if _, err := producer.Await(ctx); err != nil {
+		return 0, err
+	}
+	return consumer.Await(ctx)
+}, flow.WithName("test.fanSum"))
+
+// THE POINT: a channel a worker created (not the coordinator) is attributed to
+// its run through the job that owns it, so the run's completion reclaims its
+// canonical stream the same way it does the coordinator's own channels.
+func TestAWorkerCreatedChannelStreamIsReclaimed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 2, Concurrency: 2})
+
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		var err error
+		got, err = ctx.Go(fanSum, struct{}{}).Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("fanSum returned %d, want 15", got)
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatalf("shared client: %v", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		names, err := client.ListStreams(t.Context())
+		if err != nil {
+			t.Fatalf("list streams: %v", err)
+		}
+		canonical := 0
+		for _, n := range names {
+			if strings.HasPrefix(n, chanPrefix) {
+				canonical++
+			}
+		}
+		if canonical == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d canonical channel streams remain after the run completed; the worker-created channel was not reclaimed", canonical)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // THE POINT: a channel is shared by handing it to a call. The workflow on the
 // coordinator and the function on a worker — or two functions on two workers
 // — use it the way two threads would, and the values cross machines.

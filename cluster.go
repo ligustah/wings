@@ -925,6 +925,18 @@ func (c *Cluster) forgetRun(run string) {
 	}
 }
 
+// runOfJob names the run a live job belongs to, for attributing a worker job's
+// shared-channel outbox to the run whose completion retires the channel. Only a
+// live job is resolvable; a settled one has left the pending set.
+func (c *Cluster) runOfJob(job string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p, ok := c.pending[job]; ok && p.origin.Run != "" {
+		return p.origin.Run, true
+	}
+	return "", false
+}
+
 // settle publishes a job's outcome to everyone waiting on it, exactly once.
 func (p *pendingJob) settle(res resultEnvelope) {
 	p.once.Do(func() {

@@ -242,6 +242,14 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 	r.feeders[chanStreamFor(id)]++
 	r.mu.Unlock()
 
+	// A worker-created channel is known to the coordinator only by this outbox;
+	// attribute its canonical stream to the job's run (the coordinator's own
+	// channels are attributed in clusterChannels.Link instead) so the run's
+	// completion retires it too. Resolved off the lock to keep c.mu after r.mu.
+	if run, ok := c.runOfJob(job); ok {
+		r.noteRunChannel(run, chanStreamFor(id))
+	}
+
 	c.wg.Go(func() {
 		rc, err := c.relayFor(client, id)
 		if err != nil {
