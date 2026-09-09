@@ -80,6 +80,24 @@ func TestUIServesTheWebApp(t *testing.T) {
 	}
 }
 
+// THE POINT: the coordinator serves pprof on the inspection endpoint, so a live
+// coordinator can be profiled for goroutine growth and churn.
+func TestInspectionServesPprof(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), UI: "127.0.0.1:0"})
+	resp, err := http.Get("http://" + c.uiAddr + "/debug/pprof/goroutine?debug=1")
+	if err != nil {
+		t.Fatalf("GET goroutine profile: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET goroutine profile: status %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "goroutine profile") {
+		t.Fatalf("did not serve a goroutine profile; got %d bytes", len(body))
+	}
+}
+
 // THE POINT: after a run completes, the API lists it and serves its decoded
 // history.
 func TestInspectionAPIServesRunHistory(t *testing.T) {

@@ -5,8 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
+	"runtime"
 	"time"
 )
+
+// statsInterval is how often the inspection server logs the live goroutine count.
+const statsInterval = 30 * time.Second
 
 // The inspection API: a read-only view of the cluster served over HTTP when
 // Config.UI is set. It reports the live runtime state — workers, the pending
@@ -29,7 +34,25 @@ func (c *Cluster) startUI(addr string) error {
 		}
 	})
 	c.log.Info("wings: serving the inspection UI", "addr", c.uiAddr)
+	c.wg.Go(c.logRuntimeStats)
 	return nil
+}
+
+// logRuntimeStats logs the live goroutine count every statsInterval while the
+// inspection server runs — a cheap always-on signal for goroutine growth. To see
+// what is churning (short-lived goroutines by call site) rather than the live
+// count, capture the execution trace at /debug/pprof/trace.
+func (c *Cluster) logRuntimeStats() {
+	t := time.NewTicker(statsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			c.log.Info("wings: runtime", "goroutines", runtime.NumGoroutine())
+		}
+	}
 }
 
 func (c *Cluster) uiHandler() http.Handler {
@@ -38,6 +61,13 @@ func (c *Cluster) uiHandler() http.Handler {
 	mux.HandleFunc("GET /api/workers", c.handleWorkers)
 	mux.HandleFunc("GET /api/pending", c.handlePending)
 	runAPI{store: c.inspectStore}.register(mux)
+	// pprof on the same local endpoint: /debug/pprof/goroutine for a live
+	// goroutine profile by call site, /debug/pprof/trace for goroutine churn.
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	mux.Handle("GET /", uiStatic())
 	return mux
 }
