@@ -345,6 +345,84 @@ func TestAnInProcessCallsChannelIsReclaimedWhenItReturns(t *testing.T) {
 	}
 }
 
+// recvFan forks a producer and receives on its own thread, like the trainer's
+// Train where main receives the boards' sends. Called directly, the receiver is
+// the run's own thread, so its wants go to the run's coordinator outbox
+// (chanout.<run>.0.<id>) rather than a job's.
+var recvFan = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
+	ch := ctx.NewChannel[int]()
+	prod := ctx.Go(counts, feed{Values: ch, Count: 5})
+	total := 0
+	for {
+		v, ok, err := ch.Recv(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			break
+		}
+		total += v
+	}
+	if _, err := prod.Await(ctx); err != nil {
+		return 0, err
+	}
+	return total, nil
+}, flow.WithName("test.recvFan"))
+
+// THE POINT: a channel the caller thread itself receives on is reclaimed when the
+// call returns, not only at run end — even though the receiver's wants live in the
+// run's own coordinator outbox, which is not a job that ever settles. This is the
+// trainer's shape (main receives the boards' decisions inside a called activity).
+func TestACallersReceiveChannelIsReclaimedWhenTheCallReturns(t *testing.T) {
+	reclaimHold.release = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(reclaimHold.release) }) }
+	t.Cleanup(release)
+
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4})
+
+	var got int
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			var err error
+			if got, err = recvFan(ctx, struct{}{}); err != nil {
+				return err
+			}
+			_, err = ctx.Go(heldOpen, struct{}{}).Await(ctx)
+			return err
+		})
+	}()
+
+	// The channel must first appear — its wants live in the run's own outbox — and
+	// then be reclaimed while the run is still held open on heldOpen.
+	waitForChannel := func(want bool, deadline time.Duration, what string) {
+		t.Helper()
+		end := time.Now().Add(deadline)
+		for time.Now().Before(end) {
+			if (streamsWithPrefix(t, c, chanPrefix) > 0) == want {
+				return
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("run ended while waiting for %s: %v", what, err)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	waitForChannel(true, 15*time.Second, "the caller's receive channel to appear")
+	waitForChannel(false, 20*time.Second, "the channel to be reclaimed mid-run")
+
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("recvFan returned %d, want 15", got)
+	}
+}
+
 func streamsWithPrefix(t *testing.T, c *Cluster, prefix string) int {
 	t.Helper()
 	client, err := c.sharedClient()

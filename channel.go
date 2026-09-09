@@ -148,6 +148,16 @@ func (r *channelRelay) jobFinal(job string) bool {
 	return r.finalJob[job]
 }
 
+// canonDone reports that a channel has been retired: its owning activity or run
+// has finished, so no more will be sent on it and every outbox feeding it is
+// complete. The run's own outbox (chanout.<run>.0.<id>) settles no job, so this
+// is the only thing that ends it before the run does.
+func (r *channelRelay) canonDone(canonical string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.doneCanon[canonical]
+}
+
 // hadOutbox reports whether the relay has ever tailed an outbox for a job, so
 // only such a job's settle chases its channel outboxes.
 func (c *Cluster) hadOutbox(job string) bool {
@@ -312,11 +322,14 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 					return
 				}
 				if expired {
-					// Caught up (nothing new before the poll timed out). If the job
-					// has settled and its output is home, everything it ever wrote is
-					// merged into the canonical stream now, so drop the outbox and
-					// stop — the canonical stream stays for a resume to replay from.
-					if c.relay.jobFinal(job) {
+					// Caught up (nothing new before the poll timed out). Everything
+					// this outbox holds is merged into the canonical stream now, so
+					// drop it once nothing more will be written to it: the job has
+					// settled and its output is home (jobFinal), or the channel has
+					// been retired (canonDone), which ends the run's own outbox — the
+					// receiver's wants — that no job's settle ever finalizes. The
+					// canonical stream stays for a resume to replay from.
+					if c.relay.jobFinal(job) || c.relay.canonDone(chanStreamFor(id)) {
 						c.dropOutbox(name)
 						return
 					}
