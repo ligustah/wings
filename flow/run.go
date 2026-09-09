@@ -516,6 +516,7 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 
 	// The call.s position is one back from the cursor; an executor records it.
 	step := t.at() - 1
+	startCh := t.channelCount()
 	out, callErr := t.run.exec.Invoke(WithOrigin(ctx, Origin{
 		Run:     t.run.name,
 		Thread:  t.id,
@@ -532,10 +533,40 @@ func (t *threadState) call(ctx context.Context, name string, payload []byte) ([]
 	// Recorded either way, named for its call: a failed call is a fact the next
 	// attempt replays.
 	t.record(&protos.ReturnEvent{Result: packResult(out, callErr), CallSerial: step})
+	t.retireCallChannels(ctx, startCh)
 	if callErr != nil {
 		return nil, &callError{name: name, err: callErr}
 	}
 	return out, t.err()
+}
+
+// channelCount is how many channels this thread has created so far.
+func (t *threadState) channelCount() uint64 {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	return t.channels
+}
+
+// retireCallChannels asks the host to reclaim the shared channels this thread
+// created during a call that has just returned — its channels numbered [start,
+// now). The call's result is recorded and a replay re-inserts it rather than
+// re-entering the call, so those channels are dead. A no-op unless the host is a
+// [ChannelRetirer]; a channel created by a sub-thread it forked is that thread's,
+// numbered under it, and is not among these.
+func (t *threadState) retireCallChannels(ctx context.Context, start uint64) {
+	retirer, ok := t.run.host.(ChannelRetirer)
+	if !ok {
+		return
+	}
+	end := t.channelCount()
+	if end <= start {
+		return
+	}
+	ids := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		ids = append(ids, t.run.channelID(fmt.Sprintf("%s.ch%d", t.id, i)))
+	}
+	retirer.RetireChannels(ctx, t.run.name, ids)
 }
 
 // callError is the failure of a call the run made or a thread it forked — its

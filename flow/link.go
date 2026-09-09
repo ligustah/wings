@@ -72,6 +72,18 @@ type ChannelValueAt struct {
 	Next int64
 }
 
+// ChannelRetirer is an optional [ChannelHost] capability: reclaiming the channels
+// a thread created during an in-process call, once the call returns. The call's
+// result is recorded and a replay re-inserts it rather than re-entering the call,
+// so those channels hold nothing a later replay reads — the same reason a settled
+// job's channels are reclaimed. ids are the channels' shared ids ("<run>/<name>").
+// Best-effort and asynchronous: the host reclaims each when it is safe to (a
+// shared channel waits for its senders' data to arrive), and a run's end reclaims
+// whatever remains.
+type ChannelRetirer interface {
+	RetireChannels(ctx context.Context, run string, ids []string)
+}
+
 // WithChannelHost lets this run share channels with other runs. Without one, a
 // channel that leaves the run in a call's input is an error at the call.
 func WithChannelHost(h ChannelHost) RunOption { return func(o *runOptions) { o.host = h } }

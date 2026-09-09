@@ -477,6 +477,36 @@ func (c *Cluster) retireThreadChannels(run, thread string) {
 	}
 }
 
+// retireChannels marks the named coordinator-created channels of run for
+// retirement — an in-process activity call that created them has returned, so
+// their data is dead (its result is recorded; a replay re-inserts it rather than
+// re-entering the call). Each is dropped as its last feeding outbox goes, so one
+// still fed by a live sender waits. Like retireThreadChannels, but for channels
+// named by the returning call rather than found by a settled job's thread.
+func (c *Cluster) retireChannels(run string, ids []string) {
+	r := c.relay
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	byRun := r.canonByRun[run]
+	var drop []string
+	for _, id := range ids {
+		canonical := chanStreamFor(id)
+		if !byRun[canonical] {
+			continue
+		}
+		r.doneCanon[canonical] = true
+		if r.feeders[canonical] == 0 {
+			drop = append(drop, canonical)
+		}
+	}
+	r.mu.Unlock()
+	for _, canonical := range drop {
+		c.dropCanonical(canonical)
+	}
+}
+
 // dropCanonical deletes one canonical stream and forgets the relay's state for
 // it. Called when the channel's activity has finished and its last outbox is gone.
 func (c *Cluster) dropCanonical(canonical string) {
@@ -599,6 +629,14 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 		client: h.n.client,
 		in:     chanStreamFor(id),
 	}, nil
+}
+
+// RetireChannels implements [flow.ChannelRetirer]: the run body's in-process
+// call that created these channels has returned, so retire them. Done off the
+// caller so the call is not held for storage work; the run's end retires whatever
+// is left.
+func (h clusterChannels) RetireChannels(_ context.Context, run string, ids []string) {
+	h.c.wg.Go(func() { h.c.retireChannels(run, ids) })
 }
 
 // ChannelValues implements [flow.ChannelValueReader] for a run on the

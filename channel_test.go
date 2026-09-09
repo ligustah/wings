@@ -272,6 +272,79 @@ func TestAnActivitysChannelIsReclaimedWhenItReturns(t *testing.T) {
 	}
 }
 
+// THE POINT: a channel created during an in-process activity call is reclaimed
+// when the call returns, not only at run end. Calling fanSum directly (rather
+// than forking it) creates its channel under the run body, which is never a job;
+// the fix retires it on the call's return, so the direct-call shape — the one
+// that avoids a round trip per receive — reclaims per activity too.
+func TestAnInProcessCallsChannelIsReclaimedWhenItReturns(t *testing.T) {
+	reclaimHold.release = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(reclaimHold.release) }) }
+	t.Cleanup(release)
+
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4})
+
+	client, err := c.sharedClient()
+	if err != nil {
+		t.Fatalf("shared client: %v", err)
+	}
+
+	var got int
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			var err error
+			if got, err = fanSum(ctx, struct{}{}); err != nil { // direct call: runs in place
+				return err
+			}
+			// Hold the run open: fanSum has returned and its channel should be
+			// reclaimed while this waits, though no job's thread ever owned it.
+			_, err = ctx.Go(heldOpen, struct{}{}).Await(ctx)
+			return err
+		})
+	}()
+
+	canonicals := func() int {
+		names, err := client.ListStreams(t.Context())
+		if err != nil {
+			t.Fatalf("list streams: %v", err)
+		}
+		n := 0
+		for _, s := range names {
+			if strings.HasPrefix(s, chanPrefix) {
+				n++
+			}
+		}
+		return n
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	reclaimed := false
+	for time.Now().Before(deadline) {
+		if canonicals() == 0 {
+			reclaimed = true
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("run finished before the channel was seen reclaimed mid-run: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if !reclaimed {
+		t.Fatalf("the in-process call's channel stream was not reclaimed while the run was open")
+	}
+
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("fanSum returned %d, want 15", got)
+	}
+}
+
 func streamsWithPrefix(t *testing.T, c *Cluster, prefix string) int {
 	t.Helper()
 	client, err := c.sharedClient()
