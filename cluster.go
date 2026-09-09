@@ -875,6 +875,17 @@ func (c *Cluster) forget(p *pendingJob) {
 			c.dropOutputsOf(job, keep, writers)
 		})
 	}
+	// The job has returned, so the values it received are dead — its result is
+	// recorded and a replay never re-enters it. Drop them, keeping the metadata
+	// history, unless channel data is being kept. Any attempt: a first-try success
+	// is past dropOutputsOf above but still has values to reclaim.
+	if !c.closed && !c.cfg.RetainChannelData {
+		job, keep := p.job.ID, p.job.Attempt
+		writers := maps.Clone(p.ran)
+		c.wg.Go(func() {
+			c.reclaimChannelData(job, keep, writers)
+		})
+	}
 	// A job done for good will send no more on its shared channels, so its
 	// outboxes can be merged home and dropped rather than tailed for the cluster's
 	// life. Only chased for a job the relay actually tailed an outbox for.
@@ -888,7 +899,7 @@ func (c *Cluster) forget(p *pendingJob) {
 	// needs — its result is recorded, and replay re-inserts it rather than running
 	// the activity again. Retire them mid-run, so a long run of short activities
 	// does not accumulate their channel data. Dropped as their last feeder leaves.
-	if !c.closed && p.origin.Run != "" && p.origin.Thread != "" {
+	if !c.closed && !c.cfg.RetainChannelData && p.origin.Run != "" && p.origin.Thread != "" {
 		run, thread := p.origin.Run, p.origin.Thread
 		c.wg.Go(func() { c.retireThreadChannels(run, thread) })
 	}
@@ -928,7 +939,7 @@ func (c *Cluster) forgetRun(run string) {
 	// The run is finished for good and will not resume, so its channels' canonical
 	// streams — kept otherwise so a resume can replay receives — are now dead.
 	// Retire them once their last feeding outbox is dropped (see dropOutbox).
-	if !c.closed {
+	if !c.closed && !c.cfg.RetainChannelData {
 		c.wg.Go(func() { c.retireRunChannels(run) })
 	}
 }

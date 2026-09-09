@@ -541,6 +541,57 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 	}
 }
 
+// reclaimChannelData drops the value streams a settled job's kept attempt wrote
+// — the received channel values its history named. They are dead once the job
+// returns: its result is recorded in the caller's history and mirrored, and a
+// replay never re-enters a returned job, so nothing reads them again. The
+// metadata history stays, an inspectable skeleton. Drains first, so dropping the
+// worker's stream does not cut a transaction the coordinator is still copying.
+// Abandoned attempts' value streams go with the rest of their output in
+// [Cluster.dropOutputsOf]; this is only the kept attempt's.
+func (c *Cluster) reclaimChannelData(job string, keep int, writers map[int]*workerConn) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	ctx := context.WithoutCancel(c.ctx)
+	c.drainOutputs(ctx, writers[keep], job)
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		c.log.Warn("wings: could not look for a settled job's value streams", "job", job, "err", err)
+		return
+	}
+	var stale []string
+	for _, name := range names {
+		if o, ok := parseOutput(name); ok && o.Prefix == valuesPrefix && o.Job == streamPart(job) && o.Attempt == keep {
+			stale = append(stale, name)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	c.markDropped(stale)
+	defer c.unmarkDropped(stale)
+
+	fleet := c.fleet()
+	w := writers[keep]
+	reachable := w != nil && w.client != client && slices.Contains(fleet, w)
+	for _, name := range stale {
+		if reachable {
+			if c.outputs != nil {
+				c.outputs.Forget(w.id, name)
+			}
+			if err := dropStream(ctx, w.client, name); err != nil {
+				c.log.Warn("wings: could not discard a settled job's value stream on a worker",
+					"worker", w.id, "stream", name, "err", err)
+			}
+		}
+		if err := dropStream(ctx, client, name); err != nil {
+			c.log.Warn("wings: could not discard a settled job's value stream", "stream", name, "err", err)
+		}
+	}
+}
+
 // fleet is a snapshot of the workers, for use without the lock.
 func (c *Cluster) fleet() []*workerConn {
 	c.mu.Lock()
