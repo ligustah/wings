@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,6 +97,9 @@ type channelRelay struct {
 	// doneCanon names canonical streams whose owning run has completed, so the
 	// last feeder to leave drops them. Keyed by canonical stream name.
 	doneCanon map[string]bool
+	// tailStop cancels a tailed outbox's reads, so retiring its channel wakes the
+	// tail to drop it at once rather than after its next poll. Keyed by outbox name.
+	tailStop map[string]context.CancelFunc
 }
 
 func (c *Cluster) startChannelRelay() {
@@ -109,6 +113,7 @@ func (c *Cluster) startChannelRelay() {
 		canonByRun: map[string]map[string]bool{},
 		canonByJob: map[string]map[string]bool{},
 		doneCanon:  map[string]bool{},
+		tailStop:   map[string]context.CancelFunc{},
 	}
 	c.wg.Go(c.runChannelRelay)
 }
@@ -266,29 +271,36 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 	job := o.Job
 
 	r := c.relay
+	tailCtx, tailStop := context.WithCancel(c.ctx)
 	r.mu.Lock()
 	if r.tailed[name] || c.closed {
 		r.mu.Unlock()
+		tailStop()
 		return
 	}
 	r.tailed[name] = true
 	r.outboxJobs[job] = true
 	r.feeders[chanStreamFor(id)]++
+	r.tailStop[name] = tailStop
 	r.mu.Unlock()
 
 	// A worker-created channel is known to the coordinator only by this outbox;
-	// attribute its canonical stream to the job (so the job's settle retires it)
-	// and to the job's run (so the run's end retires whatever is left). The
-	// coordinator's own channels are attributed in clusterChannels.Link instead;
-	// runOfJob names a live placed job, so it skips them. Resolved off the lock to
-	// keep c.mu after r.mu.
-	if run, ok := c.runOfJob(job); ok {
+	// attribute its canonical stream to the job's run (so the run's end retires
+	// whatever is left) and, when this job created it rather than merely sending or
+	// receiving on it, to the job (so the job's settle retires exactly what it
+	// created). The coordinator's own channels are attributed in
+	// clusterChannels.Link instead; runOfJob names a live placed job, so it skips
+	// them. Resolved off the lock to keep c.mu after r.mu.
+	if run, thread, ok := c.runOfJob(job); ok {
 		canonical := chanStreamFor(id)
 		r.noteRunChannel(run, canonical)
-		r.noteJobChannel(job, canonical)
+		if createdByThread(canonical, run, thread) {
+			r.noteJobChannel(job, canonical)
+		}
 	}
 
 	c.wg.Go(func() {
+		defer c.forgetTail(name, tailStop)
 		rc, err := c.relayFor(client, id)
 		if err != nil {
 			c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
@@ -313,11 +325,13 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 				}
 				continue
 			}
-			readCtx, cancel := context.WithTimeout(c.ctx, followPoll)
+			readCtx, cancel := context.WithTimeout(tailCtx, followPoll)
 			recs, err := st.ReadBlocking(readCtx, from, recordBatch)
-			expired := readCtx.Err() != nil
+			// A wake (tailCtx ended while c.ctx lives) means the channel was retired.
+			woke := tailCtx.Err() != nil && c.ctx.Err() == nil
+			expired := readCtx.Err() != nil && !woke
 			cancel()
-			if err != nil {
+			if err != nil && !woke {
 				if c.ctx.Err() != nil {
 					return
 				}
@@ -326,9 +340,9 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 					// this outbox holds is merged into the canonical stream now, so
 					// drop it once nothing more will be written to it: the job has
 					// settled and its output is home (jobFinal), or the channel has
-					// been retired (canonDone), which ends the run's own outbox — the
-					// receiver's wants — that no job's settle ever finalizes. The
-					// canonical stream stays for a resume to replay from.
+					// been retired (canonDone) — the wake below is the prompt path for
+					// that, this the backstop for a tail registered after the retire.
+					// The canonical stream stays for a resume to replay from.
 					if c.relay.jobFinal(job) || c.relay.canonDone(chanStreamFor(id)) {
 						c.dropOutbox(name)
 						return
@@ -346,23 +360,59 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 				}
 				continue
 			}
-			var merged []flow.ChannelItem
-			for _, rec := range recs {
-				from = rec.Offset + 1
-				appended, err := rc.merge(c.ctx, rec.Record)
-				if err != nil {
-					if c.ctx.Err() == nil {
-						c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
-					}
-					return
+			if from, err = c.mergeOutbox(rc, id, from, recs); err != nil {
+				if c.ctx.Err() == nil {
+					c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
 				}
-				merged = append(merged, appended...)
+				return
 			}
-			if len(merged) > 0 {
-				c.wakeOnChannel(id, merged)
+			if woke {
+				// Retired: drain what the outbox still holds into the canonical, so a
+				// value the run's own thread sent is not lost, then drop it.
+				for {
+					rest, err := st.Read(c.ctx, from, recordBatch)
+					if err != nil || len(rest) == 0 {
+						break
+					}
+					if from, err = c.mergeOutbox(rc, id, from, rest); err != nil {
+						break
+					}
+				}
+				c.dropOutbox(name)
+				return
 			}
 		}
 	})
+}
+
+// mergeOutbox puts each of an outbox's records through the channel's arbiter,
+// advancing the read position, and wakes receivers on whatever it appended.
+func (c *Cluster) mergeOutbox(rc *relayChannel, id string, from int64, recs []dsclient.OffsetRecord[flow.ChannelItem]) (int64, error) {
+	var merged []flow.ChannelItem
+	for _, rec := range recs {
+		from = rec.Offset + 1
+		appended, err := rc.merge(c.ctx, rec.Record)
+		if err != nil {
+			return from, err
+		}
+		merged = append(merged, appended...)
+	}
+	if len(merged) > 0 {
+		c.wakeOnChannel(id, merged)
+	}
+	return from, nil
+}
+
+// forgetTail drops a tail's cancel registration as it exits and releases the
+// context, whether it left on its own or was woken to retire.
+func (c *Cluster) forgetTail(name string, stop context.CancelFunc) {
+	r := c.relay
+	r.mu.Lock()
+	if r.tailStop[name] != nil {
+		delete(r.tailStop, name)
+	}
+	r.mu.Unlock()
+	stop()
 }
 
 // finishChannels marks a settled job's shared-channel outboxes for the relay to
@@ -460,12 +510,32 @@ func (c *Cluster) retireRunChannels(run string) {
 	c.retireCanonicals(cs)
 }
 
+// createdByThread reports whether canonical is the stream of a channel that
+// thread created. A channel's id is "<run>/<thread>.ch<n>", so its stream name
+// is the thread's channel prefix followed by the digits of n — and a sub-thread's
+// channel ("<thread>.<k>.ch<n>") has a digit, not "ch", after the prefix, so it
+// does not match its parent. This is what tells a channel a job created from one
+// it merely sends or receives on: only the creator retires it.
+func createdByThread(canonical, run, thread string) bool {
+	prefix := chanPrefix + streamPart(run) + "_" + streamPart(thread) + "_ch"
+	rest, ok := strings.CutPrefix(canonical, prefix)
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // retireJobChannels retires the channels a forked activity created. The remote
 // activity has returned (its job settled), so its result is recorded and its
 // channels' data is dead — a replay re-inserts the result rather than re-entering
-// the activity. The channels are those observed under the job's outboxes
-// (noteJobChannel), the same reclaim a returned in-process call gets by explicit
-// id. Selects for [retireCanonicals].
+// the activity. The channels are those observed to be created under the job
+// (noteJobChannel, gated by createdByThread), the same reclaim a returned
+// in-process call gets by explicit id. Selects for [retireCanonicals].
 func (c *Cluster) retireJobChannels(job string) {
 	r := c.relay
 	if r == nil {
@@ -515,14 +585,27 @@ func (c *Cluster) retireCanonicals(canonicals []string) {
 		return
 	}
 	r.mu.Lock()
+	retired := make(map[string]bool, len(canonicals))
 	var drop []string
+	var wake []context.CancelFunc
 	for _, canonical := range canonicals {
 		r.doneCanon[canonical] = true
+		retired[canonical] = true
 		if r.feeders[canonical] == 0 {
 			drop = append(drop, canonical)
 		}
 	}
+	// Wake the tails feeding a retired channel so they drop their outboxes at once,
+	// rather than after their next poll; the last one gone drops the canonical.
+	for name, stop := range r.tailStop {
+		if o, ok := parseOutput(name); ok && retired[chanPrefix+o.Name] {
+			wake = append(wake, stop)
+		}
+	}
 	r.mu.Unlock()
+	for _, stop := range wake {
+		stop()
+	}
 	for _, canonical := range drop {
 		c.dropCanonical(canonical)
 	}
