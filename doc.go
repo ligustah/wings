@@ -45,4 +45,28 @@
 // Large output does not belong in a result; stream it over a [flow.Channel]
 // with [flow.ByteWriter] and [flow.ByteReader]. A per-job event log a retry can
 // resume from uses [Record] and [Replay].
+//
+// # Keeping state small
+//
+// A run's durable footprint is its threads' histories plus the data on its
+// channels, and it is reclaimed as the run goes, not only at the end. A call
+// that returns has its history and the channel values it received dropped at
+// once: the result is recorded in the caller and kept separately, and a replay
+// never re-enters a returned call, so nothing reads them again. So a long run
+// stays small when it is many short calls that return — each one's state is
+// reclaimed as it finishes — rather than one long-lived thread that accumulates.
+//
+// The run body is the one thread that lives for the whole run; keep its own
+// state small. Fan work out to calls and forked threads that return, gather
+// their results, and hold as little as possible in the body's own variables.
+//
+// Move bulk data over a [flow.Channel] rather than through results or the body's
+// memory. A shared channel keeps one copy of each value, on the coordinator's
+// canonical stream for that channel; it is dropped when the call that owns the
+// channel returns, or the run ends. A receiver records only which value it took,
+// not the bytes, and reads them back from that one copy on a replay.
+//
+// [Config.RetainHistory] and [Config.RetainChannelData] turn the two reclaims
+// off, keeping a returned call's history or its channel data for inspection and
+// step-by-step replay while debugging; both default to reclaiming.
 package wings
