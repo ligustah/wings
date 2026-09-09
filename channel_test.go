@@ -291,72 +291,9 @@ func streamsWithPrefix(t *testing.T, c *Cluster, prefix string) int {
 	return n
 }
 
-// THE POINT: a received value is dead once the activity that took it returns —
-// its result is recorded, and a replay never re-enters it — so an activity's
-// value streams are dropped when it returns, not only when the whole run ends,
-// while its metadata history stays an inspectable skeleton. fanSum receives and
-// returns; its values are reclaimed while the run is still held open elsewhere.
-func TestAReturnedActivitysValuesAreReclaimed(t *testing.T) {
-	reclaimHold.release = make(chan struct{})
-	var once sync.Once
-	release := func() { once.Do(func() { close(reclaimHold.release) }) }
-	t.Cleanup(release)
-
-	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4})
-
-	var got int
-	done := make(chan error, 1)
-	go func() {
-		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-			var err error
-			if got, err = ctx.Go(fanSum, struct{}{}).Await(ctx); err != nil {
-				return err
-			}
-			// Hold the run open: fanSum has returned and its values should be
-			// reclaimed while this waits.
-			_, err = ctx.Go(heldOpen, struct{}{}).Await(ctx)
-			return err
-		})
-	}()
-
-	// Its value stream is created as it receives, then dropped when it returns,
-	// all while the run is still held open — proof the reclaim is per-activity.
-	deadline := time.Now().Add(30 * time.Second)
-	seen, reclaimed := false, false
-	for time.Now().Before(deadline) {
-		n := streamsWithPrefix(t, c, valuesPrefix)
-		if n > 0 {
-			seen = true
-		}
-		if seen && n == 0 {
-			reclaimed = true
-			break
-		}
-		select {
-		case err := <-done:
-			t.Fatalf("run finished before the values were seen reclaimed mid-run: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-	if !reclaimed {
-		t.Fatal("the returned activity's value stream was not created then reclaimed while the run was still open")
-	}
-	// The metadata history stays: dropping values leaves an inspectable skeleton.
-	if streamsWithPrefix(t, c, historyPrefix) == 0 {
-		t.Fatal("the history skeleton was dropped along with the values; only the values should go")
-	}
-
-	release()
-	if err := <-done; err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got != 15 {
-		t.Fatalf("fanSum returned %d, want 15", got)
-	}
-}
-
-// THE POINT: RetainChannelData keeps a returned activity's received values, for
-// replaying it step by step while debugging, rather than dropping them.
+// THE POINT: RetainChannelData keeps a returned activity's channel data — the
+// canonical stream that holds the one copy of its values — for replaying it step
+// by step while debugging, rather than dropping it when the activity returns.
 func TestRetainChannelDataKeepsReturnedValues(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4, RetainChannelData: true})
 
@@ -372,8 +309,8 @@ func TestRetainChannelDataKeepsReturnedValues(t *testing.T) {
 	if got != 15 {
 		t.Fatalf("fanSum returned %d, want 15", got)
 	}
-	if streamsWithPrefix(t, c, valuesPrefix) == 0 {
-		t.Fatal("RetainChannelData was set but the received values were dropped anyway")
+	if streamsWithPrefix(t, c, chanPrefix) == 0 {
+		t.Fatal("RetainChannelData was set but the channel data was dropped anyway")
 	}
 }
 

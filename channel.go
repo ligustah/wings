@@ -36,6 +36,11 @@ const (
 
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
+// pushGroup names the mirror that pushes a channel's canonical stream to one
+// worker. A moved receiver's pre-push and its live push share it, so the live
+// push resumes where the pre-push stopped rather than copying the stream twice.
+func pushGroup(workerID, id string) string { return "wings.push." + workerID + "." + streamPart(id) }
+
 func outboxFor(run string, attempt int, id string) string {
 	return outputName{Prefix: chanoutPrefix, Job: run, Attempt: attempt, Name: id}.String()
 }
@@ -522,7 +527,7 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 		if err := ensureStream(w.ctx, shared, canonical); err != nil {
 			return
 		}
-		err := w.client.RunMirror(w.ctx, "wings.push."+w.id+"."+streamPart(id), dsclient.MirrorSpec{
+		err := w.client.RunMirror(w.ctx, pushGroup(w.id, id), dsclient.MirrorSpec{
 			From:   shared,
 			Source: canonical,
 			Dest:   canonical,
@@ -594,6 +599,81 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 		client: h.n.client,
 		in:     chanStreamFor(id),
 	}, nil
+}
+
+// ChannelValues implements [flow.ChannelValueReader] for a run on the
+// coordinator, reading values off the channel's canonical stream.
+func (h clusterChannels) ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
+	client, err := h.c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	return channelValues(ctx, client, id, cursor, n)
+}
+
+// ChannelValues implements [flow.ChannelValueReader] for a job's run on a
+// worker, reading values off the canonical stream pushed to the worker.
+func (h nodeChannels) ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
+	return channelValues(ctx, h.n.client, id, cursor, n)
+}
+
+// channelValues reads the values on a channel's canonical stream at or after
+// cursor, which is a stream offset. A replay reads back a received value this
+// way rather than keeping its own copy, so the canonical stream is the one copy.
+// It returns as soon as a read yields values, so a replay is not delayed waiting
+// to fill n; it blocks only when nothing is there yet — the canonical stream is
+// pushed to a moved receiver's worker and may lag its replay, and the caller knows
+// the value it wants was received, so it is still coming — returning empty only if
+// ctx ends. n bounds how many values one read gathers ahead into the cache.
+func channelValues(ctx context.Context, client *dsclient.Client, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
+	canonical := chanStreamFor(id)
+	var st *dsclient.Stream[flow.ChannelItem]
+	from := cursor
+	for {
+		if st == nil {
+			ok, err := client.StreamExists(ctx, canonical)
+			if err != nil {
+				return nil, fmt.Errorf("wings: look for channel stream %s: %w", canonical, err)
+			}
+			if !ok {
+				if err := pause(ctx, 200*time.Millisecond); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if st, err = eventStream[flow.ChannelItem](client, canonical); err != nil {
+				return nil, err
+			}
+		}
+		readCtx, cancel := context.WithTimeout(ctx, followPoll)
+		recs, err := st.ReadBlocking(readCtx, from, recordBatch)
+		expired := readCtx.Err() != nil
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if expired {
+				continue // caught up; the value is still on its way, so wait
+			}
+			return nil, fmt.Errorf("wings: read channel stream %s at %d: %w", canonical, from, err)
+		}
+		var out []flow.ChannelValueAt
+		for _, rec := range recs {
+			from = rec.Offset + 1
+			if it := rec.Record; !it.Want && it.To == "" && !it.Closed {
+				out = append(out, flow.ChannelValueAt{From: it.From, Seq: it.Seq, Data: it.Data, Next: from})
+				if len(out) >= n {
+					break
+				}
+			}
+		}
+		// Records that were only wants and grants carry no value; keep reading rather
+		// than hand the caller an empty result it would read as the value being gone.
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
 }
 
 // channelLink is a run's connection to one shared channel: sends go to the run's

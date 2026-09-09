@@ -875,17 +875,6 @@ func (c *Cluster) forget(p *pendingJob) {
 			c.dropOutputsOf(job, keep, writers)
 		})
 	}
-	// The job has returned, so the values it received are dead — its result is
-	// recorded and a replay never re-enters it. Drop them, keeping the metadata
-	// history, unless channel data is being kept. Any attempt: a first-try success
-	// is past dropOutputsOf above but still has values to reclaim.
-	if !c.closed && !c.cfg.RetainChannelData && len(p.ran) > 0 {
-		job, keep := p.job.ID, p.job.Attempt
-		writers := maps.Clone(p.ran)
-		c.wg.Go(func() {
-			c.reclaimChannelData(job, keep, writers)
-		})
-	}
 	// A job done for good will send no more on its shared channels, so its
 	// outboxes can be merged home and dropped rather than tailed for the cluster's
 	// life. Only chased for a job the relay actually tailed an outbox for.
@@ -1141,10 +1130,10 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 			c.log.Warn("wings: could not give a retry its predecessor's history",
 				"job", job.ID, "worker", w.id, "err", err)
 		}
-		if err := c.hydrateValues(c.ctx, w, job); err != nil {
-			// A retry without its received values cannot replay the receives its
-			// history names; it fails and the next attempt is tried elsewhere.
-			c.log.Warn("wings: could not give a retry its predecessor's received values",
+		if err := c.hydrateChannels(c.ctx, w, job); err != nil {
+			// Not fatal: the replay still reads the canonical once the push is
+			// discovered, only later — this just gets it there sooner.
+			c.log.Warn("wings: could not pre-push a moved job's channels",
 				"job", job.ID, "worker", w.id, "err", err)
 		}
 		if err := c.hydrateLineage(c.ctx, w, job); err != nil {

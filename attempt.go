@@ -35,17 +35,6 @@ func historyName(job string, attempt int) string {
 	return outputName{Prefix: historyPrefix, Job: job, Attempt: attempt, Name: "history"}.String()
 }
 
-// valuesPrefix holds the channel receive values one thread took, moved off its
-// history so the big bytes can be reclaimed on return while the metadata stays.
-// One stream per thread; the Name part is the thread.
-const valuesPrefix = "wings.values."
-
-// valuesName is the stream a job attempt keeps one thread's received channel
-// values on, alongside the attempt's history.
-func valuesName(job string, attempt int, thread string) string {
-	return outputName{Prefix: valuesPrefix, Job: job, Attempt: attempt, Name: thread}.String()
-}
-
 // attemptOutputs is one attempt's transactional producer and its open transaction.
 type attemptOutputs struct {
 	node    *workerNode
@@ -279,88 +268,31 @@ func (h *historyStore) Read(ctx context.Context, _, thread string, offset int64,
 	return out, nil
 }
 
-func (h *historyStore) Sink(ctx context.Context, _, thread string) (flow.Sink, error) {
-	return &historySink{h: h, thread: thread}, nil
+func (h *historyStore) Sink(ctx context.Context, _, _ string) (flow.Sink, error) {
+	return &historySink{h: h}, nil
 }
 
 // Drop is a no-op: a joined thread's events stay in the attempt's stream, which
 // goes as a whole when the job settles.
 func (h *historyStore) Drop(ctx context.Context, _, _ string) error { return nil }
 
-// valueStream opens one thread's value stream, where its received channel values
-// live apart from its history.
-func (h *historyStore) valueStream(ctx context.Context, thread string) (*dsclient.Stream[[]byte], error) {
-	st, err := h.a.node.client.OpenStream[[]byte](valuesName(h.a.job, h.a.attempt, thread),
-		dsclient.WithCodec[[]byte](dswire.RawCodec{}))
-	if err != nil {
-		return nil, fmt.Errorf("wings: open value stream for thread %s of job %s: %w", thread, h.a.job, err)
-	}
-	return st, nil
-}
-
-// ReadValues implements [flow.ValueReader], reading back the receive values this
-// attempt moved off the thread's history. index counts the thread's moved values
-// from zero, which is their offset on the stream.
-func (h *historyStore) ReadValues(ctx context.Context, _, thread string, index int64, n int) ([][]byte, error) {
-	name := valuesName(h.a.job, h.a.attempt, thread)
-	ok, err := h.a.node.client.StreamExists(ctx, name)
-	if err != nil {
-		return nil, fmt.Errorf("wings: look for value stream %s: %w", name, err)
-	}
-	if !ok {
-		return nil, nil
-	}
-	st, err := h.valueStream(ctx, thread)
-	if err != nil {
-		return nil, err
-	}
-	recs, err := st.Read(ctx, index, n)
-	if err != nil {
-		return nil, fmt.Errorf("wings: read value stream %s at %d: %w", name, index, err)
-	}
-	out := make([][]byte, len(recs))
-	for i, r := range recs {
-		out[i] = r.Record
-	}
-	return out, nil
-}
-
 // historySink appends a run's events inside the attempt's transaction, standing
 // the stream up lazily on the first event that belongs to a thread — so a
-// function that forks, sleeps and calls nothing leaves nothing behind. A
-// received channel value is moved off the event onto the thread's own value
-// stream, written in the same transaction so the two stay consistent on a move.
+// function that forks, sleeps and calls nothing leaves nothing behind. A receive
+// on a shared channel arrives already recorded by identity alone (the flow layer
+// keeps its value on the channel host, not here); a local channel's receive keeps
+// its value inline, as the function recorded it.
 type historySink struct {
-	h      *historyStore
-	thread string
+	h *historyStore
 
 	mu     sync.Mutex
 	stream *dsclient.Stream[*protos.Event]
-	values *dsclient.Stream[[]byte]
 	held   []*protos.Event
 }
 
 func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if rv := ev.GetChannelRecv(); rv != nil && !rv.GetClosed() && rv.GetValue() != nil {
-		if s.values == nil {
-			name := valuesName(s.h.a.job, s.h.a.attempt, s.thread)
-			if err := ensureStream(context.WithoutCancel(ctx), s.h.a.node.client, name); err != nil {
-				return err
-			}
-			vs, err := s.h.valueStream(ctx, s.thread)
-			if err != nil {
-				return err
-			}
-			s.values = vs
-		}
-		if err := s.h.a.append(ctx, s.values, [][]byte{rv.GetValue().GetSerialized()}); err != nil {
-			return err
-		}
-		ev = strippedRecvEvent(ev)
-	}
 
 	if s.stream == nil {
 		if ev.GetRunStart() != nil || ev.GetRunEnd() != nil {
@@ -381,23 +313,4 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 	batch := append(s.held, ev)
 	s.held = nil
 	return s.h.a.append(ctx, s.stream, batch)
-}
-
-// strippedRecvEvent rebuilds a receive event without its value, which has been
-// moved to the value stream. Rebuilt field by field rather than cloned so the
-// big value bytes are not copied only to be dropped.
-func strippedRecvEvent(ev *protos.Event) *protos.Event {
-	rv := ev.GetChannelRecv()
-	return &protos.Event{
-		Timestamp: ev.GetTimestamp(),
-		Serial:    ev.GetSerial(),
-		Attempt:   ev.GetAttempt(),
-		ThreadId:  ev.GetThreadId(),
-		Payload: &protos.Event_ChannelRecv{ChannelRecv: &protos.ChannelRecvEvent{
-			Channel:      rv.GetChannel(),
-			FromThreadId: rv.GetFromThreadId(),
-			FromSeq:      rv.GetFromSeq(),
-			Closed:       rv.GetClosed(),
-		}},
-	}
 }

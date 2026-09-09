@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,18 +120,20 @@ type threadState struct {
 	// prefix (nothing this attempt records is added to either).
 	events  []*protos.Event
 	offsets []int64
-	// valueIdx aligns with events: for a receive whose value lives on the side
-	// stream it is that value's index there; -1 otherwise (a receive that kept
-	// its value inline in the event, or a non-receive). See [replayable].
+	// valueIdx aligns with events: non-negative for a receive on a shared channel,
+	// whose value the host keeps and the event records by identity alone; -1
+	// otherwise (a receive that kept its value inline in the event — a local
+	// channel, or an older history — or a non-receive). See [replayable].
 	valueIdx []int64
 	// values caches received values read ahead of the cursor by offset, so a
 	// resume does not reopen and reread the stream once per receive. Filled and
 	// drained only by this thread's own replay goroutine, so it needs no lock.
 	values map[int64][]byte
-	// sideValues is the same cache for values read from the side stream, keyed by
-	// their index there rather than by a stream offset.
-	sideValues map[int64][]byte
-	serial     uint64
+	// chanVals reads back the values of shared channels from the host, one cursor
+	// per channel, caching those scanned past but not yet taken. Used only by this
+	// thread's own replay goroutine, so it needs no lock.
+	chanVals map[string]*chanValueCursor
+	serial   uint64
 
 	sink    Sink
 	sinkErr error // the first persistence failure, if any
@@ -269,7 +272,7 @@ func (t *threadState) recordedValue(ctx context.Context, pos uint64) ([]byte, er
 	t.run.mu.Unlock()
 
 	if idx >= 0 {
-		return t.sideValue(ctx, idx)
+		return t.channelValue(ctx, pos)
 	}
 
 	if data, ok := t.values[off]; ok {
@@ -304,33 +307,74 @@ func (t *threadState) recordedValue(ctx context.Context, pos uint64) ([]byte, er
 	return found, nil
 }
 
-// sideValue reads a received value off the side stream by its index there, the
-// value having been moved off the event stream at record time (see
-// [ValueReader]). Values ahead of idx are cached, so a run of receives reads the
-// side stream in windows rather than once per receive.
-func (t *threadState) sideValue(ctx context.Context, idx int64) ([]byte, error) {
-	if data, ok := t.sideValues[idx]; ok {
-		delete(t.sideValues, idx)
+// valueKey identifies one value a channel carried, by its sender and sequence.
+type valueKey struct {
+	from string
+	seq  uint64
+}
+
+// chanValueCursor scans one shared channel's values from the host in order,
+// caching those passed before the one a receive took, so a run of receives reads
+// the host's record in windows rather than once per receive.
+type chanValueCursor struct {
+	at    int64
+	cache map[valueKey][]byte
+}
+
+// channelValue reads back the value a receive took from a shared channel, whose
+// bytes the host keeps rather than the receiver's own history (see
+// [Channel.Recv]). The value is named by the receive event's (from, seq); the
+// host is scanned in order from where the last read left off, caching values
+// passed on the way to the one wanted.
+func (t *threadState) channelValue(ctx context.Context, pos uint64) ([]byte, error) {
+	t.run.mu.Lock()
+	ev := t.events[pos]
+	t.run.mu.Unlock()
+	rv := ev.GetChannelRecv()
+
+	id := rv.GetChannel()
+	if !strings.Contains(id, "/") {
+		// A channel this run created is recorded by its local name; its id to the
+		// host is the run-qualified form. One that arrived from another run is
+		// already recorded by its full id.
+		id = t.run.name + "/" + id
+	}
+	want := valueKey{from: rv.GetFromThreadId(), seq: rv.GetFromSeq()}
+
+	cur := t.chanVals[id]
+	if cur == nil {
+		cur = &chanValueCursor{cache: map[valueKey][]byte{}}
+		if t.chanVals == nil {
+			t.chanVals = map[string]*chanValueCursor{}
+		}
+		t.chanVals[id] = cur
+	}
+	if data, ok := cur.cache[want]; ok {
+		delete(cur.cache, want)
 		return data, nil
 	}
-	reader, ok := t.run.store.(ValueReader)
+
+	reader, ok := t.run.host.(ChannelValueReader)
 	if !ok {
-		return nil, fmt.Errorf("flow: thread %q has a value on a side stream but its store cannot read one back", t.id)
+		return nil, fmt.Errorf("flow: thread %q took a value from shared channel %s but its host cannot read one back", t.id, id)
 	}
-	values, err := reader.ReadValues(ctx, t.run.name, t.id, idx, valuePrefetch)
-	if err != nil {
-		return nil, err
-	}
-	if len(values) == 0 {
-		return nil, fmt.Errorf("flow: the recorded value at index %d of thread %q is gone", idx, t.id)
-	}
-	for i, v := range values[1:] {
-		if t.sideValues == nil {
-			t.sideValues = map[int64][]byte{}
+	for {
+		values, err := reader.ChannelValues(ctx, id, cur.at, valuePrefetch)
+		if err != nil {
+			return nil, err
 		}
-		t.sideValues[idx+1+int64(i)] = v
+		if len(values) == 0 {
+			return nil, fmt.Errorf("flow: the value thread %q took from channel %s (%s#%d) is gone",
+				t.id, id, want.from, want.seq)
+		}
+		for _, v := range values {
+			cur.at = v.Next
+			if (valueKey{from: v.From, seq: v.Seq}) == want {
+				return v.Data, nil
+			}
+			cur.cache[valueKey{from: v.From, seq: v.Seq}] = v.Data
+		}
 	}
-	return values[0], nil
 }
 
 // record appends an event to this thread and hands it to the sink. A sink

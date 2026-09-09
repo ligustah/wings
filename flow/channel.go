@@ -282,12 +282,14 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		t.record(&protos.ChannelRecvEvent{Channel: c.name, Closed: true})
 		return zero, false, t.err()
 	}
-	t.record(&protos.ChannelRecvEvent{
-		Channel:      c.name,
-		FromThreadId: item.from,
-		FromSeq:      item.seq,
-		Value:        &protos.Data{Serialized: item.data},
-	})
+	rec := &protos.ChannelRecvEvent{Channel: c.name, FromThreadId: item.from, FromSeq: item.seq}
+	// On a shared channel the host keeps the one copy of the value, read back from
+	// it on replay by (from, seq); only a purely local channel, which has no host
+	// record, records the bytes here. See [threadState.recordedValue].
+	if !cs.hosted() {
+		rec.Value = &protos.Data{Serialized: item.data}
+	}
+	t.record(rec)
 	v, err := c.decode(item)
 	if err != nil {
 		return zero, false, err
@@ -589,6 +591,15 @@ func (cs *chanState) shut() {
 		cs.closed = true
 		cs.broadcast()
 	}
+}
+
+// hosted reports whether the channel is shared through a host, whose record of
+// it holds the values a replay reads back — rather than a purely local channel,
+// whose receives record their own copy.
+func (cs *chanState) hosted() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.link != nil
 }
 
 // awaitTaken blocks until a sent item is received, returning at once if the

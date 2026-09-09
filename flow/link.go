@@ -52,6 +52,26 @@ type ChannelHost interface {
 	Link(ctx context.Context, run, id string) (ChannelLink, error)
 }
 
+// ChannelValueReader is an optional [ChannelHost] capability: reading back the
+// values a channel carried, so a receiver's replay need not keep its own copy of
+// what it took — the host's record of the channel is the one copy. A receive on
+// a shared channel is recorded by identity alone (from and seq, see
+// [ChannelRecvEvent]); replay finds the bytes here. cursor is an opaque position
+// in the host's order, zero at the start; a read returns the value records at or
+// after it, each with the position to continue from.
+type ChannelValueReader interface {
+	ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]ChannelValueAt, error)
+}
+
+// ChannelValueAt is one value a channel carried, with the cursor to read the
+// next from. From and Seq identify it, matching a [ChannelRecvEvent]'s from.
+type ChannelValueAt struct {
+	From string
+	Seq  uint64
+	Data []byte
+	Next int64
+}
+
 // WithChannelHost lets this run share channels with other runs. Without one, a
 // channel that leaves the run in a call's input is an error at the call.
 func WithChannelHost(h ChannelHost) RunOption { return func(o *runOptions) { o.host = h } }
@@ -241,6 +261,28 @@ func (h *MemChannelHost) Link(_ context.Context, _, id string) (ChannelLink, err
 		h.chans[id] = ch
 	}
 	return &memLink{ch: ch}, nil
+}
+
+// ChannelValues implements [ChannelValueReader] over the in-memory record.
+// cursor is an index into it; each returned value carries the next index.
+func (h *MemChannelHost) ChannelValues(_ context.Context, id string, cursor int64, n int) ([]ChannelValueAt, error) {
+	h.mu.Lock()
+	ch := h.chans[id]
+	h.mu.Unlock()
+	if ch == nil {
+		return nil, nil
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	var out []ChannelValueAt
+	for i := cursor; i < int64(len(ch.items)) && len(out) < n; i++ {
+		it := ch.items[i]
+		if it.Want || it.To != "" || it.Closed {
+			continue
+		}
+		out = append(out, ChannelValueAt{From: it.From, Seq: it.Seq, Data: it.Data, Next: i + 1})
+	}
+	return out, nil
 }
 
 type memChannel struct {

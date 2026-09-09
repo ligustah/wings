@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
+
+	"github.com/ligustah/wings/flow/protos"
 )
 
 // Getting a job's streams off a worker onto the coordinator, and back when the
@@ -72,7 +74,7 @@ func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 
 // parseOutput takes a stream name apart and reports whether it is one of ours.
 func parseOutput(stream string) (outputName, bool) {
-	for _, prefix := range []string{recordingPrefix, historyPrefix, valuesPrefix, priorPrefix, chanoutPrefix} {
+	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {
 			continue
@@ -329,47 +331,100 @@ func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnve
 	})
 }
 
-// hydrateValues copies a job's last attempt's value streams — one per thread —
-// onto the worker about to run the next attempt, under that attempt's names, so
-// the replay reads back the values its history names. A thread that received
-// nothing has no stream and is skipped.
-func (c *Cluster) hydrateValues(ctx context.Context, w *workerConn, job jobEnvelope) error {
+// hydrateChannels copies the canonical streams a moved job receives from onto the
+// worker about to run its next attempt, before it is dispatched, so the replay
+// reads its recorded receives from a local copy — rather than waiting for the
+// push to be discovered once the job links its outbox, a wait that can outlast a
+// heartbeat and move the job again. The catch-up copy is awaited on the same
+// consumer group the live push uses, so the push later resumes from it rather than
+// re-copying; subscribeChannel then keeps delivering new values. Nothing is copied
+// into the job's own storage: the canonical stream stays the one durable copy, and
+// the worker's copy is transient, as for any worker that uses the channel. The
+// channels are read from the job's last history, where each receive names its own.
+func (c *Cluster) hydrateChannels(ctx context.Context, w *workerConn, job jobEnvelope) error {
 	client, err := c.sharedClient()
 	if err != nil {
 		return err
 	}
-	names, err := client.ListStreams(ctx)
-	if err != nil {
-		return fmt.Errorf("wings: look for the value streams of job %s: %w", job.ID, err)
+	if w.client == client {
+		return nil // one broker; the worker already reads the coordinator's canonical
 	}
-	prior := -1
-	for _, name := range names {
-		if o, ok := parseOutput(name); ok && o.Prefix == valuesPrefix && o.Job == streamPart(job.ID) && o.Attempt < job.Attempt && o.Attempt > prior {
-			prior = o.Attempt
+	ids, err := c.receivedChannels(ctx, client, job)
+	if err != nil || len(ids) == 0 {
+		return err
+	}
+	for _, id := range ids {
+		canonical := chanStreamFor(id)
+		ok, err := client.StreamExists(ctx, canonical)
+		if err != nil {
+			return fmt.Errorf("wings: look for channel stream %s: %w", canonical, err)
 		}
-	}
-	if prior < 0 {
-		return nil
-	}
-	for _, name := range names {
-		o, ok := parseOutput(name)
-		if !ok || o.Prefix != valuesPrefix || o.Job != streamPart(job.ID) || o.Attempt != prior {
-			continue
+		if !ok {
+			continue // nothing was put on it, so nothing to replay
 		}
-		dest := valuesName(job.ID, job.Attempt, o.Name)
-		if err := w.client.RunMirror(ctx, "wings.hydrate."+dest, dsclient.MirrorSpec{
+		if err := ensureStream(ctx, w.client, canonical); err != nil {
+			return err
+		}
+		if err := w.client.RunMirror(ctx, pushGroup(w.id, id), dsclient.MirrorSpec{
 			From:             client,
-			Source:           name,
-			Dest:             dest,
+			Source:           canonical,
+			Dest:             canonical,
 			Create:           true,
 			StopWhenCaughtUp: true,
 			Batch:            recordBatch,
 		}); err != nil {
-			return err
+			return fmt.Errorf("wings: pre-push channel %s to worker %s: %w", id, w.id, err)
 		}
+		// Keep delivering new values on the same group, which resumes where the
+		// catch-up stopped.
+		c.subscribeChannel(w.id, id)
 	}
 	return nil
 }
+
+// receivedChannels are the ids of the shared channels a job's last history shows
+// it received from, each canonical stream named the way its receives name it.
+func (c *Cluster) receivedChannels(ctx context.Context, client *dsclient.Client, job jobEnvelope) ([]string, error) {
+	source, err := c.lastHistory(ctx, job.ID, job.Attempt)
+	if err != nil || source == "" {
+		return nil, err
+	}
+	st, err := eventStream[*protos.Event](client, source)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var ids []string
+	for from := int64(0); ; {
+		recs, err := st.Read(ctx, from, recordBatch)
+		if err != nil {
+			return nil, fmt.Errorf("wings: read history %s to find its channels: %w", source, err)
+		}
+		if len(recs) == 0 {
+			return ids, nil
+		}
+		for _, r := range recs {
+			from = r.Offset + 1
+			rv := r.Record.GetChannelRecv()
+			if rv == nil || rv.GetChannel() == "" {
+				continue
+			}
+			// A channel received from another run is recorded by its full id; one this
+			// run created is recorded by its local name, qualified here as its
+			// canonical stream is.
+			id := rv.GetChannel()
+			if !strings.Contains(id, "/") {
+				id = job.Run + "/" + id
+			}
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+}
+
+// lastHistory is the coordinator's copy of a job's last history from an attempt
 
 // lastHistory is the coordinator's copy of a job's last history from an attempt
 // before the one given (any attempt when before is negative), or "".
@@ -481,7 +536,7 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 	// of the job's streams on its worker: deleting one mid-transaction fails the
 	// pull for the whole worker, which would strand other jobs' output on it. The
 	// kept attempt's worker is the one still pulling; abandoned ones are drained or
-	// dead. (reclaimChannelData drains the same way.)
+	// dead.
 	c.drainOutputs(ctx, writers[keep], job)
 	names, err := client.ListStreams(ctx)
 	if err != nil {
@@ -543,57 +598,6 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 		}
 		if err := dropStream(ctx, client, name); err != nil {
 			c.log.Warn("wings: could not discard abandoned output", "stream", name, "err", err)
-		}
-	}
-}
-
-// reclaimChannelData drops the value streams a settled job's kept attempt wrote
-// — the received channel values its history named. They are dead once the job
-// returns: its result is recorded in the caller's history and mirrored, and a
-// replay never re-enters a returned job, so nothing reads them again. The
-// metadata history stays, an inspectable skeleton. Drains first, so dropping the
-// worker's stream does not cut a transaction the coordinator is still copying.
-// Abandoned attempts' value streams go with the rest of their output in
-// [Cluster.dropOutputsOf]; this is only the kept attempt's.
-func (c *Cluster) reclaimChannelData(job string, keep int, writers map[int]*workerConn) {
-	client, err := c.sharedClient()
-	if err != nil {
-		return
-	}
-	ctx := context.WithoutCancel(c.ctx)
-	c.drainOutputs(ctx, writers[keep], job)
-	names, err := client.ListStreams(ctx)
-	if err != nil {
-		c.log.Warn("wings: could not look for a settled job's value streams", "job", job, "err", err)
-		return
-	}
-	var stale []string
-	for _, name := range names {
-		if o, ok := parseOutput(name); ok && o.Prefix == valuesPrefix && o.Job == streamPart(job) && o.Attempt == keep {
-			stale = append(stale, name)
-		}
-	}
-	if len(stale) == 0 {
-		return
-	}
-	c.markDropped(stale)
-	defer c.unmarkDropped(stale)
-
-	fleet := c.fleet()
-	w := writers[keep]
-	reachable := w != nil && w.client != client && slices.Contains(fleet, w)
-	for _, name := range stale {
-		if reachable {
-			if c.outputs != nil {
-				c.outputs.Forget(w.id, name)
-			}
-			if err := dropStream(ctx, w.client, name); err != nil {
-				c.log.Warn("wings: could not discard a settled job's value stream on a worker",
-					"worker", w.id, "stream", name, "err", err)
-			}
-		}
-		if err := dropStream(ctx, client, name); err != nil {
-			c.log.Warn("wings: could not discard a settled job's value stream", "stream", name, "err", err)
 		}
 	}
 }

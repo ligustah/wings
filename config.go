@@ -102,12 +102,13 @@ type Config struct {
 	// by default.
 	RetainHistory bool
 
-	// RetainChannelData keeps the received channel values a settled activity
-	// recorded, instead of dropping them when it returns. Those values are the
-	// bulk of a receiver's history and are dead once it returns — its result is
-	// recorded and a replay never re-enters it — so they are dropped by default,
-	// leaving the metadata history as an inspectable skeleton. Set this to keep
-	// them, for replaying a returned activity step by step while debugging.
+	// RetainChannelData keeps a settled activity's shared-channel streams, instead
+	// of dropping them when it returns. A receiver records what it took by identity
+	// alone and reads the bytes back from the channel's canonical stream, so that
+	// stream is the one copy of the channel's values; it is the bulk of the data
+	// and is dead once the activity returns — its result is recorded and a replay
+	// never re-enters it — so it is dropped by default. Set this to keep it, for
+	// replaying a returned activity step by step while debugging.
 	RetainChannelData bool
 
 	// LocalSharedBroker, for the [LocalProcess] target, has the worker child

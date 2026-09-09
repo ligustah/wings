@@ -313,7 +313,6 @@ const loadBatch = 512
 func (r *threadRunner) load(ctx context.Context, store Store) ([]*protos.Event, []int64, []int64, error) {
 	var events []*protos.Event
 	var offsets, valueIdx []int64
-	var moved int64
 	for from := int64(0); ; {
 		batch, err := store.Read(ctx, r.name, r.id, from, loadBatch)
 		if err != nil {
@@ -323,12 +322,12 @@ func (r *threadRunner) load(ctx context.Context, store Store) ([]*protos.Event, 
 			return events, offsets, valueIdx, nil
 		}
 		for _, ea := range batch {
-			// Decided from the raw event, before stripValue nils it: a non-closed
-			// receive with no inline value had its value moved to the side stream,
-			// and takes the next index there.
+			// Decided from the raw event, before strippedEvent nils it: a non-closed
+			// receive with no inline value took from a shared channel, whose value
+			// the host keeps and replay reads back by identity (see channelValue). A
+			// non-negative mark flags it; -1 means the value is inline on the stream.
 			if rv := ea.Event.GetChannelRecv(); rv != nil && !rv.GetClosed() && rv.GetValue() == nil {
-				valueIdx = append(valueIdx, moved)
-				moved++
+				valueIdx = append(valueIdx, 0)
 			} else {
 				valueIdx = append(valueIdx, -1)
 			}
