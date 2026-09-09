@@ -889,8 +889,8 @@ func (c *Cluster) forget(p *pendingJob) {
 	// the activity again. Retire them mid-run, so a long run of short activities
 	// does not accumulate their channel data. Dropped as their last feeder leaves.
 	if !c.closed && !c.cfg.RetainChannelData && p.origin.Run != "" && p.origin.Thread != "" {
-		run, thread := p.origin.Run, p.origin.Thread
-		c.wg.Go(func() { c.retireThreadChannels(run, thread) })
+		job := p.job.ID
+		c.wg.Go(func() { c.retireJobChannels(job) })
 	}
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {

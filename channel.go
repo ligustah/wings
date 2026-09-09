@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -88,9 +87,12 @@ type channelRelay struct {
 	// coordinator's own plus one per forked sender — so the canonical is dropped
 	// only when the last of them is gone. Keyed by canonical stream name.
 	feeders map[string]int
-	// canonByRun names the canonical streams of a run's coordinator-created
-	// channels, so the run's completion can retire them. Keyed by run name.
+	// canonByRun names the canonical streams of a run's channels, so the run's
+	// completion can retire whatever is left. Keyed by run name.
 	canonByRun map[string]map[string]bool
+	// canonByJob names the canonical streams a placed job created, observed as its
+	// outboxes are found, so the job's settle retires exactly them. Keyed by job.
+	canonByJob map[string]map[string]bool
 	// doneCanon names canonical streams whose owning run has completed, so the
 	// last feeder to leave drops them. Keyed by canonical stream name.
 	doneCanon map[string]bool
@@ -105,6 +107,7 @@ func (c *Cluster) startChannelRelay() {
 		outboxJobs: map[string]bool{},
 		feeders:    map[string]int{},
 		canonByRun: map[string]map[string]bool{},
+		canonByJob: map[string]map[string]bool{},
 		doneCanon:  map[string]bool{},
 	}
 	c.wg.Go(c.runChannelRelay)
@@ -122,6 +125,21 @@ func (r *channelRelay) noteRunChannel(run, canonical string) {
 		r.canonByRun[run] = byRun
 	}
 	byRun[canonical] = true
+}
+
+// noteJobChannel records that canonical was created by a placed job, so the
+// job's settle retires exactly the channels it created — the same reclaim scope
+// a returned in-process call gets, keyed by what the coordinator observed rather
+// than inferred from the stream's name.
+func (r *channelRelay) noteJobChannel(job, canonical string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	byJob := r.canonByJob[job]
+	if byJob == nil {
+		byJob = map[string]bool{}
+		r.canonByJob[job] = byJob
+	}
+	byJob[canonical] = true
 }
 
 func (r *channelRelay) jobFinal(job string) bool {
@@ -249,11 +267,15 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 	r.mu.Unlock()
 
 	// A worker-created channel is known to the coordinator only by this outbox;
-	// attribute its canonical stream to the job's run (the coordinator's own
-	// channels are attributed in clusterChannels.Link instead) so the run's
-	// completion retires it too. Resolved off the lock to keep c.mu after r.mu.
+	// attribute its canonical stream to the job (so the job's settle retires it)
+	// and to the job's run (so the run's end retires whatever is left). The
+	// coordinator's own channels are attributed in clusterChannels.Link instead;
+	// runOfJob names a live placed job, so it skips them. Resolved off the lock to
+	// keep c.mu after r.mu.
 	if run, ok := c.runOfJob(job); ok {
-		r.noteRunChannel(run, chanStreamFor(id))
+		canonical := chanStreamFor(id)
+		r.noteRunChannel(run, canonical)
+		r.noteJobChannel(job, canonical)
 	}
 
 	c.wg.Go(func() {
@@ -425,41 +447,23 @@ func (c *Cluster) retireRunChannels(run string) {
 	c.retireCanonicals(cs)
 }
 
-// createdByThread reports whether canonical is the stream of a channel that
-// thread created. A channel's id is "<run>/<thread>.ch<n>", so its stream name
-// is the thread's channel prefix followed by the digits of n — and a sub-thread's
-// channel ("<thread>.<k>.ch<n>") has a digit, not "ch", after the prefix, so it
-// does not match its parent.
-func createdByThread(canonical, run, thread string) bool {
-	prefix := chanPrefix + streamPart(run) + "_" + streamPart(thread) + "_ch"
-	rest, ok := strings.CutPrefix(canonical, prefix)
-	if !ok || rest == "" {
-		return false
-	}
-	for _, r := range rest {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// retireThreadChannels retires the channels a forked activity created, found by
-// its thread's name. The remote activity has returned (its job settled), so its
-// result is recorded and its channels' data is dead — a replay re-inserts the
-// result rather than re-entering the activity. Selects for [retireCanonicals].
-func (c *Cluster) retireThreadChannels(run, thread string) {
+// retireJobChannels retires the channels a forked activity created. The remote
+// activity has returned (its job settled), so its result is recorded and its
+// channels' data is dead — a replay re-inserts the result rather than re-entering
+// the activity. The channels are those observed under the job's outboxes
+// (noteJobChannel), the same reclaim a returned in-process call gets by explicit
+// id. Selects for [retireCanonicals].
+func (c *Cluster) retireJobChannels(job string) {
 	r := c.relay
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
-	var cs []string
-	for canonical := range r.canonByRun[run] {
-		if createdByThread(canonical, run, thread) {
-			cs = append(cs, canonical)
-		}
+	cs := make([]string, 0, len(r.canonByJob[job]))
+	for canonical := range r.canonByJob[job] {
+		cs = append(cs, canonical)
 	}
+	delete(r.canonByJob, job)
 	r.mu.Unlock()
 	c.retireCanonicals(cs)
 }
@@ -490,7 +494,7 @@ func (c *Cluster) retireChannels(run string, ids []string) {
 // done and drop those with no feeding outbox left; the rest go as their last
 // feeder's outbox is dropped (dropOutbox), so a channel still fed by a live sender
 // waits for its data to arrive home. Every reclaim — a returned in-process call
-// ([Cluster.retireChannels]), a settled job's thread ([Cluster.retireThreadChannels]),
+// ([Cluster.retireChannels]), a settled forked activity ([Cluster.retireJobChannels]),
 // a finished run ([Cluster.retireRunChannels]) — selects its channels and calls this.
 func (c *Cluster) retireCanonicals(canonicals []string) {
 	r := c.relay
