@@ -879,7 +879,7 @@ func (c *Cluster) forget(p *pendingJob) {
 	// recorded and a replay never re-enters it. Drop them, keeping the metadata
 	// history, unless channel data is being kept. Any attempt: a first-try success
 	// is past dropOutputsOf above but still has values to reclaim.
-	if !c.closed && !c.cfg.RetainChannelData {
+	if !c.closed && !c.cfg.RetainChannelData && len(p.ran) > 0 {
 		job, keep := p.job.ID, p.job.Attempt
 		writers := maps.Clone(p.ran)
 		c.wg.Go(func() {
