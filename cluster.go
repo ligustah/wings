@@ -913,9 +913,15 @@ func (c *Cluster) forgetRun(run string) {
 	// coordinator's, not a placed job's, so the per-job settle path never
 	// finalizes them and they were tailed for the cluster's life. The run is over
 	// now — everything it sent is merged into the canonical streams — so mark them
-	// final and let the relay drop them. The canonical streams stay for a resume.
+	// final and let the relay drop them.
 	if !c.closed && c.hadOutbox(streamPart(run)) {
 		c.wg.Go(func() { c.finishChannels(run, nil) })
+	}
+	// The run is finished for good and will not resume, so its channels' canonical
+	// streams — kept otherwise so a resume can replay receives — are now dead.
+	// Retire them once their last feeding outbox is dropped (see dropOutbox).
+	if !c.closed {
+		c.wg.Go(func() { c.retireRunChannels(run) })
 	}
 }
 

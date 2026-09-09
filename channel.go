@@ -78,6 +78,16 @@ type channelRelay struct {
 	// outboxJobs names jobs the relay has ever tailed an outbox for, so a settled
 	// job with no shared channel is not chased. Keyed by streamPart(job).
 	outboxJobs map[string]bool
+	// feeders counts the outboxes still feeding each canonical stream — the
+	// coordinator's own plus one per forked sender — so the canonical is dropped
+	// only when the last of them is gone. Keyed by canonical stream name.
+	feeders map[string]int
+	// canonByRun names the canonical streams of a run's coordinator-created
+	// channels, so the run's completion can retire them. Keyed by run name.
+	canonByRun map[string]map[string]bool
+	// doneCanon names canonical streams whose owning run has completed, so the
+	// last feeder to leave drops them. Keyed by canonical stream name.
+	doneCanon map[string]bool
 }
 
 func (c *Cluster) startChannelRelay() {
@@ -87,8 +97,25 @@ func (c *Cluster) startChannelRelay() {
 		tailed:     map[string]bool{},
 		finalJob:   map[string]bool{},
 		outboxJobs: map[string]bool{},
+		feeders:    map[string]int{},
+		canonByRun: map[string]map[string]bool{},
+		doneCanon:  map[string]bool{},
 	}
 	c.wg.Go(c.runChannelRelay)
+}
+
+// noteRunChannel records that canonical belongs to run, so the run's completion
+// can retire it. Called from the coordinator's channel host, which alone has the
+// run and the channel id unmangled.
+func (r *channelRelay) noteRunChannel(run, canonical string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	byRun := r.canonByRun[run]
+	if byRun == nil {
+		byRun = map[string]bool{}
+		r.canonByRun[run] = byRun
+	}
+	byRun[canonical] = true
 }
 
 func (r *channelRelay) jobFinal(job string) bool {
@@ -212,6 +239,7 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 	}
 	r.tailed[name] = true
 	r.outboxJobs[job] = true
+	r.feeders[chanStreamFor(id)]++
 	r.mu.Unlock()
 
 	c.wg.Go(func() {
@@ -334,10 +362,10 @@ func (c *Cluster) finishChannels(job string, w *workerConn) {
 	c.pokeRelay()
 }
 
-// dropOutbox deletes a settled channel's outbox and lets its tail stop. The
-// canonical stream is left alone, so a resume still replays receives from it.
-// tailed keeps the name, so no discovery pass starts a fresh tail on the gone
-// stream.
+// dropOutbox deletes a settled channel's outbox and lets its tail stop. tailed
+// keeps the name, so no discovery pass starts a fresh tail on the gone stream.
+// Dropping it drops the canonical stream too once this was its last feeder and
+// the owning run has finished (dropRetiredCanonical).
 func (c *Cluster) dropOutbox(name string) {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -348,6 +376,64 @@ func (c *Cluster) dropOutbox(name string) {
 		c.log.Warn("wings: could not drop a settled channel outbox", "stream", name, "err", err)
 	}
 	c.unmarkDropped([]string{name})
+
+	o, _ := parseOutput(name)
+	canonical := chanPrefix + o.Name
+	r := c.relay
+	r.mu.Lock()
+	if r.feeders[canonical] > 0 {
+		r.feeders[canonical]--
+	}
+	retire := r.feeders[canonical] == 0 && r.doneCanon[canonical]
+	r.mu.Unlock()
+	if retire {
+		c.dropCanonical(canonical)
+	}
+}
+
+// retireRunChannels marks a finished run's canonical streams for retirement and
+// drops any whose feeding outboxes are already gone; the rest go as their last
+// feeder's outbox is dropped (dropOutbox). A completed run will not resume, so
+// its canonical streams — kept otherwise so a resume can replay receives — are
+// dead. Covers the run's coordinator-created channels (noteRunChannel).
+func (c *Cluster) retireRunChannels(run string) {
+	r := c.relay
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	var drop []string
+	for canonical := range r.canonByRun[run] {
+		r.doneCanon[canonical] = true
+		if r.feeders[canonical] == 0 {
+			drop = append(drop, canonical)
+		}
+	}
+	delete(r.canonByRun, run)
+	r.mu.Unlock()
+	for _, canonical := range drop {
+		c.dropCanonical(canonical)
+	}
+}
+
+// dropCanonical deletes one canonical stream and forgets the relay's state for
+// it. Called when the channel's run has finished and its last outbox is gone.
+func (c *Cluster) dropCanonical(canonical string) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	c.markDropped([]string{canonical})
+	if err := dropStream(context.WithoutCancel(c.ctx), client, canonical); err != nil {
+		c.log.Warn("wings: could not drop a finished run's channel stream", "stream", canonical, "err", err)
+	}
+	c.unmarkDropped([]string{canonical})
+	r := c.relay
+	r.mu.Lock()
+	delete(r.channels, canonical)
+	delete(r.feeders, canonical)
+	delete(r.doneCanon, canonical)
+	r.mu.Unlock()
 }
 
 // subscribeChannel starts pushing a channel's canonical stream onto a worker
@@ -410,6 +496,11 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 	outbox, err := eventStream[flow.ChannelItem](client, out)
 	if err != nil {
 		return nil, err
+	}
+	// The run owns this channel; record it so the run's completion can retire its
+	// canonical stream. Only here is the run paired with the unmangled id.
+	if h.c.relay != nil {
+		h.c.relay.noteRunChannel(run, chanStreamFor(id))
 	}
 	h.c.pokeRelay()
 	return &channelLink{

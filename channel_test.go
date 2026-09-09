@@ -42,9 +42,10 @@ var counts = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	return in.Count, in.Values.Close(ctx)
 }, flow.WithName("test.counts"))
 
-// THE POINT: a settled job's shared-channel outbox is dropped once its output is
-// home and merged, rather than tailed for the cluster's life. The canonical
-// stream stays, so a resume can still replay receives from it.
+// THE POINT: a finished run's channel data is reclaimed. A settled job's outbox
+// is dropped once its output is home and merged; and once the run completes — so
+// it will never resume and replay receives from them — its canonical streams are
+// dropped too, rather than kept for the cluster's life.
 func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")
@@ -75,9 +76,10 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 		t.Fatalf("shared client: %v", err)
 	}
 
-	// Every outbox is dropped once the run settles: the two forked jobs' by the
-	// per-job settle path, and the workflow's own export outbox by forgetRun once
-	// the run completes. The canonical stream must survive for a resume.
+	// All channel streams go once the run completes: every outbox (the two forked
+	// jobs' by the per-job settle path, the workflow's own export outbox by
+	// forgetRun) and then each canonical stream, once its last feeding outbox is
+	// gone. A completed run will not resume, so nothing reads them again.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		names, err := client.ListStreams(t.Context())
@@ -93,14 +95,11 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 				canonical++
 			}
 		}
-		if outboxes == 0 {
-			if canonical == 0 {
-				t.Fatal("the canonical channel stream was dropped; a resume could not replay")
-			}
+		if outboxes == 0 && canonical == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d channel outboxes still present after the run settled; they were not all dropped", outboxes)
+			t.Fatalf("after the run completed, %d outboxes and %d canonical channel streams remain; not all reclaimed", outboxes, canonical)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
