@@ -2,7 +2,10 @@ package flow
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ligustah/wings/flow/protos"
@@ -224,6 +227,44 @@ func TestReadEventsPagesAThread(t *testing.T) {
 	}
 	if pages < 2 {
 		t.Fatalf("expected more than one page, got %d", pages)
+	}
+}
+
+func TestFormatValue(t *testing.T) {
+	big := strings.Repeat("x", valueCap+500)
+	bin := make([]byte, 40)
+	for i := range bin {
+		bin[i] = byte(i)
+	}
+	bigBin := make([]byte, valueCap)
+	cases := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"empty", nil, ""},
+		{"text", []byte(`{"ok":true}`), `{"ok":true}`},
+		{"tabs and newlines", []byte("a\tb\nc"), "a\tb\nc"},
+		{"long text truncated", []byte(big), string(big[:valueCap]) + fmt.Sprintf("… (+%d bytes)", 500)},
+		{"binary as hex", bin, hex.EncodeToString(bin)},
+		{"long binary truncated", bigBin, hex.EncodeToString(bigBin[:valueCap/2]) + fmt.Sprintf("… (+%d bytes)", valueCap-valueCap/2)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatValue(tc.in); got != tc.want {
+				t.Fatalf("formatValue = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	if !printableUTF8([]byte("hello")) {
+		t.Fatal("printableUTF8 rejected plain text")
+	}
+	if printableUTF8([]byte{0x00, 0x01}) {
+		t.Fatal("printableUTF8 accepted control bytes")
+	}
+	if printableUTF8([]byte{0xff, 0xfe}) {
+		t.Fatal("printableUTF8 accepted invalid UTF-8")
 	}
 }
 

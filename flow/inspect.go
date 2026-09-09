@@ -2,10 +2,12 @@ package flow
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ligustah/wings/flow/protos"
 )
@@ -283,7 +285,11 @@ type EventView struct {
 	At     time.Time `json:"at"`
 	Kind   string    `json:"kind"`
 	Detail string    `json:"detail,omitempty"`
-	Error  string    `json:"error,omitempty"`
+	// Value is the event's recorded value, formatted for display: a call or
+	// effect's result, a join's child result. Text when the bytes are printable
+	// UTF-8, a hex dump otherwise, capped so a large value does not flood the view.
+	Value string `json:"value,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // Inspect reads the recorded history of run from store and returns a read-only
@@ -335,8 +341,10 @@ func eventView(ev *protos.Event) EventView {
 		v.Kind, v.Detail = "call", p.GetName()
 	case *protos.ReturnEvent:
 		v.Kind = "return"
-		if _, err := unpackResult(p.GetResult()); err != nil {
+		if data, err := unpackResult(p.GetResult()); err != nil {
 			v.Error = err.Error()
+		} else {
+			v.Value = formatValue(data)
 		}
 	case *protos.ForkEvent:
 		v.Kind, v.Detail = "fork", p.GetThreadId()
@@ -345,8 +353,10 @@ func eventView(ev *protos.Event) EventView {
 		}
 	case *protos.JoinEvent:
 		v.Kind, v.Detail = "join", p.GetThreadId()
-		if _, err := unpackResult(p.GetResult()); err != nil {
+		if data, err := unpackResult(p.GetResult()); err != nil {
 			v.Error = err.Error()
+		} else {
+			v.Value = formatValue(data)
 		}
 	case *protos.SleepEvent:
 		v.Kind, v.Detail = "sleep", p.GetDuration().AsDuration().String()
@@ -354,8 +364,10 @@ func eventView(ev *protos.Event) EventView {
 		v.Kind, v.Detail = "time", p.GetTime().AsTime().Format(time.RFC3339Nano)
 	case *protos.EffectEvent:
 		v.Kind = "effect"
-		if _, err := unpackResult(p.GetResult()); err != nil {
+		if data, err := unpackResult(p.GetResult()); err != nil {
 			v.Error = err.Error()
+		} else {
+			v.Value = formatValue(data)
 		}
 	case *protos.ChannelSendEvent:
 		v.Kind = "send"
@@ -382,6 +394,44 @@ func eventView(ev *protos.Event) EventView {
 		v.Kind = protos.EventType(ev)
 	}
 	return v
+}
+
+const valueCap = 2048
+
+// formatValue renders a recorded value for display: printable UTF-8 as text,
+// anything else as hex, each truncated near valueCap bytes with a "… (+N bytes)"
+// marker.
+func formatValue(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if printableUTF8(b) {
+		if len(b) <= valueCap {
+			return string(b)
+		}
+		cut := valueCap
+		for cut > 0 && !utf8.RuneStart(b[cut]) {
+			cut--
+		}
+		return string(b[:cut]) + fmt.Sprintf("… (+%d bytes)", len(b)-cut)
+	}
+	const hexCap = valueCap / 2
+	if len(b) <= hexCap {
+		return hex.EncodeToString(b)
+	}
+	return hex.EncodeToString(b[:hexCap]) + fmt.Sprintf("… (+%d bytes)", len(b)-hexCap)
+}
+
+func printableUTF8(b []byte) bool {
+	if !utf8.Valid(b) {
+		return false
+	}
+	for _, r := range string(b) {
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 func statusName(s protos.WorkflowStatus) string {
