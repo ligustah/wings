@@ -246,8 +246,9 @@ func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 			cs.shut()
 		case it.To != "":
 			cs.grant(it)
-		case it.Want:
-			// The grant is what matters, and it follows.
+		case it.Want, it.Unwant:
+			// The grant is what matters, and it follows; a retraction changes only
+			// what the host gives out.
 		default:
 			// put drops a copy already here; not announced back to the link.
 			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false)
