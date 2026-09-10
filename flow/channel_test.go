@@ -238,6 +238,49 @@ func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 	}
 }
 
+// THE POINT: the send side and receive side vended by Writer and Reader carry
+// values the same as the channel itself, so a thread can be handed only the
+// capability it needs.
+func TestWriterAndReaderCarryValues(t *testing.T) {
+	var got int
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		w, r := ch.Writer(), ch.Reader()
+
+		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
+			for i := 1; i <= 3; i++ {
+				if err := w.Send(ctx, i); err != nil {
+					return 0, err
+				}
+			}
+			return 0, w.Close(ctx)
+		})
+
+		total := 0
+		for {
+			v, ok, err := r.Recv(ctx)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			total += v
+		}
+		if _, err := producer.Await(ctx); err != nil {
+			return err
+		}
+		got = total
+		return nil
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 6 {
+		t.Fatalf("got %d, want 6 (1+2+3)", got)
+	}
+}
+
 // THE POINT: which of two concurrent senders arrives first is the operating
 // system's decision, not the run's — so a replay that took "whatever is
 // there" would take a different value than the run it is replaying, and every

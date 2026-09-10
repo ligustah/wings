@@ -349,6 +349,37 @@ func (c *Channel[T]) Close(ctx Context) error {
 	return t.err()
 }
 
+// Writer is the send side of a channel: the capability to [Writer.Send] and
+// [Writer.Close], with no way to receive. Obtain it with [Channel.Writer]; pass
+// it to a thread that should only produce.
+type Writer[T any] struct{ ch *Channel[T] }
+
+// Reader is the receive side of a channel: the capability to [Reader.Recv], with
+// no way to send or close. Obtain it with [Channel.Reader]; pass it to a thread
+// that should only consume.
+type Reader[T any] struct{ ch *Channel[T] }
+
+// Writer returns the channel's send side.
+func (c *Channel[T]) Writer() Writer[T] { return Writer[T]{ch: c} }
+
+// Reader returns the channel's receive side.
+func (c *Channel[T]) Reader() Reader[T] { return Reader[T]{ch: c} }
+
+// Send puts a value on the channel. See [Channel.Send].
+func (w Writer[T]) Send(ctx Context, v T) error { return w.ch.Send(ctx, v) }
+
+// Close says nothing more will be sent. See [Channel.Close].
+func (w Writer[T]) Close(ctx Context) error { return w.ch.Close(ctx) }
+
+// Name is the channel's identity in its run's history. See [Channel.Name].
+func (w Writer[T]) Name() string { return w.ch.Name() }
+
+// Recv takes the next value off the channel. See [Channel.Recv].
+func (r Reader[T]) Recv(ctx Context) (T, bool, error) { return r.ch.Recv(ctx) }
+
+// Name is the channel's identity in its run's history. See [Channel.Name].
+func (r Reader[T]) Name() string { return r.ch.Name() }
+
 // bind resolves the calling thread and this channel's shared state.
 func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 	c.mu.Lock()
