@@ -51,6 +51,19 @@ func (p *parking) waits(of []flow.Wait) map[string][]string {
 	return out
 }
 
+// has reports whether any thread has parked on a wait of this kind yet, so a
+// test can wait for a park to be recorded instead of racing a fixed sleep.
+func (p *parking) has(on string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, w := range p.parked {
+		if w.On == on {
+			return true
+		}
+	}
+	return false
+}
+
 // THE POINT: a thread that waits says so, once per wait, and says when the
 // wait is over — which is what lets a process that bounds its running
 // threads not count the waiting ones. A wait that is over before it began
@@ -61,24 +74,39 @@ func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 		ch := ctx.NewBufferedChannel[int](1)
 		release := make(chan struct{})
 		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			<-release
-			if err := ch.Send(ctx, 1); err != nil { // the one place in the buffer
-				return 0, err
+			<-release // held until the receive below is parked with nothing to take
+			for _, v := range []int{1, 2, 3} {
+				if err := ch.Send(ctx, v); err != nil {
+					return 0, err
+				}
 			}
-			// A second send with the one-place buffer full: waits for a receive.
-			return 0, ch.Send(ctx, 2)
+			return 0, nil
 		})
 
-		// A receive with nothing to take: waits, for the producer.
+		// A receive with nothing to take waits, for the producer; release the
+		// producer only once that wait is on record, so the receive park is certain.
 		go func() {
-			time.Sleep(20 * time.Millisecond)
+			for !p.has(flow.WaitRecv) {
+				time.Sleep(time.Millisecond)
+			}
 			close(release)
 		}()
+		if _, _, err := ch.Recv(ctx); err != nil { // parks (WaitRecv), then takes 1
+			return err
+		}
+
+		// With the first value taken the producer sends the next two: the second
+		// fills the one-place buffer and the third waits for room while nothing is
+		// receiving. Drain only once that send wait is on record, so it is certain.
+		for !p.has(flow.WaitSend) {
+			time.Sleep(time.Millisecond)
+		}
 		for range 2 {
 			if _, _, err := ch.Recv(ctx); err != nil {
 				return err
 			}
 		}
+
 		if err := ctx.Sleep(10 * time.Millisecond); err != nil {
 			return err
 		}
