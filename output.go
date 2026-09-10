@@ -15,11 +15,13 @@ import (
 )
 
 // Getting a job's streams off a worker onto the coordinator, and back when the
-// job moves. What an attempt commits comes home as its transactions (pull.go);
-// what is written outside one — a shared channel's outbox — comes by a
-// [dsclient.MirrorSet], which also carries a copy the other way onto the worker
-// a retry runs on. No bookkeeping: where a copy has reached lives at the
-// destination, and what to copy is re-derived from stream names each pass.
+// job moves. Everything an attempt writes — history, recordings, and shared-channel
+// outboxes — it writes inside its transaction, so it all comes home as the
+// attempt's transactions (pull.go); a [dsclient.MirrorSet] only watches worker
+// catalogs, to subscribe a worker to a channel when its outbox appears, and makes
+// the copies the other way onto the worker a retry runs on (hydrate). No
+// bookkeeping: where a copy has reached lives at the destination, re-derived from
+// stream names.
 
 const (
 	// outputSet names the mirror's consumer group, so a restarted coordinator
@@ -108,11 +110,6 @@ func streamPart(s string) string {
 	return b.String()
 }
 
-// chanoutBatch is how many outbox records the mirror moves per transaction.
-// Small, because an outbox record can be a quarter-megabyte [flow.Bytes] chunk,
-// and recordBatch of those would exceed the transport limit.
-const chanoutBatch = 8
-
 // jobOutput stands up a stream for [Record] on the worker the coordinator will
 // keep it from.
 func jobOutput(ctx context.Context, prefix, name string) (*dsclient.Client, string, error) {
@@ -180,9 +177,11 @@ func awaitStream(ctx context.Context, client *dsclient.Client, name string, expe
 	}
 }
 
-// startOutputMirror keeps a copy of what jobs write outside their transactions —
-// shared-channel outboxes — over one set spanning the whole fleet, re-read each
-// pass so machines coming and going are picked up and released.
+// startOutputMirror watches the fleet's catalogs so a worker's outbox, when it
+// appears, subscribes that worker to the channel's canonical stream. It copies
+// nothing home — everything a job writes comes by the transaction pull (pull.go) —
+// but the pull cannot see a pure receiver's outbox, which writes no record, so the
+// subscription is noticed here instead.
 func (c *Cluster) startOutputMirror() error {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -195,25 +194,17 @@ func (c *Cluster) startOutputMirror() error {
 		Create:   true,
 		Discover: outputDiscover,
 		Select: func(cand dsclient.MirrorCandidate) (dsclient.MirrorTarget, error) {
-			o, ok := parseOutput(cand.Stream)
-			// A prior was put there by a mirror; forwarding it back would be two
-			// mirrors on one destination. Everything else non-output is plumbing.
-			if !ok || o.Prefix == priorPrefix {
-				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
-			}
-			// Transactional output (history, recordings) is pulled instead; only
-			// what is written outside a transaction comes this way.
-			if o.Prefix != chanoutPrefix {
-				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
-			}
-			if c.wasDropped(cand.Stream) {
-				return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
-			}
-			// A worker's outbox is also its subscription to the channel.
-			if o.Prefix == chanoutPrefix {
+			// Everything a job writes — history, recordings, and shared-channel
+			// outboxes — is written inside the attempt's transaction and comes home
+			// by the transaction pull (pull.go), so the set copies nothing. It still
+			// watches worker catalogs for one thing the pull cannot see: a pure
+			// receiver's outbox is created as its subscription but, writing no record,
+			// produces no transaction — so the canonical stream is pushed to a worker
+			// when its outbox appears here, not when a record of it is pulled.
+			if o, ok := parseOutput(cand.Stream); ok && o.Prefix == chanoutPrefix && !c.wasDropped(cand.Stream) {
 				c.subscribeChannel(cand.Source, o.Name)
 			}
-			return dsclient.MirrorTarget{Name: cand.Stream, Batch: chanoutBatch}, nil
+			return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
 		},
 		OnStreamError: func(cand dsclient.MirrorCandidate, err error) error {
 			if c.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
@@ -452,30 +443,21 @@ func (c *Cluster) lastHistory(ctx context.Context, job string, before int) (stri
 
 // drainOutputs waits, bounded and best-effort, for the coordinator's copies of
 // what a worker holds to be as complete as the worker's own, before it stops
-// being readable. Both callers have already stopped sending it work.
+// being readable. Everything a job writes comes home by the transaction pull
+// (pull.go), so this waits on the pulled level. Both callers have already stopped
+// sending the worker work.
 func (c *Cluster) drainOutputs(ctx context.Context, from *workerConn, job string) {
 	client, err := c.sharedClient()
-	if err != nil || from == nil || from.client == client || c.outputs == nil {
+	if err != nil || from == nil || from.client == client {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, outputDrain)
 	defer cancel()
 
-	// A worker the set has not listed yet reports not-drained; poke so a
-	// recently-adopted one is reconciled.
-	c.pokeOutputs()
-
 	for {
-		done, err := c.outputs.CaughtUp(ctx, from.id)
-		if err != nil {
-			return // not a source of this set; nothing to wait for
-		}
-		if done {
-			// And the transactions, which come the other way. See pull.go.
-			level, err := c.pulledLevel(ctx, from, job)
-			if err != nil || level {
-				return
-			}
+		level, err := c.pulledLevel(ctx, from, job)
+		if err != nil || level {
+			return
 		}
 		select {
 		case <-ctx.Done():

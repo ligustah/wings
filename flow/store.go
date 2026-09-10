@@ -18,6 +18,14 @@ type Sink interface {
 	Append(ctx context.Context, ev *protos.Event) error
 }
 
+// Committer is an optional [Sink] capability: flushing what has been appended so
+// far, so writes that must land together — a shared-channel send's event and the
+// outbox record it travels by — commit as one transaction. A Sink that does not
+// implement it commits each append on its own, so the two land separately.
+type Committer interface {
+	Commit(ctx context.Context) error
+}
+
 // EventAt pairs an event with its offset on a thread's stream, so a value
 // dropped when the history was loaded can be read back by offset later.
 type EventAt struct {

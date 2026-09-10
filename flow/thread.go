@@ -482,6 +482,27 @@ func (t *threadState) err() error {
 	return t.sinkErr
 }
 
+// commit flushes the sink's pending writes, so a shared-channel send's event and
+// its outbox record commit together (see [Committer]). A no-op for a sink that
+// commits each append on its own. Runs off the caller's cancellation: what is
+// already recorded must be committed even as the attempt is torn down.
+func (t *threadState) commit(ctx context.Context) error {
+	t.run.mu.Lock()
+	sink, serr, over := t.sink, t.sinkErr, t.run.over
+	t.run.mu.Unlock()
+	if serr != nil {
+		return serr
+	}
+	if sink == nil || over {
+		return nil
+	}
+	c, ok := sink.(Committer)
+	if !ok {
+		return nil
+	}
+	return c.Commit(context.WithoutCancel(ctx))
+}
+
 // nextChild names the next thread this one forks, from the fork counter rather
 // than start order, so a replay re-adopts the child a previous attempt created.
 func (t *threadState) nextChild() string {

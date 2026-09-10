@@ -16,14 +16,15 @@ import (
 // A channel shared between runs on different machines is a durable stream
 // relayed through the coordinator (the flow package's ChannelHost is the seam).
 // Each run has an outbox per channel — wings.chanout.<job>.<attempt>.<channel> —
-// copied home by the same mirror as a recording, but written outside the
-// attempt's transaction: each record is named by sender and sequence, so a
-// duplicate from a replay is dropped, and what it needs is to be seen at once.
-// The coordinator's relay merges every outbox into one canonical stream,
+// written as part of the attempt's transaction, so a send's record comes home
+// with the history that produced it, together, under the transaction pull
+// (pull.go); each record is named by sender and sequence, so a duplicate is
+// dropped. The coordinator's relay merges every outbox into one canonical stream,
 // wings.chan.<channel>, deduped by the [flow.Ledger]. A run receives by reading
 // the canonical stream — its own on the coordinator, a pushed copy on a worker.
-// Creating an outbox is also the subscription; the canonical stream is never
-// dropped, so a restarted coordinator replays receives from it.
+// A run marks its outbox with a Link record when it subscribes, so even a pure
+// receiver that sends nothing leaves an outbox the relay can see; the canonical
+// stream is never dropped, so a restarted coordinator replays receives from it.
 
 const (
 	chanoutPrefix = "wings.chanout."
@@ -429,13 +430,17 @@ func (c *Cluster) finishChannels(job string, w *workerConn) {
 	if err != nil {
 		return
 	}
-	if w != nil && w.client != client && c.outputs != nil {
+	if w != nil && w.client != client {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), outputDrain)
 		caught := false
-		for !caught {
-			done, err := c.outputs.CaughtUp(ctx, w.id)
+		for {
+			// The outbox comes home by the transaction pull now (pull.go), so wait
+			// on the pulled level rather than the mirror: the coordinator's copy of
+			// the job's streams must be as complete as the worker's before the relay
+			// drops the outbox.
+			done, err := c.pulledLevel(ctx, w, job)
 			if err != nil {
-				break // not a source of the set; cannot confirm the copy is home
+				break // cannot confirm the copy is home
 			}
 			if done {
 				caught = true
@@ -726,10 +731,26 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 	if err != nil {
 		return nil, err
 	}
+	// A worker's outbox comes home inside the attempt's transactions (pull.go), not
+	// by a stream copy, so an outbox that never has a record written to it — a pure
+	// creator's or receiver's — produces no transaction and the coordinator never
+	// learns it exists, and so never attributes or reclaims its channel. Write one
+	// marker, committed now, so every outbox is pulled and the relay sees it; the
+	// ledger drops the marker from the channel's record.
+	mctx := context.WithoutCancel(ctx)
+	if err := h.job.outputs.append(mctx, outbox, []flow.ChannelItem{{Link: true}}); err != nil {
+		return nil, err
+	}
+	if err := h.job.outputs.commit(mctx); err != nil {
+		return nil, err
+	}
 	return &channelLink{
+		// Through the attempt's transaction, so each record goes home with the
+		// history that justified it (pull.go); flow commits the transaction as part
+		// of the send or receive that wrote it. The whole outbox is transactional,
+		// so it is pulled, not mirrored.
 		send: func(ctx context.Context, it flow.ChannelItem) error {
-			_, err := outbox.Append(ctx, []flow.ChannelItem{it})
-			return err
+			return h.job.outputs.append(ctx, outbox, []flow.ChannelItem{it})
 		},
 		client: h.n.client,
 		in:     chanStreamFor(id),

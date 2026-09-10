@@ -27,6 +27,11 @@ type ChannelItem struct {
 	// a sender counting room by what it has mirrored can free the place. Relayed to
 	// every link; a sender applies it to its own queued send.
 	Consumed bool
+	// Link marks a record written only so a run's outbox exists: the run has linked
+	// the channel but may send nothing. A host uses it to learn the outbox is there
+	// (see the wings relay); it carries no value and is never put on the channel's
+	// record.
+	Link bool
 }
 
 // ChannelLink is one run's connection to a shared channel.
@@ -175,8 +180,10 @@ func (r *runState) encodingThread() (t *threadState, replay bool) {
 	return r.encoder, r.encoder.peek() != nil
 }
 
-// attach connects this run to a channel another run owns, once.
-func (r *runState) attach(ctx context.Context, id string, capacity int) (*chanState, error) {
+// attach connects this run to a channel another run owns, once. mode is the
+// handle's role, set before the pump starts so a read-capable attach keeps the
+// values the pump delivers rather than racing noteRole to mark the channel read.
+func (r *runState) attach(ctx context.Context, id string, capacity int, mode handleMode) (*chanState, error) {
 	if cs := r.channel(id); cs != nil {
 		return cs, nil
 	}
@@ -190,6 +197,7 @@ func (r *runState) attach(ctx context.Context, id string, capacity int) (*chanSt
 	cs := newChanState(capacity)
 	cs.link = link
 	cs.attached = true
+	cs.reads = mode != modeWrite
 
 	r.mu.Lock()
 	if r.channels == nil {

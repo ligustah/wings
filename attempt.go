@@ -314,3 +314,10 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 	s.held = nil
 	return s.h.a.append(ctx, s.stream, batch)
 }
+
+// Commit implements [flow.Committer]: it commits the attempt's transaction so a
+// shared-channel send's event and its outbox record — both appended to this
+// attempt's producer — go home together (pull.go).
+func (s *historySink) Commit(ctx context.Context) error {
+	return s.h.a.commit(ctx)
+}

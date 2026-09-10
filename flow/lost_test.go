@@ -12,45 +12,50 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// lossyHost is a channel host that never hears one announcement: the value
-// a sender's first attempt announced just before the attempt ended, as a
-// worker that died — or was moved on — between the record of a send and
-// the copy of it reaching home.
-type lossyHost struct {
+// countingHost records how many times each value is announced, so a test can
+// show a replay re-sends nothing: the host keeps what a send committed (a
+// faithful ChannelLink.Send, as the transactional wings host is — see pull.go),
+// and a replayed send reads the event back rather than announcing again.
+type countingHost struct {
 	flow.ChannelHost
-	mu   sync.Mutex
-	lost bool
+	mu    sync.Mutex
+	sends map[uint64]int // value seq → times announced
 }
 
-func (h *lossyHost) Link(ctx context.Context, run, id string) (flow.ChannelLink, error) {
+func (h *countingHost) Link(ctx context.Context, run, id string) (flow.ChannelLink, error) {
 	l, err := h.ChannelHost.Link(ctx, run, id)
 	if err != nil {
 		return nil, err
 	}
-	return &lossyLink{ChannelLink: l, host: h}, nil
+	return &countingLink{ChannelLink: l, host: h}, nil
 }
 
-type lossyLink struct {
+func (h *countingHost) announces(seq uint64) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sends[seq]
+}
+
+type countingLink struct {
 	flow.ChannelLink
-	host *lossyHost
+	host *countingHost
 }
 
-func (l *lossyLink) Send(ctx context.Context, it flow.ChannelItem) error {
-	if !it.Consumed && !it.Closed && it.Seq == 1 {
+func (l *countingLink) Send(ctx context.Context, it flow.ChannelItem) error {
+	if !it.Consumed && !it.Closed {
 		l.host.mu.Lock()
-		first := !l.host.lost
-		l.host.lost = true
-		l.host.mu.Unlock()
-		if first {
-			return nil
+		if l.host.sends == nil {
+			l.host.sends = map[uint64]int{}
 		}
+		l.host.sends[it.Seq]++
+		l.host.mu.Unlock()
 	}
 	return l.ChannelLink.Send(ctx, it)
 }
 
 // lostAttempt is a placer that runs a function thread from its own history,
 // as a worker does, but cuts the first attempt short once the sender says
-// it has sent, and then resumes it — a worker's retry after the loss.
+// it has sent, and then resumes it — a worker's retry after a move.
 type lostAttempt struct {
 	store flow.Store
 	host  flow.ChannelHost
@@ -100,15 +105,14 @@ var (
 	dyingSent = make(chan struct{})
 )
 
-// THE POINT: a sender's history says it sent what nobody received, when
-// the attempt ended between the record and the copy reaching the host. The
-// replay announces every send again — the host drops the copies it has —
-// so the one it never had arrives, and the receiver is not left waiting
-// for a value that is on record as sent.
-func TestAReplayedSendReachesAHostThatMissedIt(t *testing.T) {
+// THE POINT: a sender's attempt ends after recording its sends and is moved on.
+// The value it committed is durably on record with its host, so the replay reads
+// each send back rather than announcing it again — no value is sent twice — and
+// the receiver still sees every one. A replay has no side effect on the channel.
+func TestAReplayedSendIsNotAnnouncedAgain(t *testing.T) {
 	dyingRuns.Store(0)
 	dyingSent = make(chan struct{})
-	host := &lossyHost{ChannelHost: flow.NewMemChannelHost()}
+	host := &countingHost{ChannelHost: flow.NewMemChannelHost()}
 	e := &lostAttempt{store: flow.NewMemStore(), host: host, sent: dyingSent}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -135,13 +139,16 @@ func TestAReplayedSendReachesAHostThatMissedIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// In some order: the value that was lost arrives after the ones that
-	// were not, whatever the sender's order was.
 	slices.Sort(seen)
 	if !slices.Equal(seen, []int{10, 20, 30}) {
 		t.Fatalf("received %v, want 10, 20 and 30", seen)
 	}
-	if !host.lost {
-		t.Fatal("the host lost nothing; the test proves nothing")
+	// Each value was announced exactly once across both attempts: the replay read
+	// its sends back from history and announced nothing. Sends are 0-numbered, so
+	// the three values are seq 0, 1 and 2.
+	for seq := uint64(0); seq <= 2; seq++ {
+		if n := host.announces(seq); n != 1 {
+			t.Fatalf("value #%d was announced %d times, want exactly once (a replay must not re-send)", seq, n)
+		}
 	}
 }

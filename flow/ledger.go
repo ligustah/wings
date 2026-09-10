@@ -118,6 +118,9 @@ func (a *Ledger) Closed() bool {
 // admit folds a record into state and reports whether it was new.
 func (a *Ledger) admit(it ChannelItem) bool {
 	switch {
+	case it.Link:
+		// Only a sign the outbox exists; nothing to record or count.
+		return false
 	case it.Closed:
 		if a.closed {
 			return false

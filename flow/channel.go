@@ -184,14 +184,6 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 
 	seq := t.nextSend(c.name)
 
-	// Given up on before, with the value queued: queue it again for a receiver
-	// of this attempt and give up again.
-	if ierr, ok := t.interrupted("send"); ok {
-		if _, err := cs.put(ctx, t.qualified(), seq, data, true); err != nil {
-			return err
-		}
-		return ierr
-	}
 	// Consume the event before waiting: a replay that waited first would wait
 	// for a receive already replayed away.
 	ev, err := t.expect[*protos.ChannelSendEvent]()
@@ -206,23 +198,61 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		if ev.GetRefused() {
 			return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 		}
-	} else if cs.isClosed() {
+		// Recorded on a previous attempt: the value came home with this event in
+		// one transaction (pull.go), so it is durably queued — queue it locally
+		// again without re-announcing. The relay delivers the one copy; the host
+		// will hand it back here through the pump.
+		item, err := cs.put(ctx, t.qualified(), seq, data, false)
+		if err != nil {
+			return err
+		}
+		// The backpressure wait was cut short by the body before: same outcome now.
+		if ierr, ok := t.interrupted("send"); ok {
+			return ierr
+		}
+		// More history follows, so the send's wait already played out; do not
+		// repeat it. Only when this event is the last recorded did the attempt
+		// unload waiting here, and a bounded channel's backpressure must survive the
+		// reload — so wait again.
+		if t.peek() != nil {
+			return t.err()
+		}
+		if err := cs.awaitTaken(ctx, t, c.sharedID(), item); err != nil {
+			if ctx.Err() != nil {
+				err = t.interrupt("send", err)
+			}
+			return err
+		}
+		return t.err()
+	}
+
+	if cs.isClosed() {
 		t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Refused: true})
 		if err := t.err(); err != nil {
 			return err
 		}
 		return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 	}
-	// A replayed send announces to other runs again: the record is made where
-	// the sender is, but the copy other runs see travels separately, so an
-	// attempt that died between the two left a send nobody received. Only the
-	// replay's announce repairs it; duplicates are dropped by identity.
+
+	// Announce the value, record the send, and commit the two together: the outbox
+	// record and this event go home in one transaction (pull.go), so a replay that
+	// finds the event knows the value is durably queued and need not re-announce.
+	// Announce before recording so a direct coordinator run — where the two are
+	// separate durable writes, not one transaction — never leaves an event with
+	// nothing queued; a torn send there has no event and replays afresh. The value
+	// itself is not recorded here: only the receiver's copy is (see Recv).
 	item, err := cs.put(ctx, t.qualified(), seq, data, true)
 	if err != nil {
 		return err
 	}
-	if ev != nil {
-		return t.err()
+	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq})
+	if cs.hosted() {
+		if err := t.commit(ctx); err != nil {
+			return err
+		}
+	}
+	if err := t.err(); err != nil {
+		return err
 	}
 
 	if err := cs.awaitTaken(ctx, t, c.sharedID(), item); err != nil {
@@ -231,11 +261,6 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		}
 		return err
 	}
-	// The value is not recorded: a replayed send re-encodes it from the body, and
-	// a shared channel delivers through the relay, so a sender's own copy is never
-	// read back. Only the receiver's copy is (see Recv), so recording it here just
-	// stored every value a second time.
-	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq})
 	return t.err()
 }
 
@@ -308,6 +333,16 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		rec.Value = &protos.Data{Serialized: item.data}
 	}
 	t.record(rec)
+	// Report the take and commit it with the receive, so the consume report is
+	// never home without the receive that justified it (pull.go). A replay does not
+	// report again — the original report came home with the receive it replays.
+	if reported, err := cs.reportConsumed(ctx, item); err != nil {
+		return zero, false, err
+	} else if reported {
+		if err := t.commit(ctx); err != nil {
+			return zero, false, err
+		}
+	}
 	v, err := c.decode(item)
 	if err != nil {
 		return zero, false, err
@@ -349,10 +384,8 @@ func (c *Channel[T]) Close(ctx Context) error {
 			return continuityf("thread %q previously sent %s#%d at this point, but is now closing %s",
 				t.id, ev.GetChannel(), ev.GetSeq(), c.name)
 		}
-		// Announced again, for the reason a replayed send is.
-		if err := cs.announceClose(ctx); err != nil {
-			return err
-		}
+		// The close came home with this event (pull.go), so it is durable; shut the
+		// local view without announcing it again.
 		cs.shut()
 		return t.err()
 	}
@@ -362,8 +395,13 @@ func (c *Channel[T]) Close(ctx Context) error {
 		}
 		return err
 	}
-	cs.shut()
 	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Closed: true})
+	if cs.hosted() {
+		if err := t.commit(ctx); err != nil {
+			return err
+		}
+	}
+	cs.shut()
 	return t.err()
 }
 
@@ -435,7 +473,7 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 	if c.run == nil {
 		// A handle from another run, first used here: attach through the host
 		// and keep it under its id.
-		cs, err := t.run.attach(ctx, c.id, c.capacity)
+		cs, err := t.run.attach(ctx, c.id, c.capacity, c.mode)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -666,6 +704,24 @@ func (cs *chanState) free(from string, seq uint64) {
 	}
 }
 
+// reportConsumed tells the host a bounded shared channel's value was taken, so a
+// sender counting room by its own mirror may free the place. Reports nothing on
+// an unbounded channel — no sender waits on room — or a local one. Returns whether
+// it reported, so the caller commits the report with the receive that justified it.
+func (cs *chanState) reportConsumed(ctx context.Context, item *chanItem) (bool, error) {
+	cs.mu.Lock()
+	link, report := cs.link, cs.capacity >= 0
+	from, seq := item.from, item.seq
+	cs.mu.Unlock()
+	if link == nil || !report {
+		return false, nil
+	}
+	if err := link.Send(ctx, ChannelItem{Consumed: true, From: from, Seq: seq}); err != nil {
+		return false, fmt.Errorf("flow: receive on a shared channel: %w", err)
+	}
+	return true, nil
+}
+
 // announceClose tells the host the channel is closed, if it is shared.
 func (cs *chanState) announceClose(ctx context.Context) error {
 	cs.mu.Lock()
@@ -739,8 +795,9 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 // is closed and drained. The single reader takes the first untaken item, on its
 // own channel and on a shared one alike: a shared channel's host mirrors its
 // ordered record into the queue, so the reader consumes it in that order without
-// announcing anything. On a bounded shared channel the take is reported to the
-// host so a sender may free a place. The thread is parked while it waits.
+// announcing anything. The take is reported to the host afterwards, committed
+// with the receive (see [Channel.Recv], [chanState.reportConsumed]). The thread
+// is parked while it waits.
 func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, recvSeq uint64) (*chanItem, error) {
 	parked := false
 	resume := noResume
@@ -752,14 +809,7 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 			}
 			it.taken = true
 			cs.broadcast()
-			link, report := cs.link, cs.capacity >= 0
-			from, seq := it.from, it.seq
 			cs.mu.Unlock()
-			if link != nil && report {
-				if err := link.Send(ctx, ChannelItem{Consumed: true, From: from, Seq: seq}); err != nil {
-					return nil, fmt.Errorf("flow: receive on a shared channel: %w", err)
-				}
-			}
 			return it, resume(ctx)
 		}
 		if cs.closed && !cs.pending() {

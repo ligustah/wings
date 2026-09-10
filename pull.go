@@ -101,8 +101,11 @@ func (c *Cluster) pullWanted(workload string) bool {
 }
 
 // pulledStream says where a pulled record goes on the coordinator: the same name
-// for a job's output; nowhere for plumbing, a prior (put there by the
-// coordinator), a channel outbox, or a stream the job has finished with.
+// for a job's output, a shared-channel outbox among it; nowhere for plumbing, a
+// prior (put there by the coordinator), or a stream the job has finished with. An
+// outbox is pulled like any other output now that a send writes it inside the
+// attempt's transaction, so the record and the history that justified it come
+// home together.
 func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 	name, _, ok := streams.SplitPartitionLogName(sourceLog)
 	if !ok {
@@ -114,8 +117,6 @@ func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 	}
 	switch {
 	case o.Prefix == priorPrefix:
-		return "", false
-	case o.Prefix == chanoutPrefix:
 		return "", false
 	case c.wasDropped(name):
 		return "", false
@@ -136,7 +137,7 @@ func (c *Cluster) pulledLevel(ctx context.Context, w *workerConn, job string) (b
 	}
 	for _, name := range names {
 		o, ok := parseOutput(name)
-		if !ok || o.Prefix == priorPrefix || o.Prefix == chanoutPrefix || (job != "" && o.Job != streamPart(job)) {
+		if !ok || o.Prefix == priorPrefix || (job != "" && o.Job != streamPart(job)) {
 			continue
 		}
 		theirs, err := committedThrough(ctx, w.client, name)
