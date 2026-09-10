@@ -9,9 +9,10 @@ import (
 )
 
 // Selector waits for the first of several cases to be ready and runs it. Build
-// one with [Context.Select], add cases with [Selector.Await], [Selector.Recv]
-// and [Selector.After], then call [Selector.Do]. Which case won is recorded, so
-// a replay takes the same one rather than whatever is ready first.
+// one with [Context.Select], add cases with [Selector.Await], [Selector.Recv],
+// [Selector.Send] and [Selector.After], then call [Selector.Do]. Which case won
+// is recorded, so a replay takes the same one rather than whatever is ready
+// first.
 type Selector struct {
 	cases  []selCase
 	timers []*time.Timer
@@ -52,11 +53,11 @@ func (s *Selector) Await[T any](fut *Future[T], handle func(T, error) error) *Se
 func (s *Selector) Recv[T any](r Reader[T], handle func(v T, ok bool, err error) error) *Selector {
 	s.cases = append(s.cases, selCase{
 		ready: func() bool {
-			cs := recvState(r.ch)
+			cs := selState(r.ch)
 			return cs != nil && cs.readable()
 		},
 		waitCh: func() reflect.Value {
-			cs := recvState(r.ch)
+			cs := selState(r.ch)
 			if cs == nil {
 				return reflect.Value{}
 			}
@@ -65,6 +66,30 @@ func (s *Selector) Recv[T any](r Reader[T], handle func(v T, ok bool, err error)
 		fire: func(ctx Context) error {
 			v, ok, err := r.ch.Recv(ctx)
 			return handle(v, ok, err)
+		},
+	})
+	return s
+}
+
+// Send adds a case that wins when v can be put on w without blocking — the
+// buffer has room, or the channel is closed — then sends v and hands the result
+// to handle, as [Channel.Send] reports it (ErrChannelClosed on a closed
+// channel). For the run's own channels.
+func (s *Selector) Send[T any](w Writer[T], v T, handle func(err error) error) *Selector {
+	s.cases = append(s.cases, selCase{
+		ready: func() bool {
+			cs := selState(w.ch)
+			return cs != nil && cs.sendable()
+		},
+		waitCh: func() reflect.Value {
+			cs := selState(w.ch)
+			if cs == nil {
+				return reflect.Value{}
+			}
+			return reflect.ValueOf(cs.changedChan())
+		},
+		fire: func(ctx Context) error {
+			return handle(w.ch.Send(ctx, v))
 		},
 	})
 	return s
@@ -192,9 +217,9 @@ func closed(ch <-chan struct{}) bool {
 	}
 }
 
-// recvState resolves a channel's runtime for a select recv case, or nil when it
-// is not usable here yet.
-func recvState[T any](ch *Channel[T]) *chanState {
+// selState resolves a channel's runtime for a select recv or send case, or nil
+// when it is not usable here yet.
+func selState[T any](ch *Channel[T]) *chanState {
 	ch.mu.Lock()
 	run, name := ch.run, ch.name
 	ch.mu.Unlock()

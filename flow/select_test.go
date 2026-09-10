@@ -115,6 +115,52 @@ func TestSelectRecvTakesAValue(t *testing.T) {
 	}
 }
 
+// THE POINT: a select send wins when the buffer has room, puts the value, and a
+// later receive takes it — the write side is selectable like the read side.
+func TestSelectSendWhenThereIsRoom(t *testing.T) {
+	var got int
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
+		if err := ctx.Select().
+			Send(w, 99, func(err error) error { return err }).
+			After(time.Second, func() error { return errors.New("had room but the send never won") }).
+			Do(ctx); err != nil {
+			return err
+		}
+		v, _, err := r.Recv(ctx)
+		got = v
+		return err
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 99 {
+		t.Fatalf("got %d, want the sent value 99", got)
+	}
+}
+
+// THE POINT: with the buffer full the send case is not ready, so back-pressure
+// hands the win to another case instead of blocking the whole select.
+func TestSelectSendYieldsWhenFull(t *testing.T) {
+	var fired string
+	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		_, w := ctx.NewChannel[int](flow.WithCapacity(1))
+		if err := w.Send(ctx, 1); err != nil { // fills the one place
+			return err
+		}
+		return ctx.Select().
+			Send(w, 2, func(error) error { fired = "send"; return nil }).
+			After(20*time.Millisecond, func() error { fired = "timeout"; return nil }).
+			Do(ctx)
+	}, flow.WithStore(flow.NewMemStore()))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if fired != "timeout" {
+		t.Fatalf("fired %q, want the timeout: a full channel's send case must not win", fired)
+	}
+}
+
 func TestSelectOutsideARunIsAnError(t *testing.T) {
 	var ctx flow.Context
 	if err := ctx.Select().After(time.Second, func() error { return nil }).Do(ctx); err == nil {

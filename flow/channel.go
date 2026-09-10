@@ -874,6 +874,15 @@ func (cs *chanState) readable() bool {
 	return cs.closed || cs.pending()
 }
 
+// sendable reports whether a send would queue without blocking: the buffer has
+// room (always, when unbounded), or the channel is closed and the send returns
+// at once refused. For a [Context.Select] send case over the run's own channels.
+func (cs *chanState) sendable() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.closed || cs.roomFor(nil)
+}
+
 // changedChan is the channel that closes on the next change, for a waiter to
 // block on and re-check.
 func (cs *chanState) changedChan() <-chan struct{} {
