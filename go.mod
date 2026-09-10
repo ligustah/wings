@@ -7,6 +7,7 @@ toolchain go1.27.0
 require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
+	github.com/ligustah/commitlog/blockv3 v0.1.0
 	github.com/ligustah/commitlog/compress v0.1.0
 	github.com/ligustah/durable_streams v0.165.0
 	github.com/ligustah/durable_streams/broker v0.266.0
@@ -45,7 +46,6 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/ligustah/commitlog v0.106.0 // indirect
-	github.com/ligustah/commitlog/blockv3 v0.1.0 // indirect
 	github.com/ligustah/durable_streams/dsembedded v0.87.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect

@@ -1,6 +1,7 @@
 package wings
 
 import (
+	"github.com/ligustah/commitlog/blockv3"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 )
@@ -41,6 +42,10 @@ func (c Compression) resolve() dswire.Compression {
 // from the WINGS_COMPRESSION it was launched with — before any stream is made.
 var streamCompression = dswire.CompressionZstd
 
+// streamBlockFormat is the block layout wings writes: v3, which packs records
+// more tightly than v2. Reads stay compatible; existing v2 streams keep theirs.
+var streamBlockFormat = int(blockv3.Version)
+
 func streamConfig() *dsclient.StreamConfig {
-	return &dsclient.StreamConfig{Compression: streamCompression}
+	return &dsclient.StreamConfig{Compression: streamCompression, BlockFormat: streamBlockFormat}
 }

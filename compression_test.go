@@ -3,6 +3,7 @@ package wings
 import (
 	"testing"
 
+	"github.com/ligustah/commitlog/blockv3"
 	"github.com/ligustah/durable_streams/dswire"
 
 	"github.com/ligustah/wings/flow"
@@ -30,21 +31,29 @@ func TestCompressionResolve(t *testing.T) {
 
 // THE POINT: a run with compression disabled still creates its streams and a
 // channel still round-trips — the override threads through to stream creation.
-// THE POINT: the pull states the cluster's storage codec for every destination
-// when compression is on, and states nothing when it is off, so a disabled
-// cluster pulls into plain streams as it always did.
+// THE POINT: wings stamps the v3 block layout on the streams it creates, so
+// they store on the faster, tighter format rather than the engine's v2 default.
+func TestStreamConfigWritesV3(t *testing.T) {
+	if got := streamConfig().BlockFormat; got != int(blockv3.Version) {
+		t.Errorf("streamConfig writes block format %d, want v3 (%d)", got, blockv3.Version)
+	}
+}
+
+// THE POINT: the pull always states the v3 block layout for a destination, and
+// adds the cluster's codec when compression is on — so a disabled cluster still
+// pulls into v3 streams, just uncompressed.
 func TestPulledOptionsFollowTheStorageCodec(t *testing.T) {
 	defer func(prev dswire.Compression) { streamCompression = prev }(streamCompression)
 	var c Cluster
 
 	streamCompression = dswire.CompressionNone
-	if opts := c.pulledOptions("wings.history.x"); opts != nil {
-		t.Errorf("disabled compression should state no option, got %d", len(opts))
+	if opts := c.pulledOptions("wings.history.x"); len(opts) != 1 {
+		t.Errorf("disabled compression should state only the block format, got %d options", len(opts))
 	}
 
 	streamCompression = dswire.CompressionZstd
-	if opts := c.pulledOptions("wings.history.x"); len(opts) != 1 {
-		t.Errorf("enabled compression should state one option, got %d", len(opts))
+	if opts := c.pulledOptions("wings.history.x"); len(opts) != 2 {
+		t.Errorf("enabled compression should state block format and codec, got %d options", len(opts))
 	}
 }
 

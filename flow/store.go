@@ -7,6 +7,7 @@ import (
 	"sync"
 	"uuid"
 
+	"github.com/ligustah/commitlog/blockv3"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 
@@ -137,7 +138,7 @@ func (s *streamStore) open(ctx context.Context, name string, create bool) (*dscl
 		if !create {
 			return nil, nil
 		}
-		if err := s.client.CreateStream(ctx, name, &dsclient.StreamConfig{Compression: s.compression}); err != nil {
+		if err := s.client.CreateStream(ctx, name, &dsclient.StreamConfig{Compression: s.compression, BlockFormat: int(blockv3.Version)}); err != nil {
 			return nil, fmt.Errorf("flow: create %s: %w", name, err)
 		}
 	}

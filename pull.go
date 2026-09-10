@@ -126,16 +126,18 @@ func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 	return name, true
 }
 
-// pulledOptions opens every pulled destination with the cluster's storage codec,
-// so the coordinator's copy — an attempt's history among the largest streams —
-// is compressed like every stream wings creates itself. The puller is the sole
-// creator of these copies and every wings creator uses the one codec, so stating
-// it here settles the stream's storage with no option to disagree over.
+// pulledOptions opens every pulled destination with the cluster's storage
+// settings, so the coordinator's copy — an attempt's history among the largest
+// streams — is stored like every stream wings creates itself: the v3 block
+// layout, and the cluster's codec when compression is on. The puller is the sole
+// creator of these copies and every wings creator uses the same settings, so
+// stating them here settles the stream's storage with nothing to disagree over.
 func (c *Cluster) pulledOptions(string) []streams.StreamOption {
-	if streamCompression == dswire.CompressionNone {
-		return nil
+	opts := []streams.StreamOption{streams.WithBlockFormat(streamBlockFormat)}
+	if streamCompression != dswire.CompressionNone {
+		opts = append(opts, streams.WithCompression(compress.Codec(streamCompression)))
 	}
-	return []streams.StreamOption{streams.WithCompression(compress.Codec(streamCompression))}
+	return opts
 }
 
 // pulledLevel reports whether the coordinator's copies of a job's outputs (or
