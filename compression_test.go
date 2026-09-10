@@ -30,6 +30,24 @@ func TestCompressionResolve(t *testing.T) {
 
 // THE POINT: a run with compression disabled still creates its streams and a
 // channel still round-trips — the override threads through to stream creation.
+// THE POINT: the pull states the cluster's storage codec for every destination
+// when compression is on, and states nothing when it is off, so a disabled
+// cluster pulls into plain streams as it always did.
+func TestPulledOptionsFollowTheStorageCodec(t *testing.T) {
+	defer func(prev dswire.Compression) { streamCompression = prev }(streamCompression)
+	var c Cluster
+
+	streamCompression = dswire.CompressionNone
+	if opts := c.pulledOptions("wings.history.x"); opts != nil {
+		t.Errorf("disabled compression should state no option, got %d", len(opts))
+	}
+
+	streamCompression = dswire.CompressionZstd
+	if opts := c.pulledOptions("wings.history.x"); len(opts) != 1 {
+		t.Errorf("enabled compression should state one option, got %d", len(opts))
+	}
+}
+
 func TestRunWithCompressionDisabled(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Compression: CompressionNone})
 	var got int

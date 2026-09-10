@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ligustah/commitlog/compress"
 	streams "github.com/ligustah/durable_streams"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
@@ -48,9 +49,10 @@ func (c *Cluster) pull(w *workerConn) {
 			},
 			// One incarnation per writer: a moved job is a new attempt under a
 			// new id, so no writer is superseded under the same name.
-			Epoch:  func(string) (uint16, error) { return 1, nil },
-			Only:   c.pullWanted,
-			Stream: c.pulledStream,
+			Epoch:   func(string) (uint16, error) { return 1, nil },
+			Only:    c.pullWanted,
+			Stream:  c.pulledStream,
+			Options: c.pulledOptions,
 		})
 		if w.ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			return
@@ -122,6 +124,18 @@ func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+// pulledOptions opens every pulled destination with the cluster's storage codec,
+// so the coordinator's copy — an attempt's history among the largest streams —
+// is compressed like every stream wings creates itself. The puller is the sole
+// creator of these copies and every wings creator uses the one codec, so stating
+// it here settles the stream's storage with no option to disagree over.
+func (c *Cluster) pulledOptions(string) []streams.StreamOption {
+	if streamCompression == dswire.CompressionNone {
+		return nil
+	}
+	return []streams.StreamOption{streams.WithCompression(compress.Codec(streamCompression))}
 }
 
 // pulledLevel reports whether the coordinator's copies of a job's outputs (or
