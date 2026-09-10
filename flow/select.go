@@ -49,21 +49,21 @@ func (s *Selector) Await[T any](fut *Future[T], handle func(T, error) error) *Se
 // Recv adds a case that wins when a value can be received from ch — or ch is
 // closed — then hands the outcome to handle, as [Channel.Recv] reports it. For
 // the run's own channels.
-func (s *Selector) Recv[T any](ch *Channel[T], handle func(v T, ok bool, err error) error) *Selector {
+func (s *Selector) Recv[T any](r Reader[T], handle func(v T, ok bool, err error) error) *Selector {
 	s.cases = append(s.cases, selCase{
 		ready: func() bool {
-			cs := recvState(ch)
+			cs := recvState(r.ch)
 			return cs != nil && cs.readable()
 		},
 		waitCh: func() reflect.Value {
-			cs := recvState(ch)
+			cs := recvState(r.ch)
 			if cs == nil {
 				return reflect.Value{}
 			}
 			return reflect.ValueOf(cs.changedChan())
 		},
 		fire: func(ctx Context) error {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.ch.Recv(ctx)
 			return handle(v, ok, err)
 		},
 	})

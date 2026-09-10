@@ -11,11 +11,16 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// feed is a call's input carrying a channel: the handle travels, the values
-// follow through the cluster.
+// feed is a consumer's input carrying the receive side of a channel: the handle
+// travels, the values follow through the cluster.
 type feed struct {
-	Values *flow.Channel[int] `json:"values"`
-	Count  int                `json:"count,omitempty"`
+	Values flow.Reader[int] `json:"values"`
+}
+
+// writeFeed is a producer's input carrying the send side of a channel.
+type writeFeed struct {
+	Values flow.Writer[int] `json:"values"`
+	Count  int              `json:"count,omitempty"`
 }
 
 // sums receives everything on the channel it was handed and returns the total.
@@ -34,7 +39,7 @@ var sums = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 }, flow.WithName("test.sums"))
 
 // counts sends 1..Count on the channel it was handed, then closes it.
-var counts = flow.Define(func(ctx flow.Context, in feed) (int, error) {
+var counts = flow.Define(func(ctx flow.Context, in writeFeed) (int, error) {
 	for i := 1; i <= in.Count; i++ {
 		if err := in.Values.Send(ctx, i); err != nil {
 			return 0, err
@@ -55,9 +60,9 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 
 	var got int
 	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		producer := ctx.Go(counts, feed{Values: ch, Count: 5})
-		consumer := ctx.Go(sums, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		producer := ctx.Go(counts, writeFeed{Values: w, Count: 5})
+		consumer := ctx.Go(sums, feed{Values: r})
 		if _, err := producer.Await(ctx); err != nil {
 			return err
 		}
@@ -138,9 +143,9 @@ func TestAMovedReceiverReplaysItsRecordedValues(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-			ch := ctx.NewChannel[int]()
-			producer := ctx.Go(counts, feed{Values: ch, Count: 5})
-			consumer := ctx.Go(sumsSlow, feed{Values: ch})
+			r, w := ctx.NewChannel[int]()
+			producer := ctx.Go(counts, writeFeed{Values: w, Count: 5})
+			consumer := ctx.Go(sumsSlow, feed{Values: r})
 			if _, err := producer.Await(ctx); err != nil {
 				return err
 			}
@@ -177,9 +182,9 @@ func TestAMovedReceiverReplaysItsRecordedValues(t *testing.T) {
 // forks, and returns the total. The channel is created on the worker running
 // fanSum, not the coordinator — a worker-created shared channel.
 var fanSum = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
-	ch := ctx.NewChannel[int]()
-	producer := ctx.Go(counts, feed{Values: ch, Count: 5})
-	consumer := ctx.Go(sums, feed{Values: ch})
+	r, w := ctx.NewChannel[int]()
+	producer := ctx.Go(counts, writeFeed{Values: w, Count: 5})
+	consumer := ctx.Go(sums, feed{Values: r})
 	if _, err := producer.Await(ctx); err != nil {
 		return 0, err
 	}
@@ -350,11 +355,11 @@ func TestAnInProcessCallsChannelIsReclaimedWhenItReturns(t *testing.T) {
 // the run's own thread, so its wants go to the run's coordinator outbox
 // (chanout.<run>.0.<id>) rather than a job's.
 var recvFan = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
-	ch := ctx.NewChannel[int]()
-	prod := ctx.Go(counts, feed{Values: ch, Count: 5})
+	r, w := ctx.NewChannel[int]()
+	prod := ctx.Go(counts, writeFeed{Values: w, Count: 5})
 	total := 0
 	for {
-		v, ok, err := ch.Recv(ctx)
+		v, ok, err := r.Recv(ctx)
 		if err != nil {
 			return 0, err
 		}
@@ -533,14 +538,14 @@ func TestAChannelCrossesMachines(t *testing.T) {
 			t.Run("workflow to function", func(t *testing.T) {
 				var got int
 				err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-					ch := ctx.NewChannel[int]()
-					fut := ctx.Go(sums, feed{Values: ch})
+					r, w := ctx.NewChannel[int]()
+					fut := ctx.Go(sums, feed{Values: r})
 					for _, v := range []int{1, 2, 3, 4} {
-						if err := ch.Send(ctx, v); err != nil {
+						if err := w.Send(ctx, v); err != nil {
 							return err
 						}
 					}
-					if err := ch.Close(ctx); err != nil {
+					if err := w.Close(ctx); err != nil {
 						return err
 					}
 					var err error
@@ -558,10 +563,10 @@ func TestAChannelCrossesMachines(t *testing.T) {
 			t.Run("function to workflow", func(t *testing.T) {
 				var got []int
 				err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-					ch := ctx.NewChannel[int]()
-					fut := ctx.Go(counts, feed{Values: ch, Count: 3})
+					r, w := ctx.NewChannel[int]()
+					fut := ctx.Go(counts, writeFeed{Values: w, Count: 3})
 					for {
-						v, ok, err := ch.Recv(ctx)
+						v, ok, err := r.Recv(ctx)
 						if err != nil {
 							return err
 						}
@@ -584,9 +589,9 @@ func TestAChannelCrossesMachines(t *testing.T) {
 			t.Run("function to function", func(t *testing.T) {
 				var got int
 				err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-					ch := ctx.NewChannel[int]()
-					producer := ctx.Go(counts, feed{Values: ch, Count: 5})
-					consumer := ctx.Go(sums, feed{Values: ch})
+					r, w := ctx.NewChannel[int]()
+					producer := ctx.Go(counts, writeFeed{Values: w, Count: 5})
+					consumer := ctx.Go(sums, feed{Values: r})
 					if _, err := producer.Await(ctx); err != nil {
 						return err
 					}
@@ -608,16 +613,19 @@ func TestAChannelCrossesMachines(t *testing.T) {
 			t.Run("fan-out over two channels", func(t *testing.T) {
 				var totals [2]int
 				err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-					chs := [2]*flow.Channel[int]{ctx.NewChannel[int](), ctx.NewChannel[int]()}
-					first := ctx.Go(sums, feed{Values: chs[0]})
-					second := ctx.Go(sums, feed{Values: chs[1]})
+					var rs [2]flow.Reader[int]
+					var ws [2]flow.Writer[int]
+					rs[0], ws[0] = ctx.NewChannel[int]()
+					rs[1], ws[1] = ctx.NewChannel[int]()
+					first := ctx.Go(sums, feed{Values: rs[0]})
+					second := ctx.Go(sums, feed{Values: rs[1]})
 					for v := 1; v <= 6; v++ {
-						if err := chs[(v-1)%2].Send(ctx, v); err != nil {
+						if err := ws[(v-1)%2].Send(ctx, v); err != nil {
 							return err
 						}
 					}
-					for i := range chs {
-						if err := chs[i].Close(ctx); err != nil {
+					for i := range ws {
+						if err := ws[i].Close(ctx); err != nil {
 							return err
 						}
 					}
@@ -692,14 +700,14 @@ func TestAMovedFunctionReplaysItsReceives(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1})
 	var got []int
 	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		fut := ctx.Go(receivesThenStalls, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(receivesThenStalls, feed{Values: r})
 		for _, v := range []int{7, 8, 9, 10, 11} {
-			if err := ch.Send(ctx, v); err != nil {
+			if err := w.Send(ctx, v); err != nil {
 				return err
 			}
 		}
-		if err := ch.Close(ctx); err != nil {
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
 		var err error

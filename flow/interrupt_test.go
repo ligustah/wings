@@ -30,13 +30,13 @@ func givesUp(seen *[]error, attempts *int) func(ctx flow.Context) error {
 		cancel()
 		*seen = append(*seen, err)
 
-		quiet := ctx.NewChannel[int]()
+		quiet, _ := ctx.NewChannel[int]()
 		tctx, cancel = ctx.WithTimeout(bound)
 		_, _, err = quiet.Recv(tctx)
 		cancel()
 		*seen = append(*seen, err)
 
-		full := ctx.NewBufferedChannel[int](1)
+		_, full := ctx.NewChannel[int](flow.WithCapacity(1))
 		if err := full.Send(ctx, 0); err != nil { // fills the one place
 			return err
 		}
@@ -201,11 +201,11 @@ func TestASendOnAClosedChannelIsRefused(t *testing.T) {
 	var seen []error
 	body := func(ctx flow.Context) error {
 		seen = seen[:0]
-		ch := ctx.NewChannel[int]()
-		if err := ch.Close(ctx); err != nil {
+		_, w := ctx.NewChannel[int]()
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
-		seen = append(seen, ch.Send(ctx, 2))
+		seen = append(seen, w.Send(ctx, 2))
 		attempts++
 		if attempts == 1 {
 			return errors.New("fail once, to be retried")
@@ -231,19 +231,19 @@ func TestASendOnAClosedChannelIsRefused(t *testing.T) {
 // closed only after.
 func TestASendUnderWayAtTheCloseIsDrained(t *testing.T) {
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
+		r, w := ctx.NewChannel[int]()
 		sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			return 1, ch.Send(ctx, 1)
+			return 1, w.Send(ctx, 1)
 		})
 		time.Sleep(50 * time.Millisecond)
-		if err := ch.Close(ctx); err != nil {
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
-		v, more, err := ch.Recv(ctx)
+		v, more, err := r.Recv(ctx)
 		if err != nil || !more || v != 1 {
 			return fmt.Errorf("the receive got %d, %v, %v; want the value the sender offered", v, more, err)
 		}
-		if _, more, err := ch.Recv(ctx); err != nil || more {
+		if _, more, err := r.Recv(ctx); err != nil || more {
 			return fmt.Errorf("the second receive got %v, %v; want the channel closed", more, err)
 		}
 		_, err = sender.Await(ctx)

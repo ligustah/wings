@@ -15,7 +15,7 @@ var selFast = flow.Define(func(ctx flow.Context, n int) (int, error) { return n,
 func TestAwaitAnyReturnsTheFinisher(t *testing.T) {
 	var idx, got int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		block := ctx.NewChannel[int]()
+		block, _ := ctx.NewChannel[int]()
 		fast := ctx.Go(selFast, 42)
 		slow := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			v, _, err := block.Recv(ctx) // nothing is ever sent
@@ -39,7 +39,7 @@ func TestSelectReplaysTheSameCase(t *testing.T) {
 	var wins []int
 	var vals []int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		block := ctx.NewChannel[int]()
+		block, _ := ctx.NewChannel[int]()
 		a := ctx.Go(selFast, 7)
 		slow := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			v, _, err := block.Recv(ctx)
@@ -69,7 +69,7 @@ func TestSelectReplaysTheSameCase(t *testing.T) {
 func TestSelectAfterWins(t *testing.T) {
 	var fired []string
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]() // nothing is ever sent
+		ch, _ := ctx.NewChannel[int]() // nothing is ever sent
 		err := ctx.Select().
 			Recv(ch, func(int, bool, error) error { fired = append(fired, "recv"); return nil }).
 			After(20*time.Millisecond, func() error { fired = append(fired, "timeout"); return nil }).
@@ -95,15 +95,15 @@ func TestSelectAfterWins(t *testing.T) {
 func TestSelectRecvTakesAValue(t *testing.T) {
 	var got int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](1)
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
 		producer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
-			return flow.None{}, ch.Send(ctx, 99)
+			return flow.None{}, w.Send(ctx, 99)
 		})
 		if _, err := producer.Await(ctx); err != nil {
 			return err
 		}
 		return ctx.Select().
-			Recv(ch, func(v int, ok bool, err error) error { got = v; return err }).
+			Recv(r, func(v int, ok bool, err error) error { got = v; return err }).
 			After(time.Second, func() error { return errors.New("timed out waiting for the value") }).
 			Do(ctx)
 	}, flow.WithStore(flow.NewMemStore()))

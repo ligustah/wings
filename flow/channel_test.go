@@ -62,11 +62,11 @@ func allEvents(store *flow.MemStore, run string) ([]*protos.Event, error) {
 func TestSendRecordsNoValue(t *testing.T) {
 	store := flow.NewMemStore()
 	err := flow.Run(context.Background(), "sendval", func(c flow.Context) error {
-		ch := c.NewBufferedChannel[int](4)
-		if err := ch.Send(c, 7); err != nil {
+		r, w := c.NewChannel[int](flow.WithCapacity(4))
+		if err := w.Send(c, 7); err != nil {
 			return err
 		}
-		v, ok, err := ch.Recv(c)
+		v, ok, err := r.Recv(c)
 		if err != nil || !ok || v != 7 {
 			return fmt.Errorf("recv %d %v %v", v, ok, err)
 		}
@@ -111,21 +111,21 @@ func TestReplayDoesNotHoldReceivedValues(t *testing.T) {
 
 	body := func(sum *int) func(flow.Context) error {
 		return func(c flow.Context) error {
-			ch := c.NewUnboundedChannel[[]byte]()
+			r, w := c.NewChannel[[]byte]()
 			for i := 0; i < n; i++ {
 				b := make([]byte, size)
 				for j := range b {
 					b[j] = byte(i + j) // varied, so the codec cannot compress it away
 				}
-				if err := ch.Send(c, b); err != nil {
+				if err := w.Send(c, b); err != nil {
 					return err
 				}
 			}
-			if err := ch.Close(c); err != nil {
+			if err := w.Close(c); err != nil {
 				return err
 			}
 			for {
-				v, ok, err := ch.Recv(c)
+				v, ok, err := r.Recv(c)
 				if err != nil {
 					return err
 				}
@@ -198,7 +198,7 @@ func countEvents(t *testing.T, store *flow.MemStore, run string) map[string]int 
 func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 	var got int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
+		r, w := ctx.NewChannel[int]()
 
 		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for i := 1; i <= 3; i++ {
@@ -206,16 +206,16 @@ func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 				if err != nil {
 					return 0, err
 				}
-				if err := ch.Send(ctx, v); err != nil {
+				if err := w.Send(ctx, v); err != nil {
 					return 0, err
 				}
 			}
-			return 0, ch.Close(ctx)
+			return 0, w.Close(ctx)
 		})
 
 		total := 0
 		for {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -244,8 +244,7 @@ func TestAChannelCarriesValuesBetweenThreads(t *testing.T) {
 func TestWriterAndReaderCarryValues(t *testing.T) {
 	var got int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		w, r := ch.Writer(), ch.Reader()
+		r, w := ctx.NewChannel[int]()
 
 		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for i := 1; i <= 3; i++ {
@@ -295,7 +294,7 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 	name := flow.NewName()
 	store := flow.NewMemStore()
 	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
+		r, w := ctx.NewChannel[int]()
 
 		// Two producers racing. Each sends its own numbers as fast as it can,
 		// so the interleaving is genuinely up to the scheduler.
@@ -303,7 +302,7 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 		for p := range 2 {
 			producers = append(producers, ctx.Spawn(func(ctx flow.Context) (int, error) {
 				for i := range n {
-					if err := ch.Send(ctx, p*100+i); err != nil {
+					if err := w.Send(ctx, p*100+i); err != nil {
 						return 0, err
 					}
 				}
@@ -313,7 +312,7 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 
 		var order []int
 		for range 2 * n {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -374,25 +373,25 @@ func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
 	const n = 4
 	var got int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](n)
+		r, w := ctx.NewChannel[int](flow.WithCapacity(n))
 
 		// Fills the buffer and returns without anybody having received. On an
 		// unbuffered channel this thread would still be blocked on its first
 		// send when Await was called, and the run would deadlock.
 		filler := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for i := range n {
-				if err := ch.Send(ctx, i); err != nil {
+				if err := w.Send(ctx, i); err != nil {
 					return 0, err
 				}
 			}
-			return n, ch.Close(ctx)
+			return n, w.Close(ctx)
 		})
 		if _, err := filler.Await(ctx); err != nil {
 			return err
 		}
 
 		for {
-			_, ok, err := ch.Recv(ctx)
+			_, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -415,16 +414,16 @@ func TestABufferedSendDoesNotWaitForAReceiver(t *testing.T) {
 func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
 	var got string
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[string](2)
+		r, w := ctx.NewChannel[string](flow.WithCapacity(2))
 
 		sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			if err := ch.Send(ctx, "a"); err != nil {
+			if err := w.Send(ctx, "a"); err != nil {
 				return 0, err
 			}
-			if err := ch.Send(ctx, "b"); err != nil {
+			if err := w.Send(ctx, "b"); err != nil {
 				return 0, err
 			}
-			return 0, ch.Close(ctx)
+			return 0, w.Close(ctx)
 		})
 		if _, err := sender.Await(ctx); err != nil {
 			return err
@@ -432,7 +431,7 @@ func TestAClosedChannelDrainsBeforeItReportsClosed(t *testing.T) {
 
 		var parts []string
 		for {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -458,11 +457,14 @@ func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
 	var names []string
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		names = nil
-		names = append(names, ctx.NewChannel[int]().Name())
-		names = append(names, ctx.NewChannel[int]().Name())
+		r0, _ := ctx.NewChannel[int]()
+		names = append(names, r0.Name())
+		r1, _ := ctx.NewChannel[int]()
+		names = append(names, r1.Name())
 
 		child := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			names = append(names, ctx.NewChannel[int]().Name())
+			rc, _ := ctx.NewChannel[int]()
+			names = append(names, rc.Name())
 			return 0, nil
 		})
 		_, err := child.Await(ctx)
@@ -482,17 +484,17 @@ func TestChannelsAreNamedForTheThreadThatMadeThem(t *testing.T) {
 // rather than working by accident.
 func TestAChannelOutsideARunRefusesToBeUsed(t *testing.T) {
 	ctx := flow.From(context.Background())
-	ch := ctx.NewChannel[int]()
+	r, w := ctx.NewChannel[int]()
 
-	if err := ch.Send(ctx, 1); err == nil {
+	if err := w.Send(ctx, 1); err == nil {
 		t.Fatal("want an error from a send outside a run")
 	} else if !strings.Contains(err.Error(), "outside a Run") {
 		t.Fatalf("got %v", err)
 	}
-	if _, _, err := ch.Recv(ctx); err == nil {
+	if _, _, err := r.Recv(ctx); err == nil {
 		t.Fatal("want an error from a receive outside a run")
 	}
-	if err := ch.Close(ctx); err == nil {
+	if err := w.Close(ctx); err == nil {
 		t.Fatal("want an error from a close outside a run")
 	}
 }
@@ -502,23 +504,23 @@ func TestAChannelOutsideARunRefusesToBeUsed(t *testing.T) {
 func TestABufferedChannelHoldsOnlyItsCapacity(t *testing.T) {
 	var secondSent, firstTaken time.Time
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](1)
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
 		filler := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			if err := ch.Send(ctx, 1); err != nil { // the one place
+			if err := w.Send(ctx, 1); err != nil { // the one place
 				return 0, err
 			}
-			if err := ch.Send(ctx, 2); err != nil { // waits for the place to free
+			if err := w.Send(ctx, 2); err != nil { // waits for the place to free
 				return 0, err
 			}
 			secondSent = time.Now()
 			return 2, nil
 		})
 		time.Sleep(50 * time.Millisecond)
-		if _, _, err := ch.Recv(ctx); err != nil {
+		if _, _, err := r.Recv(ctx); err != nil {
 			return err
 		}
 		firstTaken = time.Now()
-		if _, _, err := ch.Recv(ctx); err != nil {
+		if _, _, err := r.Recv(ctx); err != nil {
 			return err
 		}
 		_, err := filler.Await(ctx)

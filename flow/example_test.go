@@ -61,17 +61,17 @@ func ExampleContext_Go() {
 func ExampleChannel() {
 	var got []int
 	err := flow.Run(context.Background(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](3)
+		r, w := ctx.NewChannel[int](flow.WithCapacity(3))
 		producer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
 			for _, n := range []int{1, 2, 3} {
-				if err := ch.Send(ctx, n); err != nil {
+				if err := w.Send(ctx, n); err != nil {
 					return flow.None{}, err
 				}
 			}
-			return flow.None{}, ch.Close(ctx)
+			return flow.None{}, w.Close(ctx)
 		})
 		for {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -133,15 +133,15 @@ func ExampleContext_Signal() {
 func ExampleByteWriter() {
 	var n int
 	err := flow.Run(context.Background(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[flow.Bytes](4)
+		cr, cw := ctx.NewChannel[flow.Bytes](flow.WithCapacity(4))
 		writer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
-			w := flow.NewByteWriter(ctx, ch.Writer())
+			w := flow.NewByteWriter(ctx, cw)
 			if _, err := io.WriteString(w, "hello, world"); err != nil {
 				return flow.None{}, err
 			}
 			return flow.None{}, w.Close()
 		})
-		read, err := io.ReadAll(flow.NewByteReader(ctx, ch.Reader()))
+		read, err := io.ReadAll(flow.NewByteReader(ctx, cr))
 		if err != nil {
 			return err
 		}

@@ -34,18 +34,18 @@ func (s *discardStore) Drop(context.Context, string, string) error { return nil 
 func TestUnboundedChannelSendNeverBlocks(t *testing.T) {
 	const n = 5000
 	err := Run(context.Background(), "unbounded", func(c Context) error {
-		ch := c.NewUnboundedChannel[int]()
+		r, w := c.NewChannel[int]()
 		for i := 0; i < n; i++ {
-			if err := ch.Send(c, i); err != nil {
+			if err := w.Send(c, i); err != nil {
 				return err
 			}
 		}
-		if err := ch.Close(c); err != nil {
+		if err := w.Close(c); err != nil {
 			return err
 		}
 		sum := 0
 		for {
-			v, ok, err := ch.Recv(c)
+			v, ok, err := r.Recv(c)
 			if err != nil {
 				return err
 			}

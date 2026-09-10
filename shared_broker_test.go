@@ -44,14 +44,14 @@ func TestLocalSharedBrokerChannelCrossesWorkers(t *testing.T) {
 
 	var got int
 	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		fut := ctx.Go(sums, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(sums, feed{Values: r})
 		for _, v := range []int{1, 2, 3, 4} {
-			if err := ch.Send(ctx, v); err != nil {
+			if err := w.Send(ctx, v); err != nil {
 				return err
 			}
 		}
-		if err := ch.Close(ctx); err != nil {
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
 		var err error

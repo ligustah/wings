@@ -65,8 +65,8 @@ func TestTheZeroContextIsSafeAndSaysWhatIsMissing(t *testing.T) {
 	if _, ok, err := ctx.Checkpoint[int](); ok || err != nil {
 		t.Errorf("Checkpoint on the zero Context: ok=%v err=%v; want no checkpoint and no error", ok, err)
 	}
-	ch := ctx.NewChannel[int]()
-	if err := ch.Send(ctx, 1); err == nil {
+	_, w := ctx.NewChannel[int]()
+	if err := w.Send(ctx, 1); err == nil {
 		t.Error("Send on a channel made from the zero Context succeeded")
 	}
 }

@@ -17,8 +17,8 @@ import (
 // that same value rather than whatever the scheduler offers first; a send
 // records only when it completed.
 //
-// Create one with [Context.NewChannel] or [Context.NewBufferedChannel] inside a
-// Run, at a point every attempt reaches, and pass it to threads forked by
+// Create one with [Context.NewChannel] inside a Run, at a point every attempt
+// reaches; it hands back a [Reader] and a [Writer] to pass to threads forked by
 // [Context.Go] or [Context.Map]. Safe to use from all of them at once. Not
 // usable outside a Run.
 type Channel[T any] struct {
@@ -43,37 +43,43 @@ const (
 	modeWrite handleMode = "w"
 )
 
-// NewChannel returns an unbounded channel: a send always completes at once and
-// no sender is ever parked. Use [Context.NewBufferedChannel] when a full buffer
-// should make a sender wait. Same as [Context.NewUnboundedChannel].
-func (c Context) NewChannel[T any]() *Channel[T] {
-	return newChannel[T](c, unbounded)
+// NewChannel creates a shared channel and returns its two ends: a [Reader] to
+// receive and a [Writer] to send and close. Hand one end to another thread or
+// run and keep the other, the way [io.Pipe] splits a pipe. Without options the
+// channel is unbounded — a send always completes at once and never parks (so it
+// never forces the job to unload), but the buffer can grow without limit if the
+// receiver falls behind. Pass [WithCapacity] for backpressure.
+func (c Context) NewChannel[T any](opts ...ChannelOption) (Reader[T], Writer[T]) {
+	cfg := channelConfig{capacity: unbounded}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	ch := newChannel[T](c, cfg.capacity)
+	return ch.Reader(), ch.Writer()
+}
+
+// ChannelOption configures a channel at creation. See [WithCapacity].
+type ChannelOption func(*channelConfig)
+
+type channelConfig struct{ capacity int }
+
+// WithCapacity bounds a channel so a send waits once this many values are
+// buffered and unconsumed, giving the sender backpressure. The capacity is
+// approximate: a sender learns what the reader has consumed only as the host
+// relays it, so the buffer may briefly run over. A capacity below 1 is raised to
+// 1; without this option the channel is unbounded.
+func WithCapacity(capacity int) ChannelOption {
+	return func(c *channelConfig) {
+		if capacity < 1 {
+			capacity = 1
+		}
+		c.capacity = capacity
+	}
 }
 
 // unbounded is the capacity of a channel a send never waits on. Negative so it
 // cannot be reached by a count of queued items.
 const unbounded = -1
-
-// NewUnboundedChannel returns a channel a send never blocks on: it has no
-// capacity limit, so Send always completes at once and no sender is ever parked
-// (and so never unloaded, which would replay its whole job). Use it when the
-// receiver is guaranteed to drain the channel and backpressure is unwanted. It
-// can grow without limit if the receiver falls behind.
-func (c Context) NewUnboundedChannel[T any]() *Channel[T] {
-	return newChannel[T](c, unbounded)
-}
-
-// NewBufferedChannel returns a channel that accepts capacity values before a
-// send has to wait for the reader to consume one. The bound is approximate: a
-// sender learns what the reader has consumed only as the host relays it, so the
-// buffer may briefly run over. capacity below 1 is raised to 1; use
-// [Context.NewChannel] for an unbounded channel.
-func (c Context) NewBufferedChannel[T any](capacity int) *Channel[T] {
-	if capacity < 1 {
-		capacity = 1
-	}
-	return newChannel[T](c, capacity)
-}
 
 func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	t := threadFrom(ctx)
@@ -120,12 +126,10 @@ type channelHandle struct {
 	Mode     handleMode `json:"mode,omitempty"`
 }
 
-// MarshalJSON shares the channel so it can travel in a call's input, a result,
-// or a value sent on another channel: the run's host is told and untaken sends
-// go with it, so the run needs a [ChannelHost]. See [WithChannelHost]. A whole
-// channel shares both sides; see [Writer] and [Reader] to share one.
-func (c *Channel[T]) MarshalJSON() ([]byte, error) { return c.share(modeBoth) }
-
+// share encodes one side of the channel so it can travel in a call's input, a
+// result, or a value sent on another channel: the run's host is told and untaken
+// sends go with it, so the run needs a [ChannelHost]. See [WithChannelHost],
+// [Writer.MarshalJSON] and [Reader.MarshalJSON].
 func (c *Channel[T]) share(mode handleMode) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -406,12 +410,12 @@ func (c *Channel[T]) Close(ctx Context) error {
 }
 
 // Writer is the send side of a channel: the capability to [Writer.Send] and
-// [Writer.Close], with no way to receive. Obtain it with [Channel.Writer]; pass
+// [Writer.Close], with no way to receive. [Context.NewChannel] returns one; pass
 // it to a thread that should only produce.
 type Writer[T any] struct{ ch *Channel[T] }
 
 // Reader is the receive side of a channel: the capability to [Reader.Recv], with
-// no way to send or close. Obtain it with [Channel.Reader]; pass it to a thread
+// no way to send or close. [Context.NewChannel] returns one; pass it to a thread
 // that should only consume.
 type Reader[T any] struct{ ch *Channel[T] }
 

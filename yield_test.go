@@ -100,8 +100,8 @@ func TestALongWaitIsUnloadedAndWokenByWhatItWaitsFor(t *testing.T) {
 
 	var got int
 	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		receiver := ctx.Go(receivesOnce, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		receiver := ctx.Go(receivesOnce, feed{Values: r})
 		// Long enough for the receiver to be unloaded, and the slot it
 		// held is free meanwhile.
 		if _, err := ctx.Go(double, 1).Await(ctx); err != nil {
@@ -110,7 +110,7 @@ func TestALongWaitIsUnloadedAndWokenByWhatItWaitsFor(t *testing.T) {
 		if err := ctx.Sleep(600 * time.Millisecond); err != nil {
 			return err
 		}
-		if err := ch.Send(ctx, 7); err != nil {
+		if err := w.Send(ctx, 7); err != nil {
 			return err
 		}
 		var err error

@@ -98,19 +98,20 @@ func (c Context) Go[In, Out any](f Func[In, Out], in In) *Future[Out] {
 // lineage so another process can replay its way to the closure; see [Thread] and
 // [RunLineage].
 //
-//	ch := ctx.NewChannel[int]()
+//	r, w := ctx.NewChannel[int]()
 //	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 //	    for _, item := range work {
 //	        v, err := Digest(ctx, item)
 //	        if err != nil {
 //	            return 0, err
 //	        }
-//	        if err := ch.Send(ctx, v); err != nil {
+//	        if err := w.Send(ctx, v); err != nil {
 //	            return 0, err
 //	        }
 //	    }
-//	    return 0, ch.Close(ctx)
+//	    return 0, w.Close(ctx)
 //	})
+//	// ... the spawning thread receives on r.
 func (c Context) Spawn[Out any](body func(ctx Context) (Out, error)) *Future[Out] {
 	codec := dswire.ReflectCodec[Out]{New: allocator[Out]()}
 	return spawn(c, "Spawn", "", nil, codec, func(ctx Context) ([]byte, error) {

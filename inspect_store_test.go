@@ -19,14 +19,14 @@ func TestRetainHistoryKeepsAMovedThreadsHistory(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1, RetainHistory: true})
 	run := flow.NewName()
 	err := c.Run(t.Context(), run, func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		fut := ctx.Go(receivesThenStalls, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(receivesThenStalls, feed{Values: r})
 		for _, v := range []int{7, 8, 9, 10, 11} {
-			if err := ch.Send(ctx, v); err != nil {
+			if err := w.Send(ctx, v); err != nil {
 				return err
 			}
 		}
-		if err := ch.Close(ctx); err != nil {
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
 		_, err := fut.Await(ctx)
@@ -81,9 +81,9 @@ func TestInspectionStoreSurfacesForkedThreads(t *testing.T) {
 
 	run := flow.NewName()
 	err := c.Run(t.Context(), run, func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		producer := ctx.Go(counts, feed{Values: ch, Count: 4})
-		consumer := ctx.Go(sums, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		producer := ctx.Go(counts, writeFeed{Values: w, Count: 4})
+		consumer := ctx.Go(sums, feed{Values: r})
 		if _, err := producer.Await(ctx); err != nil {
 			return err
 		}

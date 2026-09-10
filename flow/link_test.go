@@ -15,7 +15,7 @@ import (
 // handle arrives in its input, the way a work function on a worker would get
 // it.
 type feed struct {
-	Values *flow.Channel[int] `json:"values"`
+	Values flow.Reader[int] `json:"values"`
 }
 
 var consumer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
@@ -53,17 +53,17 @@ func TestAChannelReachesAnotherRun(t *testing.T) {
 	store := flow.NewMemStore()
 	var got int
 	err := flow.Run(t.Context(), "parent", func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](1)
-		if err := ch.Send(ctx, 1); err != nil { // before the channel is shared
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
+		if err := w.Send(ctx, 1); err != nil { // before the channel is shared
 			return err
 		}
-		fut := ctx.Go(consumer, feed{Values: ch})
+		fut := ctx.Go(consumer, feed{Values: r})
 		for _, v := range []int{2, 3, 4} {
-			if err := ch.Send(ctx, v); err != nil {
+			if err := w.Send(ctx, v); err != nil {
 				return err
 			}
 		}
-		if err := ch.Close(ctx); err != nil {
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
 		var err error
@@ -79,7 +79,7 @@ func TestAChannelReachesAnotherRun(t *testing.T) {
 }
 
 type writeFeed struct {
-	Values *flow.Writer[int] `json:"values"`
+	Values flow.Writer[int] `json:"values"`
 }
 
 // writerProducer is handed only the send side: it can send and close, not receive.
@@ -101,12 +101,11 @@ func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
 	store := flow.NewMemStore()
 	var got int
 	err := flow.Run(t.Context(), "reader", func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		w := ch.Writer()
-		fut := ctx.Go(writerProducer, writeFeed{Values: &w})
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(writerProducer, writeFeed{Values: w})
 		total := 0
 		for {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -138,14 +137,14 @@ func TestSelectReadsOverHostedChannels(t *testing.T) {
 	store := flow.NewMemStore()
 	var got int
 	err := flow.Run(t.Context(), "fanin", func(ctx flow.Context) error {
-		a, b := ctx.NewChannel[int](), ctx.NewChannel[int]()
-		aw, bw := a.Writer(), b.Writer()
-		fa := ctx.Go(writerProducer, writeFeed{Values: &aw})
-		fb := ctx.Go(writerProducer, writeFeed{Values: &bw})
+		ar, aw := ctx.NewChannel[int]()
+		br, bw := ctx.NewChannel[int]()
+		fa := ctx.Go(writerProducer, writeFeed{Values: aw})
+		fb := ctx.Go(writerProducer, writeFeed{Values: bw})
 
 		total := 0
 		done := [2]bool{}
-		chans := [2]*flow.Channel[int]{a, b}
+		chans := [2]flow.Reader[int]{ar, br}
 		for !done[0] || !done[1] {
 			sel := ctx.Select()
 			for i, ch := range chans {
@@ -187,7 +186,7 @@ func TestSelectReadsOverHostedChannels(t *testing.T) {
 }
 
 // producer sends into a channel it was handed and closes it.
-var producer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
+var producer = flow.Define(func(ctx flow.Context, in writeFeed) (int, error) {
 	for i := 1; i <= 3; i++ {
 		if err := in.Values.Send(ctx, i*10); err != nil {
 			return 0, err
@@ -210,11 +209,11 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 	replayedRecv.attempts.Store(0)
 	replayedRecv.seen = nil
 	err := flow.Run(t.Context(), "receiver", func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		fut := ctx.Go(producer, feed{Values: ch})
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(producer, writeFeed{Values: w})
 		var seen []int
 		for {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -247,13 +246,12 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 	}
 }
 
-
 // THE POINT: a channel cannot leave a run that has no host, and the error
 // arrives at the call rather than as a hang somewhere else.
 func TestAChannelCannotLeaveARunWithoutAHost(t *testing.T) {
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		_, err := consumer(ctx, feed{Values: ch})
+		r, _ := ctx.NewChannel[int]()
+		_, err := consumer(ctx, feed{Values: r})
 		return err
 	}, flow.WithStore(flow.NewMemStore()), flow.Once())
 	if err == nil || !strings.Contains(err.Error(), "no channel host") {
@@ -298,13 +296,13 @@ func TestASharedChannelHonoursItsCapacity(t *testing.T) {
 	var secondSent time.Time
 	var got int
 	err := flow.Run(t.Context(), "capacity", func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](1)
-		fut := ctx.Go(takesTwoWhenTold, feed{Values: ch})
-		if err := ch.Send(ctx, 1); err != nil { // the one place in the buffer
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
+		fut := ctx.Go(takesTwoWhenTold, feed{Values: r})
+		if err := w.Send(ctx, 1); err != nil { // the one place in the buffer
 			return err
 		}
 		time.AfterFunc(100*time.Millisecond, func() { close(told.release) })
-		if err := ch.Send(ctx, 2); err != nil { // no room until the other run takes one
+		if err := w.Send(ctx, 2); err != nil { // no room until the other run takes one
 			return err
 		}
 		secondSent = time.Now()
@@ -333,16 +331,18 @@ func TestFanOutIsOneChannelPerReceiver(t *testing.T) {
 	store := flow.NewMemStore()
 	var totals [2]int
 	err := flow.Run(t.Context(), "split", func(ctx flow.Context) error {
-		chs := [2]*flow.Channel[int]{ctx.NewChannel[int](), ctx.NewChannel[int]()}
-		first := ctx.Go(consumer, feed{Values: chs[0]})
-		second := ctx.Go(consumer, feed{Values: chs[1]})
+		r0, w0 := ctx.NewChannel[int]()
+		r1, w1 := ctx.NewChannel[int]()
+		ws := [2]flow.Writer[int]{w0, w1}
+		first := ctx.Go(consumer, feed{Values: r0})
+		second := ctx.Go(consumer, feed{Values: r1})
 		for v := 1; v <= 6; v++ {
-			if err := chs[(v-1)%2].Send(ctx, v); err != nil {
+			if err := ws[(v-1)%2].Send(ctx, v); err != nil {
 				return err
 			}
 		}
-		for i := range chs {
-			if err := chs[i].Close(ctx); err != nil {
+		for i := range ws {
+			if err := ws[i].Close(ctx); err != nil {
 				return err
 			}
 		}

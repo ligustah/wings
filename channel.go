@@ -53,7 +53,7 @@ func outboxFor(run string, attempt int, id string) string {
 type relayChannel struct {
 	stream *dsclient.Stream[flow.ChannelItem]
 
-	mu      sync.Mutex
+	mu     sync.Mutex
 	ledger *flow.Ledger
 }
 

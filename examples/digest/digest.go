@@ -120,8 +120,7 @@ var DigestBatch = flow.Define(func(ctx flow.Context, in Batch) (int, error) {
 var Fanout = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	const batches = 4
-	results := ctx.NewChannel[Result]()
-	w := results.Writer()
+	results, w := ctx.NewChannel[Result]()
 
 	var futures []*flow.Future[int]
 	for b := range batches {

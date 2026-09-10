@@ -49,18 +49,18 @@ func (p *placingElsewhere) Place(ctx context.Context, th flow.Thread, body func(
 }
 
 var spawnsAProducer = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
-	ch := ctx.NewChannel[int]()
+	r, w := ctx.NewChannel[int]()
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for i := 1; i <= 3; i++ {
-			if err := ch.Send(ctx, base+i); err != nil {
+			if err := w.Send(ctx, base+i); err != nil {
 				return 0, err
 			}
 		}
-		return 3, ch.Close(ctx)
+		return 3, w.Close(ctx)
 	})
 	total := 0
 	for {
-		v, ok, err := ch.Recv(ctx)
+		v, ok, err := r.Recv(ctx)
 		if err != nil {
 			return flow.None{}, err
 		}
@@ -100,28 +100,28 @@ func TestAThreadOfRunCodeRunsElsewhereByItsLineage(t *testing.T) {
 }
 
 var spawnsWithin = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
-	results := ctx.NewBufferedChannel[int](4)
+	rr, rw := ctx.NewChannel[int](flow.WithCapacity(4))
 	outer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		// A thread of run code forked by one that was itself placed
 		// elsewhere: its lineage is three long.
 		inner := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			return base * 2, results.Send(ctx, base*2)
+			return base * 2, rw.Send(ctx, base*2)
 		})
 		v, err := inner.Await(ctx)
 		if err != nil {
 			return 0, err
 		}
-		return v + 1, results.Send(ctx, v+1)
+		return v + 1, rw.Send(ctx, v+1)
 	})
 	v, err := outer.Await(ctx)
 	if err != nil {
 		return flow.None{}, err
 	}
-	a, _, err := results.Recv(ctx)
+	a, _, err := rr.Recv(ctx)
 	if err != nil {
 		return flow.None{}, err
 	}
-	b, _, err := results.Recv(ctx)
+	b, _, err := rr.Recv(ctx)
 	if err != nil {
 		return flow.None{}, err
 	}

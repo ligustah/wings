@@ -86,7 +86,7 @@ func (e *lostAttempt) Place(ctx context.Context, th flow.Thread, body func(flow.
 	return flow.RunThread(ctx, th.Run, th.ID, th.Fn, th.Input, e.opts()...)
 }
 
-var sendsThenDies = flow.Define(func(ctx flow.Context, in feed) (int, error) {
+var sendsThenDies = flow.Define(func(ctx flow.Context, in writeFeed) (int, error) {
 	for i := 1; i <= 3; i++ {
 		if err := in.Values.Send(ctx, i*10); err != nil {
 			return 0, err
@@ -118,10 +118,10 @@ func TestAReplayedSendIsNotAnnouncedAgain(t *testing.T) {
 	defer cancel()
 	var seen []int
 	err := flow.Run(ctx, "receiver", func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](3)
-		fut := ctx.Go(sendsThenDies, feed{Values: ch})
+		r, w := ctx.NewChannel[int](flow.WithCapacity(3))
+		fut := ctx.Go(sendsThenDies, writeFeed{Values: w})
 		for {
-			v, ok, err := ch.Recv(ctx)
+			v, ok, err := r.Recv(ctx)
 			if err != nil {
 				return err
 			}

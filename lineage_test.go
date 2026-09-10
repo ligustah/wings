@@ -103,18 +103,18 @@ type spawnReport struct {
 // workflow drains: the thread should run on a worker, the workflow stays on
 // the coordinator, and the channel joins them.
 var producesOnAWorker = flow.Define(func(ctx flow.Context, base int) (flow.None, error) {
-	ch := ctx.NewChannel[int]()
+	r, w := ctx.NewChannel[int]()
 	producer := ctx.Spawn(func(ctx flow.Context) (string, error) {
 		for i := 1; i <= 3; i++ {
-			if err := ch.Send(ctx, base+i); err != nil {
+			if err := w.Send(ctx, base+i); err != nil {
 				return "", err
 			}
 		}
-		return where(ctx), ch.Close(ctx)
+		return where(ctx), w.Close(ctx)
 	})
 	total := 0
 	for {
-		v, ok, err := ch.Recv(ctx)
+		v, ok, err := r.Recv(ctx)
 		if err != nil {
 			return flow.None{}, err
 		}
@@ -184,15 +184,15 @@ type nestedSpawnReport struct {
 // forks a thread of run code. That thread's lineage is three long: the
 // workflow, this function, the closure.
 var spawnsInAJob = flow.Define(func(ctx flow.Context, base int) (nestedSpawnReport, error) {
-	results := ctx.NewBufferedChannel[int](1)
+	r, w := ctx.NewChannel[int](flow.WithCapacity(1))
 	inner := ctx.Spawn(func(ctx flow.Context) (string, error) {
-		return where(ctx), results.Send(ctx, base*2)
+		return where(ctx), w.Send(ctx, base*2)
 	})
 	ran, err := inner.Await(ctx)
 	if err != nil {
 		return nestedSpawnReport{}, err
 	}
-	v, _, err := results.Recv(ctx)
+	v, _, err := r.Recv(ctx)
 	if err != nil {
 		return nestedSpawnReport{}, err
 	}

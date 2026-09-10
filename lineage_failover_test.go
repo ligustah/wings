@@ -24,7 +24,7 @@ var sightings = make(chan sighting, 4)
 // worker. Its retry, wherever it lands, must replay the effect rather than
 // draw it again.
 var movesItsSpawn = flow.Define(func(ctx flow.Context, _ int) (flow.None, error) {
-	seen := ctx.NewBufferedChannel[sighting](2)
+	cr, cw := ctx.NewChannel[sighting](flow.WithCapacity(2))
 	fut := ctx.Spawn(func(ctx flow.Context) (sighting, error) {
 		r, err := ctx.Effect(func() (int, error) { return rand.IntN(1<<30) + 1, nil })
 		if err != nil {
@@ -35,7 +35,7 @@ var movesItsSpawn = flow.Define(func(ctx flow.Context, _ int) (flow.None, error)
 		if err := ctx.Heartbeat(1); err != nil {
 			return sighting{}, err
 		}
-		if err := seen.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
+		if err := cw.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
 			return sighting{}, err
 		}
 		if ctx.Attempt() == 0 {
@@ -44,7 +44,7 @@ var movesItsSpawn = flow.Define(func(ctx flow.Context, _ int) (flow.None, error)
 		}
 		return sighting{Worker: where(ctx), Value: r}, nil
 	})
-	first, _, err := seen.Recv(ctx)
+	first, _, err := cr.Recv(ctx)
 	if err != nil {
 		return flow.None{}, err
 	}
@@ -280,7 +280,7 @@ func TestARestartedCoordinatorRejoinsSeveralThreadsOfRunCode(t *testing.T) {
 }
 
 type report struct {
-	Seen *flow.Channel[sighting] `json:"seen"`
+	Seen flow.Writer[sighting] `json:"seen"`
 }
 
 // parentOfSpawn is a work function that forks a thread of run code and waits
@@ -307,10 +307,10 @@ var parentOfSpawn = flow.Define(func(ctx flow.Context, in report) (int, error) {
 }, flow.WithName("test.parentOfSpawn"))
 
 var parentMoves = flow.Define(func(ctx flow.Context, _ int) (flow.None, error) {
-	seen := ctx.NewBufferedChannel[sighting](4)
-	fut := ctx.Go(parentOfSpawn, report{Seen: seen})
+	r, w := ctx.NewChannel[sighting](flow.WithCapacity(4))
+	fut := ctx.Go(parentOfSpawn, report{Seen: w})
 	for range 2 {
-		s, _, err := seen.Recv(ctx)
+		s, _, err := r.Recv(ctx)
 		if err != nil {
 			return flow.None{}, err
 		}

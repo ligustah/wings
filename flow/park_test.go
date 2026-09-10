@@ -71,12 +71,12 @@ func (p *parking) has(on string) bool {
 func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 	p := &parking{}
 	err := flow.Run(t.Context(), "parked", func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[int](1)
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
 		release := make(chan struct{})
 		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			<-release // held until the receive below is parked with nothing to take
 			for _, v := range []int{1, 2, 3} {
-				if err := ch.Send(ctx, v); err != nil {
+				if err := w.Send(ctx, v); err != nil {
 					return 0, err
 				}
 			}
@@ -91,7 +91,7 @@ func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 			}
 			close(release)
 		}()
-		if _, _, err := ch.Recv(ctx); err != nil { // parks (WaitRecv), then takes 1
+		if _, _, err := r.Recv(ctx); err != nil { // parks (WaitRecv), then takes 1
 			return err
 		}
 
@@ -102,7 +102,7 @@ func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 		for range 2 {
-			if _, _, err := ch.Recv(ctx); err != nil {
+			if _, _, err := r.Recv(ctx); err != nil {
 				return err
 			}
 		}

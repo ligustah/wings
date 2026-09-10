@@ -17,18 +17,18 @@ import (
 // A work function is run code: it may fork, use a channel, call other
 // functions, read the clock and sleep, on whichever worker it lands on.
 var activity = flow.Define(func(ctx flow.Context, in int) (string, error) {
-	ch := ctx.NewBufferedChannel[int](2)
+	r, w := ctx.NewChannel[int](flow.WithCapacity(2))
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for i := range 2 {
-			if err := ch.Send(ctx, in+i); err != nil {
+			if err := w.Send(ctx, in+i); err != nil {
 				return 0, err
 			}
 		}
-		return 0, ch.Close(ctx)
+		return 0, w.Close(ctx)
 	})
 	sum := 0
 	for {
-		v, ok, err := ch.Recv(ctx)
+		v, ok, err := r.Recv(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -518,16 +518,16 @@ func TestAWaitingThreadGivesUpItsSlot(t *testing.T) {
 
 	var total int
 	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		receiver := ctx.Go(sums, feed{Values: ch}) // takes the slot, then waits
-		v, err := ctx.Go(double, 21).Await(ctx)    // needs the slot
+		r, w := ctx.NewChannel[int]()
+		receiver := ctx.Go(sums, feed{Values: r}) // takes the slot, then waits
+		v, err := ctx.Go(double, 21).Await(ctx)   // needs the slot
 		if err != nil {
 			return err
 		}
-		if err := ch.Send(ctx, v); err != nil {
+		if err := w.Send(ctx, v); err != nil {
 			return err
 		}
-		if err := ch.Close(ctx); err != nil {
+		if err := w.Close(ctx); err != nil {
 			return err
 		}
 		total, err = receiver.Await(ctx)

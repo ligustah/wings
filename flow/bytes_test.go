@@ -26,10 +26,10 @@ func TestAByteStreamCarriesBytesBetweenThreads(t *testing.T) {
 	var got bytes.Buffer
 
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[flow.Bytes](4)
+		cr, cw := ctx.NewChannel[flow.Bytes](flow.WithCapacity(4))
 
 		producer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
-			w := flow.NewByteWriter(ctx, ch.Writer())
+			w := flow.NewByteWriter(ctx, cw)
 			if _, err := w.Write(pattern(size)); err != nil {
 				return flow.None{}, err
 			}
@@ -37,7 +37,7 @@ func TestAByteStreamCarriesBytesBetweenThreads(t *testing.T) {
 		})
 
 		// Read back in pieces that never line up with a chunk boundary.
-		r := flow.NewByteReader(ctx, ch.Reader())
+		r := flow.NewByteReader(ctx, cr)
 		if _, err := io.CopyBuffer(&got, struct{ io.Reader }{r}, make([]byte, 1000)); err != nil {
 			return err
 		}
@@ -60,10 +60,10 @@ func TestALargeWriteIsSplitIntoChunks(t *testing.T) {
 	var sends int
 
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[flow.Bytes](8)
+		cr, cw := ctx.NewChannel[flow.Bytes](flow.WithCapacity(8))
 
 		producer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
-			w := flow.NewByteWriter(ctx, ch.Writer())
+			w := flow.NewByteWriter(ctx, cw)
 			// Hand it the whole thing in one Write, as an encoder that builds its
 			// output in memory would.
 			if _, err := w.Write(pattern(size)); err != nil {
@@ -73,7 +73,7 @@ func TestALargeWriteIsSplitIntoChunks(t *testing.T) {
 		})
 
 		for {
-			_, ok, err := ch.Recv(ctx)
+			_, ok, err := cr.Recv(ctx)
 			if err != nil {
 				return err
 			}
@@ -99,14 +99,14 @@ func TestAnEmptyByteStreamReadsCleanly(t *testing.T) {
 	var got bytes.Buffer
 
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		ch := ctx.NewBufferedChannel[flow.Bytes](1)
+		cr, cw := ctx.NewChannel[flow.Bytes](flow.WithCapacity(1))
 
 		producer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
-			w := flow.NewByteWriter(ctx, ch.Writer())
+			w := flow.NewByteWriter(ctx, cw)
 			return flow.None{}, w.Close()
 		})
 
-		r := flow.NewByteReader(ctx, ch.Reader())
+		r := flow.NewByteReader(ctx, cr)
 		if _, err := io.Copy(&got, r); err != nil {
 			return err
 		}

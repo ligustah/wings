@@ -44,34 +44,34 @@ func ok(name string) error {
 
 var Pipeline = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 20)
-	raw := ctx.NewBufferedChannel[int](2)
-	squared := ctx.NewBufferedChannel[int](2)
+	rawR, rawW := ctx.NewChannel[int](flow.WithCapacity(2))
+	squaredR, squaredW := ctx.NewChannel[int](flow.WithCapacity(2))
 
 	source := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for i := 1; i <= n; i++ {
-			if err := raw.Send(ctx, i); err != nil {
+			if err := rawW.Send(ctx, i); err != nil {
 				return 0, err
 			}
 		}
-		if err := raw.Close(ctx); err != nil {
+		if err := rawW.Close(ctx); err != nil {
 			return 0, err
 		}
 		return pid(ctx)
 	})
 	transform := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for {
-			v, more, err := raw.Recv(ctx)
+			v, more, err := rawR.Recv(ctx)
 			if err != nil {
 				return 0, err
 			}
 			if !more {
 				break
 			}
-			if err := squared.Send(ctx, v*v); err != nil {
+			if err := squaredW.Send(ctx, v*v); err != nil {
 				return 0, err
 			}
 		}
-		if err := squared.Close(ctx); err != nil {
+		if err := squaredW.Close(ctx); err != nil {
 			return 0, err
 		}
 		return pid(ctx)
@@ -79,7 +79,7 @@ var Pipeline = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) 
 	sink := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		sum := 0
 		for {
-			v, more, err := squared.Recv(ctx)
+			v, more, err := squaredR.Recv(ctx)
 			if err != nil {
 				return 0, err
 			}
@@ -116,7 +116,7 @@ var _ = flow.Main(Pipeline)
 // --- fanin: several producers, several consumers, one channel ---
 
 type Feed struct {
-	Values *flow.Channel[int] `json:"values"`
+	Values flow.Reader[int] `json:"values"`
 }
 
 type Tally struct {
@@ -147,13 +147,13 @@ var Consume = flow.Define(func(ctx flow.Context, in Feed) (Tally, error) {
 var Fanin = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 50)
 	const producers, consumers = 3, 4
-	values := ctx.NewChannel[int]()
+	valuesR, valuesW := ctx.NewChannel[int]()
 
 	var prods []*flow.Future[int]
 	for p := range producers {
 		prods = append(prods, ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for i := range n {
-				if err := values.Send(ctx, p*n+i+1); err != nil {
+				if err := valuesW.Send(ctx, p*n+i+1); err != nil {
 					return 0, err
 				}
 			}
@@ -162,14 +162,14 @@ var Fanin = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	}
 	var cons []*flow.Future[Tally]
 	for range consumers {
-		cons = append(cons, ctx.Go(Consume, Feed{Values: values}))
+		cons = append(cons, ctx.Go(Consume, Feed{Values: valuesR}))
 	}
 	for _, p := range prods {
 		if _, err := p.Await(ctx); err != nil {
 			return flow.None{}, err
 		}
 	}
-	if err := values.Close(ctx); err != nil {
+	if err := valuesW.Close(ctx); err != nil {
 		return flow.None{}, err
 	}
 	total := Tally{}
@@ -286,9 +286,9 @@ var _ = flow.Main(Flaky)
 // --- deep: lineages several long, channels at every level ---
 
 type Level struct {
-	Depth int                `json:"depth"`
-	Pids  []int              `json:"pids"`
-	Back  *flow.Channel[int] `json:"back"`
+	Depth int              `json:"depth"`
+	Pids  []int            `json:"pids"`
+	Back  flow.Reader[int] `json:"back"`
 }
 
 // descend forks another copy of itself until depth runs out; the deepest hands
@@ -299,8 +299,8 @@ func descend(ctx flow.Context, depth, max int) (Level, error) {
 		return Level{}, err
 	}
 	if depth == max {
-		back := ctx.NewBufferedChannel[int](1)
-		if err := back.Send(ctx, depth*100); err != nil {
+		backR, backW := ctx.NewChannel[int](flow.WithCapacity(1))
+		if err := backW.Send(ctx, depth*100); err != nil {
 			return Level{}, err
 		}
 		out, err := ctx.Map(Square, []int{depth, depth + 1})
@@ -310,16 +310,16 @@ func descend(ctx flow.Context, depth, max int) (Level, error) {
 		if out[0] != depth*depth {
 			return Level{}, fmt.Errorf("deep: at depth %d Map gave %v", depth, out)
 		}
-		return Level{Depth: depth, Pids: []int{p}, Back: back}, nil
+		return Level{Depth: depth, Pids: []int{p}, Back: backR}, nil
 	}
-	report := ctx.NewChannel[int]()
+	reportR, reportW := ctx.NewChannel[int]()
 	child := ctx.Spawn(func(ctx flow.Context) (Level, error) {
-		if err := report.Send(ctx, depth+1); err != nil {
+		if err := reportW.Send(ctx, depth+1); err != nil {
 			return Level{}, err
 		}
 		return descend(ctx, depth+1, max)
 	})
-	v, _, err := report.Recv(ctx)
+	v, _, err := reportR.Recv(ctx)
 	if err != nil {
 		return Level{}, err
 	}
@@ -426,12 +426,12 @@ var _ = flow.Main(Effects)
 var Wide = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 50)
 	const each = 20
-	values := ctx.NewBufferedChannel[int](8)
+	valuesR, valuesW := ctx.NewChannel[int](flow.WithCapacity(8))
 	var threads []*flow.Future[int]
 	for i := range n {
 		threads = append(threads, ctx.Spawn(func(ctx flow.Context) (int, error) {
 			for j := range each {
-				if err := values.Send(ctx, i*each+j); err != nil {
+				if err := valuesW.Send(ctx, i*each+j); err != nil {
 					return 0, err
 				}
 			}
@@ -441,7 +441,7 @@ var Wide = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	start := time.Now()
 	seen := map[int]bool{}
 	for range n * each {
-		v, more, err := values.Recv(ctx)
+		v, more, err := valuesR.Recv(ctx)
 		if err != nil {
 			return flow.None{}, err
 		}
@@ -556,22 +556,22 @@ var _ = flow.Main(Panicky)
 var Bulky = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 12)
 	const size = 256 << 10
-	values := ctx.NewBufferedChannel[[]byte](2)
+	valuesR, valuesW := ctx.NewChannel[[]byte](flow.WithCapacity(2))
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		for i := range n {
 			b := make([]byte, size)
 			for j := range b {
 				b[j] = byte(i + j)
 			}
-			if err := values.Send(ctx, b); err != nil {
+			if err := valuesW.Send(ctx, b); err != nil {
 				return 0, err
 			}
 		}
-		return n, values.Close(ctx)
+		return n, valuesW.Close(ctx)
 	})
 	total, count := 0, 0
 	for {
-		b, more, err := values.Recv(ctx)
+		b, more, err := valuesR.Recv(ctx)
 		if err != nil {
 			return flow.None{}, err
 		}
@@ -670,20 +670,20 @@ var _ = flow.Main(Stepped)
 // sender whose channel was closed under it ---
 
 var Orphaned = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
-	values := ctx.NewChannel[int]()
+	valuesR, valuesW := ctx.NewChannel[int]()
 	producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
-		if err := values.Send(ctx, 1); err != nil {
+		if err := valuesW.Send(ctx, 1); err != nil {
 			return 0, err
 		}
 		return 0, flow.Permanent(errors.New("the producer gives up"))
 	})
-	v, more, err := values.Recv(ctx)
+	v, more, err := valuesR.Recv(ctx)
 	if err != nil || !more || v != 1 {
 		return flow.None{}, fmt.Errorf("orphaned: the first receive got %d, %v, %v", v, more, err)
 	}
 	// Nobody will send or close, so the receive is bounded and reports the bound.
 	tctx, cancel := ctx.WithTimeout(500 * time.Millisecond)
-	_, _, err = values.Recv(tctx)
+	_, _, err = valuesR.Recv(tctx)
 	cancel()
 	if !errors.Is(err, context.DeadlineExceeded) {
 		return flow.None{}, fmt.Errorf("orphaned: the orphaned receive ended with %v", err)
@@ -694,12 +694,12 @@ var Orphaned = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) 
 		return flow.None{}, fmt.Errorf("orphaned: the producer returned %v", err)
 	}
 	// Closed under a sender: the sender's send fails rather than hangs.
-	closed := ctx.NewChannel[int]()
-	if err := closed.Close(ctx); err != nil {
+	_, closedW := ctx.NewChannel[int]()
+	if err := closedW.Close(ctx); err != nil {
 		return flow.None{}, err
 	}
 	sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
-		err := closed.Send(ctx, 1)
+		err := closedW.Send(ctx, 1)
 		fmt.Printf("orphaned: sending on a closed channel: %v\n", err)
 		if err == nil {
 			return 0, errors.New("a send on a closed channel succeeded")
@@ -744,14 +744,13 @@ var Pumps = flow.Define(func(ctx flow.Context, in Outlet) (int, error) {
 
 var Crossed = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 25)
-	values := ctx.NewBufferedChannel[int](3)
-	w := values.Writer()
-	pump := ctx.Go(Pumps, Outlet{N: n, Out: &w})
+	valuesR, valuesW := ctx.NewChannel[int](flow.WithCapacity(3))
+	pump := ctx.Go(Pumps, Outlet{N: n, Out: &valuesW})
 	drain := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		p, _ := pid(ctx)
 		sum := 0
 		for {
-			v, more, err := values.Recv(ctx)
+			v, more, err := valuesR.Recv(ctx)
 			if err != nil {
 				return 0, err
 			}
