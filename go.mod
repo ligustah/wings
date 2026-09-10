@@ -1,20 +1,18 @@
 module github.com/ligustah/wings
 
-go 1.27
-
-toolchain go1.27.0
+go 1.27.0
 
 require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
 	github.com/ligustah/commitlog/blockv3 v0.1.0
 	github.com/ligustah/commitlog/compress v0.1.0
-	github.com/ligustah/durable_streams v0.165.0
-	github.com/ligustah/durable_streams/broker v0.266.0
-	github.com/ligustah/durable_streams/broker/client v0.64.0
-	github.com/ligustah/durable_streams/broker/protos v0.46.0
-	github.com/ligustah/durable_streams/dsclient v0.54.0
-	github.com/ligustah/durable_streams/dswire v0.35.0
+	github.com/ligustah/durable_streams v0.166.0
+	github.com/ligustah/durable_streams/broker v0.267.0
+	github.com/ligustah/durable_streams/broker/client v0.65.0
+	github.com/ligustah/durable_streams/broker/protos v0.47.0
+	github.com/ligustah/durable_streams/dsclient v0.55.0
+	github.com/ligustah/durable_streams/dswire v0.36.0
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.83.2
@@ -46,7 +44,8 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/ligustah/commitlog v0.106.0 // indirect
-	github.com/ligustah/durable_streams/dsembedded v0.87.0 // indirect
+	github.com/ligustah/durable_streams/dsembedded v0.88.0 // indirect
+	github.com/ligustah/mapper v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -57,16 +56,20 @@ require (
 	github.com/prometheus/common v0.70.0 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/tysonmote/gommap v0.0.3 // indirect
+	github.com/yourbasic/graph v0.0.0-20170921192928-40eb135c0b26 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.67.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+	golang.org/x/mod v0.39.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 // indirect
