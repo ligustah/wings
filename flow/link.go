@@ -31,7 +31,7 @@ type ChannelItem struct {
 
 // ChannelLink is one run's connection to a shared channel.
 type ChannelLink interface {
-	// Send hands the host one record this run made: a value, a close, or a want.
+	// Send hands the host one record this run made: a value, a close, or a consume report.
 	Send(ctx context.Context, item ChannelItem) error
 	// Items delivers the channel's record from the beginning in the host's order,
 	// calling yield for each, returning when yield returns false or ctx ends.
@@ -265,7 +265,7 @@ func (h *MemChannelHost) Link(_ context.Context, _, id string) (ChannelLink, err
 	defer h.mu.Unlock()
 	ch := h.chans[id]
 	if ch == nil {
-		ch = &memChannel{arbiter: NewArbiter(), changed: make(chan struct{})}
+		ch = &memChannel{ledger: NewLedger(), changed: make(chan struct{})}
 		h.chans[id] = ch
 	}
 	return &memLink{ch: ch}, nil
@@ -294,7 +294,7 @@ func (h *MemChannelHost) ChannelValues(_ context.Context, id string, cursor int6
 }
 
 type memChannel struct {
-	arbiter *Arbiter
+	ledger *Ledger
 
 	mu      sync.Mutex
 	items   []ChannelItem // the record
@@ -307,7 +307,7 @@ func (l *memLink) Send(_ context.Context, it ChannelItem) error {
 	ch := l.ch
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	recs := ch.arbiter.Offer(it)
+	recs := ch.ledger.Offer(it)
 	if len(recs) == 0 {
 		return nil
 	}

@@ -36,8 +36,12 @@ func givesUp(seen *[]error, attempts *int) func(ctx flow.Context) error {
 		cancel()
 		*seen = append(*seen, err)
 
+		full := ctx.NewBufferedChannel[int](1)
+		if err := full.Send(ctx, 0); err != nil { // fills the one place
+			return err
+		}
 		tctx, cancel = ctx.WithTimeout(bound)
-		err = quiet.Send(tctx, 1)
+		err = full.Send(tctx, 1) // the buffer is full: waits for a receive
 		cancel()
 		*seen = append(*seen, err)
 

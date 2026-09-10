@@ -17,10 +17,10 @@ import (
 // relayed through the coordinator (the flow package's ChannelHost is the seam).
 // Each run has an outbox per channel — wings.chanout.<job>.<attempt>.<channel> —
 // copied home by the same mirror as a recording, but written outside the
-// attempt's transaction: a value or want is named by sender and sequence, so a
+// attempt's transaction: each record is named by sender and sequence, so a
 // duplicate from a replay is dropped, and what it needs is to be seen at once.
 // The coordinator's relay merges every outbox into one canonical stream,
-// wings.chan.<channel>, by the rule in [flow.Arbiter]. A run receives by reading
+// wings.chan.<channel>, deduped by the [flow.Ledger]. A run receives by reading
 // the canonical stream — its own on the coordinator, a pushed copy on a worker.
 // Creating an outbox is also the subscription; the canonical stream is never
 // dropped, so a restarted coordinator replays receives from it.
@@ -48,20 +48,20 @@ func outboxFor(run string, attempt int, id string) string {
 // --- relay, on the coordinator ---
 
 // relayChannel is the relay's state for one channel: the canonical stream and
-// the arbiter that decides what goes on it.
+// the ledger that decides what goes on it.
 type relayChannel struct {
 	stream *dsclient.Stream[flow.ChannelItem]
 
 	mu      sync.Mutex
-	arbiter *flow.Arbiter
+	ledger *flow.Ledger
 }
 
-// merge puts a record through the arbiter and appends what it says — the record
-// if new, plus any grants — returning what it appended. Nothing for a duplicate.
+// merge puts a record through the ledger and appends it if new, returning what
+// it appended. Nothing for a duplicate.
 func (rc *relayChannel) merge(ctx context.Context, it flow.ChannelItem) ([]flow.ChannelItem, error) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	recs := rc.arbiter.Offer(it)
+	recs := rc.ledger.Offer(it)
 	if len(recs) == 0 {
 		return nil, nil
 	}
@@ -239,7 +239,7 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 	if err != nil {
 		return nil, err
 	}
-	rc := &relayChannel{stream: st, arbiter: flow.NewArbiter()}
+	rc := &relayChannel{stream: st, ledger: flow.NewLedger()}
 	var from int64
 	for {
 		recs, err := st.Read(c.ctx, from, recordBatch)
@@ -251,10 +251,10 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 		}
 		for _, rec := range recs {
 			from = rec.Offset + 1
-			rc.arbiter.Restore(rec.Record)
+			rc.ledger.Restore(rec.Record)
 		}
 	}
-	c.relay.consumed.Store(canonical, rc.arbiter.Consumed())
+	c.relay.consumed.Store(canonical, rc.ledger.Consumed())
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -385,7 +385,7 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 	})
 }
 
-// mergeOutbox puts each of an outbox's records through the channel's arbiter,
+// mergeOutbox puts each of an outbox's records through the channel's ledger,
 // advancing the read position, and wakes receivers on whatever it appended.
 func (c *Cluster) mergeOutbox(rc *relayChannel, id string, from int64, recs []dsclient.OffsetRecord[flow.ChannelItem]) (int64, error) {
 	var merged []flow.ChannelItem
@@ -398,7 +398,7 @@ func (c *Cluster) mergeOutbox(rc *relayChannel, id string, from int64, recs []ds
 		merged = append(merged, appended...)
 	}
 	if len(merged) > 0 {
-		c.relay.consumed.Store(chanStreamFor(id), rc.arbiter.Consumed())
+		c.relay.consumed.Store(chanStreamFor(id), rc.ledger.Consumed())
 		c.wakeOnChannel(id)
 	}
 	return from, nil
@@ -811,8 +811,8 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 				}
 			}
 		}
-		// Records that were only wants and grants carry no value; keep reading rather
-		// than hand the caller an empty result it would read as the value being gone.
+		// A consume report or a close carries no value; keep reading rather than hand
+		// the caller an empty result it would read as the value being gone.
 		if len(out) > 0 {
 			return out, nil
 		}

@@ -8,7 +8,7 @@ import "testing"
 // and the close, which is all a holder needs to tell whether a parked receive or
 // send can proceed.
 func TestLedgerCountsWithoutRetainingBytes(t *testing.T) {
-	a := NewArbiter()
+	a := NewLedger()
 	payload := []byte("a sizeable decision payload")
 
 	recs := a.Offer(ChannelItem{From: "run/main", Seq: 0, Data: payload})
@@ -43,8 +43,8 @@ func TestLedgerCountsWithoutRetainingBytes(t *testing.T) {
 // THE POINT: the dedupe is a per-sender run, not a key per value, and it admits a
 // seq that arrives out of order — a lost announcement whose gap the replay fills
 // — rather than mistaking the replay for a resend.
-func TestArbiterAdmitsAGapFilledOutOfOrder(t *testing.T) {
-	a := NewArbiter()
+func TestTheLedgerAdmitsAGapFilledOutOfOrder(t *testing.T) {
+	a := NewLedger()
 
 	// seq 1's announcement was lost, so seq 2 reaches the record before it.
 	if recs := a.Offer(ChannelItem{From: "s", Seq: 0, Data: []byte("a")}); len(recs) != 1 {
@@ -65,7 +65,7 @@ func TestArbiterAdmitsAGapFilledOutOfOrder(t *testing.T) {
 	}
 	// One sender, one entry — not one per value — and the gap closed.
 	if len(a.seen) != 1 {
-		t.Fatalf("arbiter kept %d sender entries, want 1", len(a.seen))
+		t.Fatalf("ledger kept %d sender entries, want 1", len(a.seen))
 	}
 	if r := a.seen["s"]; r == nil || r.next != 3 || len(r.ahead) != 0 {
 		t.Fatalf("sender run did not close the gap: %+v", r)

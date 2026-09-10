@@ -28,6 +28,19 @@ func (p *parking) Park(_ context.Context, w flow.Wait) func(context.Context) err
 	}
 }
 
+// only reports that names is non-empty and every entry is want.
+func only(names []string, want string) bool {
+	if len(names) == 0 {
+		return false
+	}
+	for _, n := range names {
+		if n != want {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *parking) waits(of []flow.Wait) map[string][]string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -45,12 +58,15 @@ func (p *parking) waits(of []flow.Wait) map[string][]string {
 func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 	p := &parking{}
 	err := flow.Run(t.Context(), "parked", func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
+		ch := ctx.NewBufferedChannel[int](1)
 		release := make(chan struct{})
 		producer := ctx.Spawn(func(ctx flow.Context) (int, error) {
 			<-release
-			// An unbuffered send with the receiver not yet there: waits.
-			return 0, ch.Send(ctx, 1)
+			if err := ch.Send(ctx, 1); err != nil { // the one place in the buffer
+				return 0, err
+			}
+			// A second send with the one-place buffer full: waits for a receive.
+			return 0, ch.Send(ctx, 2)
 		})
 
 		// A receive with nothing to take: waits, for the producer.
@@ -58,8 +74,10 @@ func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 			close(release)
 		}()
-		if _, _, err := ch.Recv(ctx); err != nil {
-			return err
+		for range 2 {
+			if _, _, err := ch.Recv(ctx); err != nil {
+				return err
+			}
 		}
 		if err := ctx.Sleep(10 * time.Millisecond); err != nil {
 			return err
@@ -81,15 +99,19 @@ func TestAThreadIsParkedWhileItWaits(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
+	// A buffered channel decouples sender and receiver, so a receive may park
+	// once or twice depending on whether the next value is already buffered when
+	// it looks; the point is that each wait is reported by the right thread and
+	// every one resumes. The sleep parks exactly once.
 	parked := p.waits(p.parked)
-	if got := parked[flow.WaitRecv]; len(got) != 1 || got[0] != "main" {
-		t.Errorf("receives parked: %v, want main once", got)
+	if got := parked[flow.WaitRecv]; !only(got, "main") {
+		t.Errorf("receives parked: %v, want main", got)
 	}
 	if got := parked[flow.WaitSleep]; len(got) != 1 || got[0] != "main" {
 		t.Errorf("sleeps parked: %v, want main once", got)
 	}
-	if got := parked[flow.WaitSend]; len(got) != 1 || got[0] != "main.0" {
-		t.Errorf("sends parked: %v, want main.0 once", got)
+	if got := parked[flow.WaitSend]; !only(got, "main.0") {
+		t.Errorf("sends parked: %v, want main.0", got)
 	}
 	if got := parked[flow.WaitJoin]; len(got) > 1 {
 		t.Errorf("joins parked: %v, want at most one — a thread already over is not waited for", got)

@@ -43,10 +43,11 @@ const (
 	modeWrite handleMode = "w"
 )
 
-// NewChannel returns an unbuffered channel: a send completes when a receive
-// takes it.
+// NewChannel returns an unbounded channel: a send always completes at once and
+// no sender is ever parked. Use [Context.NewBufferedChannel] when a full buffer
+// should make a sender wait. Same as [Context.NewUnboundedChannel].
 func (c Context) NewChannel[T any]() *Channel[T] {
-	return newChannel[T](c, 0)
+	return newChannel[T](c, unbounded)
 }
 
 // unbounded is the capacity of a channel a send never waits on. Negative so it
@@ -63,10 +64,13 @@ func (c Context) NewUnboundedChannel[T any]() *Channel[T] {
 }
 
 // NewBufferedChannel returns a channel that accepts capacity values before a
-// send has to wait for a receive.
+// send has to wait for the reader to consume one. The bound is approximate: a
+// sender learns what the reader has consumed only as the host relays it, so the
+// buffer may briefly run over. capacity below 1 is raised to 1; use
+// [Context.NewChannel] for an unbounded channel.
 func (c Context) NewBufferedChannel[T any](capacity int) *Channel[T] {
-	if capacity < 0 {
-		capacity = 0
+	if capacity < 1 {
+		capacity = 1
 	}
 	return newChannel[T](c, capacity)
 }
@@ -627,9 +631,8 @@ func (cs *chanState) consume(item *chanItem) {
 
 // prune drops consumed items from the queue. Safe because nothing reads a
 // consumed item again: a receive has it, a replayed receive reads its value from
-// the store, put dedupes an echo before the item is consumed (the value precedes
-// its grant on the record), and a cross-run sender's own item is never consumed
-// here so it stays to dedupe. Call with mu held.
+// the store, put dedupes an echo before the item is consumed, and a cross-run
+// sender's own item is never consumed here so it stays to dedupe. Call with mu held.
 func (cs *chanState) prune() {
 	kept := cs.items[:0]
 	for _, it := range cs.items {

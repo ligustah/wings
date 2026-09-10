@@ -130,7 +130,7 @@ func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
 }
 
 // THE POINT: Select reads over several hosted channels the way Go selects over
-// channels — readiness is a value pumped from the host, no arbiter involved — so
+// channels — readiness is a value pumped from the host, no ledger involved — so
 // fan-in is N single-reader channels drained by one selecting thread, and it
 // works the same whether the producers run here or on other machines.
 func TestSelectReadsOverHostedChannels(t *testing.T) {
@@ -373,7 +373,7 @@ func TestTheLedgerRestoresItsCountsFromTheRecord(t *testing.T) {
 		{Closed: true},
 	}
 
-	a := flow.NewArbiter()
+	a := flow.NewLedger()
 	for _, it := range record {
 		a.Restore(it)
 	}

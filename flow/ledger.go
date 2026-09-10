@@ -8,10 +8,10 @@ import "sync"
 // or send can now proceed: how many values have arrived, how many the reader has
 // reported consuming, and whether the channel is closed.
 
-// Arbiter is a host's per-channel bookkeeping. A host keeps one per channel,
+// Ledger is a host's per-channel bookkeeping. A host keeps one per channel,
 // offering each record a run sends and appending exactly what Offer returns. Not
 // safe for concurrent use without the host's own lock.
-type Arbiter struct {
+type Ledger struct {
 	mu sync.Mutex
 	// seen and consumed track, per party, which seqs are on the record, so a
 	// resend is dropped. A party's seqs mostly arrive in order, but a lost
@@ -25,10 +25,10 @@ type Arbiter struct {
 	closed   bool
 }
 
-// NewArbiter returns the bookkeeping of an empty channel. For a channel with a
+// NewLedger returns the bookkeeping of an empty channel. For a channel with a
 // record already, Restore each of its records first.
-func NewArbiter() *Arbiter {
-	return &Arbiter{seen: map[string]*seqRun{}, consumed: map[string]*seqRun{}}
+func NewLedger() *Ledger {
+	return &Ledger{seen: map[string]*seqRun{}, consumed: map[string]*seqRun{}}
 }
 
 // seqRun is the set of seqs admitted from one party: a contiguous run [0, next)
@@ -75,7 +75,7 @@ func markSeq(marks map[string]*seqRun, from string, seq uint64) {
 // Offer takes a record a run sent — a value, a consume report, or a close — and
 // returns what the host must append to the channel's record: the record itself if
 // it is new, nothing for a copy of something already on the record.
-func (a *Arbiter) Offer(it ChannelItem) []ChannelItem {
+func (a *Ledger) Offer(it ChannelItem) []ChannelItem {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !a.admit(it) {
@@ -85,21 +85,16 @@ func (a *Arbiter) Offer(it ChannelItem) []ChannelItem {
 }
 
 // Restore folds one record already on the channel's record into state, for a host
-// that starts with a record its predecessor wrote. Call Grants afterwards.
-func (a *Arbiter) Restore(it ChannelItem) {
+// that starts with a record its predecessor wrote.
+func (a *Ledger) Restore(it ChannelItem) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.admit(it)
 }
 
-// Grants returns the records owed now after a Restore. A single-reader channel
-// owes nothing — the host makes no matches — so this is always empty; kept so a
-// host restoring a record need not special-case it.
-func (a *Arbiter) Grants() []ChannelItem { return nil }
-
 // Values reports how many distinct values have arrived, so a holder can tell
 // whether a parked receive at a given sequence has a value to take.
-func (a *Arbiter) Values() uint64 {
+func (a *Ledger) Values() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.nvalues
@@ -107,21 +102,21 @@ func (a *Arbiter) Values() uint64 {
 
 // Consumed reports how many distinct values the reader has reported consuming, so
 // a holder can tell whether a parked send has had room freed since it parked.
-func (a *Arbiter) Consumed() uint64 {
+func (a *Ledger) Consumed() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.nconsume
 }
 
 // Closed reports whether the channel has been closed.
-func (a *Arbiter) Closed() bool {
+func (a *Ledger) Closed() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.closed
 }
 
 // admit folds a record into state and reports whether it was new.
-func (a *Arbiter) admit(it ChannelItem) bool {
+func (a *Ledger) admit(it ChannelItem) bool {
 	switch {
 	case it.Closed:
 		if a.closed {
