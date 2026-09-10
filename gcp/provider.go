@@ -30,9 +30,10 @@ func (p *provider) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&p.zone, "zone", "", "GCP zone, e.g. europe-west1-b (required for -provider gcp)")
 	fs.StringVar(&p.machineType, "machine-type", "", "machine type (default e2-standard-4)")
 	fs.StringVar(&p.image, "image", "", "source image (default the latest Debian 12)")
-	fs.Int64Var(&p.diskGB, "disk-gb", 0, "boot disk size in GB (default 20)")
-	fs.BoolVar(&p.preemptible, "spot", false,
-		"use preemptible Spot instances: much cheaper, and reclaimable mid-job")
+	fs.Int64Var(&p.diskGB, "disk-gb", 0, "boot disk size in GB (default 500)")
+	fs.BoolVar(&p.preemptible, "spot", true,
+		"use preemptible Spot instances: much cheaper, reclaimable mid-job, and the "+
+			"default; pass -gcp.spot=false for on-demand")
 	fs.StringVar(&p.namePrefix, "name-prefix", "", "prefix for instance names (default wings)")
 	fs.StringVar(&p.user, "user", "", "Linux account to create and connect as (default wings)")
 }

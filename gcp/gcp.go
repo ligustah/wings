@@ -35,7 +35,7 @@ type Config struct {
 	// SourceImage defaults to the latest Debian 12. Any image works as long as
 	// it runs a static linux/amd64 binary and has sshd.
 	SourceImage string
-	// DiskSizeGB defaults to 20.
+	// DiskSizeGB defaults to 500.
 	DiskSizeGB int64
 	// Network defaults to "global/networks/default".
 	Network string
@@ -85,7 +85,7 @@ func (c Config) withDefaults() Config {
 		c.SourceImage = "projects/debian-cloud/global/images/family/debian-12"
 	}
 	if c.DiskSizeGB == 0 {
-		c.DiskSizeGB = 20
+		c.DiskSizeGB = 500
 	}
 	if c.Network == "" {
 		c.Network = "global/networks/default"
