@@ -704,11 +704,27 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 		h.c.relay.noteRunChannel(run, chanStreamFor(id))
 	}
 	h.c.pokeRelay()
+
+	send := func(ctx context.Context, it flow.ChannelItem) error {
+		_, err := outbox.Append(ctx, []flow.ChannelItem{it})
+		return err
+	}
+	if run != flow.SignalSender {
+		// A run's own send goes through the run's transaction, so a send's outbox
+		// record goes home with the history that justified it (see [coordOutputs],
+		// flow.Committer) rather than as a separate durable write a crash could tear
+		// from its event. A signal (SignalSender) owns no run and so no transaction,
+		// and is written straight through.
+		outputs, err := h.c.coordOutputsFor(run)
+		if err != nil {
+			return nil, err
+		}
+		send = func(ctx context.Context, it flow.ChannelItem) error {
+			return outputs.stage(ctx, outbox, []flow.ChannelItem{it})
+		}
+	}
 	return &channelLink{
-		send: func(ctx context.Context, it flow.ChannelItem) error {
-			_, err := outbox.Append(ctx, []flow.ChannelItem{it})
-			return err
-		},
+		send:   send,
 		client: client,
 		in:     chanStreamFor(id),
 	}, nil

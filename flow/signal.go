@@ -18,6 +18,10 @@ import (
 // signalSender names the deliverer to a ChannelHost; it owns no run.
 const signalSender = "flow.signal"
 
+// SignalSender is the run name [Deliver] links a [ChannelHost] under. It owns no
+// run, so a host must not treat its send as part of a run's transaction.
+const SignalSender = signalSender
+
 // signalID names the shared channel a signal travels on.
 func signalID(run, name string) string { return run + "/signal." + name }
 

@@ -21,6 +21,9 @@ const threadStreamPrefix = "flow.thread."
 // ThreadStream is the stream name [NewStore] keeps one thread's history under.
 func ThreadStream(run, thread string) string { return streamName(run, thread) }
 
+// MainThread is the id of a run body's own thread; forked threads have derived ids.
+const MainThread = mainThread
+
 var threadPattern = regexp.MustCompile(`^main(\.\d+)*$`)
 
 // ParseThreadStream is the inverse of [ThreadStream]: it splits a thread stream

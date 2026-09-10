@@ -23,6 +23,7 @@ func (c *Cluster) Run(ctx context.Context, name string, body func(ctx flow.Conte
 	ctx, done := c.hosting(ctx)
 	defer done()
 	err = flow.Run(ctx, name, body, all...)
+	c.finishRun(ctx, name, err == nil)
 	if err == nil {
 		c.forgetRun(name)
 	}
@@ -37,15 +38,17 @@ func (c *Cluster) RunWorkflow[In, Out any](ctx context.Context, f flow.Func[In, 
 	if err != nil {
 		return err
 	}
+	name, nameErr := flow.NameOf(f)
 	ctx, done := c.hosting(ctx)
 	defer done()
-	if err = flow.RunMain(ctx, f, in, all...); err != nil {
-		return err
+	err = flow.RunMain(ctx, f, in, all...)
+	if nameErr == nil {
+		c.finishRun(ctx, name, err == nil)
+		if err == nil {
+			c.forgetRun(name)
+		}
 	}
-	if name, nerr := flow.NameOf(f); nerr == nil {
-		c.forgetRun(name)
-	}
-	return nil
+	return err
 }
 
 // Signal delivers a typed event to a running workflow by name: the run named
@@ -63,6 +66,7 @@ func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) er
 	ctx, done := c.hosting(ctx)
 	defer done()
 	err = flow.RunWorkflow(ctx, name, input, all...)
+	c.finishRun(ctx, name, err == nil)
 	if err == nil {
 		c.forgetRun(name)
 	}
@@ -75,7 +79,7 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 		return nil, err
 	}
 	all := append(append([]flow.RunOption{}, opts...),
-		flow.WithStore(flow.NewStore(client, flow.WithStoreCompression(streamCompression))),
+		flow.WithStore(newCoordStore(c, client)),
 		flow.WithPlacer(clusterPlacer{c}),
 		flow.WithChannelHost(clusterChannels{c}),
 	)
