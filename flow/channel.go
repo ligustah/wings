@@ -410,6 +410,10 @@ type chanState struct {
 	items   []*chanItem
 	closed  bool
 	changed chan struct{}
+	// byKey indexes items by from#seq so find is O(1): a send dedupes against its
+	// own echo and replays on every put, and a channel a worker only sends on keeps
+	// every send until it is retired, so a scan per send is quadratic over a wave.
+	byKey map[string]*chanItem
 	// floor is len(items) after the last prune; the queue is compacted once it has
 	// grown enough past it that pruning stays amortised. See [chanState.prune].
 	floor int
@@ -470,6 +474,10 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 		item.data = nil // claimed by a replayed receive; its value comes from the offset, not here
 	}
 	cs.items = append(cs.items, item)
+	if cs.byKey == nil {
+		cs.byKey = map[string]*chanItem{}
+	}
+	cs.byKey[itemKey(from, seq)] = item
 	cs.broadcast()
 	return item, nil
 }
@@ -543,9 +551,11 @@ func (cs *chanState) consume(item *chanItem) {
 func (cs *chanState) prune() {
 	kept := cs.items[:0]
 	for _, it := range cs.items {
-		if !it.consumed {
-			kept = append(kept, it)
+		if it.consumed {
+			delete(cs.byKey, itemKey(it.from, it.seq))
+			continue
 		}
+		kept = append(kept, it)
 	}
 	for i := len(kept); i < len(cs.items); i++ {
 		cs.items[i] = nil // let the pruned items be collected
@@ -556,12 +566,7 @@ func (cs *chanState) prune() {
 
 // find returns the queued item with an identity, or nil. Call with mu held.
 func (cs *chanState) find(from string, seq uint64) *chanItem {
-	for _, it := range cs.items {
-		if it.from == from && it.seq == seq {
-			return it
-		}
-	}
-	return nil
+	return cs.byKey[itemKey(from, seq)]
 }
 
 // announceClose tells the host the channel is closed, if it is shared.

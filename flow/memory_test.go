@@ -100,6 +100,43 @@ func TestChanStatePrunesReceivedItems(t *testing.T) {
 	}
 }
 
+// THE POINT: find is answered from the byKey index, and the index holds exactly
+// the queued items — prune drops an entry with its item, so a drain does not leak
+// a map entry per item, and a dedup lookup stays O(1) over a wave's worth of sends.
+func TestChanStateFindIndexTracksItems(t *testing.T) {
+	cs := newChanState(unbounded)
+	const n = 5000
+	for i := 0; i < n; i++ {
+		if _, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	cs.mu.Lock()
+	for i := 0; i < n; i++ {
+		if cs.find("main", uint64(i)) == nil {
+			cs.mu.Unlock()
+			t.Fatalf("find missed queued item %d", i)
+		}
+	}
+	if len(cs.byKey) != len(cs.items) {
+		idx, items := len(cs.byKey), len(cs.items)
+		cs.mu.Unlock()
+		t.Fatalf("index holds %d entries, queue holds %d; they must track", idx, items)
+	}
+	cs.mu.Unlock()
+
+	for i := 0; i < n; i++ {
+		it := cs.find("main", uint64(i))
+		it.taken = true
+		cs.consume(it)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.byKey) != len(cs.items) {
+		t.Fatalf("after draining: index holds %d entries, queue holds %d; prune leaks index entries", len(cs.byKey), len(cs.items))
+	}
+}
+
 // grantOnWant is a channel host stub: when a receiver announces a want it queues
 // a value and grants it at once, the way a real host answers a receive (the value
 // precedes its grant on the record).
