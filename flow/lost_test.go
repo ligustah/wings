@@ -36,7 +36,7 @@ type lossyLink struct {
 }
 
 func (l *lossyLink) Send(ctx context.Context, it flow.ChannelItem) error {
-	if !it.Want && it.To == "" && !it.Closed && it.Seq == 1 {
+	if !it.Consumed && !it.Closed && it.Seq == 1 {
 		l.host.mu.Lock()
 		first := !l.host.lost
 		l.host.lost = true

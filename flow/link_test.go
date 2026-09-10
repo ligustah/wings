@@ -129,6 +129,63 @@ func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
 	}
 }
 
+// THE POINT: Select reads over several hosted channels the way Go selects over
+// channels — readiness is a value pumped from the host, no arbiter involved — so
+// fan-in is N single-reader channels drained by one selecting thread, and it
+// works the same whether the producers run here or on other machines.
+func TestSelectReadsOverHostedChannels(t *testing.T) {
+	host := flow.NewMemChannelHost()
+	store := flow.NewMemStore()
+	var got int
+	err := flow.Run(t.Context(), "fanin", func(ctx flow.Context) error {
+		a, b := ctx.NewChannel[int](), ctx.NewChannel[int]()
+		aw, bw := a.Writer(), b.Writer()
+		fa := ctx.Go(writerProducer, writeFeed{Values: &aw})
+		fb := ctx.Go(writerProducer, writeFeed{Values: &bw})
+
+		total := 0
+		done := [2]bool{}
+		chans := [2]*flow.Channel[int]{a, b}
+		for !done[0] || !done[1] {
+			sel := ctx.Select()
+			for i, ch := range chans {
+				if done[i] {
+					continue
+				}
+				i := i
+				sel.Recv(ch, func(v int, ok bool, err error) error {
+					switch {
+					case err != nil:
+						return err
+					case !ok:
+						done[i] = true // drained and closed: drop the case, like niling a channel
+					default:
+						total += v
+					}
+					return nil
+				})
+			}
+			if err := sel.Do(ctx); err != nil {
+				return err
+			}
+		}
+		if _, err := fa.Await(ctx); err != nil {
+			return err
+		}
+		if _, err := fb.Await(ctx); err != nil {
+			return err
+		}
+		got = total
+		return nil
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 120 {
+		t.Fatalf("selecting over two hosted channels received a total of %d, want 120 (60+60)", got)
+	}
+}
+
 // producer sends into a channel it was handed and closes it.
 var producer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	for i := 1; i <= 3; i++ {
@@ -190,41 +247,6 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 	}
 }
 
-// THE POINT: a want retracted before it is granted takes no value — a later
-// value finds nobody waiting — so a Selector can offer a receive on several
-// channels and withdraw the ones that did not win. A retraction that arrives
-// after the grant is a no-op: the grant stands.
-func TestTheArbiterRetractsAWant(t *testing.T) {
-	a := flow.NewArbiter()
-	want := func(seq uint64) flow.ChannelItem { return flow.ChannelItem{Want: true, From: "r/main", Seq: seq} }
-	unwant := func(seq uint64) flow.ChannelItem { return flow.ChannelItem{Unwant: true, From: "r/main", Seq: seq} }
-	value := func(seq uint64) flow.ChannelItem { return flow.ChannelItem{From: "p/main", Seq: seq, Data: []byte("v")} }
-
-	if out := a.Offer(want(0)); len(out) != 1 {
-		t.Fatalf("a want with nothing to give: %d records, want 1", len(out))
-	}
-	if out := a.Offer(unwant(0)); len(out) != 1 {
-		t.Fatalf("retracting a pending want: %d records, want 1 (the retraction recorded)", len(out))
-	}
-	if out := a.Offer(unwant(0)); len(out) != 0 {
-		t.Fatalf("retracting it again: %d records, want 0", len(out))
-	}
-	// The value now finds nobody waiting: the retracted want took nothing.
-	if out := a.Offer(value(0)); len(out) != 1 || out[0].Data == nil {
-		t.Fatalf("a value after the want was retracted: %+v, want just the value recorded, no grant", out)
-	}
-
-	// A retraction that loses the race to a grant is a no-op.
-	b := flow.NewArbiter()
-	b.Offer(value(1))
-	out := b.Offer(want(1))
-	if len(out) != 2 || out[1].To != "r/main" {
-		t.Fatalf("a want with a value waiting: %+v, want the want and a grant", out)
-	}
-	if out := b.Offer(unwant(1)); len(out) != 0 {
-		t.Fatalf("retracting an already-granted want: %d records, want 0 (the grant stands)", len(out))
-	}
-}
 
 // THE POINT: a channel cannot leave a run that has no host, and the error
 // arrives at the call rather than as a hang somewhere else.
@@ -303,24 +325,26 @@ func TestASharedChannelHonoursItsCapacity(t *testing.T) {
 	}
 }
 
-// THE POINT: each value on a shared channel goes to ONE receiver, wherever
-// it runs. Two runs receiving from the same channel split what is sent
-// between them; nothing is seen twice and nothing is lost.
-func TestEachValueOnASharedChannelGoesToOneReceiver(t *testing.T) {
+// THE POINT: a shared channel has one reader. Fan-out to two runs is two
+// channels, each drained by its own run; the sender distributes across them and
+// every value is received once, wherever the run lives.
+func TestFanOutIsOneChannelPerReceiver(t *testing.T) {
 	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	var totals [2]int
 	err := flow.Run(t.Context(), "split", func(ctx flow.Context) error {
-		ch := ctx.NewChannel[int]()
-		first := ctx.Go(consumer, feed{Values: ch})
-		second := ctx.Go(consumer, feed{Values: ch})
+		chs := [2]*flow.Channel[int]{ctx.NewChannel[int](), ctx.NewChannel[int]()}
+		first := ctx.Go(consumer, feed{Values: chs[0]})
+		second := ctx.Go(consumer, feed{Values: chs[1]})
 		for v := 1; v <= 6; v++ {
-			if err := ch.Send(ctx, v); err != nil {
+			if err := chs[(v-1)%2].Send(ctx, v); err != nil {
 				return err
 			}
 		}
-		if err := ch.Close(ctx); err != nil {
-			return err
+		for i := range chs {
+			if err := chs[i].Close(ctx); err != nil {
+				return err
+			}
 		}
 		var err error
 		if totals[0], err = first.Await(ctx); err != nil {
@@ -333,91 +357,37 @@ func TestEachValueOnASharedChannelGoesToOneReceiver(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if totals[0]+totals[1] != 21 {
-		t.Fatalf("the two receivers summed %d and %d, want a total of 21: each value to exactly one of them", totals[0], totals[1])
+		t.Fatalf("the two receivers summed %d and %d, want a total of 21", totals[0], totals[1])
 	}
 }
 
-// THE POINT: the rule for handing out values is one rule, and a host that
-// starts with a record its predecessor wrote reaches the same state from it
-// — and grants what the predecessor admitted but never got to grant.
-func TestTheArbiterRestoresItsStateFromTheRecord(t *testing.T) {
+// THE POINT: a host that starts with a record its predecessor wrote reaches the
+// same counts from it — values, consumes, and the close — so a restarted
+// coordinator tells a parked receive or send the same thing the first one would.
+func TestTheLedgerRestoresItsCountsFromTheRecord(t *testing.T) {
+	record := []flow.ChannelItem{
+		{From: "p/main", Seq: 0, Data: []byte("v")},
+		{From: "p/main", Seq: 1, Data: []byte("v")},
+		{Consumed: true, From: "p/main", Seq: 0},
+		{From: "p/main", Seq: 2, Data: []byte("v")},
+		{Closed: true},
+	}
+
 	a := flow.NewArbiter()
-	var record []flow.ChannelItem
-	offer := func(it flow.ChannelItem) []flow.ChannelItem {
-		out := a.Offer(it)
-		record = append(record, out...)
-		return out
+	for _, it := range record {
+		a.Restore(it)
 	}
-	value := func(seq uint64) flow.ChannelItem {
-		return flow.ChannelItem{From: "p/main", Seq: seq, Data: []byte("v")}
+	if a.Values() != 3 || a.Consumed() != 1 || !a.Closed() {
+		t.Fatalf("restored values=%d consumed=%d closed=%v, want 3/1/true", a.Values(), a.Consumed(), a.Closed())
 	}
-	want := func(from string, seq uint64) flow.ChannelItem {
-		return flow.ChannelItem{Want: true, From: from, Seq: seq}
-	}
-
-	if out := offer(value(0)); len(out) != 1 {
-		t.Fatalf("a value with nobody waiting: %d records, want 1", len(out))
-	}
-	out := offer(want("a/main", 0))
-	if len(out) != 2 || out[1].To != "a/main" || out[1].From != "p/main" || out[1].Seq != 0 {
-		t.Fatalf("a want with a value waiting: %+v, want the want and a grant of p/main#0 to a/main#0", out)
-	}
-	if out := offer(want("a/main", 0)); len(out) != 0 {
-		t.Fatalf("the same want again: %d records, want none", len(out))
-	}
-	if out := offer(want("b/main", 0)); len(out) != 1 {
-		t.Fatalf("a want with nothing to give: %d records, want 1", len(out))
-	}
-	out = offer(value(1))
-	if len(out) != 2 || out[1].To != "b/main" || out[1].Seq != 1 {
-		t.Fatalf("a value with a want waiting: %+v, want the value and a grant of p/main#1 to b/main#0", out)
-	}
-	if out := offer(value(1)); len(out) != 0 {
-		t.Fatalf("the same value again: %d records, want none", len(out))
-	}
-	if out := offer(want("c/main", 0)); len(out) != 1 {
-		t.Fatalf("a third want with nothing to give: %d records, want 1", len(out))
-	}
-	for _, tc := range []struct {
-		name string
-		it   flow.ChannelItem
-		want bool
-	}{
-		{"a granted want", want("a/main", 0), true},
-		{"a want still open", want("c/main", 0), false},
-		{"a want never made", want("d/main", 0), false},
-		{"a granted value", value(0), true},
-		{"a value never sent", value(9), false},
-	} {
-		if got := a.Settled(tc.it); got != tc.want {
-			t.Errorf("Settled(%s) = %v, want %v", tc.name, got, tc.want)
+	// Re-offering what is already on the record changes nothing: a restarted
+	// coordinator does not double-count its predecessor's writes.
+	for _, it := range record {
+		if out := a.Offer(it); len(out) != 0 {
+			t.Fatalf("re-offering a restored record appended %+v, want nothing", out)
 		}
 	}
-	if out := offer(flow.ChannelItem{Closed: true}); len(out) != 1 {
-		t.Fatalf("a close: %d records, want 1", len(out))
-	}
-	if !a.Settled(want("c/main", 0)) {
-		t.Errorf("a want still open on a closed channel is settled: the receiver is owed the close")
-	}
-
-	// A successor that reads the whole record owes nothing.
-	b := flow.NewArbiter()
-	for _, it := range record {
-		b.Restore(it)
-	}
-	if owed := b.Grants(); len(owed) != 0 {
-		t.Fatalf("restored from the whole record, the arbiter owes %+v, want nothing", owed)
-	}
-	// One that reads a record cut before a grant owes that grant.
-	c := flow.NewArbiter()
-	for _, it := range record {
-		if it.To == "b/main" {
-			continue
-		}
-		c.Restore(it)
-	}
-	owed := c.Grants()
-	if len(owed) != 1 || owed[0].To != "b/main" || owed[0].Seq != 1 {
-		t.Fatalf("restored from a record missing its last grant, the arbiter owes %+v, want that grant", owed)
+	if a.Values() != 3 || a.Consumed() != 1 {
+		t.Fatalf("counts changed on re-offer: values=%d consumed=%d", a.Values(), a.Consumed())
 	}
 }

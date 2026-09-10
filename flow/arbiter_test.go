@@ -2,11 +2,12 @@ package flow
 
 import "testing"
 
-// THE POINT: the arbiter keeps only the identity of a value it is holding for a
-// later want, not its bytes. The value's bytes travel on in the record the host
-// appends (Offer's return); keeping them too held a wave's worth of relayed
-// values on the coordinator (the memory write-up's finding 4).
-func TestArbiterDoesNotRetainValueBytes(t *testing.T) {
+// THE POINT: the ledger passes a value's bytes through in the record it returns
+// for the host to append, but keeps none of them itself — only counts and the
+// identity needed to dedupe a resend. It tracks values arrived, consumes reported
+// and the close, which is all a holder needs to tell whether a parked receive or
+// send can proceed.
+func TestLedgerCountsWithoutRetainingBytes(t *testing.T) {
 	a := NewArbiter()
 	payload := []byte("a sizeable decision payload")
 
@@ -14,29 +15,28 @@ func TestArbiterDoesNotRetainValueBytes(t *testing.T) {
 	if len(recs) != 1 || string(recs[0].Data) != string(payload) {
 		t.Fatalf("Offer must return the value with its bytes for the record; got %+v", recs)
 	}
-	if len(a.values) != 1 {
-		t.Fatalf("want the value backlogged (no want yet), got %d", len(a.values))
-	}
-	if a.values[0].Data != nil {
-		t.Fatalf("arbiter retained %d value bytes; it should keep only identity", len(a.values[0].Data))
-	}
-	if a.values[0].From != "run/main" || a.values[0].Seq != 0 {
-		t.Fatalf("arbiter lost the value identity: %+v", a.values[0])
+	if a.Values() != 1 || a.Consumed() != 0 || a.Closed() {
+		t.Fatalf("after one value: values=%d consumed=%d closed=%v, want 1/0/false", a.Values(), a.Consumed(), a.Closed())
 	}
 
-	// The identity is enough to match a want and grant it.
-	grants := a.Offer(ChannelItem{Want: true, From: "run/other", Seq: 0})
-	var granted *ChannelItem
-	for i := range grants {
-		if grants[i].To != "" {
-			granted = &grants[i]
-		}
+	if recs := a.Offer(ChannelItem{Consumed: true, From: "run/main", Seq: 0}); len(recs) != 1 {
+		t.Fatalf("a consume report should be admitted once: %v", recs)
 	}
-	if granted == nil {
-		t.Fatalf("a want after a backlogged value should be granted; got %+v", grants)
+	if recs := a.Offer(ChannelItem{Consumed: true, From: "run/main", Seq: 0}); len(recs) != 0 {
+		t.Fatalf("a repeated consume report must be dropped: %v", recs)
 	}
-	if granted.From != "run/main" || granted.Seq != 0 || granted.To != "run/other" || granted.ToSeq != 0 {
-		t.Fatalf("grant named the wrong pair: %+v", *granted)
+	if a.Consumed() != 1 {
+		t.Fatalf("consumed=%d, want 1", a.Consumed())
+	}
+
+	if recs := a.Offer(ChannelItem{Closed: true}); len(recs) != 1 {
+		t.Fatalf("a close should be admitted once: %v", recs)
+	}
+	if recs := a.Offer(ChannelItem{Closed: true}); len(recs) != 0 {
+		t.Fatalf("a repeated close must be dropped: %v", recs)
+	}
+	if !a.Closed() {
+		t.Fatalf("the channel should read closed")
 	}
 }
 

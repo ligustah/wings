@@ -83,6 +83,9 @@ func (c *Cluster) yieldLocked(p *pendingJob, y *yieldEnvelope) {
 	p.worker = nil
 	p.since, p.started, p.beat = time.Time{}, time.Time{}, time.Time{}
 	p.yield = y
+	if y.Wait == flow.WaitSend {
+		p.consumeBase = c.channelConsumed(y.Channel)
+	}
 	c.log.Info("wings: a job yielded its worker", "job", p.job.ID, "fn", p.job.Func, "why", y.describe())
 }
 
@@ -101,26 +104,66 @@ func (c *Cluster) wake(p *pendingJob, why string) {
 }
 
 // yieldSettled reports whether a channel wait was already satisfied when the
-// yield arrived — the grant or close landed while the attempt was unloading, so
-// woke nobody. Such a job must be woken at once.
+// yield arrived — the value, consume, or close landed while the attempt was
+// unloading, so woke nobody. Such a job must be woken at once.
 func (c *Cluster) yieldSettled(p *pendingJob, y *yieldEnvelope) bool {
-	if y.Channel == "" || c.relay == nil {
+	if y.Channel == "" {
 		return false
 	}
-	c.relay.mu.Lock()
-	rc := c.relay.channels[chanStreamFor(y.Channel)]
-	c.relay.mu.Unlock()
+	rc := c.relayChannel(y.Channel)
 	if rc == nil {
 		return false
 	}
-	thread := runOf(p.job) + "/" + threadOf(p.job)
-	return rc.arbiter.Settled(flow.ChannelItem{Want: y.Wait == flow.WaitRecv, From: thread, Seq: y.Seq})
+	return settledOn(rc.arbiter, y.Wait, y.Seq, p.consumeBase)
 }
 
-// wakeOnChannel wakes the yielded jobs a channel record is for: a receive by the
-// grant naming its thread or by the close, a send by any grant (a value taken is
-// room made). A want wakes nobody.
-func (c *Cluster) wakeOnChannel(id string, recs []flow.ChannelItem) {
+// settledOn reports whether a channel wait can proceed from the host's record: a
+// receive once a value has arrived at its sequence (a single reader takes values
+// in arrival order) or the channel closed; a send once a consume has freed room
+// beyond what the sender had already seen when it parked, or the channel closed.
+func settledOn(a *flow.Arbiter, wait string, seq, consumeBase uint64) bool {
+	if a.Closed() {
+		return true
+	}
+	switch wait {
+	case flow.WaitRecv:
+		return a.Values() > seq
+	case flow.WaitSend:
+		return a.Consumed() > consumeBase
+	}
+	return false
+}
+
+// channelConsumed is how many values the reader has reported consuming on a
+// channel, or zero for one the relay has no record of yet. Read from a lock-free
+// snapshot so a job unloading under the cluster lock need not take the relay's.
+func (c *Cluster) channelConsumed(id string) uint64 {
+	if c.relay == nil {
+		return 0
+	}
+	if v, ok := c.relay.consumed.Load(chanStreamFor(id)); ok {
+		return v.(uint64)
+	}
+	return 0
+}
+
+func (c *Cluster) relayChannel(id string) *relayChannel {
+	if c.relay == nil {
+		return nil
+	}
+	c.relay.mu.Lock()
+	defer c.relay.mu.Unlock()
+	return c.relay.channels[chanStreamFor(id)]
+}
+
+// wakeOnChannel wakes the yielded jobs a channel record is for: a receive when a
+// value it can take has arrived or the channel closed, a send when a consume has
+// freed room or the channel closed.
+func (c *Cluster) wakeOnChannel(id string) {
+	rc := c.relayChannel(id)
+	if rc == nil {
+		return
+	}
 	canonical := chanStreamFor(id)
 	var due []*pendingJob
 	c.mu.Lock()
@@ -128,14 +171,8 @@ func (c *Cluster) wakeOnChannel(id string, recs []flow.ChannelItem) {
 		if p.yield == nil || p.yield.Channel == "" || chanStreamFor(p.yield.Channel) != canonical {
 			continue
 		}
-		thread := runOf(p.job) + "/" + threadOf(p.job)
-		for _, rec := range recs {
-			granted, closed := rec.To != "", rec.Closed
-			if p.yield.Wait == flow.WaitRecv && (closed || (granted && rec.To == thread)) ||
-				p.yield.Wait == flow.WaitSend && granted {
-				due = append(due, p)
-				break
-			}
+		if settledOn(rc.arbiter, p.yield.Wait, p.yield.Seq, p.consumeBase) {
+			due = append(due, p)
 		}
 	}
 	c.mu.Unlock()

@@ -602,22 +602,24 @@ func TestAChannelCrossesMachines(t *testing.T) {
 				}
 			})
 
-			// Each value to exactly one of two receivers on two workers: the
-			// coordinator grants it, and the totals account for every value
-			// once.
-			t.Run("two functions receiving", func(t *testing.T) {
+			// Fan-out is N single-reader channels: each receiver has its own
+			// channel, and the sender distributes across them. The totals still
+			// account for every value once.
+			t.Run("fan-out over two channels", func(t *testing.T) {
 				var totals [2]int
 				err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-					ch := ctx.NewChannel[int]()
-					first := ctx.Go(sums, feed{Values: ch})
-					second := ctx.Go(sums, feed{Values: ch})
+					chs := [2]*flow.Channel[int]{ctx.NewChannel[int](), ctx.NewChannel[int]()}
+					first := ctx.Go(sums, feed{Values: chs[0]})
+					second := ctx.Go(sums, feed{Values: chs[1]})
 					for v := 1; v <= 6; v++ {
-						if err := ch.Send(ctx, v); err != nil {
+						if err := chs[(v-1)%2].Send(ctx, v); err != nil {
 							return err
 						}
 					}
-					if err := ch.Close(ctx); err != nil {
-						return err
+					for i := range chs {
+						if err := chs[i].Close(ctx); err != nil {
+							return err
+						}
 					}
 					var err error
 					if totals[0], err = first.Await(ctx); err != nil {
@@ -630,7 +632,7 @@ func TestAChannelCrossesMachines(t *testing.T) {
 					t.Fatalf("Run: %v", err)
 				}
 				if totals[0]+totals[1] != 21 {
-					t.Fatalf("the receivers summed %d and %d, want 21 in all: each value to one of them", totals[0], totals[1])
+					t.Fatalf("the receivers summed %d and %d, want 21 in all", totals[0], totals[1])
 				}
 			})
 		})

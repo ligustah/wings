@@ -475,6 +475,12 @@ type chanItem struct {
 	data []byte
 
 	taken bool
+	// freed means the single reader reported consuming this value (see
+	// ChannelItem.Consumed), so a sender counting room by its own mirror may free
+	// the place. Distinct from taken: a reader sends the report before its receive
+	// is durably recorded, so a moved receiver that replays the report must still
+	// be free to take the value itself if no recorded receive accounts for it.
+	freed bool
 	// buffered means the send completed on arrival, because the channel had
 	// room for it.
 	buffered bool
@@ -510,13 +516,11 @@ type chanState struct {
 	// claimed names items a replayed receive took before they were queued, so
 	// they are taken on arrival.
 	claimed map[string]bool
-	// link is set once the channel is shared with other runs. From then the
-	// host decides who takes what: asked is the wants this attempt has sent and not
-	// yet been granted, and granted maps a want key to the item the host gave it, so
-	// a receive finds its value without scanning the backlog.
-	link    ChannelLink
-	asked   map[string]bool
-	granted map[string]*chanItem
+	// link is set once the channel is shared with other runs. The single reader
+	// then consumes the host's ordered record the same way it drains a local
+	// channel — the pump mirrors that record into items — so no per-receive state
+	// is kept here.
+	link ChannelLink
 }
 
 func newChanState(capacity int) *chanState {
@@ -602,24 +606,6 @@ func (cs *chanState) claim(from string, seq uint64) {
 	cs.claimed[itemKey(from, seq)] = true
 }
 
-// grant records the host giving one item to one want: the item is marked taken,
-// and a receive here waiting on that want finds it. The item precedes its grant
-// on the record, so it is always here to be found.
-func (cs *chanState) grant(g ChannelItem) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	it := cs.find(g.From, g.Seq)
-	if it == nil {
-		return // impossible: the value precedes its grant on the record
-	}
-	it.taken = true
-	if cs.granted == nil {
-		cs.granted = map[string]*chanItem{}
-	}
-	cs.granted[itemKey(g.To, g.ToSeq)] = it
-	cs.broadcast()
-}
-
 // consume drops a received item's value once the receiver has decoded and
 // recorded it. Nothing reads a taken item's data again — find, roomFor and
 // pending use only its identity and flags — and holding it kept every value ever
@@ -663,6 +649,18 @@ func (cs *chanState) prune() {
 // find returns the queued item with an identity, or nil. Call with mu held.
 func (cs *chanState) find(from string, seq uint64) *chanItem {
 	return cs.byKey[itemKey(from, seq)]
+}
+
+// free marks a mirrored item freed when the reader reports consuming it, so a
+// bounded sender counting room by its own mirror opens the place. Not taken: a
+// replaying receiver may still need to take the value itself (see chanItem.freed).
+func (cs *chanState) free(from string, seq uint64) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if it := cs.find(from, seq); it != nil && !it.freed {
+		it.freed = true
+		cs.broadcast()
+	}
 }
 
 // announceClose tells the host the channel is closed, if it is shared.
@@ -715,7 +713,7 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 		if !item.taken && !item.buffered && cs.roomFor(item) {
 			item.buffered = true
 		}
-		if item.taken || item.buffered {
+		if item.taken || item.freed || item.buffered {
 			cs.mu.Unlock()
 			return resume(ctx)
 		}
@@ -735,44 +733,31 @@ func (cs *chanState) awaitTaken(ctx context.Context, t *threadState, id string, 
 }
 
 // awaitAny blocks until something can be taken, and returns nil when the channel
-// is closed and drained. On the run's own channel it takes the first untaken
-// item; on a shared channel the receive is sent to the host as a want and it
-// takes the item the host's grant names. A channel can become shared while a
-// receive waits, and the receive carries on. The thread is parked while it waits.
+// is closed and drained. The single reader takes the first untaken item, on its
+// own channel and on a shared one alike: a shared channel's host mirrors its
+// ordered record into the queue, so the reader consumes it in that order without
+// announcing anything. On a bounded shared channel the take is reported to the
+// host so a sender may free a place. The thread is parked while it waits.
 func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, recvSeq uint64) (*chanItem, error) {
 	parked := false
 	resume := noResume
-	want := itemKey(t.qualified(), recvSeq)
 	for {
 		cs.mu.Lock()
-		link := cs.link
-		if link == nil {
-			for _, it := range cs.items {
-				if !it.taken {
-					it.taken = true
-					cs.broadcast()
-					cs.mu.Unlock()
-					return it, resume(ctx)
-				}
-			}
-		} else {
-			if it := cs.granted[want]; it != nil {
-				delete(cs.granted, want)
-				delete(cs.asked, want) // this recvSeq is done and never recurs; drop it, or a long drain holds an entry per receive
-				cs.mu.Unlock()
-				return it, resume(ctx)
-			}
-			if !cs.asked[want] {
-				if cs.asked == nil {
-					cs.asked = map[string]bool{}
-				}
-				cs.asked[want] = true
-				cs.mu.Unlock()
-				if err := link.Send(ctx, ChannelItem{Want: true, From: t.qualified(), Seq: recvSeq}); err != nil {
-					return nil, fmt.Errorf("flow: receive on a shared channel: %w", err)
-				}
+		for _, it := range cs.items {
+			if it.taken {
 				continue
 			}
+			it.taken = true
+			cs.broadcast()
+			link, report := cs.link, cs.capacity >= 0
+			from, seq := it.from, it.seq
+			cs.mu.Unlock()
+			if link != nil && report {
+				if err := link.Send(ctx, ChannelItem{Consumed: true, From: from, Seq: seq}); err != nil {
+					return nil, fmt.Errorf("flow: receive on a shared channel: %w", err)
+				}
+			}
+			return it, resume(ctx)
 		}
 		if cs.closed && !cs.pending() {
 			cs.mu.Unlock()
@@ -806,7 +791,7 @@ func (cs *chanState) roomFor(item *chanItem) bool {
 		if it == item {
 			break
 		}
-		if !it.taken {
+		if !it.taken && !it.freed {
 			used++
 		}
 	}

@@ -2,34 +2,33 @@ package flow
 
 import "sync"
 
-// A shared channel gives each value to one receiver. A cross-run receive is a
-// want; the host answers with a grant naming the value that receiver gets. The
-// rule, applied by every host alike: each value to the earliest still-open want,
-// both in the order they reached the host. A want is idempotent, so a receive
-// can be abandoned and resumed without granting a value twice.
+// A shared channel has one reader. The reader consumes the host's ordered record
+// in arrival order, so the host keeps no matching state — only enough to dedupe a
+// record a replaying party resends, and to tell a holder whether a parked receive
+// or send can now proceed: how many values have arrived, how many the reader has
+// reported consuming, and whether the channel is closed.
 
-// Arbiter applies that rule. A host keeps one per channel and appends to the
-// channel's record exactly what Offer returns. Not safe for concurrent use
-// without the host's own lock.
+// Arbiter is a host's per-channel bookkeeping. A host keeps one per channel,
+// offering each record a run sends and appending exactly what Offer returns. Not
+// safe for concurrent use without the host's own lock.
 type Arbiter struct {
 	mu sync.Mutex
-	// seen and asked track, per sender and per receiver, which seqs are on the
-	// record, so a resend is dropped. A party's seqs mostly arrive in order, but a
-	// lost announcement (a worker that died between a send's record and its copy
-	// home) lets a later one arrive first, with the gap filled by the replay — so
-	// a plain high-water is not enough; see seqRun. One small entry per party
-	// rather than one per record ever.
-	seen   map[string]*seqRun
-	asked  map[string]*seqRun
-	values []ChannelItem // on the record and not yet granted, in order
-	wants  []ChannelItem // on the record and not yet granted, in order
-	closed bool
+	// seen and consumed track, per party, which seqs are on the record, so a
+	// resend is dropped. A party's seqs mostly arrive in order, but a lost
+	// announcement (a worker that died between a send's record and its copy home)
+	// lets a later one arrive first, with the gap filled by the replay — so a plain
+	// high-water is not enough; see seqRun. One small entry per party.
+	seen     map[string]*seqRun
+	consumed map[string]*seqRun
+	nvalues  uint64 // distinct values admitted
+	nconsume uint64 // distinct consume reports admitted
+	closed   bool
 }
 
-// NewArbiter returns the arbiter of an empty channel. For a channel with a
+// NewArbiter returns the bookkeeping of an empty channel. For a channel with a
 // record already, Restore each of its records first.
 func NewArbiter() *Arbiter {
-	return &Arbiter{seen: map[string]*seqRun{}, asked: map[string]*seqRun{}}
+	return &Arbiter{seen: map[string]*seqRun{}, consumed: map[string]*seqRun{}}
 }
 
 // seqRun is the set of seqs admitted from one party: a contiguous run [0, next)
@@ -73,73 +72,55 @@ func markSeq(marks map[string]*seqRun, from string, seq uint64) {
 	r.add(seq)
 }
 
-// Offer takes a record a run sent — a value, a want, a close — and returns
-// what the host must append to the channel's record, in order: the record
-// itself if it is new, then every grant it makes possible. Nothing for a
-// copy of something already on the record, and never a grant a run sent, as
-// grants are the host's to make.
+// Offer takes a record a run sent — a value, a consume report, or a close — and
+// returns what the host must append to the channel's record: the record itself if
+// it is new, nothing for a copy of something already on the record.
 func (a *Arbiter) Offer(it ChannelItem) []ChannelItem {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if it.To != "" {
-		return nil
-	}
 	if !a.admit(it) {
 		return nil
 	}
-	return append([]ChannelItem{it}, a.match()...)
+	return []ChannelItem{it}
 }
 
-// Restore replays one record already on the channel's record, in order, for
-// a host that starts with a record its predecessor wrote. Grants restored
-// this way settle the wants and values they name. Call Grants afterwards.
+// Restore folds one record already on the channel's record into state, for a host
+// that starts with a record its predecessor wrote. Call Grants afterwards.
 func (a *Arbiter) Restore(it ChannelItem) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if it.To == "" {
-		a.admit(it)
-		return
-	}
-	a.values = withoutItem(a.values, it.From, it.Seq)
-	a.wants = withoutItem(a.wants, it.To, it.ToSeq)
+	a.admit(it)
 }
 
-// Grants returns the grants owed now: after a Restore, whatever a predecessor
-// admitted and did not live to grant.
-func (a *Arbiter) Grants() []ChannelItem {
+// Grants returns the records owed now after a Restore. A single-reader channel
+// owes nothing — the host makes no matches — so this is always empty; kept so a
+// host restoring a record need not special-case it.
+func (a *Arbiter) Grants() []ChannelItem { return nil }
+
+// Values reports how many distinct values have arrived, so a holder can tell
+// whether a parked receive at a given sequence has a value to take.
+func (a *Arbiter) Values() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.match()
+	return a.nvalues
 }
 
-// Settled reports whether a wait on the channel is over as far as the record
-// goes: a want (Want set, From and Seq the receiver's) has been granted, or
-// the channel is closed; a value (From and Seq the sender's) has been
-// granted to someone. For whoever holds a thread that stopped waiting
-// before it could see.
-func (a *Arbiter) Settled(it ChannelItem) bool {
+// Consumed reports how many distinct values the reader has reported consuming, so
+// a holder can tell whether a parked send has had room freed since it parked.
+func (a *Arbiter) Consumed() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if it.Want {
-		if a.closed {
-			return true
-		}
-		return admittedIn(a.asked, it.From, it.Seq) && !has(a.wants, it.From, it.Seq)
-	}
-	return admittedIn(a.seen, it.From, it.Seq) && !has(a.values, it.From, it.Seq)
+	return a.nconsume
 }
 
-func has(items []ChannelItem, from string, seq uint64) bool {
-	for _, it := range items {
-		if it.From == from && it.Seq == seq {
-			return true
-		}
-	}
-	return false
+// Closed reports whether the channel has been closed.
+func (a *Arbiter) Closed() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.closed
 }
 
-// admit takes a value, want, close or retraction into state and reports whether
-// it was new.
+// admit folds a record into state and reports whether it was new.
 func (a *Arbiter) admit(it ChannelItem) bool {
 	switch {
 	case it.Closed:
@@ -147,49 +128,18 @@ func (a *Arbiter) admit(it ChannelItem) bool {
 			return false
 		}
 		a.closed = true
-	case it.Unwant:
-		// Too late once granted: the want has left a.wants, the grant stands, and
-		// the value it named is the next receive's. Only a still-pending want is
-		// retracted, and only that is worth recording.
-		if !has(a.wants, it.From, it.Seq) {
+	case it.Consumed:
+		if admittedIn(a.consumed, it.From, it.Seq) {
 			return false
 		}
-		a.wants = withoutItem(a.wants, it.From, it.Seq)
-	case it.Want:
-		if admittedIn(a.asked, it.From, it.Seq) {
-			return false
-		}
-		markSeq(a.asked, it.From, it.Seq)
-		a.wants = append(a.wants, ChannelItem{From: it.From, Seq: it.Seq, Want: true})
+		markSeq(a.consumed, it.From, it.Seq)
+		a.nconsume++
 	default:
 		if admittedIn(a.seen, it.From, it.Seq) {
 			return false
 		}
 		markSeq(a.seen, it.From, it.Seq)
-		// Only the identity is kept: match, has, withoutItem and Settled read no
-		// more, and the value's bytes travel on in Offer's returned record. Storing
-		// the whole item held a wave's worth of relayed values on the coordinator.
-		a.values = append(a.values, ChannelItem{From: it.From, Seq: it.Seq})
+		a.nvalues++
 	}
 	return true
-}
-
-// match pairs values with wants, earliest with earliest, and returns the grants.
-func (a *Arbiter) match() []ChannelItem {
-	var grants []ChannelItem
-	for len(a.values) > 0 && len(a.wants) > 0 {
-		v, w := a.values[0], a.wants[0]
-		a.values, a.wants = a.values[1:], a.wants[1:]
-		grants = append(grants, ChannelItem{From: v.From, Seq: v.Seq, To: w.From, ToSeq: w.Seq})
-	}
-	return grants
-}
-
-func withoutItem(items []ChannelItem, from string, seq uint64) []ChannelItem {
-	for i, it := range items {
-		if it.From == from && it.Seq == seq {
-			return append(items[:i:i], items[i+1:]...)
-		}
-	}
-	return items
 }

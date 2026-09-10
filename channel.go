@@ -100,6 +100,10 @@ type channelRelay struct {
 	// tailStop cancels a tailed outbox's reads, so retiring its channel wakes the
 	// tail to drop it at once rather than after its next poll. Keyed by outbox name.
 	tailStop map[string]context.CancelFunc
+	// consumed is each channel's consume count, kept outside mu so a job unloading
+	// on a send can snapshot it while holding the cluster lock without the relay's.
+	// Keyed by canonical stream name, value uint64.
+	consumed sync.Map
 }
 
 func (c *Cluster) startChannelRelay() {
@@ -216,8 +220,8 @@ func (c *Cluster) runChannelRelay() {
 }
 
 // relayFor returns the relay's state for a channel, creating the canonical
-// stream and replaying what is on it so a restarted coordinator does not append
-// what its predecessor did, and grants what the predecessor admitted but never granted.
+// stream and replaying what is on it so a restarted coordinator does not re-admit
+// what its predecessor already wrote.
 func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, error) {
 	canonical := chanStreamFor(id)
 	r := c.relay
@@ -250,11 +254,7 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 			rc.arbiter.Restore(rec.Record)
 		}
 	}
-	if owed := rc.arbiter.Grants(); len(owed) > 0 {
-		if _, err := st.Append(c.ctx, owed); err != nil {
-			return nil, fmt.Errorf("wings: grant what was owed on %s: %w", canonical, err)
-		}
-	}
+	c.relay.consumed.Store(canonical, rc.arbiter.Consumed())
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -398,7 +398,8 @@ func (c *Cluster) mergeOutbox(rc *relayChannel, id string, from int64, recs []ds
 		merged = append(merged, appended...)
 	}
 	if len(merged) > 0 {
-		c.wakeOnChannel(id, merged)
+		c.relay.consumed.Store(chanStreamFor(id), rc.arbiter.Consumed())
+		c.wakeOnChannel(id)
 	}
 	return from, nil
 }
@@ -803,7 +804,7 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 		var out []flow.ChannelValueAt
 		for _, rec := range recs {
 			from = rec.Offset + 1
-			if it := rec.Record; !it.Want && it.To == "" && !it.Closed {
+			if it := rec.Record; !it.Consumed && !it.Closed {
 				out = append(out, flow.ChannelValueAt{From: it.From, Seq: it.Seq, Data: it.Data, Next: from})
 				if len(out) >= n {
 					break

@@ -8,34 +8,25 @@ import (
 )
 
 // Sharing a channel between runs. flow says what a shared channel is; a
-// [ChannelHost] moves the bytes. A shared channel behaves as one between threads:
-// each value goes to one receiver, and a send waits at capacity. Receivers on
-// different machines cannot agree, so the host agrees for them — a receive is a
-// want the host answers with a grant (see [Arbiter]) — and a sender counts room
-// by what the host has told it.
+// [ChannelHost] moves the bytes. A shared channel has one reader: the host keeps
+// the channel's records in one order, and the reader consumes them in that order
+// the way it drains a local channel, so no cross-machine arbitration is needed. A
+// sender counts room by the consume reports the host relays back.
 
-// ChannelItem is one record of a shared channel: a value, a close, a receiver's
-// want, or the host's grant of a value to a want.
+// ChannelItem is one record of a shared channel: a value, a close, or the
+// reader's report that it consumed a value.
 type ChannelItem struct {
 	// From is the sender "<run>/<thread>" and Seq its nth send, identifying the
-	// value everywhere. On a want, From/Seq are the receiver and its nth receive;
-	// on a grant, they name the value granted.
+	// value everywhere. On a consume report, From/Seq name the value consumed.
 	From string
 	Seq  uint64
 	Data []byte
 	// Closed marks a close rather than a value.
 	Closed bool
-	// Want marks a receiver asking for a value.
-	Want bool
-	// Unwant retracts a want (From/Seq the receiver's) not yet granted, so a
-	// [Selector] can offer a receive on several hosted channels, take the first
-	// granted, and withdraw the rest. A retraction that races a grant loses: the
-	// grant stands and the value is delivered to the next receive.
-	Unwant bool
-	// To and ToSeq, set on a grant, name the want the value is given to. Only the
-	// host makes grants.
-	To    string
-	ToSeq uint64
+	// Consumed reports that the single reader took the value named by From/Seq, so
+	// a sender counting room by what it has mirrored can free the place. Relayed to
+	// every link; a sender applies it to its own queued send.
+	Consumed bool
 }
 
 // ChannelLink is one run's connection to a shared channel.
@@ -244,11 +235,9 @@ func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 		switch {
 		case it.Closed:
 			cs.shut()
-		case it.To != "":
-			cs.grant(it)
-		case it.Want, it.Unwant:
-			// The grant is what matters, and it follows; a retraction changes only
-			// what the host gives out.
+		case it.Consumed:
+			// The reader consumed this value; free the place in a sender's own mirror.
+			cs.free(it.From, it.Seq)
 		default:
 			// put drops a copy already here; not announced back to the link.
 			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false)
@@ -296,7 +285,7 @@ func (h *MemChannelHost) ChannelValues(_ context.Context, id string, cursor int6
 	var out []ChannelValueAt
 	for i := cursor; i < int64(len(ch.items)) && len(out) < n; i++ {
 		it := ch.items[i]
-		if it.Want || it.To != "" || it.Closed {
+		if it.Consumed || it.Closed {
 			continue
 		}
 		out = append(out, ChannelValueAt{From: it.From, Seq: it.Seq, Data: it.Data, Next: i + 1})

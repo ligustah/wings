@@ -234,6 +234,9 @@ type pendingJob struct {
 	blocked bool
 	// yield is set while the job is off every worker by its own choice. See yield.go.
 	yield *yieldEnvelope
+	// consumeBase is the channel's consumed count when a send unloaded, so the job
+	// is woken only once a later consume frees room it had not already seen.
+	consumeBase uint64
 	// recovered says a restarted coordinator took this job from its journal;
 	// incomplete says nothing has forked it in this process yet, so it has no input.
 	recovered  bool

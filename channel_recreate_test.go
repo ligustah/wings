@@ -51,31 +51,20 @@ func TestAnOutboxRecreatedUnderTheRelayStillReachesTheChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sender: %v", err)
 	}
-	if _, err := so.Append(ctx, []flow.ChannelItem{{From: "recreate/main.0", Seq: 0}}); err != nil {
+	if _, err := so.Append(ctx, []flow.ChannelItem{{From: "recreate/main.0", Seq: 0, Data: []byte("v")}}); err != nil {
 		t.Fatalf("send value: %v", err)
 	}
 
-	// A receiver wants one value; its outbox is not re-created, so this is seen
-	// the ordinary way. The grant can only be made once the value arrives too.
-	ro, err := eventStream[flow.ChannelItem](client, receiver)
-	if err != nil {
-		t.Fatalf("open receiver: %v", err)
-	}
-	if _, err := ro.Append(ctx, []flow.ChannelItem{{From: "recreate/main", Seq: 0, Want: true}}); err != nil {
-		t.Fatalf("send want: %v", err)
-	}
-
-	// The value must reach the canonical stream and be granted to the want,
-	// though the sender's outbox was re-created under the tail. Without the
-	// relay re-opening its handle, the value stays stranded and no grant is
-	// ever made.
+	// The value must reach the canonical stream, though the sender's outbox was
+	// re-created under the tail. Without the relay re-opening its handle, the
+	// value stays stranded and never arrives.
 	canonical := chanStreamFor(id)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if st, err := eventStream[flow.ChannelItem](client, canonical); err == nil {
 			recs, _ := st.Read(ctx, 0, 200)
 			for _, r := range recs {
-				if r.Record.To != "" { // a grant
+				if it := r.Record; it.From == "recreate/main.0" && it.Seq == 0 && !it.Consumed && !it.Closed {
 					return
 				}
 			}
