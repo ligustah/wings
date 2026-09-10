@@ -24,14 +24,14 @@ const ByteChunk = 256 << 10
 // buffered channel.
 type ByteWriter struct {
 	ctx Context
-	ch  *Channel[Bytes]
+	ch  Writer[Bytes]
 
 	buf    []byte
 	closed bool
 	err    error
 }
 
-func NewByteWriter(ctx Context, ch *Channel[Bytes]) *ByteWriter {
+func NewByteWriter(ctx Context, ch Writer[Bytes]) *ByteWriter {
 	return &ByteWriter{ctx: ctx, ch: ch}
 }
 
@@ -98,13 +98,13 @@ func (w *ByteWriter) Close() error {
 // once the channel is closed and drained. Its Close is a no-op.
 type ByteReader struct {
 	ctx  Context
-	ch   *Channel[Bytes]
+	ch   Reader[Bytes]
 	buf  Bytes
 	pos  int
 	done bool
 }
 
-func NewByteReader(ctx Context, ch *Channel[Bytes]) *ByteReader {
+func NewByteReader(ctx Context, ch Reader[Bytes]) *ByteReader {
 	return &ByteReader{ctx: ctx, ch: ch}
 }
 

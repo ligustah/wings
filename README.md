@@ -160,10 +160,11 @@ var Render = flow.Define(func(ctx flow.Context, in RenderIn) (flow.None, error) 
     return flow.None{}, encode(w)
 })
 
-// The workflow makes the channel, forks the render, and reads the bytes back.
+// The workflow makes the channel, forks the render with the write side, and
+// reads the bytes back from the read side.
 out := ctx.NewBufferedChannel[flow.Bytes](8)
-done := ctx.Go(Render, RenderIn{Out: out})
-_, err := io.Copy(dst, flow.NewByteReader(ctx, out))
+done := ctx.Go(Render, RenderIn{Out: out.Writer()})
+_, err := io.Copy(dst, flow.NewByteReader(ctx, out.Reader()))
 ```
 
 Chunks are `flow.ByteChunk` in size, recorded and replayed like any channel value, so

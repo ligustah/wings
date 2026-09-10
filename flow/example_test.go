@@ -135,13 +135,13 @@ func ExampleByteWriter() {
 	err := flow.Run(context.Background(), flow.NewName(), func(ctx flow.Context) error {
 		ch := ctx.NewBufferedChannel[flow.Bytes](4)
 		writer := ctx.Spawn(func(ctx flow.Context) (flow.None, error) {
-			w := flow.NewByteWriter(ctx, ch)
+			w := flow.NewByteWriter(ctx, ch.Writer())
 			if _, err := io.WriteString(w, "hello, world"); err != nil {
 				return flow.None{}, err
 			}
 			return flow.None{}, w.Close()
 		})
-		read, err := io.ReadAll(flow.NewByteReader(ctx, ch))
+		read, err := io.ReadAll(flow.NewByteReader(ctx, ch.Reader()))
 		if err != nil {
 			return err
 		}
