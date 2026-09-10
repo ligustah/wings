@@ -96,7 +96,7 @@ func openJournal(ctx context.Context, client *dsclient.Client, log *slog.Logger,
 		return nil, fmt.Errorf("wings: check %s: %w", journalStream, err)
 	}
 	if !ok {
-		if err := client.CreateStream(ctx, journalStream, nil); err != nil {
+		if err := client.CreateStream(ctx, journalStream, streamConfig()); err != nil {
 			return nil, fmt.Errorf("wings: create %s: %w", journalStream, err)
 		}
 	}

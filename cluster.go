@@ -303,6 +303,8 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	}
 	cfg.Scaling = cfg.Scaling.withDefaults(cfg.Concurrency)
 
+	streamCompression = cfg.Compression.resolve()
+
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	c := &Cluster{
 		cfg:      cfg,

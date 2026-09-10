@@ -46,7 +46,7 @@ func (c *Cluster) openMachineLog(ctx context.Context) (*machineLog, error) {
 		return nil, fmt.Errorf("wings: check %s: %w", machineStream, err)
 	}
 	if !ok {
-		if err := client.CreateStream(ctx, machineStream, nil); err != nil {
+		if err := client.CreateStream(ctx, machineStream, streamConfig()); err != nil {
 			return nil, fmt.Errorf("wings: create %s: %w", machineStream, err)
 		}
 	}

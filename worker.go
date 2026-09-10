@@ -19,6 +19,7 @@ import (
 	"github.com/ligustah/durable_streams/broker/embed"
 	"github.com/ligustah/durable_streams/broker/protos"
 	"github.com/ligustah/durable_streams/dsclient"
+	"github.com/ligustah/durable_streams/dswire"
 	"google.golang.org/grpc"
 
 	"github.com/ligustah/wings/flow"
@@ -96,7 +97,7 @@ func (n *workerNode) declareStreams(ctx context.Context) error {
 		if ok {
 			continue
 		}
-		if err := n.client.CreateStream(ctx, name, nil); err != nil {
+		if err := n.client.CreateStream(ctx, name, streamConfig()); err != nil {
 			return fmt.Errorf("wings: create stream %s: %w", name, err)
 		}
 	}
@@ -589,6 +590,9 @@ func isWorkerProcess() bool { return os.Getenv(envMode) == modeWorker }
 func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	concurrency, _ := strconv.Atoi(os.Getenv(envConcurrency))
 	jobTimeout, _ := time.ParseDuration(os.Getenv(envJobTimeout))
+	if v, err := strconv.Atoi(os.Getenv(envCompression)); err == nil {
+		streamCompression = dswire.Compression(v)
+	}
 	id := os.Getenv(envWorkerID)
 	if id == "" {
 		id = "worker"

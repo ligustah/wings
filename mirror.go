@@ -47,7 +47,7 @@ func (c *Cluster) openMirror(ctx context.Context, workerID string) (*mirror, err
 		return nil, fmt.Errorf("wings: check %s: %w", name, err)
 	}
 	if !ok {
-		if err := client.CreateStream(ctx, name, nil); err != nil {
+		if err := client.CreateStream(ctx, name, streamConfig()); err != nil {
 			return nil, fmt.Errorf("wings: create %s: %w", name, err)
 		}
 	}

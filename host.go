@@ -75,7 +75,7 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 		return nil, err
 	}
 	all := append(append([]flow.RunOption{}, opts...),
-		flow.WithStore(flow.NewStore(client)),
+		flow.WithStore(flow.NewStore(client, flow.WithStoreCompression(streamCompression))),
 		flow.WithPlacer(clusterPlacer{c}),
 		flow.WithChannelHost(clusterChannels{c}),
 	)

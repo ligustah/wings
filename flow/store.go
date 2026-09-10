@@ -70,11 +70,29 @@ func streamName(run, thread string) string {
 // streamStore keeps each thread's history on its own durable stream, so resuming
 // a thread replays exactly its own events.
 type streamStore struct {
-	client *dsclient.Client
+	client      *dsclient.Client
+	compression dswire.Compression
 }
 
-// NewStore returns a Store backed by a durable-streams client.
-func NewStore(client *dsclient.Client) Store { return &streamStore{client: client} }
+// StoreOption configures a [NewStore].
+type StoreOption func(*streamStore)
+
+// WithStoreCompression sets the storage codec for the history streams the store
+// creates. Defaults to [dswire.CompressionZstd]; pass [dswire.CompressionNone]
+// to store uncompressed.
+func WithStoreCompression(c dswire.Compression) StoreOption {
+	return func(s *streamStore) { s.compression = c }
+}
+
+// NewStore returns a Store backed by a durable-streams client. History streams
+// are Zstd-compressed unless [WithStoreCompression] says otherwise.
+func NewStore(client *dsclient.Client, opts ...StoreOption) Store {
+	s := &streamStore{client: client, compression: dswire.CompressionZstd}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
 
 // ListRuns implements [Lister] by reading the broker's stream catalog.
 func (s *streamStore) ListRuns(ctx context.Context) ([]string, error) {
@@ -119,7 +137,7 @@ func (s *streamStore) open(ctx context.Context, name string, create bool) (*dscl
 		if !create {
 			return nil, nil
 		}
-		if err := s.client.CreateStream(ctx, name, nil); err != nil {
+		if err := s.client.CreateStream(ctx, name, &dsclient.StreamConfig{Compression: s.compression}); err != nil {
 			return nil, fmt.Errorf("flow: create %s: %w", name, err)
 		}
 	}

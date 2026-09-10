@@ -15,6 +15,7 @@ const (
 	envConcurrency = "WINGS_CONCURRENCY"
 	envJobTimeout  = "WINGS_JOB_TIMEOUT"
 	envWorkerID    = "WINGS_WORKER_ID"
+	envCompression = "WINGS_COMPRESSION"
 
 	modeWorker = "worker"
 
@@ -130,6 +131,11 @@ type Config struct {
 	// coordinator gives up — the bound that turns an unkillable poison-pill job
 	// into an error. Defaults to 5; below 1 means one attempt.
 	MaxAttempts int
+
+	// Compression is the storage codec for the durable streams this cluster
+	// creates — history, channels, and the rest. The zero value uses the default
+	// (Zstd); set [CompressionNone] to store uncompressed. See [Compression].
+	Compression Compression
 
 	// Build controls cross-compilation of the worker binary. Used only by [Remote].
 	Build BuildConfig

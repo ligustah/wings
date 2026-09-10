@@ -270,6 +270,8 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 		// keeps it off the internet.
 		envListen: fmt.Sprintf("127.0.0.1:%d", defaultRemotePort),
 		envDir:    path.Join(remoteWorkDir, "data"),
+
+		envCompression: fmt.Sprint(int(streamCompression)),
 	}
 	if c.cfg.Concurrency > 0 {
 		env[envConcurrency] = fmt.Sprint(c.cfg.Concurrency)

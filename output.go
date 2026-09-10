@@ -138,7 +138,7 @@ func ensureStream(ctx context.Context, client *dsclient.Client, name string) err
 	if ok {
 		return nil
 	}
-	if err := client.CreateStream(ctx, name, nil); err != nil {
+	if err := client.CreateStream(ctx, name, streamConfig()); err != nil {
 		return fmt.Errorf("wings: create %s: %w", name, err)
 	}
 	return nil
