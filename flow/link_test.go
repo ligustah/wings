@@ -190,6 +190,42 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 	}
 }
 
+// THE POINT: a want retracted before it is granted takes no value — a later
+// value finds nobody waiting — so a Selector can offer a receive on several
+// channels and withdraw the ones that did not win. A retraction that arrives
+// after the grant is a no-op: the grant stands.
+func TestTheArbiterRetractsAWant(t *testing.T) {
+	a := flow.NewArbiter()
+	want := func(seq uint64) flow.ChannelItem { return flow.ChannelItem{Want: true, From: "r/main", Seq: seq} }
+	unwant := func(seq uint64) flow.ChannelItem { return flow.ChannelItem{Unwant: true, From: "r/main", Seq: seq} }
+	value := func(seq uint64) flow.ChannelItem { return flow.ChannelItem{From: "p/main", Seq: seq, Data: []byte("v")} }
+
+	if out := a.Offer(want(0)); len(out) != 1 {
+		t.Fatalf("a want with nothing to give: %d records, want 1", len(out))
+	}
+	if out := a.Offer(unwant(0)); len(out) != 1 {
+		t.Fatalf("retracting a pending want: %d records, want 1 (the retraction recorded)", len(out))
+	}
+	if out := a.Offer(unwant(0)); len(out) != 0 {
+		t.Fatalf("retracting it again: %d records, want 0", len(out))
+	}
+	// The value now finds nobody waiting: the retracted want took nothing.
+	if out := a.Offer(value(0)); len(out) != 1 || out[0].Data == nil {
+		t.Fatalf("a value after the want was retracted: %+v, want just the value recorded, no grant", out)
+	}
+
+	// A retraction that loses the race to a grant is a no-op.
+	b := flow.NewArbiter()
+	b.Offer(value(1))
+	out := b.Offer(want(1))
+	if len(out) != 2 || out[1].To != "r/main" {
+		t.Fatalf("a want with a value waiting: %+v, want the want and a grant", out)
+	}
+	if out := b.Offer(unwant(1)); len(out) != 0 {
+		t.Fatalf("retracting an already-granted want: %d records, want 0 (the grant stands)", len(out))
+	}
+}
+
 // THE POINT: a channel cannot leave a run that has no host, and the error
 // arrives at the call rather than as a hang somewhere else.
 func TestAChannelCannotLeaveARunWithoutAHost(t *testing.T) {

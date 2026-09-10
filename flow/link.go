@@ -27,6 +27,11 @@ type ChannelItem struct {
 	Closed bool
 	// Want marks a receiver asking for a value.
 	Want bool
+	// Unwant retracts a want (From/Seq the receiver's) not yet granted, so a
+	// [Selector] can offer a receive on several hosted channels, take the first
+	// granted, and withdraw the rest. A retraction that races a grant loses: the
+	// grant stands and the value is delivered to the next receive.
+	Unwant bool
 	// To and ToSeq, set on a grant, name the want the value is given to. Only the
 	// host makes grants.
 	To    string

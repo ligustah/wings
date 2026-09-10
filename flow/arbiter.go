@@ -138,7 +138,8 @@ func has(items []ChannelItem, from string, seq uint64) bool {
 	return false
 }
 
-// admit takes a value, want or close into state and reports whether it was new.
+// admit takes a value, want, close or retraction into state and reports whether
+// it was new.
 func (a *Arbiter) admit(it ChannelItem) bool {
 	switch {
 	case it.Closed:
@@ -146,6 +147,14 @@ func (a *Arbiter) admit(it ChannelItem) bool {
 			return false
 		}
 		a.closed = true
+	case it.Unwant:
+		// Too late once granted: the want has left a.wants, the grant stands, and
+		// the value it named is the next receive's. Only a still-pending want is
+		// retracted, and only that is worth recording.
+		if !has(a.wants, it.From, it.Seq) {
+			return false
+		}
+		a.wants = withoutItem(a.wants, it.From, it.Seq)
 	case it.Want:
 		if admittedIn(a.asked, it.From, it.Seq) {
 			return false
