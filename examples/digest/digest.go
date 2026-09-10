@@ -96,8 +96,8 @@ var _ = flow.Main(Main)
 // Batch digests seeds through Digest and reports each result on the channel it
 // was handed as it arrives. Its own Digest calls fan out across the fleet.
 type Batch struct {
-	Work    []Work                `json:"work"`
-	Results *flow.Channel[Result] `json:"results"`
+	Work    []Work               `json:"work"`
+	Results *flow.Writer[Result] `json:"results"`
 }
 
 var DigestBatch = flow.Define(func(ctx flow.Context, in Batch) (int, error) {
@@ -121,6 +121,7 @@ var Fanout = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	jobs, rounds := cmp.Or(in.Jobs, 32), cmp.Or(in.Rounds, 2_000_000)
 	const batches = 4
 	results := ctx.NewChannel[Result]()
+	w := results.Writer()
 
 	var futures []*flow.Future[int]
 	for b := range batches {
@@ -128,7 +129,7 @@ var Fanout = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 		for i := b; i < jobs; i += batches {
 			work = append(work, Work{Seed: fmt.Sprintf("job-%03d", i), Rounds: rounds})
 		}
-		batch := Batch{Work: work, Results: results}
+		batch := Batch{Work: work, Results: &w}
 		if b%2 == 0 {
 			futures = append(futures, ctx.Go(DigestBatch, batch))
 		} else {

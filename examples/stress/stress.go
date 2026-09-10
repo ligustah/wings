@@ -720,7 +720,7 @@ var _ = flow.Main(Orphaned)
 
 type Outlet struct {
 	N   int
-	Out *flow.Channel[int]
+	Out *flow.Writer[int]
 }
 
 var Pumps = flow.Define(func(ctx flow.Context, in Outlet) (int, error) {
@@ -745,7 +745,8 @@ var Pumps = flow.Define(func(ctx flow.Context, in Outlet) (int, error) {
 var Crossed = flow.Define(func(ctx flow.Context, in Params) (flow.None, error) {
 	n := cmp.Or(in.N, 25)
 	values := ctx.NewBufferedChannel[int](3)
-	pump := ctx.Go(Pumps, Outlet{N: n, Out: values})
+	w := values.Writer()
+	pump := ctx.Go(Pumps, Outlet{N: n, Out: &w})
 	drain := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		p, _ := pid(ctx)
 		sum := 0
