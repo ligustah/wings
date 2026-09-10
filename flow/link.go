@@ -193,6 +193,7 @@ func (r *runState) attach(ctx context.Context, id string, capacity int) (*chanSt
 	}
 	cs := newChanState(capacity)
 	cs.link = link
+	cs.attached = true
 
 	r.mu.Lock()
 	if r.channels == nil {

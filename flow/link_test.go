@@ -78,6 +78,57 @@ func TestAChannelReachesAnotherRun(t *testing.T) {
 	}
 }
 
+type writeFeed struct {
+	Values *flow.Writer[int] `json:"values"`
+}
+
+// writerProducer is handed only the send side: it can send and close, not receive.
+var writerProducer = flow.Define(func(ctx flow.Context, in writeFeed) (int, error) {
+	for i := 1; i <= 3; i++ {
+		if err := in.Values.Send(ctx, i*10); err != nil {
+			return 0, err
+		}
+	}
+	return 3, in.Values.Close(ctx)
+}, flow.WithName("test.writerProducer"))
+
+// THE POINT: a run handed only a Writer still delivers every value to the
+// receiver, though that run drops each value's bytes once the host has them
+// (it never receives, so nothing local reads them back). The receiver reads
+// the values from the host's copy.
+func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
+	host := flow.NewMemChannelHost()
+	store := flow.NewMemStore()
+	var got int
+	err := flow.Run(t.Context(), "reader", func(ctx flow.Context) error {
+		ch := ctx.NewChannel[int]()
+		w := ch.Writer()
+		fut := ctx.Go(writerProducer, writeFeed{Values: &w})
+		total := 0
+		for {
+			v, ok, err := ch.Recv(ctx)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			total += v
+		}
+		if _, err := fut.Await(ctx); err != nil {
+			return err
+		}
+		got = total
+		return nil
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 60 {
+		t.Fatalf("the reader received a total of %d, want 60 (10+20+30)", got)
+	}
+}
+
 // producer sends into a channel it was handed and closes it.
 var producer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 	for i := 1; i <= 3; i++ {

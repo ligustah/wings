@@ -137,6 +137,38 @@ func TestChanStateFindIndexTracksItems(t *testing.T) {
 	}
 }
 
+// THE POINT: a run that only holds a write handle for a channel reached from
+// another run drops each sent value's bytes — nothing local ever reads them back
+// — while keeping the identity, so a replayed send is still deduped.
+func TestChanStateWriterOnlyDropsSentBytes(t *testing.T) {
+	cs := newChanState(unbounded)
+	cs.attached = true
+	cs.noteRole(modeWrite) // a writer handle leaves reads unset
+
+	it, err := cs.put(context.Background(), "w/main", 0, []byte("payload"), false)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if it.data != nil {
+		t.Fatalf("a writer-only run kept %d bytes of a sent value", len(it.data))
+	}
+	if again, _ := cs.put(context.Background(), "w/main", 0, []byte("payload"), false); again != it {
+		t.Fatalf("a replayed send was not deduped to the queued item")
+	}
+
+	// A read-capable handle keeps the bytes: the run may receive them.
+	rs := newChanState(unbounded)
+	rs.attached = true
+	rs.noteRole(modeBoth)
+	kept, err := rs.put(context.Background(), "w/main", 0, []byte("payload"), false)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if kept.data == nil {
+		t.Fatalf("a read-capable run dropped a value it may receive")
+	}
+}
+
 // grantOnWant is a channel host stub: when a receiver announces a want it queues
 // a value and grants it at once, the way a real host answers a receive (the value
 // precedes its grant on the record).

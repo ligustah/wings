@@ -27,11 +27,21 @@ type Channel[T any] struct {
 	codec dswire.Codec[T]
 
 	// id and capacity are set on a handle that arrived from another run; mu
-	// guards binding it to this run on first use.
+	// guards binding it to this run on first use. mode is how it arrived — read,
+	// write, or both — so a run handed only a writer is known to never receive.
 	id       string
 	capacity int
+	mode     handleMode
 	mu       sync.Mutex
 }
+
+type handleMode string
+
+const (
+	modeBoth  handleMode = ""
+	modeRead  handleMode = "r"
+	modeWrite handleMode = "w"
+)
 
 // NewChannel returns an unbuffered channel: a send completes when a receive
 // takes it.
@@ -101,14 +111,18 @@ func (c *Channel[T]) sharedID() string {
 // channelHandle is how a channel travels in encoded input or output; the
 // capacity goes with it so a sender in another run knows the room.
 type channelHandle struct {
-	Channel  string `json:"channel"`
-	Capacity int    `json:"capacity,omitempty"`
+	Channel  string     `json:"channel"`
+	Capacity int        `json:"capacity,omitempty"`
+	Mode     handleMode `json:"mode,omitempty"`
 }
 
 // MarshalJSON shares the channel so it can travel in a call's input, a result,
 // or a value sent on another channel: the run's host is told and untaken sends
-// go with it, so the run needs a [ChannelHost]. See [WithChannelHost].
-func (c *Channel[T]) MarshalJSON() ([]byte, error) {
+// go with it, so the run needs a [ChannelHost]. See [WithChannelHost]. A whole
+// channel shares both sides; see [Writer] and [Reader] to share one.
+func (c *Channel[T]) MarshalJSON() ([]byte, error) { return c.share(modeBoth) }
+
+func (c *Channel[T]) share(mode handleMode) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	id, capacity := c.id, c.capacity
@@ -125,7 +139,7 @@ func (c *Channel[T]) MarshalJSON() ([]byte, error) {
 	if id == "" {
 		return nil, errors.New("flow: this channel was created outside a Run and cannot be shared")
 	}
-	return json.Marshal(channelHandle{Channel: id, Capacity: capacity})
+	return json.Marshal(channelHandle{Channel: id, Capacity: capacity, Mode: mode})
 }
 
 // UnmarshalJSON receives a channel another run shared; it binds to this run on
@@ -140,7 +154,7 @@ func (c *Channel[T]) UnmarshalJSON(b []byte) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.id, c.run, c.name, c.capacity = h.Channel, nil, h.Channel, h.Capacity
+	c.id, c.run, c.name, c.capacity, c.mode = h.Channel, nil, h.Channel, h.Capacity, h.Mode
 	c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
 	return nil
 }
@@ -374,11 +388,33 @@ func (w Writer[T]) Close(ctx Context) error { return w.ch.Close(ctx) }
 // Name is the channel's identity in its run's history. See [Channel.Name].
 func (w Writer[T]) Name() string { return w.ch.Name() }
 
+// MarshalJSON shares the send side, so the run that receives it can send but not
+// receive. See [Channel.MarshalJSON].
+func (w Writer[T]) MarshalJSON() ([]byte, error) { return w.ch.share(modeWrite) }
+
+// UnmarshalJSON receives a send side another run shared.
+func (w *Writer[T]) UnmarshalJSON(b []byte) error { return unmarshalSide(&w.ch, b) }
+
 // Recv takes the next value off the channel. See [Channel.Recv].
 func (r Reader[T]) Recv(ctx Context) (T, bool, error) { return r.ch.Recv(ctx) }
 
 // Name is the channel's identity in its run's history. See [Channel.Name].
 func (r Reader[T]) Name() string { return r.ch.Name() }
+
+// MarshalJSON shares the receive side. See [Channel.MarshalJSON].
+func (r Reader[T]) MarshalJSON() ([]byte, error) { return r.ch.share(modeRead) }
+
+// UnmarshalJSON receives a receive side another run shared.
+func (r *Reader[T]) UnmarshalJSON(b []byte) error { return unmarshalSide(&r.ch, b) }
+
+func unmarshalSide[T any](ch **Channel[T], b []byte) error {
+	c := &Channel[T]{}
+	if err := c.UnmarshalJSON(b); err != nil {
+		return err
+	}
+	*ch = c
+	return nil
+}
 
 // bind resolves the calling thread and this channel's shared state.
 func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
@@ -403,6 +439,7 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 		if c.codec == nil {
 			c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
 		}
+		cs.noteRole(c.mode)
 		return t, cs, nil
 	}
 	if t.run != c.run {
@@ -412,7 +449,22 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 	if cs == nil {
 		return nil, nil, fmt.Errorf("flow: channel %s is not part of this run", c.name)
 	}
+	cs.noteRole(c.mode)
 	return t, cs, nil
+}
+
+// noteRole records that a handle of this mode is bound here. A read-capable
+// handle means this run may receive on the channel, so its own queued sends are
+// kept; a run that only ever holds a writer never receives here, so [chanState.put]
+// can drop each sent value once the host has it. A locally created channel keeps
+// its sends regardless — it is not attached, so it is read-capable by default.
+func (cs *chanState) noteRole(mode handleMode) {
+	if mode == modeWrite {
+		return
+	}
+	cs.mu.Lock()
+	cs.reads = true
+	cs.mu.Unlock()
 }
 
 // chanItem is one value in flight, tagged with where it came from so a receive
@@ -445,6 +497,13 @@ type chanState struct {
 	// own echo and replays on every put, and a channel a worker only sends on keeps
 	// every send until it is retired, so a scan per send is quadratic over a wave.
 	byKey map[string]*chanItem
+	// attached is set when this runtime was reached from another run through the
+	// host, rather than created here. reads is set when a read-capable handle binds.
+	// A run that only holds a writer for an attached channel never receives on it,
+	// so put drops each sent value once the host has the canonical copy. See
+	// [chanState.noteRole].
+	attached bool
+	reads    bool
 	// floor is len(items) after the last prune; the queue is compacted once it has
 	// grown enough past it that pruning stays amortised. See [chanState.prune].
 	floor int
@@ -499,6 +558,12 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	// two machines can each take the last place, and the channel is briefly one
 	// over. Bounded and rare, and the alternative is a round trip per send.
 	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.roomFor(nil)}
+	if cs.attached && !cs.reads {
+		// A writer-only run never receives here, so its own queued value is read by
+		// no one — the host holds the canonical copy a receiver reads. Keep the
+		// identity to dedupe a replayed send; drop the bytes the wave would pile up.
+		item.data = nil
+	}
 	if cs.claimed[itemKey(from, seq)] {
 		delete(cs.claimed, itemKey(from, seq))
 		item.taken = true
