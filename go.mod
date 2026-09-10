@@ -8,8 +8,8 @@ require (
 	cloud.google.com/go/compute v1.67.0
 	github.com/dave/jennifer v1.7.1
 	github.com/ligustah/durable_streams v0.162.0
-	github.com/ligustah/durable_streams/broker v0.259.0
-	github.com/ligustah/durable_streams/broker/client v0.57.0
+	github.com/ligustah/durable_streams/broker v0.262.0
+	github.com/ligustah/durable_streams/broker/client v0.60.0
 	github.com/ligustah/durable_streams/broker/protos v0.42.0
 	github.com/ligustah/durable_streams/dsclient v0.53.0
 	github.com/ligustah/durable_streams/dswire v0.33.0

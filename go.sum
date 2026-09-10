@@ -129,10 +129,10 @@ github.com/ligustah/commitlog v0.104.0 h1:JwEgfEkzgK3hxns9JBExNxnOi0we7Tbis4qdk9
 github.com/ligustah/commitlog v0.104.0/go.mod h1:ALe2R67SQGz6gC0y8+pFMUKDBby8cry/MnhbFXZTdKc=
 github.com/ligustah/durable_streams v0.162.0 h1:zDfF32TuO1WCvS40aWeZPy9r7StjVqWnhP44siKQ8wE=
 github.com/ligustah/durable_streams v0.162.0/go.mod h1:0/JP2LevLFTW3Tof719AfvumGK0nAltINnQlNsQfWVw=
-github.com/ligustah/durable_streams/broker v0.259.0 h1:GPmaVhs7hdr1PqY9pH9FxNxA6YKXqKUGw58kTJ9/Bxc=
-github.com/ligustah/durable_streams/broker v0.259.0/go.mod h1:043gvF+Mp0csnuwi1Xqly+DUiYHOLq9Qs2jbOYUZ360=
-github.com/ligustah/durable_streams/broker/client v0.57.0 h1:lVE92S2yfOVwkv7IqUwKAHFgKqaXCQSxAoFdnA3BsX0=
-github.com/ligustah/durable_streams/broker/client v0.57.0/go.mod h1:Z3rgBE6m9NFNnJgj+M/OCbxUNhTfrHw8BCgJrCIA3HE=
+github.com/ligustah/durable_streams/broker v0.262.0 h1:kK+AVX6e68VrZQFFlHWh9rIdJNeptLT73MoPPdVUCg4=
+github.com/ligustah/durable_streams/broker v0.262.0/go.mod h1:l55gIJtOBJ/VAjhFu7cHhUB9Qv+XpgwLfvqW1qJQIo0=
+github.com/ligustah/durable_streams/broker/client v0.60.0 h1:bjKQlmcczFHCiqMRub3wLANuzoNZ9r6x4q1giU9cZn4=
+github.com/ligustah/durable_streams/broker/client v0.60.0/go.mod h1:QGwscHdZEvNfYSvJyMXf8vSXzelDuUxmiKmVP4QASU0=
 github.com/ligustah/durable_streams/broker/protos v0.42.0 h1:vtu/+MPVOjJX2sxUJ1CjPjBpvFgKHN0e41gFlHEuYts=
 github.com/ligustah/durable_streams/broker/protos v0.42.0/go.mod h1:KxVHtmPizCMpitZtoruQ/mAcWQPda1yIHqYNgFbH1l8=
 github.com/ligustah/durable_streams/dsclient v0.53.0 h1:79LUI4qYkpIakpKlKMV9c5I7X2gB9dDL68MURtf7i0w=

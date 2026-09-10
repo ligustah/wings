@@ -15,7 +15,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/ligustah/durable_streams/broker/client"
 	"github.com/ligustah/durable_streams/broker/client/dsremote"
+	"github.com/ligustah/durable_streams/broker/client/zstd"
 	"github.com/ligustah/wings/internal/payload"
 )
 
@@ -25,6 +27,7 @@ import (
 func dialWorker(addr string) (*dsremote.Client, error) {
 	return dsremote.Dial([]string{addr},
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		client.WithCompression(zstd.Name),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxMessage),
 			grpc.MaxCallSendMsgSize(maxMessage),
