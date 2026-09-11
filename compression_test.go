@@ -29,6 +29,31 @@ func TestCompressionResolve(t *testing.T) {
 	}
 }
 
+// THE POINT: -compression names map to the codec (case-insensitively, empty is
+// the default), and an unknown name is an error rather than a silent default.
+func TestParseCompression(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Compression
+	}{
+		{"", CompressionDefault},
+		{"default", CompressionDefault},
+		{"none", CompressionNone},
+		{"Snappy", CompressionSnappy},
+		{" s2 ", CompressionS2},
+		{"ZSTD", CompressionZstd},
+	}
+	for _, tc := range cases {
+		got, err := parseCompression(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("parseCompression(%q) = %v, %v; want %v, nil", tc.in, got, err, tc.want)
+		}
+	}
+	if _, err := parseCompression("lz4"); err == nil {
+		t.Error("parseCompression(\"lz4\") = nil error, want an error for an unknown codec")
+	}
+}
+
 // THE POINT: a run with compression disabled still creates its streams and a
 // channel still round-trips — the override threads through to stream creation.
 // THE POINT: wings stamps the v3 block layout on the streams it creates, so

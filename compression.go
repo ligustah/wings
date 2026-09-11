@@ -1,6 +1,9 @@
 package wings
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/ligustah/commitlog/blockv3"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
@@ -23,6 +26,25 @@ const (
 	// CompressionZstd gives the best ratio; wings' default.
 	CompressionZstd
 )
+
+// parseCompression maps a codec name to a Compression, for the -compression CLI
+// flag; the empty string is the default (Zstd).
+func parseCompression(s string) (Compression, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "default":
+		return CompressionDefault, nil
+	case "none":
+		return CompressionNone, nil
+	case "snappy":
+		return CompressionSnappy, nil
+	case "s2":
+		return CompressionS2, nil
+	case "zstd":
+		return CompressionZstd, nil
+	default:
+		return 0, fmt.Errorf("unknown -compression %q; want none, snappy, s2 or zstd", s)
+	}
+}
 
 func (c Compression) resolve() dswire.Compression {
 	switch c {
