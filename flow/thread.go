@@ -205,6 +205,17 @@ func threadFrom(ctx context.Context) *threadState {
 	return t
 }
 
+// Self reports the run and thread of the goroutine's current thread; ok is false
+// outside a run body. A host uses it to route what a thread writes — a recording,
+// a channel link's marker — to that thread's own transaction.
+func Self(ctx context.Context) (run, thread string, ok bool) {
+	t := threadFrom(ctx)
+	if t == nil {
+		return "", "", false
+	}
+	return t.run.name, t.id, true
+}
+
 // peek returns the event at the cursor without consuming it, or nil once replay
 // has caught up with history.
 func (t *threadState) peek() *protos.Event {

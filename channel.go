@@ -18,10 +18,11 @@ import (
 // Each run has an outbox per channel — wings.chanout.<job>.<attempt>.<channel> —
 // written as part of the attempt's transaction, so a send's record comes home
 // with the history that produced it, together, under the transaction pull
-// (pull.go); a send's record and its event commit atomically and isolated from
-// the run's other threads (the coordinator gives each thread its own producer,
-// [coordOutputs.stage]; a worker buffers each thread's records, [attemptOutputs.buffer]),
-// so a value reaches an outbox exactly once and a replay never resends it. The
+// (pull.go); each thread has its own transactional producer ([coordOutputs],
+// [attemptOutputs]), so a send's record and its event commit atomically and
+// isolated from the run's other threads — a worker thread holds a value until its
+// event so no concurrent commit can tear the two ([attemptOutputs.stage]) — and a
+// value reaches an outbox exactly once, so a replay never resends it. The
 // coordinator's relay merges every outbox into one canonical stream,
 // wings.chan.<channel>, admitting each record once and advancing the outbox's read
 // position in the same commit (a durable, restart-idempotent merge cursor), with
@@ -42,12 +43,11 @@ const (
 
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
-// pendingSend is a shared-channel record a sending thread has announced but whose
-// event is not yet recorded. It is held by the sending thread's qualified id and
-// staged into the attempt's transaction only by that thread's own next committed
-// event (see [attemptOutputs.appendEvent]), so a sibling thread's commit cannot
-// flush a send's record ahead of the event that justifies it — a tear a replay
-// would resend, which is why the host deduped sends before.
+// pendingSend is a shared-channel value a thread has announced but whose event is
+// not yet recorded. A worker thread's producer holds it until that thread's next
+// event stages it (see [attemptOutputs.stage], [attemptOutputs.appendEvents]), so
+// no commit in between — a heartbeat, an unload — makes a value durable without
+// its event, a tear a replay would resend.
 type pendingSend struct {
 	stream *dsclient.Stream[flow.ChannelItem]
 	item   flow.ChannelItem
@@ -828,6 +828,16 @@ type nodeChannels struct {
 	job *jobState
 }
 
+// threadOrMain is the id of the thread running on ctx, falling back to the main
+// thread when ctx is not inside a run body — so a channel write always routes to
+// a real producer.
+func threadOrMain(ctx context.Context) string {
+	if _, thread, ok := flow.Self(ctx); ok {
+		return thread
+	}
+	return flow.MainThread
+}
+
 func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.ChannelLink, error) {
 	out := outboxFor(h.job.id, h.job.attempt, id)
 	// Not the attempt's context: a half-made outbox is the next attempt's
@@ -839,34 +849,32 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 	if err != nil {
 		return nil, err
 	}
-	// A worker's outbox comes home inside the attempt's transactions (pull.go), not
-	// by a stream copy, so an outbox that never has a record written to it — a pure
+	// A worker's outbox comes home inside a thread's transactions (pull.go), not by a
+	// stream copy, so an outbox that never has a record written to it — a pure
 	// creator's or receiver's — produces no transaction and the coordinator never
 	// learns it exists, and so never attributes or reclaims its channel. Write one
-	// marker, committed now, so every outbox is pulled and the relay sees it; the
-	// ledger drops the marker from the channel's record.
+	// marker through the linking thread's producer, committed now, so every outbox is
+	// pulled and the relay sees it; the relay drops the marker from the record.
 	mctx := context.WithoutCancel(ctx)
-	if err := h.job.outputs.append(mctx, outbox, []flow.ChannelItem{{Link: true}}); err != nil {
+	linker := h.job.txns.For(threadOrMain(ctx))
+	if err := linker.append(mctx, outbox, []flow.ChannelItem{{Link: true}}); err != nil {
 		return nil, err
 	}
-	if err := h.job.outputs.commit(mctx); err != nil {
+	if err := linker.commit(mctx); err != nil {
 		return nil, err
 	}
 	return &channelLink{
-		// Buffered by the sending thread and staged into the attempt's transaction
-		// with the event that justifies it (pull.go, [attemptOutputs.buffer],
-		// [attemptOutputs.appendEvent]); flow commits the transaction as part of the
-		// send or receive that wrote it, never letting a sibling thread's commit tear
-		// the record from its event. The whole outbox is transactional, so it is
-		// pulled, not mirrored.
-		send: func(ctx context.Context, sender string, it flow.ChannelItem) error {
-			// A close (idempotent) and a consume report (never resent) need no
-			// torn-pair protection, so they ride the attempt's transaction with the
-			// event they pair with; only a value is held (see [attemptOutputs.buffer]).
+		// Each record goes into the writing thread's own transaction, so it commits
+		// with the event that justifies it and no sibling thread's commit can tear the
+		// two apart (pull.go, [attemptOutputs.stage]). A value waits for its send event;
+		// a close or consume report rides the event it pairs with. The whole outbox is
+		// transactional, so it is pulled, not mirrored.
+		send: func(ctx context.Context, _ string, it flow.ChannelItem) error {
+			out := h.job.txns.For(threadOrMain(ctx))
 			if it.Closed || it.Consumed {
-				return h.job.outputs.append(ctx, outbox, []flow.ChannelItem{it})
+				return out.append(ctx, outbox, []flow.ChannelItem{it})
 			}
-			h.job.outputs.buffer(sender, outbox, it)
+			out.stage(outbox, it)
 			return nil
 		},
 		client: h.n.client,

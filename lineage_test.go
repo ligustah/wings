@@ -48,7 +48,7 @@ func TestThreadHistoryFindsAForgottenAncestorViaRanAs(t *testing.T) {
 	const run, thread, jobID, child = "deep", "main.0", "jobabc", "main.0.0"
 
 	// A durable history for the job that ran main.0, with the fork of its child.
-	name := historyName(jobID, 0)
+	name := historyName(jobID, 0, thread)
 	if err := ensureStream(ctx, client, name); err != nil {
 		t.Fatalf("ensureStream: %v", err)
 	}

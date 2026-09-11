@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ligustah/durable_streams/dsclient"
-
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
 )
@@ -113,7 +111,6 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	if client == nil {
 		return
 	}
-	name := historyName(p.job.ID, attempt)
 	current := func() bool {
 		if c.ctx.Err() != nil || p.finished() {
 			return false
@@ -136,57 +133,62 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	own := threadOf(p.job)
 	owned := func(id string) bool { return id == own || strings.HasPrefix(id, own+".") }
 
-	var (
-		st         *dsclient.Stream[*protos.Event]
-		from       int64
-		open       = map[string]forkedCall{}
-		dispatched = map[string]bool{}
-	)
+	// Each thread of the run has its own history stream; a child's Fork/Join
+	// markers live in its parent's stream, so reading every owned thread's stream
+	// finds them all. New in-process sub-thread streams appear as the run forks, so
+	// the set is re-listed each pass. Only per-thread order matters (a child's fork
+	// and join are co-located in its parent's stream), not order across streams.
+	open := map[string]forkedCall{}
+	dispatched := map[string]bool{}
+	readers := map[string]int64{}
 	for current() {
-		if st == nil {
-			ok, err := client.StreamExists(c.ctx, name)
-			if err != nil {
-				wait(time.Second)
-				continue
-			}
-			if !ok {
-				wait(followLook)
-				continue
-			}
-			if st, err = eventStream[*protos.Event](client, name); err != nil {
-				c.log.Warn("wings: cannot follow a job's history for its calls", "job", p.job.ID, "err", err)
-				return
-			}
-		}
-		readCtx, cancel := context.WithTimeout(c.ctx, followPoll)
-		recs, err := st.ReadBlocking(readCtx, from, recordBatch)
-		expired := readCtx.Err() != nil
-		cancel()
+		names, err := historyStreams(c.ctx, client, p.job.ID, attempt)
 		if err != nil {
 			if c.ctx.Err() != nil {
 				return
 			}
-			if !expired {
-				wait(time.Second)
-			}
+			wait(time.Second)
 			continue
 		}
-		for _, r := range recs {
-			from = r.Offset + 1
-			ev := r.Record
-			if !owned(ev.GetThreadId()) {
+		for _, n := range names {
+			if _, ok := readers[n]; !ok {
+				readers[n] = 0
+			}
+		}
+		progressed := false
+		for name, from := range readers {
+			st, err := eventStream[*protos.Event](client, name)
+			if err != nil {
+				if c.ctx.Err() != nil {
+					return
+				}
 				continue
 			}
-			switch e := protos.UnpackEventPayload(ev).(type) {
-			case *protos.ForkEvent:
-				call := forkedCall{fn: e.GetFunction(), input: e.GetInput().GetSerialized()}
-				if call.fn == "" {
-					root, lineage := lineageOfJob(p.job)
-					call.root, call.lineage = root, append(lineage, e.GetThreadId())
+			recs, err := st.Read(c.ctx, from, recordBatch)
+			if err != nil {
+				if c.ctx.Err() != nil {
+					return
 				}
-				open[callKey(e.GetThreadId(), 0)] = call
-			case *protos.JoinEvent:
-				delete(open, callKey(e.GetThreadId(), 0))
+				continue
+			}
+			for _, r := range recs {
+				readers[name] = r.Offset + 1
+				progressed = true
+				ev := r.Record
+				if !owned(ev.GetThreadId()) {
+					continue
+				}
+				switch e := protos.UnpackEventPayload(ev).(type) {
+				case *protos.ForkEvent:
+					call := forkedCall{fn: e.GetFunction(), input: e.GetInput().GetSerialized()}
+					if call.fn == "" {
+						root, lineage := lineageOfJob(p.job)
+						call.root, call.lineage = root, append(lineage, e.GetThreadId())
+					}
+					open[callKey(e.GetThreadId(), 0)] = call
+				case *protos.JoinEvent:
+					delete(open, callKey(e.GetThreadId(), 0))
+				}
 			}
 		}
 		for key, call := range open {
@@ -198,6 +200,9 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 			thread, step, _ := strings.Cut(key, "#")
 			n, _ := strconv.ParseUint(step, 10, 64)
 			c.wg.Go(func() { c.dispatchNested(p, attempt, thread, n, call) })
+		}
+		if !progressed {
+			wait(followLook)
 		}
 	}
 }
@@ -379,8 +384,10 @@ func (e nestedPlacer) place(ctx context.Context, th flow.Thread) ([]byte, error)
 	box := e.n.boxLocked(attempt, callKey(th.ID, 0))
 	e.n.runMu.Unlock()
 
-	// Committing the open transaction is what makes this a request.
-	if err := e.job.outputs.commit(ctx); err != nil {
+	// Committing the forking thread's open transaction is what makes this a
+	// request: its ForkEvent must be durable for the coordinator to read and
+	// dispatch (follow), and only that thread's producer carries it.
+	if err := e.job.txns.For(th.Parent).commit(ctx); err != nil {
 		return nil, err
 	}
 	select {

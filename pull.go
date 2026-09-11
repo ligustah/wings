@@ -83,15 +83,19 @@ func (c *Cluster) pullWanted(workload string) bool {
 	if !ok {
 		return true
 	}
-	i := strings.LastIndexByte(rest, '.')
-	if i < 0 {
+	// The id is streamPart(job).streamPart(thread).attempt (a thread per producer);
+	// both parts are dot-free, so the job is the first segment and the attempt the
+	// last. A legacy two-part id (job.attempt) still parses: the job is first, the
+	// attempt last.
+	parts := strings.Split(rest, ".")
+	if len(parts) < 2 {
 		return true
 	}
-	attempt, err := strconv.Atoi(rest[i+1:])
+	attempt, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil {
 		return true
 	}
-	part := rest[:i]
+	part := parts[0]
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for id, p := range c.pending {

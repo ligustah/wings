@@ -188,13 +188,14 @@ func clusterFrom(ctx context.Context) *Cluster {
 }
 
 // jobState is what a running job carries on a worker: which job and attempt, the
-// worker, its earlier attempts' recordings, and the transaction its output goes in.
+// worker, its earlier attempts' recordings, and the per-thread transactions its
+// output goes in.
 type jobState struct {
 	id      string
 	attempt int
 	priors  []Recording
 	node    *workerNode
-	outputs *attemptOutputs
+	txns    *attemptTxns
 }
 
 type jobKey struct{}

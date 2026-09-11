@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // THE POINT: what a job commits on a worker with an engine of its own comes
@@ -33,7 +35,9 @@ func TestWhatAJobCommitsComesHomeAsTransactions(t *testing.T) {
 	}
 
 	// The attempt's transactional id, as the worker's engine named the
-	// writer: the job's, from the journal, and attempt 0.
+	// writer: the job's, from the journal, the main thread, and attempt 0.
+	// Each thread commits under its own producer now, so the writer carries
+	// the thread id between the job and the attempt.
 	entries := awaitJournal(t, c, func(es []journalEntry) bool { return countKind(es, journalCompleted) >= 1 })
 	var job string
 	for _, e := range entries {
@@ -44,7 +48,7 @@ func TestWhatAJobCommitsComesHomeAsTransactions(t *testing.T) {
 	if job == "" {
 		t.Fatalf("no submitted job in the journal: %+v", entries)
 	}
-	workload := "wings.job." + streamPart(job) + "." + strconv.Itoa(0)
+	workload := "wings.job." + streamPart(job) + "." + streamPart(flow.MainThread) + "." + strconv.Itoa(0)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		mark, known, err := c.engine.Coordinator().AppliedThrough(workload)

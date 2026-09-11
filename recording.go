@@ -10,6 +10,8 @@ import (
 
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
+
+	"github.com/ligustah/wings/flow"
 )
 
 // recordBatch is how many events go in one append; each is still its own record.
@@ -55,15 +57,23 @@ func Record[E any](ctx context.Context, name string) (*Recorder[E], error) {
 	if err != nil {
 		return nil, err
 	}
+	// The recording belongs to the thread that makes it: its writes go in that
+	// thread's transaction, so a flush never tears a sibling thread's staged send,
+	// and the history event that names the recording commits with it.
+	_, thread, _ := flow.Self(ctx)
+	if thread == "" {
+		thread = flow.MainThread
+	}
+	outputs := j.txns.For(thread)
 	r := &Recorder[E]{
 		ctx:     ctx,
 		stream:  stream,
-		outputs: j.outputs,
+		outputs: outputs,
 		name:    name,
 		id:      id,
 		attempt: j.attempt,
 	}
-	r.unregister = j.outputs.register(r.Flush)
+	r.unregister = outputs.register(r.Flush)
 	return r, nil
 }
 

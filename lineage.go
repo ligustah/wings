@@ -3,6 +3,7 @@ package wings
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,40 +40,40 @@ func lineageOfJob(job jobEnvelope) (flow.Root, []string) {
 	return flow.Root{Function: job.Func, Input: job.Payload}, []string{threadOf(job)}
 }
 
-// hydrateLineage puts a lineage job's ancestors' histories on the worker about
-// to run it, in the attempt's history stream, unless that stream is already
+// hydrateLineage puts a lineage job's ancestors' histories on the worker about to
+// run it, each ancestor thread in its own history stream (so replay reads each
+// thread from its own stream, as flow's RunLineage does), unless they are already
 // there.
 func (c *Cluster) hydrateLineage(ctx context.Context, w *workerConn, job jobEnvelope) error {
 	if len(job.Lineage) < 2 {
 		return nil
 	}
-	dest := historyName(job.ID, job.Attempt)
-	ok, err := w.client.StreamExists(ctx, dest)
+	run := runOf(job)
+	ancestors := job.Lineage[:len(job.Lineage)-1]
+	// Idempotency: the ancestors' streams commit together in one transaction, so any
+	// one being present means the whole set is.
+	first := historyName(job.ID, job.Attempt, ancestors[0])
+	ok, err := w.client.StreamExists(ctx, first)
 	if err != nil {
 		return fmt.Errorf("wings: look for the history of job %s on worker %s: %w", job.ID, w.id, err)
 	}
 	if ok {
 		return nil
 	}
-	var events []*protos.Event
-	run := runOf(job)
-	for i, id := range job.Lineage[:len(job.Lineage)-1] {
+
+	byThread := make(map[string][]*protos.Event, len(ancestors))
+	for i, id := range ancestors {
 		evs, err := c.historyReaching(ctx, run, id, job.Lineage[i+1])
 		if err != nil {
 			return err
 		}
-		events = append(events, evs...)
+		byThread[id] = evs
 	}
-	if err := ensureStream(ctx, w.client, dest); err != nil {
-		return err
-	}
-	st, err := eventStream[*protos.Event](w.client, dest)
-	if err != nil {
-		return err
-	}
-	// In a transaction: the coordinator builds the attempt's history from the
-	// worker's transactions (pull.go), so records written outside one are lost.
-	producer, err := w.client.Producer(ctx, "wings.lineage."+dest)
+
+	// In one transaction across the ancestors' streams: the coordinator builds the
+	// attempt's history from the worker's transactions (pull.go), so records written
+	// outside one are lost.
+	producer, err := w.client.Producer(ctx, "wings.lineage."+streamPart(job.ID)+"."+strconv.Itoa(job.Attempt))
 	if err != nil {
 		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
 	}
@@ -80,9 +81,21 @@ func (c *Cluster) hydrateLineage(ctx context.Context, w *workerConn, job jobEnve
 	if err != nil {
 		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
 	}
-	if _, err := dsclient.Output(tx, st).Append(ctx, events); err != nil {
-		_ = tx.Abort(ctx)
-		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
+	for id, evs := range byThread {
+		name := historyName(job.ID, job.Attempt, id)
+		if err := ensureStream(ctx, w.client, name); err != nil {
+			_ = tx.Abort(ctx)
+			return err
+		}
+		st, err := eventStream[*protos.Event](w.client, name)
+		if err != nil {
+			_ = tx.Abort(ctx)
+			return err
+		}
+		if _, err := dsclient.Output(tx, st).Append(ctx, evs); err != nil {
+			_ = tx.Abort(ctx)
+			return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
@@ -153,13 +166,23 @@ func (c *Cluster) threadHistory(ctx context.Context, run, thread string) ([]*pro
 		// A thread the coordinator ran itself keeps its history in the store.
 		return flow.NewStore(client).Events(ctx, run, thread)
 	}
-	name, err := c.lastHistory(ctx, jobID, -1)
+	attempt, ok, err := c.lastAttempt(ctx, jobID, -1)
 	if err != nil {
 		return nil, err
 	}
-	if name == "" {
-		// The job's history was dropped once its thread was joined; fall back to
-		// the store.
+	if !ok {
+		// No history home for the job; fall back to the store (the coordinator may
+		// have run the thread itself).
+		return flow.NewStore(client).Events(ctx, run, thread)
+	}
+	name := historyName(jobID, attempt, thread)
+	exists, err := client.StreamExists(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("wings: look for history %s: %w", name, err)
+	}
+	if !exists {
+		// The thread's stream was dropped once it was joined, or it ran in-process on
+		// the coordinator; fall back to the store.
 		return flow.NewStore(client).Events(ctx, run, thread)
 	}
 	st, err := eventStream[*protos.Event](client, name)
@@ -177,9 +200,7 @@ func (c *Cluster) threadHistory(ctx context.Context, run, thread string) ([]*pro
 			return events, nil
 		}
 		for _, r := range recs {
-			if r.Record.GetThreadId() == thread {
-				events = append(events, r.Record)
-			}
+			events = append(events, r.Record)
 			from = r.Offset + 1
 		}
 	}

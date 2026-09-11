@@ -148,13 +148,15 @@ type progressOf struct {
 	n       *workerNode
 	job     string
 	attempt int
-	outputs *attemptOutputs
+	txns    *attemptTxns
 }
 
-// Heartbeat commits what the attempt has written before reporting progress, so a
-// checkpoint never claims more than a retry can be handed.
+// Heartbeat commits what every thread of the attempt has written before
+// reporting progress, so a checkpoint never claims more than a retry can be
+// handed — a thread's progress is never reported ahead of another thread's
+// durable writes.
 func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
-	if err := p.outputs.commit(ctx); err != nil {
+	if err := p.txns.commitAll(ctx); err != nil {
 		return err
 	}
 	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
@@ -412,11 +414,11 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 
 	// Progress and the last attempt's checkpoint, installed for every job since
 	// Heartbeat is always allowed and the checkpoint is what makes a redispatch cheap.
-	outputs := newAttemptOutputs(n, job)
-	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, outputs}, flow.Resume{
+	txns := newAttemptTxns(n, job)
+	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, txns}, flow.Resume{
 		Attempt: job.Attempt, Checkpoint: job.Checkpoint,
 	})
-	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, outputs: outputs}
+	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, txns: txns}
 	ctx = withJob(ctx, state)
 	// The fleet's parallelism, so a thread fanning out here sizes to the fleet;
 	// absent from an older coordinator or a bare call, flow falls back to this process.
@@ -448,7 +450,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// dispatch: whether and where to retry is the coordinator's call. A thread of
 	// run code is reached by replaying its ancestors (lineage.go).
 	runOpts := []flow.RunOption{
-		flow.WithStore(&historyStore{a: outputs, name: historyName(job.ID, job.Attempt)}),
+		flow.WithStore(&historyStore{txns: txns, job: job.ID, attempt: job.Attempt}),
 		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
 		flow.Once(),
 	}
@@ -461,7 +463,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	}
 	// Commit what the attempt wrote before its answer leaves; a failed commit is
 	// the attempt failing.
-	if cerr := outputs.finish(ctx); cerr != nil && err == nil {
+	if cerr := txns.finishAll(ctx); cerr != nil && err == nil {
 		err = cerr
 	}
 	if err != nil {

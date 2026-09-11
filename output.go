@@ -307,19 +307,31 @@ func (c *Cluster) hydrateHistory(ctx context.Context, w *workerConn, job jobEnve
 	if err != nil {
 		return err
 	}
-	source, err := c.lastHistory(ctx, job.ID, job.Attempt)
-	if err != nil || source == "" {
+	attempt, ok, err := c.lastAttempt(ctx, job.ID, job.Attempt)
+	if err != nil || !ok {
 		return err
 	}
-	dest := historyName(job.ID, job.Attempt)
-	return w.client.RunMirror(ctx, "wings.hydrate."+dest, dsclient.MirrorSpec{
-		From:             client,
-		Source:           source,
-		Dest:             dest,
-		Create:           true,
-		StopWhenCaughtUp: true,
-		Batch:            recordBatch,
-	})
+	sources, err := historyStreams(ctx, client, job.ID, attempt)
+	if err != nil {
+		return err
+	}
+	// Each thread's history is its own stream; copy every one, keeping its thread
+	// (the Name component) under the new attempt so the retry replays each thread.
+	for _, source := range sources {
+		o, _ := parseOutput(source)
+		dest := outputName{Prefix: historyPrefix, Job: o.Job, Attempt: job.Attempt, Name: o.Name}.String()
+		if err := w.client.RunMirror(ctx, "wings.hydrate."+dest, dsclient.MirrorSpec{
+			From:             client,
+			Source:           source,
+			Dest:             dest,
+			Create:           true,
+			StopWhenCaughtUp: true,
+			Batch:            recordBatch,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // hydrateChannels copies the canonical streams a moved job receives from onto the
@@ -375,70 +387,95 @@ func (c *Cluster) hydrateChannels(ctx context.Context, w *workerConn, job jobEnv
 
 // receivedChannels are the ids of the shared channels a job's last history shows
 // it received from, each canonical stream named the way its receives name it.
+// Every thread's history is scanned, since any thread of the run may have received.
 func (c *Cluster) receivedChannels(ctx context.Context, client *dsclient.Client, job jobEnvelope) ([]string, error) {
-	source, err := c.lastHistory(ctx, job.ID, job.Attempt)
-	if err != nil || source == "" {
+	attempt, ok, err := c.lastAttempt(ctx, job.ID, job.Attempt)
+	if err != nil || !ok {
 		return nil, err
 	}
-	st, err := eventStream[*protos.Event](client, source)
+	sources, err := historyStreams(ctx, client, job.ID, attempt)
 	if err != nil {
 		return nil, err
 	}
 	seen := map[string]bool{}
 	var ids []string
-	for from := int64(0); ; {
-		recs, err := st.Read(ctx, from, recordBatch)
+	for _, source := range sources {
+		st, err := eventStream[*protos.Event](client, source)
 		if err != nil {
-			return nil, fmt.Errorf("wings: read history %s to find its channels: %w", source, err)
+			return nil, err
 		}
-		if len(recs) == 0 {
-			return ids, nil
-		}
-		for _, r := range recs {
-			from = r.Offset + 1
-			rv := r.Record.GetChannelRecv()
-			if rv == nil || rv.GetChannel() == "" {
-				continue
+		for from := int64(0); ; {
+			recs, err := st.Read(ctx, from, recordBatch)
+			if err != nil {
+				return nil, fmt.Errorf("wings: read history %s to find its channels: %w", source, err)
 			}
-			// A channel received from another run is recorded by its full id; one this
-			// run created is recorded by its local name, qualified here as its
-			// canonical stream is.
-			id := rv.GetChannel()
-			if !strings.Contains(id, "/") {
-				id = job.Run + "/" + id
+			if len(recs) == 0 {
+				break
 			}
-			if !seen[id] {
-				seen[id] = true
-				ids = append(ids, id)
+			for _, r := range recs {
+				from = r.Offset + 1
+				rv := r.Record.GetChannelRecv()
+				if rv == nil || rv.GetChannel() == "" {
+					continue
+				}
+				// A channel received from another run is recorded by its full id; one this
+				// run created is recorded by its local name, qualified here as its
+				// canonical stream is.
+				id := rv.GetChannel()
+				if !strings.Contains(id, "/") {
+					id = job.Run + "/" + id
+				}
+				if !seen[id] {
+					seen[id] = true
+					ids = append(ids, id)
+				}
 			}
 		}
 	}
+	return ids, nil
 }
 
-// lastHistory is the coordinator's copy of a job's last history from an attempt
-
-// lastHistory is the coordinator's copy of a job's last history from an attempt
-// before the one given (any attempt when before is negative), or "".
-func (c *Cluster) lastHistory(ctx context.Context, job string, before int) (string, error) {
+// lastAttempt is the highest attempt of job with any history on the coordinator,
+// before the one given (any attempt when before is negative); ok is false when
+// the job has none home yet.
+func (c *Cluster) lastAttempt(ctx context.Context, job string, before int) (int, bool, error) {
 	client, err := c.sharedClient()
 	if err != nil {
-		return "", err
+		return 0, false, err
 	}
 	names, err := client.ListStreams(ctx)
 	if err != nil {
-		return "", fmt.Errorf("wings: look for the history of job %s: %w", job, err)
+		return 0, false, fmt.Errorf("wings: look for the history of job %s: %w", job, err)
 	}
-	source, last := "", -1
+	last, found := -1, false
 	for _, name := range names {
 		o, ok := parseOutput(name)
 		if !ok || o.Prefix != historyPrefix || o.Job != streamPart(job) || (before >= 0 && o.Attempt >= before) {
 			continue
 		}
 		if o.Attempt > last {
-			source, last = name, o.Attempt
+			last, found = o.Attempt, true
 		}
 	}
-	return source, nil
+	return last, found, nil
+}
+
+// historyStreams are the names of every thread's history stream for one attempt
+// of a job, on the coordinator.
+func historyStreams(ctx context.Context, client *dsclient.Client, job string, attempt int) ([]string, error) {
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("wings: look for the history of job %s: %w", job, err)
+	}
+	var out []string
+	for _, name := range names {
+		o, ok := parseOutput(name)
+		if !ok || o.Prefix != historyPrefix || o.Job != streamPart(job) || o.Attempt != attempt {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out, nil
 }
 
 // drainOutputs waits, bounded and best-effort, for the coordinator's copies of
