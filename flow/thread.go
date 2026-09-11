@@ -514,6 +514,28 @@ func (t *threadState) commit(ctx context.Context) error {
 	return c.Commit(context.WithoutCancel(ctx))
 }
 
+// commitBoundary flushes the sink as the thread is about to wait, so a sink that
+// coalesces commits does not strand a value a parked producer left unsent (see
+// [BoundaryCommitter]). A no-op for a sink that commits eagerly. Best-effort like
+// [threadState.commit]: any failure is sticky in the sink and surfaces on the
+// thread's next write.
+func (t *threadState) commitBoundary(ctx context.Context) error {
+	t.run.mu.Lock()
+	sink, serr, over := t.sink, t.sinkErr, t.run.over
+	t.run.mu.Unlock()
+	if serr != nil {
+		return serr
+	}
+	if sink == nil || over {
+		return nil
+	}
+	c, ok := sink.(BoundaryCommitter)
+	if !ok {
+		return nil
+	}
+	return c.CommitBoundary(context.WithoutCancel(ctx))
+}
+
 // nextChild names the next thread this one forks, from the fork counter rather
 // than start order, so a replay re-adopts the child a previous attempt created.
 func (t *threadState) nextChild() string {

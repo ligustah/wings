@@ -40,7 +40,15 @@ func (t *threadState) park(ctx context.Context, on string) func(ctx context.Cont
 }
 
 func (t *threadState) parkOn(ctx context.Context, on, channel string, seq uint64) func(ctx context.Context) error {
-	if t.run.parker == nil || t.readonly {
+	if t.readonly {
+		return noResume
+	}
+	// Flush before waiting, so a coalescing sink makes this thread's writes durable
+	// and visible to whoever it is about to wait on (see [BoundaryCommitter]). This
+	// is independent of the parker, which only accounts a waiting thread's
+	// concurrency: a run with no parker (the coordinator's own) still flushes here.
+	_ = t.commitBoundary(ctx)
+	if t.run.parker == nil {
 		return noResume
 	}
 	resume := t.run.parker.Park(ctx, Wait{Run: t.run.name, Thread: t.id, On: on, Channel: channel, Seq: seq})

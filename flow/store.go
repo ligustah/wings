@@ -27,6 +27,15 @@ type Committer interface {
 	Commit(ctx context.Context) error
 }
 
+// BoundaryCommitter is an optional [Sink] capability called as a thread is about
+// to wait: a sink that coalesces commits still has to make a parked thread's
+// writes durable and visible here, or a value a parked producer left unsent would
+// never reach the receiver waiting for it. A sink that commits eagerly need not
+// implement it.
+type BoundaryCommitter interface {
+	CommitBoundary(ctx context.Context) error
+}
+
 // EventAt pairs an event with its offset on a thread's stream, so a value
 // dropped when the history was loaded can be read back by offset later.
 type EventAt struct {

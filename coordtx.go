@@ -247,19 +247,31 @@ func (s *coordSink) Append(ctx context.Context, ev *protos.Event) error {
 		}
 		s.stream = st
 	}
-	// Stage the event, then commit unless commitInterval is holding the transaction
-	// open to coalesce plain history writes. A channel send's own commit follows at
-	// once through [coordSink.Commit] (flow calls it right after recording the send),
-	// so a staged value still goes home with the event that justifies it regardless
-	// of coalescing (see [clusterChannels.Link]); only history the thread does not
-	// immediately commit waits, and a coordinator restart replays it.
+	// Stage the event, then commit unless a CommitInterval is holding the transaction
+	// open to coalesce writes. What must be durable at once — a channel send's value,
+	// or a thread's writes as it blocks — is flushed by [coordSink.Commit] and
+	// [coordSink.CommitBoundary]; between those, work in flight coalesces and a
+	// coordinator restart replays whatever the last commit did not cover.
 	if err := s.out.stageEvent(ctx, s.stream, ev); err != nil {
 		return err
 	}
 	return s.out.commitIfDue(ctx)
 }
 
-// Commit implements [flow.Committer]: it commits a consume report this thread
-// staged after recording its receive, so the report commits with or after the
-// receive that justified it.
-func (s *coordSink) Commit(ctx context.Context) error { return s.out.commit(ctx) }
+// Commit implements [flow.Committer]: it commits a channel send's event with the
+// value it staged, or a consume report with the receive that justified it. Under
+// a CommitInterval it coalesces, committing only once the transaction has aged
+// past the interval; a parked thread's [coordSink.CommitBoundary] flushes what is
+// left open so nothing waits on it forever.
+func (s *coordSink) Commit(ctx context.Context) error { return s.out.commitIfDue(ctx) }
+
+// CommitBoundary implements [flow.BoundaryCommitter]: it force-commits as the
+// thread waits, so a value coalesced under a CommitInterval reaches whoever the
+// thread is about to wait on. Without an interval the sink commits eagerly, so
+// there is nothing held open.
+func (s *coordSink) CommitBoundary(ctx context.Context) error {
+	if s.out.commitInterval <= 0 {
+		return nil
+	}
+	return s.out.commit(ctx)
+}
