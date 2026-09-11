@@ -41,7 +41,7 @@ type countingLink struct {
 	host *countingHost
 }
 
-func (l *countingLink) Send(ctx context.Context, it flow.ChannelItem) error {
+func (l *countingLink) Send(ctx context.Context, sender string, it flow.ChannelItem) error {
 	if !it.Consumed && !it.Closed {
 		l.host.mu.Lock()
 		if l.host.sends == nil {
@@ -50,7 +50,7 @@ func (l *countingLink) Send(ctx context.Context, it flow.ChannelItem) error {
 		l.host.sends[it.Seq]++
 		l.host.mu.Unlock()
 	}
-	return l.ChannelLink.Send(ctx, it)
+	return l.ChannelLink.Send(ctx, sender, it)
 }
 
 // lostAttempt is a placer that runs a function thread from its own history,

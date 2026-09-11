@@ -75,5 +75,6 @@ func Deliver[T any](ctx context.Context, host ChannelHost, run, name string, v T
 	defer link.Close()
 	// A fresh id per delivery, so two signals are two items rather than one the
 	// host dedupes.
-	return link.Send(ctx, ChannelItem{From: "signal/" + uuid.New().String(), Data: data})
+	from := "signal/" + uuid.New().String()
+	return link.Send(ctx, from, ChannelItem{From: from, Data: data})
 }

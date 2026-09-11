@@ -36,8 +36,13 @@ type ChannelItem struct {
 
 // ChannelLink is one run's connection to a shared channel.
 type ChannelLink interface {
-	// Send hands the host one record this run made: a value, a close, or a consume report.
-	Send(ctx context.Context, item ChannelItem) error
+	// Send hands the host one record a thread made: a value, a close, or a consume
+	// report. sender is the qualified id ("<run>/<thread>") of the thread that made
+	// it, so a host that commits each thread's output in that thread's own
+	// transaction knows whose it is — a close carries no sender of its own and a
+	// consume report's From names the value consumed, not the reporter. Empty when
+	// no thread owns it (a signal).
+	Send(ctx context.Context, sender string, item ChannelItem) error
 	// Items delivers the channel's record from the beginning in the host's order,
 	// calling yield for each, returning when yield returns false or ctx ends.
 	Items(ctx context.Context, yield func(ChannelItem) bool) error
@@ -107,7 +112,7 @@ func (r *runState) linkContext() context.Context {
 // host now — except on a replay, where the host was told the first time and what
 // this thread thinks is untaken may be a value another thread has not yet
 // replayed taking.
-func (r *runState) export(ctx context.Context, name string, replay bool) (string, error) {
+func (r *runState) export(ctx context.Context, name string, replay bool, sender string) (string, error) {
 	id := r.channelID(name)
 	cs := r.channel(name)
 	if cs == nil {
@@ -146,12 +151,12 @@ func (r *runState) export(ctx context.Context, name string, replay bool) (string
 
 	if !replay {
 		for _, it := range items {
-			if err := link.Send(ctx, ChannelItem{From: it.from, Seq: it.seq, Data: it.data}); err != nil {
+			if err := link.Send(ctx, it.from, ChannelItem{From: it.from, Seq: it.seq, Data: it.data}); err != nil {
 				return "", fmt.Errorf("flow: share channel %s: %w", name, err)
 			}
 		}
 		if closed {
-			if err := link.Send(ctx, ChannelItem{Closed: true}); err != nil {
+			if err := link.Send(ctx, sender, ChannelItem{Closed: true}); err != nil {
 				return "", fmt.Errorf("flow: share channel %s: %w", name, err)
 			}
 		}
@@ -311,7 +316,7 @@ type memChannel struct {
 
 type memLink struct{ ch *memChannel }
 
-func (l *memLink) Send(_ context.Context, it ChannelItem) error {
+func (l *memLink) Send(_ context.Context, _ string, it ChannelItem) error {
 	ch := l.ch
 	ch.mu.Lock()
 	defer ch.mu.Unlock()

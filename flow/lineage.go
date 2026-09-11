@@ -345,7 +345,7 @@ func Share(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 	for _, name := range names {
-		if _, err := r.export(ctx, name, t.peek() != nil); err != nil {
+		if _, err := r.export(ctx, name, t.peek() != nil, t.qualified()); err != nil {
 			return err
 		}
 	}

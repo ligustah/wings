@@ -92,7 +92,7 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	if t.run.fragment {
 		// Fragment run: any thread of it may use this, so link now; a replay's
 		// live run already announced what was on it.
-		if _, err := t.run.export(ctx, name, true); err != nil {
+		if _, err := t.run.export(ctx, name, true, t.qualified()); err != nil {
 			// A channel that cannot be shared is unusable here; report on first
 			// use, where an error can be returned.
 			t.run.mu.Lock()
@@ -135,9 +135,13 @@ func (c *Channel[T]) share(mode handleMode) ([]byte, error) {
 	defer c.mu.Unlock()
 	id, capacity := c.id, c.capacity
 	if c.run != nil {
-		_, replay := c.run.encodingThread()
+		et, replay := c.run.encodingThread()
+		sender := ""
+		if et != nil {
+			sender = et.qualified()
+		}
 		var err error
-		if id, err = c.run.export(context.Background(), c.name, replay); err != nil {
+		if id, err = c.run.export(context.Background(), c.name, replay, sender); err != nil {
 			return nil, err
 		}
 		if cs := c.run.channel(c.name); cs != nil {
@@ -340,7 +344,7 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	// Report the take and commit it with the receive, so the consume report is
 	// never home without the receive that justified it (pull.go). A replay does not
 	// report again — the original report came home with the receive it replays.
-	if reported, err := cs.reportConsumed(ctx, item); err != nil {
+	if reported, err := cs.reportConsumed(ctx, t.qualified(), item); err != nil {
 		return zero, false, err
 	} else if reported {
 		if err := t.commit(ctx); err != nil {
@@ -393,7 +397,7 @@ func (c *Channel[T]) Close(ctx Context) error {
 		cs.shut()
 		return t.err()
 	}
-	if err := cs.announceClose(ctx); err != nil {
+	if err := cs.announceClose(ctx, t.qualified()); err != nil {
 		if ctx.Err() != nil {
 			err = t.interrupt("close", err)
 		}
@@ -594,7 +598,7 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	cs.mu.Unlock()
 
 	if link != nil && announce {
-		if err := link.Send(ctx, ChannelItem{From: from, Seq: seq, Data: data}); err != nil {
+		if err := link.Send(ctx, from, ChannelItem{From: from, Seq: seq, Data: data}); err != nil {
 			return nil, fmt.Errorf("flow: send on a shared channel: %w", err)
 		}
 	}
@@ -712,7 +716,7 @@ func (cs *chanState) free(from string, seq uint64) {
 // sender counting room by its own mirror may free the place. Reports nothing on
 // an unbounded channel — no sender waits on room — or a local one. Returns whether
 // it reported, so the caller commits the report with the receive that justified it.
-func (cs *chanState) reportConsumed(ctx context.Context, item *chanItem) (bool, error) {
+func (cs *chanState) reportConsumed(ctx context.Context, sender string, item *chanItem) (bool, error) {
 	cs.mu.Lock()
 	link, report := cs.link, cs.capacity >= 0
 	from, seq := item.from, item.seq
@@ -720,21 +724,22 @@ func (cs *chanState) reportConsumed(ctx context.Context, item *chanItem) (bool, 
 	if link == nil || !report {
 		return false, nil
 	}
-	if err := link.Send(ctx, ChannelItem{Consumed: true, From: from, Seq: seq}); err != nil {
+	if err := link.Send(ctx, sender, ChannelItem{Consumed: true, From: from, Seq: seq}); err != nil {
 		return false, fmt.Errorf("flow: receive on a shared channel: %w", err)
 	}
 	return true, nil
 }
 
-// announceClose tells the host the channel is closed, if it is shared.
-func (cs *chanState) announceClose(ctx context.Context) error {
+// announceClose tells the host the channel is closed, if it is shared. sender is
+// the closing thread, since a close carries no sender of its own.
+func (cs *chanState) announceClose(ctx context.Context, sender string) error {
 	cs.mu.Lock()
 	link := cs.link
 	cs.mu.Unlock()
 	if link == nil {
 		return nil
 	}
-	if err := link.Send(ctx, ChannelItem{Closed: true}); err != nil {
+	if err := link.Send(ctx, sender, ChannelItem{Closed: true}); err != nil {
 		return fmt.Errorf("flow: close a shared channel: %w", err)
 	}
 	return nil

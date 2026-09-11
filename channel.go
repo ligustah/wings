@@ -796,7 +796,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 	}
 	h.c.pokeRelay()
 
-	send := func(ctx context.Context, it flow.ChannelItem) error {
+	send := func(ctx context.Context, _ string, it flow.ChannelItem) error {
 		_, err := outbox.Append(ctx, []flow.ChannelItem{it})
 		return err
 	}
@@ -811,7 +811,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 		if err != nil {
 			return nil, err
 		}
-		send = func(ctx context.Context, it flow.ChannelItem) error {
+		send = func(ctx context.Context, sender string, it flow.ChannelItem) error {
 			// A close is idempotent and a consume report is never resent, so neither
 			// can produce a harmful duplicate: stage it with the event it is paired
 			// with. Only a value needs holding, since a replay of a torn send would
@@ -819,7 +819,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 			if it.Closed || it.Consumed {
 				return outputs.stage(ctx, outbox, it)
 			}
-			outputs.buffer(it.From, outbox, it)
+			outputs.buffer(sender, outbox, it)
 			return nil
 		}
 	}
@@ -867,14 +867,14 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 		// send or receive that wrote it, never letting a sibling thread's commit tear
 		// the record from its event. The whole outbox is transactional, so it is
 		// pulled, not mirrored.
-		send: func(ctx context.Context, it flow.ChannelItem) error {
+		send: func(ctx context.Context, sender string, it flow.ChannelItem) error {
 			// A close (idempotent) and a consume report (never resent) need no
 			// torn-pair protection, so they ride the attempt's transaction with the
 			// event they pair with; only a value is held (see [attemptOutputs.buffer]).
 			if it.Closed || it.Consumed {
 				return h.job.outputs.append(ctx, outbox, []flow.ChannelItem{it})
 			}
-			h.job.outputs.buffer(it.From, outbox, it)
+			h.job.outputs.buffer(sender, outbox, it)
 			return nil
 		},
 		client: h.n.client,
@@ -968,12 +968,14 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 // channelLink is a run's connection to one shared channel: sends go to the run's
 // outbox, items come from the canonical stream.
 type channelLink struct {
-	send   func(context.Context, flow.ChannelItem) error
+	send   func(ctx context.Context, sender string, it flow.ChannelItem) error
 	client *dsclient.Client
 	in     string
 }
 
-func (l *channelLink) Send(ctx context.Context, it flow.ChannelItem) error { return l.send(ctx, it) }
+func (l *channelLink) Send(ctx context.Context, sender string, it flow.ChannelItem) error {
+	return l.send(ctx, sender, it)
+}
 
 func (l *channelLink) Items(ctx context.Context, yield func(flow.ChannelItem) bool) error {
 	// The canonical stream appears when the relay has something for it, or the
