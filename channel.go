@@ -301,7 +301,19 @@ func (c *Cluster) runChannelRelay() {
 		if err == nil {
 			for _, name := range names {
 				o, ok := parseOutput(name)
-				if !ok || c.wasDropped(name) {
+				if !ok {
+					continue
+				}
+				if c.wasDropped(name) {
+					// A retired channel's value or consume stream is dropped for good;
+					// a pull whose destination was chosen before the drop can re-create
+					// it once, so drop the reappearance rather than leak it. Other
+					// dropped streams (an outbox mid-drop) are left for their own path.
+					if o.Prefix == chanvalPrefix || o.Prefix == chanconsPrefix {
+						if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
+							c.log.Warn("wings: could not re-drop a reclaimed channel stream", "stream", name, "err", err)
+						}
+					}
 					continue
 				}
 				switch o.Prefix {
@@ -833,16 +845,28 @@ func (c *Cluster) retireCanonicals(canonicals []string) {
 	}
 }
 
-// dropCanonical deletes one canonical stream and forgets the relay's state for
-// it. Called when the channel's activity has finished and its last outbox is gone.
+// dropCanonical deletes a retired channel's streams — its canonical stream and
+// the value and consume streams that hold its data — and forgets the relay's
+// state for it. Called when the channel's activity has finished and its last
+// outbox is gone, so no run will read it again and every send is home.
+//
+// The value and consume streams are pulled home, so a pull whose destination was
+// chosen before the drop can re-create one once; they are marked dropped for good
+// (unlike the coordinator-only canonical, which is unmarked once gone) so the pull
+// copies no more to them (pulledStream declines a dropped name) and the relay's
+// reaper re-drops a reappearance.
 func (c *Cluster) dropCanonical(canonical string) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return
 	}
-	c.markDropped([]string{canonical})
-	if err := dropStream(context.WithoutCancel(c.ctx), client, canonical); err != nil {
-		c.log.Warn("wings: could not drop a finished run's channel stream", "stream", canonical, "err", err)
+	suffix := strings.TrimPrefix(canonical, chanPrefix)
+	values, consumes := chanvalPrefix+suffix, chanconsPrefix+suffix
+	c.markDropped([]string{canonical, values, consumes})
+	for _, name := range []string{canonical, values, consumes} {
+		if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
+			c.log.Warn("wings: could not drop a finished run's channel stream", "stream", name, "err", err)
+		}
 	}
 	c.unmarkDropped([]string{canonical})
 	r := c.relay

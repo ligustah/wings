@@ -84,28 +84,27 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 
 	// All channel streams go once the run completes: every outbox (the two forked
 	// jobs' by the per-job settle path, the workflow's own export outbox by
-	// forgetRun) and then each canonical stream, once its last feeding outbox is
-	// gone. A completed run will not resume, so nothing reads them again.
+	// forgetRun) and then each channel's data streams — canonical, value and
+	// consume — once its last feeding outbox is gone. A completed run will not
+	// resume, so nothing reads them again.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		names, err := client.ListStreams(t.Context())
 		if err != nil {
 			t.Fatalf("list streams: %v", err)
 		}
-		outboxes, canonical := 0, 0
+		outboxes := 0
 		for _, n := range names {
 			if o, ok := parseOutput(n); ok && o.Prefix == chanoutPrefix {
 				outboxes++
 			}
-			if strings.HasPrefix(n, chanPrefix) {
-				canonical++
-			}
 		}
-		if outboxes == 0 && canonical == 0 {
+		data := channelDataStreams(t, c)
+		if outboxes == 0 && data == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("after the run completed, %d outboxes and %d canonical channel streams remain; not all reclaimed", outboxes, canonical)
+			t.Fatalf("after the run completed, %d outboxes and %d channel data streams remain; not all reclaimed", outboxes, data)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -215,11 +214,6 @@ func TestAnActivitysChannelIsReclaimedWhenItReturns(t *testing.T) {
 
 	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4})
 
-	client, err := c.sharedClient()
-	if err != nil {
-		t.Fatalf("shared client: %v", err)
-	}
-
 	var got int
 	done := make(chan error, 1)
 	go func() {
@@ -235,26 +229,12 @@ func TestAnActivitysChannelIsReclaimedWhenItReturns(t *testing.T) {
 		})
 	}()
 
-	canonicals := func() int {
-		names, err := client.ListStreams(t.Context())
-		if err != nil {
-			t.Fatalf("list streams: %v", err)
-		}
-		n := 0
-		for _, s := range names {
-			if strings.HasPrefix(s, chanPrefix) {
-				n++
-			}
-		}
-		return n
-	}
-
-	// fanSum's channel stream should be reclaimed while the run is still held open
+	// fanSum's channel streams should be reclaimed while the run is still held open
 	// on heldOpen — proof the reclamation is per-activity, not only per-run.
 	deadline := time.Now().Add(30 * time.Second)
 	reclaimed := false
 	for time.Now().Before(deadline) {
-		if canonicals() == 0 {
+		if channelDataStreams(t, c) == 0 {
 			reclaimed = true
 			break
 		}
@@ -290,11 +270,6 @@ func TestAnInProcessCallsChannelIsReclaimedWhenItReturns(t *testing.T) {
 
 	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4})
 
-	client, err := c.sharedClient()
-	if err != nil {
-		t.Fatalf("shared client: %v", err)
-	}
-
 	var got int
 	done := make(chan error, 1)
 	go func() {
@@ -310,24 +285,10 @@ func TestAnInProcessCallsChannelIsReclaimedWhenItReturns(t *testing.T) {
 		})
 	}()
 
-	canonicals := func() int {
-		names, err := client.ListStreams(t.Context())
-		if err != nil {
-			t.Fatalf("list streams: %v", err)
-		}
-		n := 0
-		for _, s := range names {
-			if strings.HasPrefix(s, chanPrefix) {
-				n++
-			}
-		}
-		return n
-	}
-
 	deadline := time.Now().Add(30 * time.Second)
 	reclaimed := false
 	for time.Now().Before(deadline) {
-		if canonicals() == 0 {
+		if channelDataStreams(t, c) == 0 {
 			reclaimed = true
 			break
 		}
@@ -405,7 +366,7 @@ func TestACallersReceiveChannelIsReclaimedWhenTheCallReturns(t *testing.T) {
 		t.Helper()
 		end := time.Now().Add(deadline)
 		for time.Now().Before(end) {
-			if (streamsWithPrefix(t, c, chanPrefix) > 0) == want {
+			if (channelDataStreams(t, c) > 0) == want {
 				return
 			}
 			select {
@@ -445,6 +406,18 @@ func streamsWithPrefix(t *testing.T, c *Cluster, prefix string) int {
 		}
 	}
 	return n
+}
+
+// channelDataStreams counts a channel's durable streams still on shared storage:
+// the canonical stream plus the value and consume streams that hold its data. A
+// reclaimed channel leaves none of the three, so this is what a reclaim test waits
+// to reach zero. The prefixes are distinct — "wings.chan." does not match
+// "wings.chanval."/"wings.chancons." — so the three counts do not overlap.
+func channelDataStreams(t *testing.T, c *Cluster) int {
+	t.Helper()
+	return streamsWithPrefix(t, c, chanPrefix) +
+		streamsWithPrefix(t, c, chanvalPrefix) +
+		streamsWithPrefix(t, c, chanconsPrefix)
 }
 
 // THE POINT: RetainChannelData keeps a returned activity's channel data — the
@@ -492,27 +465,14 @@ func TestAWorkerCreatedChannelStreamIsReclaimed(t *testing.T) {
 		t.Fatalf("fanSum returned %d, want 15", got)
 	}
 
-	client, err := c.sharedClient()
-	if err != nil {
-		t.Fatalf("shared client: %v", err)
-	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		names, err := client.ListStreams(t.Context())
-		if err != nil {
-			t.Fatalf("list streams: %v", err)
-		}
-		canonical := 0
-		for _, n := range names {
-			if strings.HasPrefix(n, chanPrefix) {
-				canonical++
-			}
-		}
-		if canonical == 0 {
+		data := channelDataStreams(t, c)
+		if data == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d canonical channel streams remain after the run completed; the worker-created channel was not reclaimed", canonical)
+			t.Fatalf("%d channel data streams remain after the run completed; the worker-created channel was not reclaimed", data)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
