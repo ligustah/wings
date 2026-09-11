@@ -96,9 +96,10 @@ type Cluster struct {
 	// ancestor's history to replay through. In memory only.
 	ranAs  map[string]string
 	closed bool
-	// coordOut is the transactional producer of each coordinator run in flight, so
-	// its history and its shared-channel outbox writes commit together. One per run,
-	// dropped when the run finishes (see coordOutputsFor, finishRun).
+	// coordOut is the transactional producer of each coordinator thread in flight,
+	// keyed by "<run>/<thread>", so its history and the shared-channel outboxes it
+	// writes commit together. Dropped when the run finishes (see coordOutputsFor,
+	// finishRun).
 	coordOut map[string]*coordOutputs
 
 	// epoch identifies this coordinator run and is part of every name it mints,
@@ -911,10 +912,11 @@ func (c *Cluster) forget(p *pendingJob) {
 	}
 }
 
-// coordOutputsFor returns the transactional producer for a coordinator run,
-// creating it on first use. Shared by the run's history sink and its shared-channel
-// links so their writes commit in one transaction.
-func (c *Cluster) coordOutputsFor(run string) (*coordOutputs, error) {
+// coordOutputsFor returns the transactional producer for a coordinator thread,
+// keyed by its qualified "<run>/<thread>" id and created on first use. The
+// thread's history sink and the shared-channel links it writes through share it,
+// so their writes commit in one transaction.
+func (c *Cluster) coordOutputsFor(id string) (*coordOutputs, error) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return nil, err
@@ -924,33 +926,39 @@ func (c *Cluster) coordOutputsFor(run string) (*coordOutputs, error) {
 	if c.coordOut == nil {
 		c.coordOut = map[string]*coordOutputs{}
 	}
-	a := c.coordOut[run]
+	a := c.coordOut[id]
 	if a == nil {
-		a = newCoordOutputs(client, run)
-		c.coordOut[run] = a
+		a = newCoordOutputs(client, id)
+		c.coordOut[id] = a
 	}
 	return a, nil
 }
 
-// finishRun closes out a coordinator run's transaction: a run that completed
-// commits its tail, one that stopped abandons it, and either way the producer is
-// dropped. Called on every exit from a run so a long-lived coordinator does not
-// accumulate producers.
+// finishRun closes out a coordinator run's transactions, one per thread: a run
+// that completed commits each tail, one that stopped abandons them, and either way
+// the producers are dropped. Called on every exit from a run so a long-lived
+// coordinator does not accumulate producers. A thread's producer is keyed under
+// "<run>/<thread>", so the run's are those with the "<run>/" prefix.
 func (c *Cluster) finishRun(ctx context.Context, run string, ok bool) {
+	prefix := run + "/"
 	c.mu.Lock()
-	a := c.coordOut[run]
-	delete(c.coordOut, run)
-	c.mu.Unlock()
-	if a == nil {
-		return
-	}
-	if ok {
-		if err := a.finish(ctx); err != nil {
-			c.log.Warn("wings: commit a finished run's history", "run", run, "err", err)
+	var outs []*coordOutputs
+	for id, a := range c.coordOut {
+		if strings.HasPrefix(id, prefix) {
+			outs = append(outs, a)
+			delete(c.coordOut, id)
 		}
-		return
 	}
-	a.abandon(ctx)
+	c.mu.Unlock()
+	for _, a := range outs {
+		if ok {
+			if err := a.finish(ctx); err != nil {
+				c.log.Warn("wings: commit a finished run's history", "run", run, "err", err)
+			}
+			continue
+		}
+		a.abandon(ctx)
+	}
 }
 
 // forgetRun releases the in-memory lineage index for a run that has finished for

@@ -19,7 +19,8 @@ import (
 // written as part of the attempt's transaction, so a send's record comes home
 // with the history that produced it, together, under the transaction pull
 // (pull.go); a send's record and its event commit atomically and isolated from
-// the run's other threads (see [coordOutputs.buffer], [attemptOutputs.buffer]),
+// the run's other threads (the coordinator gives each thread its own producer,
+// [coordOutputs.stage]; a worker buffers each thread's records, [attemptOutputs.buffer]),
 // so a value reaches an outbox exactly once and a replay never resends it. The
 // coordinator's relay merges every outbox into one canonical stream,
 // wings.chan.<channel>, admitting each record once and advancing the outbox's read
@@ -43,10 +44,10 @@ func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
 // pendingSend is a shared-channel record a sending thread has announced but whose
 // event is not yet recorded. It is held by the sending thread's qualified id and
-// staged into the run's transaction only by that thread's own next committed event
-// (see [coordOutputs.stageEvent], [attemptOutputs.appendEvent]), so a sibling
-// thread's commit cannot flush a send's record ahead of the event that justifies
-// it — a tear a replay would resend, which is why the host deduped sends before.
+// staged into the attempt's transaction only by that thread's own next committed
+// event (see [attemptOutputs.appendEvent]), so a sibling thread's commit cannot
+// flush a send's record ahead of the event that justifies it — a tear a replay
+// would resend, which is why the host deduped sends before.
 type pendingSend struct {
 	stream *dsclient.Stream[flow.ChannelItem]
 	item   flow.ChannelItem
@@ -68,7 +69,7 @@ func outboxFor(run string, attempt int, id string) string {
 // position advances in the same commit as the records it yielded — a durable,
 // restart-idempotent merge cursor), and the counts a holder waits on, folded from
 // what is on the canonical. Per-thread transactional sends (see
-// [coordOutputs.buffer], [attemptOutputs.buffer]) mean a value reaches an outbox
+// [coordOutputs.stage], [attemptOutputs.buffer]) mean a value reaches an outbox
 // exactly once and a replay never resends it, so the merge admits every record
 // rather than deduping — history is the record, which is why there is no ledger.
 type relayChannel struct {
@@ -801,26 +802,17 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 		return err
 	}
 	if run != flow.SignalSender {
-		// A run's own send is buffered by the sending thread and goes home with the
-		// event that justifies it, in one commit (see [coordOutputs.buffer],
-		// [coordOutputs.stageEvent], flow.Committer) — never torn from its event by a
-		// sibling thread's commit, a tear a replay would resend. A signal
-		// (SignalSender) owns no run and so no transaction, and is written straight
-		// through.
-		outputs, err := h.c.coordOutputsFor(run)
-		if err != nil {
-			return nil, err
-		}
+		// A record goes into the writing thread's own transaction (sender names it),
+		// so it commits with the event that justifies it and no sibling thread's
+		// commit can tear the two apart (see [coordOutputs.stage], flow.Committer). A
+		// signal (SignalSender) owns no thread and so no transaction, and is written
+		// straight through.
 		send = func(ctx context.Context, sender string, it flow.ChannelItem) error {
-			// A close is idempotent and a consume report is never resent, so neither
-			// can produce a harmful duplicate: stage it with the event it is paired
-			// with. Only a value needs holding, since a replay of a torn send would
-			// resend it (see [coordOutputs.buffer], [coordOutputs.stage]).
-			if it.Closed || it.Consumed {
-				return outputs.stage(ctx, outbox, it)
+			outputs, err := h.c.coordOutputsFor(sender)
+			if err != nil {
+				return err
 			}
-			outputs.buffer(sender, outbox, it)
-			return nil
+			return outputs.stage(ctx, outbox, it)
 		}
 	}
 	return &channelLink{
