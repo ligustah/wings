@@ -258,6 +258,9 @@ func (r *runState) closeLinks() {
 func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 	_ = link.Items(ctx, func(it ChannelItem) bool {
 		switch {
+		case it.Link:
+			// Only announces an outbox exists (a reader marking a consume stream); it
+			// carries no value and never joins the channel's record.
 		case it.Closed:
 			cs.shut()
 		case it.Consumed:

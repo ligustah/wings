@@ -56,6 +56,22 @@ func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 func chanValues(id string) string   { return chanvalPrefix + streamPart(id) }
 func chanConsumes(id string) string { return chanconsPrefix + streamPart(id) }
 
+// linkStreams names the streams a link's pump follows for its role: a reader
+// reads the value stream (values and closes), a writer the consume stream (the
+// consume reports that free its bounded buffer), a channel kept whole both. A
+// writer that read the value stream would only re-see its own values and never
+// learn what the reader took, so its buffer would never free.
+func linkStreams(id string, mode flow.LinkMode) []string {
+	switch mode {
+	case flow.LinkRead:
+		return []string{chanValues(id)}
+	case flow.LinkWrite:
+		return []string{chanConsumes(id)}
+	default:
+		return []string{chanValues(id), chanConsumes(id)}
+	}
+}
+
 // lazyStream opens a channel stream on first use, so a Link that may never send
 // pays nothing and adds no latency to the path that shares it (which a fork
 // waits on) — the stream is made when the first record is sent, off that path.
@@ -517,7 +533,7 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 // clusterChannels is the [flow.ChannelHost] for runs on the coordinator.
 type clusterChannels struct{ c *Cluster }
 
-func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMode) (flow.ChannelLink, error) {
+func (h clusterChannels) Link(ctx context.Context, run, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
 	client, err := h.c.sharedClient()
 	if err != nil {
 		return nil, err
@@ -560,7 +576,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMo
 	return &channelLink{
 		send:   send,
 		client: client,
-		in:     chanValues(id),
+		in:     linkStreams(id, mode),
 	}, nil
 }
 
@@ -628,7 +644,7 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 			return nil
 		},
 		client: h.n.client,
-		in:     chanValues(id),
+		in:     linkStreams(id, mode),
 	}, nil
 }
 
@@ -716,11 +732,13 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 }
 
 // channelLink is a run's connection to one shared channel: sends go to the
-// channel's value or consume stream, items come from its value stream (in).
+// channel's value or consume stream, and items come from the streams in names —
+// a reader follows the value stream, a writer the consume stream (for the
+// consume reports that free its buffer), a channel kept whole both.
 type channelLink struct {
 	send   func(ctx context.Context, sender string, it flow.ChannelItem) error
 	client *dsclient.Client
-	in     string
+	in     []string
 }
 
 func (l *channelLink) Send(ctx context.Context, sender string, it flow.ChannelItem) error {
@@ -728,20 +746,54 @@ func (l *channelLink) Send(ctx context.Context, sender string, it flow.ChannelIt
 }
 
 func (l *channelLink) Items(ctx context.Context, yield func(flow.ChannelItem) bool) error {
-	// The value stream appears once the writer first sends, or the push reaches
-	// this worker; until then, look again.
+	if len(l.in) == 1 {
+		return l.follow(ctx, l.in[0], yield)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var mu sync.Mutex
+	// The streams are independent, so their follows run concurrently; serialise the
+	// yields into the one pump, and end every follow once one asks to stop.
+	shared := func(it flow.ChannelItem) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if ctx.Err() != nil {
+			return false
+		}
+		if !yield(it) {
+			cancel()
+			return false
+		}
+		return true
+	}
+	var wg sync.WaitGroup
+	for _, name := range l.in {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = l.follow(ctx, name, shared)
+		}()
+	}
+	wg.Wait()
+	return ctx.Err()
+}
+
+// follow delivers one stream's records to yield in order, from the start. The
+// stream appears once the writer first sends, or the push reaches this worker;
+// until then, look again.
+func (l *channelLink) follow(ctx context.Context, name string, yield func(flow.ChannelItem) bool) error {
 	var st *dsclient.Stream[flow.ChannelItem]
 	var from int64
 	for ctx.Err() == nil {
 		if st == nil {
-			ok, err := l.client.StreamExists(ctx, l.in)
+			ok, err := l.client.StreamExists(ctx, name)
 			if err != nil || !ok {
 				if err := pause(ctx, 200*time.Millisecond); err != nil {
 					return err
 				}
 				continue
 			}
-			if st, err = eventStream[flow.ChannelItem](l.client, l.in); err != nil {
+			if st, err = eventStream[flow.ChannelItem](l.client, name); err != nil {
 				return err
 			}
 		}

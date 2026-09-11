@@ -48,6 +48,43 @@ var counts = flow.Define(func(ctx flow.Context, in writeFeed) (int, error) {
 	return in.Count, in.Values.Close(ctx)
 }, flow.WithName("test.counts"))
 
+// THE POINT: a bounded channel whose sender is the coordinator — the channel's
+// host — frees its buffer as the reader consumes, so the sender keeps going well
+// past the capacity rather than deadlocking. The reader's consume reports reach
+// the host's own buffer accounting over the consume stream (see linkStreams);
+// were the host's link to follow the value stream instead, it would only re-see
+// its own values, never free a place, and the second send would block forever.
+func TestACoordinatorSenderOnABoundedChannelFreesAsTheReaderConsumes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	const n = 20
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1})
+
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int](flow.WithCapacity(1))
+		consumer := ctx.Go(sums, feed{Values: r})
+		for i := 1; i <= n; i++ {
+			if err := w.Send(ctx, i); err != nil {
+				return err
+			}
+		}
+		if err := w.Close(ctx); err != nil {
+			return err
+		}
+		var err error
+		got, err = consumer.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if want := n * (n + 1) / 2; got != want {
+		t.Fatalf("the consumer summed %d, want %d", got, want)
+	}
+}
+
 // THE POINT: a finished run's channel data is reclaimed. A forked activity's
 // channels go as it returns, and once the run completes — so it will never resume
 // and replay receives from them — whatever is left goes too, rather than being
