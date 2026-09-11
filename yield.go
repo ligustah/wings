@@ -114,22 +114,23 @@ func (c *Cluster) yieldSettled(p *pendingJob, y *yieldEnvelope) bool {
 	if rc == nil {
 		return false
 	}
-	return settledOn(rc.ledger, y.Wait, y.Seq, p.consumeBase)
+	return settledOn(rc, y.Wait, y.Seq, p.consumeBase)
 }
 
-// settledOn reports whether a channel wait can proceed from the host's record: a
+// settledOn reports whether a channel wait can proceed from the relay's counts: a
 // receive once a value has arrived at its sequence (a single reader takes values
 // in arrival order) or the channel closed; a send once a consume has freed room
 // beyond what the sender had already seen when it parked, or the channel closed.
-func settledOn(a *flow.Ledger, wait string, seq, consumeBase uint64) bool {
-	if a.Closed() {
+func settledOn(rc *relayChannel, wait string, seq, consumeBase uint64) bool {
+	closed, values, consumed := rc.counts()
+	if closed {
 		return true
 	}
 	switch wait {
 	case flow.WaitRecv:
-		return a.Values() > seq
+		return values > seq
 	case flow.WaitSend:
-		return a.Consumed() > consumeBase
+		return consumed > consumeBase
 	}
 	return false
 }
@@ -171,7 +172,7 @@ func (c *Cluster) wakeOnChannel(id string) {
 		if p.yield == nil || p.yield.Channel == "" || chanStreamFor(p.yield.Channel) != canonical {
 			continue
 		}
-		if settledOn(rc.ledger, p.yield.Wait, p.yield.Seq, p.consumeBase) {
+		if settledOn(rc, p.yield.Wait, p.yield.Seq, p.consumeBase) {
 			due = append(due, p)
 		}
 	}

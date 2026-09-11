@@ -18,10 +18,14 @@ import (
 // Each run has an outbox per channel — wings.chanout.<job>.<attempt>.<channel> —
 // written as part of the attempt's transaction, so a send's record comes home
 // with the history that produced it, together, under the transaction pull
-// (pull.go); each record is named by sender and sequence, so a duplicate is
-// dropped. The coordinator's relay merges every outbox into one canonical stream,
-// wings.chan.<channel>, deduped by the [flow.Ledger]. A run receives by reading
-// the canonical stream — its own on the coordinator, a pushed copy on a worker.
+// (pull.go); a send's record and its event commit atomically and isolated from
+// the run's other threads (see [coordOutputs.buffer], [attemptOutputs.buffer]),
+// so a value reaches an outbox exactly once and a replay never resends it. The
+// coordinator's relay merges every outbox into one canonical stream,
+// wings.chan.<channel>, admitting each record once and advancing the outbox's read
+// position in the same commit (a durable, restart-idempotent merge cursor), with
+// no dedup — history is the record. A run receives by reading the canonical
+// stream — its own on the coordinator, a pushed copy on a worker.
 // A run marks its outbox with a Link record when it subscribes, so even a pure
 // receiver that sends nothing leaves an outbox the relay can see; the canonical
 // stream is never dropped, so a restarted coordinator replays receives from it.
@@ -37,6 +41,17 @@ const (
 
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
+// pendingSend is a shared-channel record a sending thread has announced but whose
+// event is not yet recorded. It is held by the sending thread's qualified id and
+// staged into the run's transaction only by that thread's own next committed event
+// (see [coordOutputs.stageEvent], [attemptOutputs.appendEvent]), so a sibling
+// thread's commit cannot flush a send's record ahead of the event that justifies
+// it — a tear a replay would resend, which is why the host deduped sends before.
+type pendingSend struct {
+	stream *dsclient.Stream[flow.ChannelItem]
+	item   flow.ChannelItem
+}
+
 // pushGroup names the mirror that pushes a channel's canonical stream to one
 // worker. A moved receiver's pre-push and its live push share it, so the live
 // push resumes where the pre-push stopped rather than copying the stream twice.
@@ -48,29 +63,54 @@ func outboxFor(run string, attempt int, id string) string {
 
 // --- relay, on the coordinator ---
 
-// relayChannel is the relay's state for one channel: the canonical stream and
-// the ledger that decides what goes on it.
+// relayChannel is the relay's state for one channel: the canonical stream, a
+// producer that merges outboxes into it transactionally (so each outbox's read
+// position advances in the same commit as the records it yielded — a durable,
+// restart-idempotent merge cursor), and the counts a holder waits on, folded from
+// what is on the canonical. Per-thread transactional sends (see
+// [coordOutputs.buffer], [attemptOutputs.buffer]) mean a value reaches an outbox
+// exactly once and a replay never resends it, so the merge admits every record
+// rather than deduping — history is the record, which is why there is no ledger.
 type relayChannel struct {
-	stream *dsclient.Stream[flow.ChannelItem]
+	stream   *dsclient.Stream[flow.ChannelItem]
+	producer dsclient.Producer
 
-	mu     sync.Mutex
-	ledger *flow.Ledger
+	mu       sync.Mutex
+	nvalues  uint64
+	nconsume uint64
+	closed   bool
 }
 
-// merge puts a record through the ledger and appends it if new, returning what
-// it appended. Nothing for a duplicate.
-func (rc *relayChannel) merge(ctx context.Context, it flow.ChannelItem) ([]flow.ChannelItem, error) {
+// counts snapshots how many values have arrived, how many the reader has reported
+// consuming, and whether the channel is closed — what [settledOn] waits on.
+func (rc *relayChannel) counts() (closed bool, values, consumed uint64) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	recs := rc.ledger.Offer(it)
-	if len(recs) == 0 {
-		return nil, nil
-	}
-	if _, err := rc.stream.Append(ctx, recs); err != nil {
-		return nil, err
-	}
-	return recs, nil
+	return rc.closed, rc.nvalues, rc.nconsume
 }
+
+// countLocked folds one merged record into the channel's counts. A Link marker is
+// a subscription sign with no value and is not counted (nor put on the canonical).
+// Call with mu held.
+func (rc *relayChannel) countLocked(it flow.ChannelItem) {
+	switch {
+	case it.Link:
+	case it.Closed:
+		rc.closed = true
+	case it.Consumed:
+		rc.nconsume++
+	default:
+		rc.nvalues++
+	}
+}
+
+// mergeGroup names an outbox's durable read position on the canonical, under which
+// the merge transaction stages how far the outbox has been consumed.
+func mergeGroup(outbox string) string { return "wings.merge." + outbox }
+
+// canonProducerID names the producer the relay merges a channel's outboxes into
+// its canonical stream with.
+func canonProducerID(id string) string { return "wings.merge." + streamPart(id) }
 
 type channelRelay struct {
 	poke chan struct{}
@@ -240,7 +280,14 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 	if err != nil {
 		return nil, err
 	}
-	rc := &relayChannel{stream: st, ledger: flow.NewLedger()}
+	p, err := client.Producer(c.ctx, canonProducerID(id))
+	if err != nil {
+		return nil, fmt.Errorf("wings: open a producer for %s: %w", canonical, err)
+	}
+	rc := &relayChannel{stream: st, producer: p}
+	// Fold what a predecessor already merged onto the canonical back into the
+	// counts, so a restarted coordinator's waits read the same totals; the merge
+	// cursors (GetOffset) resume each outbox where it left off.
 	var from int64
 	for {
 		recs, err := st.Read(c.ctx, from, recordBatch)
@@ -250,12 +297,14 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 		if len(recs) == 0 {
 			break
 		}
+		rc.mu.Lock()
 		for _, rec := range recs {
 			from = rec.Offset + 1
-			rc.ledger.Restore(rec.Record)
+			rc.countLocked(rec.Record)
 		}
+		rc.mu.Unlock()
 	}
-	c.relay.consumed.Store(canonical, rc.ledger.Consumed())
+	c.relay.consumed.Store(canonical, rc.nconsume)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -307,7 +356,17 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 			c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
 			return
 		}
-		var from int64
+		// Resume where this outbox was last merged, so a restarted coordinator does
+		// not re-admit what its predecessor already put on the canonical.
+		pos, _, err := client.GetOffset(c.ctx, chanStreamFor(id), mergeGroup(name))
+		if err != nil {
+			if c.ctx.Err() != nil {
+				return
+			}
+			c.log.Warn("wings: cannot read a channel merge cursor", "channel", id, "err", err)
+			return
+		}
+		from := int64(pos)
 		for c.ctx.Err() == nil {
 			// Re-opened each pass: a handle opened before the mirror's first
 			// append binds to the empty stream and never sees later writes — a
@@ -361,7 +420,7 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 				}
 				continue
 			}
-			if from, err = c.mergeOutbox(rc, id, from, recs); err != nil {
+			if from, err = c.mergeOutbox(rc, id, name, from, recs); err != nil {
 				if c.ctx.Err() == nil {
 					c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
 				}
@@ -375,7 +434,7 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 					if err != nil || len(rest) == 0 {
 						break
 					}
-					if from, err = c.mergeOutbox(rc, id, from, rest); err != nil {
+					if from, err = c.mergeOutbox(rc, id, name, from, rest); err != nil {
 						break
 					}
 				}
@@ -386,22 +445,54 @@ func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
 	})
 }
 
-// mergeOutbox puts each of an outbox's records through the channel's ledger,
-// advancing the read position, and wakes receivers on whatever it appended.
-func (c *Cluster) mergeOutbox(rc *relayChannel, id string, from int64, recs []dsclient.OffsetRecord[flow.ChannelItem]) (int64, error) {
-	var merged []flow.ChannelItem
+// mergeOutbox appends an outbox batch to the canonical stream and advances the
+// outbox's durable read position in the same transaction — so a restart resumes
+// exactly where it committed, never re-admitting a record — then wakes receivers.
+// Link markers are a subscription sign only and are not forwarded or counted.
+func (c *Cluster) mergeOutbox(rc *relayChannel, id, outbox string, from int64, recs []dsclient.OffsetRecord[flow.ChannelItem]) (int64, error) {
+	items := make([]flow.ChannelItem, 0, len(recs))
 	for _, rec := range recs {
 		from = rec.Offset + 1
-		appended, err := rc.merge(c.ctx, rec.Record)
-		if err != nil {
-			return from, err
+		if !rec.Record.Link {
+			items = append(items, rec.Record)
 		}
-		merged = append(merged, appended...)
 	}
-	if len(merged) > 0 {
-		c.relay.consumed.Store(chanStreamFor(id), rc.ledger.Consumed())
-		c.wakeOnChannel(id)
+	if len(items) == 0 {
+		// Only subscription markers: nothing to put on the canonical, and the cursor
+		// advances durably the next time a real record is merged (a marker re-read on
+		// restart is skipped again).
+		return from, nil
 	}
+	canonical := chanStreamFor(id)
+
+	rc.mu.Lock()
+	tx, err := rc.producer.BeginTimeout(c.ctx, rc.producer.TransactionTimeout())
+	if err != nil {
+		rc.mu.Unlock()
+		return from, fmt.Errorf("wings: begin merge of %s: %w", canonical, err)
+	}
+	if _, err := dsclient.Output(tx, rc.stream).Append(c.ctx, items); err != nil {
+		_ = tx.Abort(context.WithoutCancel(c.ctx))
+		rc.mu.Unlock()
+		return from, fmt.Errorf("wings: merge into %s: %w", canonical, err)
+	}
+	if err := tx.StageOffset(c.ctx, canonical, mergeGroup(outbox), uint64(from)); err != nil {
+		_ = tx.Abort(context.WithoutCancel(c.ctx))
+		rc.mu.Unlock()
+		return from, fmt.Errorf("wings: record merge cursor of %s: %w", outbox, err)
+	}
+	if err := tx.Commit(c.ctx); err != nil {
+		rc.mu.Unlock()
+		return from, fmt.Errorf("wings: commit merge of %s: %w", canonical, err)
+	}
+	for _, it := range items {
+		rc.countLocked(it)
+	}
+	consumed := rc.nconsume
+	rc.mu.Unlock()
+
+	c.relay.consumed.Store(canonical, consumed)
+	c.wakeOnChannel(id)
 	return from, nil
 }
 
@@ -710,17 +801,26 @@ func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.Channel
 		return err
 	}
 	if run != flow.SignalSender {
-		// A run's own send goes through the run's transaction, so a send's outbox
-		// record goes home with the history that justified it (see [coordOutputs],
-		// flow.Committer) rather than as a separate durable write a crash could tear
-		// from its event. A signal (SignalSender) owns no run and so no transaction,
-		// and is written straight through.
+		// A run's own send is buffered by the sending thread and goes home with the
+		// event that justifies it, in one commit (see [coordOutputs.buffer],
+		// [coordOutputs.stageEvent], flow.Committer) — never torn from its event by a
+		// sibling thread's commit, a tear a replay would resend. A signal
+		// (SignalSender) owns no run and so no transaction, and is written straight
+		// through.
 		outputs, err := h.c.coordOutputsFor(run)
 		if err != nil {
 			return nil, err
 		}
 		send = func(ctx context.Context, it flow.ChannelItem) error {
-			return outputs.stage(ctx, outbox, []flow.ChannelItem{it})
+			// A close is idempotent and a consume report is never resent, so neither
+			// can produce a harmful duplicate: stage it with the event it is paired
+			// with. Only a value needs holding, since a replay of a torn send would
+			// resend it (see [coordOutputs.buffer], [coordOutputs.stage]).
+			if it.Closed || it.Consumed {
+				return outputs.stage(ctx, outbox, it)
+			}
+			outputs.buffer(it.From, outbox, it)
+			return nil
 		}
 	}
 	return &channelLink{
@@ -761,12 +861,21 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.Chann
 		return nil, err
 	}
 	return &channelLink{
-		// Through the attempt's transaction, so each record goes home with the
-		// history that justified it (pull.go); flow commits the transaction as part
-		// of the send or receive that wrote it. The whole outbox is transactional,
-		// so it is pulled, not mirrored.
+		// Buffered by the sending thread and staged into the attempt's transaction
+		// with the event that justifies it (pull.go, [attemptOutputs.buffer],
+		// [attemptOutputs.appendEvent]); flow commits the transaction as part of the
+		// send or receive that wrote it, never letting a sibling thread's commit tear
+		// the record from its event. The whole outbox is transactional, so it is
+		// pulled, not mirrored.
 		send: func(ctx context.Context, it flow.ChannelItem) error {
-			return h.job.outputs.append(ctx, outbox, []flow.ChannelItem{it})
+			// A close (idempotent) and a consume report (never resent) need no
+			// torn-pair protection, so they ride the attempt's transaction with the
+			// event they pair with; only a value is held (see [attemptOutputs.buffer]).
+			if it.Closed || it.Consumed {
+				return h.job.outputs.append(ctx, outbox, []flow.ChannelItem{it})
+			}
+			h.job.outputs.buffer(it.From, outbox, it)
+			return nil
 		},
 		client: h.n.client,
 		in:     chanStreamFor(id),

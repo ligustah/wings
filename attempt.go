@@ -55,6 +55,11 @@ type attemptOutputs struct {
 	// push out first.
 	flushers map[int]func() error
 	nextFl   int
+
+	// pending holds each sending thread's announced shared-channel records, by
+	// qualified thread id, until that thread's own next event stages and commits
+	// them — so a sibling thread's commit cannot flush a record ahead of its event.
+	pending map[string][]pendingSend
 }
 
 func newAttemptOutputs(n *workerNode, job jobEnvelope) *attemptOutputs {
@@ -117,6 +122,72 @@ func (a *attemptOutputs) append[T any](ctx context.Context, s *dsclient.Stream[T
 		return a.commitLocked(ctx)
 	}
 	return nil
+}
+
+// buffer holds a sending thread's shared-channel record until that thread's own
+// next event stages and commits it (see [historySink.Append], [historySink.Commit]).
+func (a *attemptOutputs) buffer(from string, s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pending == nil {
+		a.pending = map[string][]pendingSend{}
+	}
+	a.pending[from] = append(a.pending[from], pendingSend{stream: s, item: it})
+}
+
+// flushPendingLocked stages a thread's buffered records into the open transaction.
+// Call with mu held and a transaction open.
+func (a *attemptOutputs) flushPendingLocked(ctx context.Context, from string) error {
+	for _, p := range a.pending[from] {
+		if _, err := dsclient.Output(a.tx, p.stream).Append(ctx, []flow.ChannelItem{p.item}); err != nil {
+			a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
+			return a.err
+		}
+	}
+	delete(a.pending, from)
+	return nil
+}
+
+// appendEvent stages a thread's buffered shared-channel records and then its
+// events into the transaction under one lock hold, so a send's record is never
+// torn from the event that justifies it by a sibling thread's commit — a tear a
+// replay would resend, which the host deduped against before.
+func (a *attemptOutputs) appendEvent(ctx context.Context, from string, s *dsclient.Stream[*protos.Event], values []*protos.Event) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.begin(ctx); err != nil {
+		return err
+	}
+	if err := a.flushPendingLocked(ctx, from); err != nil {
+		return err
+	}
+	if _, err := dsclient.Output(a.tx, s).Append(ctx, values); err != nil {
+		a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
+		return a.err
+	}
+	if time.Since(a.opened) > a.budget/2 {
+		return a.commitLocked(ctx)
+	}
+	return nil
+}
+
+// commitPending stages a thread's buffered records — a consume report sent after
+// its receive was recorded — and commits, so the report commits with the receive
+// that justified it, never before.
+func (a *attemptOutputs) commitPending(ctx context.Context, from string) error {
+	a.mu.Lock()
+	if len(a.pending[from]) > 0 {
+		if err := a.begin(ctx); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+		if err := a.flushPendingLocked(ctx, from); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+	}
+	a.mu.Unlock()
+	return a.commit(ctx)
 }
 
 func (a *attemptOutputs) commitLocked(ctx context.Context) error {
@@ -268,8 +339,8 @@ func (h *historyStore) Read(ctx context.Context, _, thread string, offset int64,
 	return out, nil
 }
 
-func (h *historyStore) Sink(ctx context.Context, _, _ string) (flow.Sink, error) {
-	return &historySink{h: h}, nil
+func (h *historyStore) Sink(ctx context.Context, run, thread string) (flow.Sink, error) {
+	return &historySink{h: h, from: run + "/" + thread}, nil
 }
 
 // Drop is a no-op: a joined thread's events stay in the attempt's stream, which
@@ -284,6 +355,9 @@ func (h *historyStore) Drop(ctx context.Context, _, _ string) error { return nil
 // its value inline, as the function recorded it.
 type historySink struct {
 	h *historyStore
+	// from is the qualified id of this sink's thread (run/thread), by which its
+	// announced shared-channel records are held until this thread's event stages them.
+	from string
 
 	mu     sync.Mutex
 	stream *dsclient.Stream[*protos.Event]
@@ -312,12 +386,13 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 	}
 	batch := append(s.held, ev)
 	s.held = nil
-	return s.h.a.append(ctx, s.stream, batch)
+	return s.h.a.appendEvent(ctx, s.from, s.stream, batch)
 }
 
-// Commit implements [flow.Committer]: it commits the attempt's transaction so a
-// shared-channel send's event and its outbox record — both appended to this
-// attempt's producer — go home together (pull.go).
+// Commit implements [flow.Committer]: it stages this thread's buffered records (a
+// consume report sent after its receive was recorded) and commits the attempt's
+// transaction, so a shared-channel send's event and its outbox record — both
+// appended to this attempt's producer — go home together (pull.go).
 func (s *historySink) Commit(ctx context.Context) error {
-	return s.h.a.commit(ctx)
+	return s.h.a.commitPending(ctx, s.from)
 }

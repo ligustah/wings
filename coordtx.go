@@ -36,6 +36,10 @@ type coordOutputs struct {
 	// err is sticky within an attempt: after a failed commit the attempt fails
 	// rather than write a record with a hole. A retry clears it (see resetTo).
 	err error
+	// pending holds each sending thread's announced shared-channel records, by
+	// qualified thread id, until that thread's own next event stages and commits
+	// them — so a sibling thread's commit cannot flush a record ahead of its event.
+	pending map[string][]pendingSend
 }
 
 func newCoordOutputs(client *dsclient.Client, run string) *coordOutputs {
@@ -72,20 +76,86 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 	return nil
 }
 
-// stage writes values to s inside the run's open transaction without committing,
-// so a shared-channel outbox record waits there for the send event that pairs
-// with it (see [coordSink.Append]).
-func (a *coordOutputs) stage[T any](ctx context.Context, s *dsclient.Stream[T], values []T) error {
+// stage writes a shared-channel record into the run's open transaction without
+// committing, for a record that needs no torn-pair protection: a close (a
+// duplicate of which is idempotent) or a consume report (never resent on a
+// replay). It commits with the event it is paired with, under that event's
+// commit. A value is held instead (see [coordOutputs.buffer]).
+func (a *coordOutputs) stage(ctx context.Context, s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.begin(ctx); err != nil {
 		return err
 	}
-	if _, err := dsclient.Output(a.tx, s).Append(ctx, values); err != nil {
+	if _, err := dsclient.Output(a.tx, s).Append(ctx, []flow.ChannelItem{it}); err != nil {
 		a.err = fmt.Errorf("wings: write output of run %s: %w", a.run, err)
 		return a.err
 	}
 	return nil
+}
+
+// buffer holds a sending thread's shared-channel value until that thread's own
+// next event stages and commits it (see [coordSink.Append], [coordSink.Commit]).
+func (a *coordOutputs) buffer(from string, s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pending == nil {
+		a.pending = map[string][]pendingSend{}
+	}
+	a.pending[from] = append(a.pending[from], pendingSend{stream: s, item: it})
+}
+
+// flushPendingLocked stages a thread's buffered records into the open transaction.
+// Call with mu held and a transaction open.
+func (a *coordOutputs) flushPendingLocked(ctx context.Context, from string) error {
+	for _, p := range a.pending[from] {
+		if _, err := dsclient.Output(a.tx, p.stream).Append(ctx, []flow.ChannelItem{p.item}); err != nil {
+			a.err = fmt.Errorf("wings: write output of run %s: %w", a.run, err)
+			return a.err
+		}
+	}
+	delete(a.pending, from)
+	return nil
+}
+
+// stageEvent stages a thread's buffered shared-channel records and then its event
+// into the run's transaction under one lock hold, so the two never tear: no
+// sibling thread can commit between a send's record and the event that justifies
+// it, and a record is never durable without its event (which a replay would
+// otherwise resend). The caller commits.
+func (a *coordOutputs) stageEvent(ctx context.Context, from string, s *dsclient.Stream[*protos.Event], ev *protos.Event) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.begin(ctx); err != nil {
+		return err
+	}
+	if err := a.flushPendingLocked(ctx, from); err != nil {
+		return err
+	}
+	if _, err := dsclient.Output(a.tx, s).Append(ctx, []*protos.Event{ev}); err != nil {
+		a.err = fmt.Errorf("wings: write output of run %s: %w", a.run, err)
+		return a.err
+	}
+	return nil
+}
+
+// flushAndCommit stages a thread's buffered records — a consume report sent after
+// its receive was recorded — and commits, so the report commits with or after the
+// receive that justified it, never before.
+func (a *coordOutputs) flushAndCommit(ctx context.Context, from string) error {
+	a.mu.Lock()
+	if len(a.pending[from]) > 0 {
+		if err := a.begin(ctx); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+		if err := a.flushPendingLocked(ctx, from); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+	}
+	a.mu.Unlock()
+	return a.commit(ctx)
 }
 
 func (a *coordOutputs) commitLocked(ctx context.Context) error {
@@ -122,6 +192,7 @@ func (a *coordOutputs) resetTo(ctx context.Context, attempt uint64) {
 		_ = a.tx.Abort(context.WithoutCancel(ctx))
 		a.tx = nil
 	}
+	a.pending = nil
 	a.err = nil
 }
 
@@ -133,6 +204,7 @@ func (a *coordOutputs) abandon(ctx context.Context) {
 		_ = a.tx.Abort(context.WithoutCancel(ctx))
 		a.tx = nil
 	}
+	a.pending = nil
 }
 
 // finish commits what is left once the run is over, on its own bounded context.
@@ -169,6 +241,7 @@ func (s *coordStore) Sink(ctx context.Context, run, thread string) (flow.Sink, e
 		out:    out,
 		client: s.client,
 		name:   flow.ThreadStream(run, thread),
+		from:   run + "/" + thread,
 		main:   thread == flow.MainThread,
 	}, nil
 }
@@ -180,7 +253,10 @@ type coordSink struct {
 	out    *coordOutputs
 	client *dsclient.Client
 	name   string
-	main   bool
+	// from is the qualified id of this sink's thread (run/thread), by which its
+	// announced shared-channel records are held until this event stages them.
+	from string
+	main bool
 
 	mu     sync.Mutex
 	stream *dsclient.Stream[*protos.Event]
@@ -205,16 +281,17 @@ func (s *coordSink) Append(ctx context.Context, ev *protos.Event) error {
 		}
 		s.stream = st
 	}
-	// Stage the event and commit: a history event is durable at once, as it was
-	// before the coordinator kept a transaction (so a restart loses nothing), and
-	// the commit flushes any shared-channel outbox record staged just before it —
-	// a send's outbox record and its event thus commit together (see
-	// [clusterChannels.Link]).
-	if err := s.out.stage(ctx, s.stream, []*protos.Event{ev}); err != nil {
+	// Stage this thread's buffered shared-channel records with the event, then
+	// commit: a history event is durable at once, as it was before the coordinator
+	// kept a transaction (so a restart loses nothing), and a send's outbox record
+	// goes home in the same commit as the event that justifies it, never torn from
+	// it by a sibling thread (see [coordOutputs.stageEvent], [clusterChannels.Link]).
+	if err := s.out.stageEvent(ctx, s.from, s.stream, ev); err != nil {
 		return err
 	}
 	return s.out.commit(ctx)
 }
 
-// Commit implements [flow.Committer].
-func (s *coordSink) Commit(ctx context.Context) error { return s.out.commit(ctx) }
+// Commit implements [flow.Committer]: it flushes a consume report this thread sent
+// after recording its receive, then commits (see [coordOutputs.flushAndCommit]).
+func (s *coordSink) Commit(ctx context.Context) error { return s.out.flushAndCommit(ctx, s.from) }
