@@ -907,33 +907,28 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMo
 	if err != nil {
 		return nil, err
 	}
+	// The outbox carries no data now — values go to the value stream, consumes to
+	// the consume stream — but it is still created, empty, as a feeder the relay
+	// accounts for when it retires the canonical stream. The run is paired with the
+	// unmangled id only here, so record it for the run's completion to retire the
+	// channel; a coordinator run is attributed this way, not from the outbox name.
 	out := outboxFor(run, 0, id)
 	if err := ensureStream(ctx, client, out); err != nil {
 		return nil, err
 	}
-	outbox, err := eventStream[flow.ChannelItem](client, out)
-	if err != nil {
-		return nil, err
-	}
-	// The run owns this channel; record it so the run's completion can retire its
-	// canonical stream. Only here is the run paired with the unmangled id.
 	if h.c.relay != nil {
 		h.c.relay.noteRunChannel(run, chanStreamFor(id))
 	}
 	h.c.pokeRelay()
 
-	// Alongside the outbox (still merged into the canonical stream the reader reads),
-	// a send's records also go to the channel's stable value or consume stream, which
-	// the reader and backpressure move onto next.
+	// A send's records go to the channel's stable value or consume stream: the reader
+	// reads values off the value stream, backpressure folds consumes off the other.
 	valLazy, consLazy := valConsLazy(client, id)
 	send := func(ctx context.Context, _ string, it flow.ChannelItem) error {
 		// A signal owns no thread and so no transaction; it only ever sends a value,
-		// written straight through to both streams.
+		// written straight through.
 		st, err := valLazy.get(ctx)
 		if err != nil {
-			return err
-		}
-		if _, err := outbox.Append(ctx, []flow.ChannelItem{it}); err != nil {
 			return err
 		}
 		_, err = st.Append(ctx, []flow.ChannelItem{it})
@@ -954,9 +949,6 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMo
 			}
 			st, err := lazy.get(ctx)
 			if err != nil {
-				return err
-			}
-			if err := outputs.stage(ctx, outbox, it); err != nil {
 				return err
 			}
 			return outputs.stage(ctx, st, it)
@@ -996,17 +988,14 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 	if err != nil {
 		return nil, err
 	}
-	// A worker's outbox comes home inside a thread's transactions (pull.go), not by a
-	// stream copy, so an outbox that never has a record written to it — a pure
-	// creator's or receiver's — produces no transaction and the coordinator never
-	// learns it exists, and so never attributes or reclaims its channel. Write one
-	// marker through the linking thread's producer, committed now, so every outbox is
-	// pulled and the relay sees it; the relay drops the marker from the record.
-	// A send's records go to the channel's stable value or consume stream — the
-	// reader reads values off the value stream, backpressure folds consumes off the
-	// consume stream — alongside the outbox the relay still merges (for the counts
-	// backpressure reads until it moves off too). The streams open on first send,
-	// off the share path a fork waits on, so linking stays cheap.
+	// The outbox carries no data now — values go to the value stream, consumes to
+	// the consume stream — but the coordinator still learns a worker's channel only
+	// from it: its name carries the job, so a marker written through the linking
+	// thread's producer and committed now comes home by the pull (pull.go) and tells
+	// the relay which run to attribute and reclaim the channel for. A pure creator's
+	// or receiver's outbox would otherwise produce no transaction and go unseen.
+	// The value and consume streams open on first send, off the share path a fork
+	// waits on, so linking stays cheap.
 	valLazy, consLazy := valConsLazy(h.n.client, id)
 	mctx := context.WithoutCancel(ctx)
 	linker := h.job.txns.For(threadOrMain(ctx))
@@ -1034,25 +1023,21 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 		// Each record goes into the writing thread's own transaction, so it commits
 		// with the event that justifies it and no sibling thread's commit can tear the
 		// two apart (pull.go, [attemptOutputs.stage]). A value waits for its send event;
-		// a close or consume report rides the event it pairs with. The whole outbox is
+		// a close or consume report rides the event it pairs with. The stream is
 		// transactional, so it is pulled, not mirrored.
 		send: func(ctx context.Context, _ string, it flow.ChannelItem) error {
 			out := h.job.txns.For(threadOrMain(ctx))
-			extra := valLazy
+			stream := valLazy
 			if it.Consumed {
-				extra = consLazy
+				stream = consLazy
 			}
-			es, err := extra.get(ctx)
+			es, err := stream.get(ctx)
 			if err != nil {
 				return err
 			}
 			if it.Closed || it.Consumed {
-				if err := out.append(ctx, outbox, []flow.ChannelItem{it}); err != nil {
-					return err
-				}
 				return out.append(ctx, es, []flow.ChannelItem{it})
 			}
-			out.stage(outbox, it)
 			out.stage(es, it)
 			return nil
 		},
