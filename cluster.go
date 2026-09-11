@@ -919,7 +919,7 @@ func (c *Cluster) coordOutputsFor(id string) (*coordOutputs, error) {
 	}
 	a := c.coordOut[id]
 	if a == nil {
-		a = newCoordOutputs(client, id)
+		a = newCoordOutputs(client, id, c.cfg.CommitInterval)
 		c.coordOut[id] = a
 	}
 	return a, nil

@@ -137,6 +137,15 @@ type Config struct {
 	// (Zstd); set [CompressionNone] to store uncompressed. See [Compression].
 	Compression Compression
 
+	// CommitInterval coalesces the coordinator's history writes: a thread's
+	// transaction is held open and its plain history events (steps, effects,
+	// sleeps, joins) commit at most once per interval, trading fewer fsyncs for a
+	// tail of history that a coordinator crash replays rather than loses. Channel
+	// sends, closes, and backpressure reports still commit at once, so delivery is
+	// unaffected; a thread commits its tail when it ends. The zero value commits
+	// every event, so a restart loses nothing.
+	CommitInterval time.Duration
+
 	// Build controls cross-compilation of the worker binary. Used only by [Remote].
 	Build BuildConfig
 

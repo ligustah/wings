@@ -32,18 +32,24 @@ type coordOutputs struct {
 	// id is the qualified "<run>/<thread>" this producer writes for.
 	id     string
 	budget time.Duration
+	// commitInterval coalesces plain history commits: a transaction older than this
+	// commits on the next append, so events between commit at most once per interval.
+	// Zero commits every event. Channel writes commit at once regardless (coordSink).
+	commitInterval time.Duration
 
 	mu       sync.Mutex
 	producer dsclient.Producer
 	tx       dsclient.Tx
-	attempt  uint64
+	// opened is when the current transaction began, for commitInterval.
+	opened  time.Time
+	attempt uint64
 	// err is sticky within an attempt: after a failed commit the attempt fails
 	// rather than write a record with a hole. A retry clears it (see resetTo).
 	err error
 }
 
-func newCoordOutputs(client *dsclient.Client, id string) *coordOutputs {
-	return &coordOutputs{client: client, id: id}
+func newCoordOutputs(client *dsclient.Client, id string, commitInterval time.Duration) *coordOutputs {
+	return &coordOutputs{client: client, id: id, commitInterval: commitInterval}
 }
 
 func (a *coordOutputs) producerID() string { return coordPrefix + streamPart(a.id) }
@@ -73,7 +79,15 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 		return a.err
 	}
 	a.tx = tx
+	a.opened = time.Now()
 	return nil
+}
+
+// commitDue reports whether an open transaction is old enough to commit under
+// commitInterval. Call with mu held. A zero interval is always due, so every
+// event commits on its own.
+func (a *coordOutputs) commitDue() bool {
+	return a.commitInterval <= 0 || time.Since(a.opened) >= a.commitInterval
 }
 
 // stage writes a shared-channel record into the thread's open transaction without
@@ -126,6 +140,17 @@ func (a *coordOutputs) commit(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.commitLocked(ctx)
+}
+
+// commitIfDue commits only once the open transaction has aged past
+// commitInterval, so plain history events between commits coalesce into one.
+func (a *coordOutputs) commitIfDue(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.commitDue() {
+		return a.commitLocked(ctx)
+	}
+	return a.err
 }
 
 // resetTo drops a failed attempt's transaction and clears its error once a higher
@@ -222,14 +247,16 @@ func (s *coordSink) Append(ctx context.Context, ev *protos.Event) error {
 		}
 		s.stream = st
 	}
-	// Stage the event and commit: a history event is durable at once, as it was
-	// before the coordinator kept a transaction (so a restart loses nothing), and a
-	// value announced earlier in this thread's transaction goes home in the same
-	// commit as the event that justifies it (see [clusterChannels.Link]).
+	// Stage the event, then commit unless commitInterval is holding the transaction
+	// open to coalesce plain history writes. A channel send's own commit follows at
+	// once through [coordSink.Commit] (flow calls it right after recording the send),
+	// so a staged value still goes home with the event that justifies it regardless
+	// of coalescing (see [clusterChannels.Link]); only history the thread does not
+	// immediately commit waits, and a coordinator restart replays it.
 	if err := s.out.stageEvent(ctx, s.stream, ev); err != nil {
 		return err
 	}
-	return s.out.commit(ctx)
+	return s.out.commitIfDue(ctx)
 }
 
 // Commit implements [flow.Committer]: it commits a consume report this thread
