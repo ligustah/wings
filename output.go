@@ -206,14 +206,15 @@ func (c *Cluster) startOutputMirror() error {
 		Create:   true,
 		Discover: outputDiscover,
 		Select: func(cand dsclient.MirrorCandidate) (dsclient.MirrorTarget, error) {
-			// Everything a job writes — history, recordings, and shared-channel
-			// outboxes — is written inside the attempt's transaction and comes home
-			// by the transaction pull (pull.go), so the set copies nothing. It still
-			// watches worker catalogs for one thing the pull cannot see: a pure
-			// receiver's outbox is created as its subscription but, writing no record,
-			// produces no transaction — so the canonical stream is pushed to a worker
-			// when its outbox appears here, not when a record of it is pulled.
-			if o, ok := parseOutput(cand.Stream); ok && o.Prefix == chanoutPrefix && !c.wasDropped(cand.Stream) {
+			// Everything a job writes is written inside the attempt's transaction and
+			// comes home by the transaction pull (pull.go), so the set copies nothing.
+			// It watches worker catalogs for one thing the pull cannot drive: a reader
+			// needs the writer's values pushed to its worker, and a reader — only a
+			// reader, never the writer — creates the channel's consume stream as it
+			// links. So the value stream is pushed to a worker when its consume stream
+			// appears here; pushing it to the writer's own worker, which appends those
+			// same values, would be a mirror loop.
+			if o, ok := parseOutput(cand.Stream); ok && o.Prefix == chanconsPrefix && !c.wasDropped(cand.Stream) {
 				c.subscribeChannel(cand.Source, o.Name)
 			}
 			return dsclient.MirrorTarget{}, dsclient.ErrSkipStream
@@ -369,21 +370,21 @@ func (c *Cluster) hydrateChannels(ctx context.Context, w *workerConn, job jobEnv
 		return err
 	}
 	for _, id := range ids {
-		canonical := chanStreamFor(id)
-		ok, err := client.StreamExists(ctx, canonical)
+		values := chanValues(id)
+		ok, err := client.StreamExists(ctx, values)
 		if err != nil {
-			return fmt.Errorf("wings: look for channel stream %s: %w", canonical, err)
+			return fmt.Errorf("wings: look for channel stream %s: %w", values, err)
 		}
 		if !ok {
 			continue // nothing was put on it, so nothing to replay
 		}
-		if err := ensureStream(ctx, w.client, canonical); err != nil {
+		if err := ensureStream(ctx, w.client, values); err != nil {
 			return err
 		}
 		if err := w.client.RunMirror(ctx, pushGroup(w.id, id), dsclient.MirrorSpec{
 			From:             client,
-			Source:           canonical,
-			Dest:             canonical,
+			Source:           values,
+			Dest:             values,
 			Create:           true,
 			StopWhenCaughtUp: true,
 			Batch:            recordBatch,

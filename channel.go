@@ -798,8 +798,9 @@ func (c *Cluster) dropCanonical(canonical string) {
 	r.mu.Unlock()
 }
 
-// subscribeChannel starts pushing a channel's canonical stream onto a worker
-// that uses it, once. Called by the output mirror when it finds the worker's outbox.
+// subscribeChannel starts pushing a channel's value stream onto a worker that
+// reads it, once. Called by the output mirror when it finds the worker's consume
+// stream, which only a reader creates, so the push never targets the writer.
 func (c *Cluster) subscribeChannel(workerID, id string) {
 	shared, err := c.sharedClient()
 	if err != nil {
@@ -823,15 +824,15 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 	c.mu.Unlock()
 	c.pokeRelay()
 
-	canonical := chanStreamFor(id)
+	values := chanValues(id)
 	w.wg.Go(func() {
-		if err := ensureStream(w.ctx, shared, canonical); err != nil {
+		if err := ensureStream(w.ctx, shared, values); err != nil {
 			return
 		}
 		err := w.client.RunMirror(w.ctx, pushGroup(w.id, id), dsclient.MirrorSpec{
 			From:   shared,
-			Source: canonical,
-			Dest:   canonical,
+			Source: values,
+			Dest:   values,
 			Create: true,
 			Batch:  recordBatch,
 		})
@@ -909,7 +910,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMo
 	return &channelLink{
 		send:   send,
 		client: client,
-		in:     chanStreamFor(id),
+		in:     chanValues(id),
 	}, nil
 }
 
@@ -929,7 +930,7 @@ func threadOrMain(ctx context.Context) string {
 	return flow.MainThread
 }
 
-func (h nodeChannels) Link(ctx context.Context, _ string, id string, _ flow.LinkMode) (flow.ChannelLink, error) {
+func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
 	out := outboxFor(h.job.id, h.job.attempt, id)
 	// Not the attempt's context: a half-made outbox is the next attempt's
 	// problem. Created whether or not anything is sent, since it is the subscription.
@@ -946,19 +947,34 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, _ flow.Link
 	// learns it exists, and so never attributes or reclaims its channel. Write one
 	// marker through the linking thread's producer, committed now, so every outbox is
 	// pulled and the relay sees it; the relay drops the marker from the record.
+	// A send's records go to the channel's stable value or consume stream — the
+	// reader reads values off the value stream, backpressure folds consumes off the
+	// consume stream — alongside the outbox the relay still merges (for the counts
+	// backpressure reads until it moves off too). The streams open on first send,
+	// off the share path a fork waits on, so linking stays cheap.
+	valLazy, consLazy := valConsLazy(h.n.client, id)
 	mctx := context.WithoutCancel(ctx)
 	linker := h.job.txns.For(threadOrMain(ctx))
 	if err := linker.append(mctx, outbox, []flow.ChannelItem{{Link: true}}); err != nil {
 		return nil, err
 	}
+	if mode == flow.LinkRead {
+		// A reader's values are the writer's, pushed here from the coordinator's copy
+		// of the value stream. The coordinator starts that push when a channel's
+		// consume stream appears on a worker, so creating it now — a reader does, a
+		// writer never does — announces this worker as the reader to push to, and only
+		// the reader, so the writer's own worker is never pushed its own values back.
+		cons, err := consLazy.get(mctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := linker.append(mctx, cons, []flow.ChannelItem{{Link: true}}); err != nil {
+			return nil, err
+		}
+	}
 	if err := linker.commit(mctx); err != nil {
 		return nil, err
 	}
-	// Alongside the outbox (which the relay still merges into the canonical stream the
-	// reader reads), a send's records also go to the channel's stable value or consume
-	// stream, which the reader and backpressure move onto next. Those streams are
-	// opened on first send, off the share path a fork waits on, so linking stays cheap.
-	valLazy, consLazy := valConsLazy(h.n.client, id)
 	return &channelLink{
 		// Each record goes into the writing thread's own transaction, so it commits
 		// with the event that justifies it and no sibling thread's commit can tear the
@@ -986,7 +1002,7 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, _ flow.Link
 			return nil
 		},
 		client: h.n.client,
-		in:     chanStreamFor(id),
+		in:     chanValues(id),
 	}, nil
 }
 
@@ -999,7 +1015,7 @@ func (h clusterChannels) RetireChannels(_ context.Context, run string, ids []str
 }
 
 // ChannelValues implements [flow.ChannelValueReader] for a run on the
-// coordinator, reading values off the channel's canonical stream.
+// coordinator, reading values off the channel's value stream on shared storage.
 func (h clusterChannels) ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
 	client, err := h.c.sharedClient()
 	if err != nil {
@@ -1009,28 +1025,28 @@ func (h clusterChannels) ChannelValues(ctx context.Context, id string, cursor in
 }
 
 // ChannelValues implements [flow.ChannelValueReader] for a job's run on a
-// worker, reading values off the canonical stream pushed to the worker.
+// worker, reading values off the value stream pushed to the worker.
 func (h nodeChannels) ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
 	return channelValues(ctx, h.n.client, id, cursor, n)
 }
 
-// channelValues reads the values on a channel's canonical stream at or after
-// cursor, which is a stream offset. A replay reads back a received value this
-// way rather than keeping its own copy, so the canonical stream is the one copy.
-// It returns as soon as a read yields values, so a replay is not delayed waiting
-// to fill n; it blocks only when nothing is there yet — the canonical stream is
-// pushed to a moved receiver's worker and may lag its replay, and the caller knows
-// the value it wants was received, so it is still coming — returning empty only if
-// ctx ends. n bounds how many values one read gathers ahead into the cache.
+// channelValues reads the values on a channel's value stream at or after cursor,
+// which is a stream offset. A replay reads back a received value this way rather
+// than keeping its own copy, so the value stream is the one copy. It returns as
+// soon as a read yields values, so a replay is not delayed waiting to fill n; it
+// blocks only when nothing is there yet — the value stream is pushed to a moved
+// receiver's worker and may lag its replay, and the caller knows the value it
+// wants was received, so it is still coming — returning empty only if ctx ends. n
+// bounds how many values one read gathers ahead into the cache.
 func channelValues(ctx context.Context, client *dsclient.Client, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
-	canonical := chanStreamFor(id)
+	values := chanValues(id)
 	var st *dsclient.Stream[flow.ChannelItem]
 	from := cursor
 	for {
 		if st == nil {
-			ok, err := client.StreamExists(ctx, canonical)
+			ok, err := client.StreamExists(ctx, values)
 			if err != nil {
-				return nil, fmt.Errorf("wings: look for channel stream %s: %w", canonical, err)
+				return nil, fmt.Errorf("wings: look for channel stream %s: %w", values, err)
 			}
 			if !ok {
 				if err := pause(ctx, 200*time.Millisecond); err != nil {
@@ -1038,7 +1054,7 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 				}
 				continue
 			}
-			if st, err = eventStream[flow.ChannelItem](client, canonical); err != nil {
+			if st, err = eventStream[flow.ChannelItem](client, values); err != nil {
 				return nil, err
 			}
 		}
@@ -1053,7 +1069,7 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 			if expired {
 				continue // caught up; the value is still on its way, so wait
 			}
-			return nil, fmt.Errorf("wings: read channel stream %s at %d: %w", canonical, from, err)
+			return nil, fmt.Errorf("wings: read channel stream %s at %d: %w", values, from, err)
 		}
 		var out []flow.ChannelValueAt
 		for _, rec := range recs {
