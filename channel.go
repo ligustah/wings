@@ -171,6 +171,9 @@ type channelRelay struct {
 	// first, so only one goroutine may open it. Keyed by canonical stream name.
 	creating map[string]*sync.Mutex
 	tailed   map[string]bool // outboxes being read
+	// folded names the value and consume streams whose counts the relay is folding,
+	// so each is folded once. Keyed by stream name.
+	folded map[string]bool
 	// finalJob names jobs that have settled and whose output is fully home, so
 	// their outboxes are complete: once its tail has merged the last of one into
 	// the canonical stream it drops it and stops. Keyed by streamPart(job).
@@ -206,6 +209,7 @@ func (c *Cluster) startChannelRelay() {
 		channels:   map[string]*relayChannel{},
 		creating:   map[string]*sync.Mutex{},
 		tailed:     map[string]bool{},
+		folded:     map[string]bool{},
 		finalJob:   map[string]bool{},
 		outboxJobs: map[string]bool{},
 		feeders:    map[string]int{},
@@ -297,10 +301,19 @@ func (c *Cluster) runChannelRelay() {
 		if err == nil {
 			for _, name := range names {
 				o, ok := parseOutput(name)
-				if !ok || o.Prefix != chanoutPrefix || c.wasDropped(name) {
+				if !ok || c.wasDropped(name) {
 					continue
 				}
-				c.tailOutbox(client, name, o.Name)
+				switch o.Prefix {
+				case chanoutPrefix:
+					c.tailOutbox(client, name, o.Name)
+				case chanvalPrefix, chanconsPrefix:
+					// Counts are folded straight off the value and consume streams: the
+					// writer's values and closes, the reader's consumes. o.Name is the
+					// id, streamPart-mangled, which the count key (chanStreamFor) and the
+					// stream names (chanValues/chanConsumes) reproduce idempotently.
+					c.foldChannel(client, name, o.Name, o.Prefix == chanvalPrefix)
+				}
 			}
 		} else if c.ctx.Err() != nil {
 			return
@@ -354,27 +367,11 @@ func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, e
 	if err != nil {
 		return nil, fmt.Errorf("wings: open a producer for %s: %w", canonical, err)
 	}
+	// Counts are folded from the value and consume streams (foldChannel), not from
+	// the canonical, so the relayChannel starts empty and the merge only keeps the
+	// canonical for an outbox's drain and drop on settle. The merge cursors
+	// (GetOffset) still resume each outbox where its predecessor left off.
 	rc := &relayChannel{stream: st, producer: p}
-	// Fold what a predecessor already merged onto the canonical back into the
-	// counts, so a restarted coordinator's waits read the same totals; the merge
-	// cursors (GetOffset) resume each outbox where it left off.
-	var from int64
-	for {
-		recs, err := st.Read(c.ctx, from, recordBatch)
-		if err != nil {
-			return nil, fmt.Errorf("wings: read %s: %w", canonical, err)
-		}
-		if len(recs) == 0 {
-			break
-		}
-		rc.mu.Lock()
-		for _, rec := range recs {
-			from = rec.Offset + 1
-			rc.countLocked(rec.Record)
-		}
-		rc.mu.Unlock()
-	}
-	c.relay.consumed.Store(canonical, rc.nconsume)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -555,15 +552,73 @@ func (c *Cluster) mergeOutbox(rc *relayChannel, id, outbox string, from int64, r
 		rc.mu.Unlock()
 		return from, fmt.Errorf("wings: commit merge of %s: %w", canonical, err)
 	}
-	for _, it := range items {
-		rc.countLocked(it)
-	}
-	consumed := rc.nconsume
 	rc.mu.Unlock()
-
-	c.relay.consumed.Store(canonical, consumed)
-	c.wakeOnChannel(id)
 	return from, nil
+}
+
+// foldChannel folds a channel's value or consume stream into its counts, waking
+// waiters as records arrive, once. The stream is the one durable copy — the
+// writer's values and closes, or the reader's consumes — so folding it from the
+// start gives exact counts and a restart re-folds to the same totals, since each
+// record is on it exactly once. Link markers are a subscription sign and skipped.
+func (c *Cluster) foldChannel(client *dsclient.Client, name, id string, values bool) {
+	r := c.relay
+	r.mu.Lock()
+	if r.folded[name] || c.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.folded[name] = true
+	r.mu.Unlock()
+
+	c.wg.Go(func() {
+		rc, err := c.relayFor(client, id)
+		if err != nil {
+			if c.ctx.Err() == nil {
+				c.log.Warn("wings: cannot fold a shared channel's counts", "channel", id, "err", err)
+			}
+			return
+		}
+		var from int64
+		for c.ctx.Err() == nil {
+			// Re-opened each pass, as the outbox tail is: a handle opened before the
+			// first append binds to the empty stream and never sees later writes — a
+			// moved writer's first append to the stable stream is that window.
+			st, err := eventStream[flow.ChannelItem](client, name)
+			if err != nil {
+				if c.ctx.Err() != nil || pause(c.ctx, time.Second) != nil {
+					return
+				}
+				continue
+			}
+			readCtx, cancel := context.WithTimeout(c.ctx, followPoll)
+			recs, err := st.ReadBlocking(readCtx, from, recordBatch)
+			expired := readCtx.Err() != nil
+			cancel()
+			if err != nil {
+				if c.ctx.Err() != nil {
+					return
+				}
+				if !expired && pause(c.ctx, time.Second) != nil {
+					return
+				}
+				continue
+			}
+			rc.mu.Lock()
+			for _, rec := range recs {
+				from = rec.Offset + 1
+				if !rec.Record.Link {
+					rc.countLocked(rec.Record)
+				}
+			}
+			consumed := rc.nconsume
+			rc.mu.Unlock()
+			if !values {
+				c.relay.consumed.Store(chanStreamFor(id), consumed)
+			}
+			c.wakeOnChannel(id)
+		}
+	})
 }
 
 // forgetTail drops a tail's cancel registration as it exits and releases the
