@@ -118,7 +118,11 @@ type channelRelay struct {
 
 	mu       sync.Mutex
 	channels map[string]*relayChannel // by canonical stream
-	tailed   map[string]bool          // outboxes being read
+	// creating serializes first-time setup of a canonical's relayChannel, one lock
+	// per canonical: opening the merge producer twice under the same id fences the
+	// first, so only one goroutine may open it. Keyed by canonical stream name.
+	creating map[string]*sync.Mutex
+	tailed   map[string]bool // outboxes being read
 	// finalJob names jobs that have settled and whose output is fully home, so
 	// their outboxes are complete: once its tail has merged the last of one into
 	// the canonical stream it drops it and stops. Keyed by streamPart(job).
@@ -152,6 +156,7 @@ func (c *Cluster) startChannelRelay() {
 	c.relay = &channelRelay{
 		poke:       make(chan struct{}, 1),
 		channels:   map[string]*relayChannel{},
+		creating:   map[string]*sync.Mutex{},
 		tailed:     map[string]bool{},
 		finalJob:   map[string]bool{},
 		outboxJobs: map[string]bool{},
@@ -267,6 +272,22 @@ func (c *Cluster) runChannelRelay() {
 func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, error) {
 	canonical := chanStreamFor(id)
 	r := c.relay
+	r.mu.Lock()
+	if rc, ok := r.channels[canonical]; ok {
+		r.mu.Unlock()
+		return rc, nil
+	}
+	cm := r.creating[canonical]
+	if cm == nil {
+		cm = &sync.Mutex{}
+		r.creating[canonical] = cm
+	}
+	r.mu.Unlock()
+
+	// One creator per canonical: opening the merge producer is what bumps its epoch,
+	// so two concurrent tails opening it would fence each other and stall the merge.
+	cm.Lock()
+	defer cm.Unlock()
 	r.mu.Lock()
 	if rc, ok := r.channels[canonical]; ok {
 		r.mu.Unlock()
