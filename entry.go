@@ -57,19 +57,20 @@ func CoordinatorMain(opts CoordinatorOptions) {
 	}
 
 	var (
-		target      = flag.String("target", "inprocess", "where workers run: inprocess | local | remote")
-		provider    = flag.String("provider", "", providerUsage())
-		workers     = flag.Int("workers", 0, "number of workers; 0 uses the default for the target")
-		concurrency = flag.Int("concurrency", 0, "jobs in flight per worker; 0 lets each worker decide")
-		dir         = flag.String("dir", "", "data directory; empty uses ./wings-data")
-		localShared = flag.Bool("local-shared-broker", false, "for -target local: workers share the coordinator's broker instead of each keeping its own data")
-		ui          = flag.String("ui", "", "serve a read-only inspection UI and API at this address; a bare port or :PORT or 0.0.0.0:PORT binds every interface (reachable over e.g. Tailscale), 127.0.0.1:PORT stays local; empty is off")
-		keepHistory = flag.Bool("keep-history", false, "keep forked threads' histories after they are joined, so a finished run's whole thread tree stays inspectable (coordinator-process threads only)")
-		inspect     = flag.String("inspect", "", "serve the inspection UI over an existing data directory and exit; does not run a workflow")
-		jobTimeout  = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
-		verbose     = flag.Bool("v", false, "log at debug level")
-		workflow    = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
-		input       = flag.String("input", "", "the workflow's input as JSON, or @file to read it from a file; leave off to resume a run already in -dir")
+		target         = flag.String("target", "inprocess", "where workers run: inprocess | local | remote")
+		provider       = flag.String("provider", "", providerUsage())
+		workers        = flag.Int("workers", 0, "number of workers; 0 uses the default for the target")
+		concurrency    = flag.Int("concurrency", 0, "jobs in flight per worker; 0 lets each worker decide")
+		dir            = flag.String("dir", "", "data directory; empty uses ./wings-data")
+		localShared    = flag.Bool("local-shared-broker", false, "for -target local: workers share the coordinator's broker instead of each keeping its own data")
+		ui             = flag.String("ui", "", "serve a read-only inspection UI and API at this address; a bare port or :PORT or 0.0.0.0:PORT binds every interface (reachable over e.g. Tailscale), 127.0.0.1:PORT stays local; empty is off")
+		keepHistory    = flag.Bool("keep-history", false, "keep forked threads' histories after they are joined, so a finished run's whole thread tree stays inspectable (coordinator-process threads only)")
+		inspect        = flag.String("inspect", "", "serve the inspection UI over an existing data directory and exit; does not run a workflow")
+		jobTimeout     = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
+		commitInterval = flag.Duration("commit-interval", 0, "coalesce the coordinator's history commits: hold a thread's transaction open and commit its plain history at most once per interval — fewer fsyncs for a crash-replayable tail; 0 commits every event. Channel delivery is unaffected")
+		verbose        = flag.Bool("v", false, "log at debug level")
+		workflow       = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
+		input          = flag.String("input", "", "the workflow's input as JSON, or @file to read it from a file; leave off to resume a run already in -dir")
 
 		// Autoscaling, off unless -max-workers is set.
 		maxWorkers    = flag.Int("max-workers", 0, "autoscale up to this many workers; 0 keeps the count fixed")
@@ -131,6 +132,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		UI:                listenAddr(*ui),
 		RetainHistory:     *keepHistory,
 		JobTimeout:        *jobTimeout,
+		CommitInterval:    *commitInterval,
 		Logger:            log,
 		Scaling: Scaling{
 			Min:           *minWorkers,
