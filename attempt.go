@@ -185,6 +185,29 @@ func (a *attemptOutputs) commitLocked(ctx context.Context) error {
 	return nil
 }
 
+// commitDue reports whether the open transaction is old enough to commit under
+// the worker's commitInterval. Call with mu held. A zero interval is always due,
+// so every event commits on its own.
+func (a *attemptOutputs) commitDue() bool {
+	ci := a.node.commitInterval
+	return ci <= 0 || time.Since(a.opened) >= ci
+}
+
+// commitIfDue commits only once the open transaction has aged past the worker's
+// commitInterval, so a run of channel sends between commits coalesces into one.
+// What must not wait for the interval — a value someone is blocked on, a reported
+// checkpoint — is flushed by [historySink.CommitBoundary] and [attemptTxns.commitAll].
+func (a *attemptOutputs) commitIfDue(ctx context.Context) error {
+	a.mu.Lock()
+	if !a.commitDue() {
+		err := a.err
+		a.mu.Unlock()
+		return err
+	}
+	a.mu.Unlock()
+	return a.commit(ctx)
+}
+
 // commit flushes every writer's held records and commits the open transaction.
 func (a *attemptOutputs) commit(ctx context.Context) error {
 	a.mu.Lock()
@@ -429,6 +452,20 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 // shared-channel send's event and its outbox record — both staged in this
 // thread's producer — go home together (pull.go). A consume report the thread
 // staged just before this also commits here, with the receive that justified it.
+// Under a CommitInterval it coalesces, committing only once the transaction has
+// aged past the interval; a parked thread's [historySink.CommitBoundary] flushes
+// what is left so nothing waits on it forever.
 func (s *historySink) Commit(ctx context.Context) error {
+	return s.out.commitIfDue(ctx)
+}
+
+// CommitBoundary implements [flow.BoundaryCommitter]: it force-commits as the
+// thread waits, so a value coalesced under a CommitInterval reaches whoever the
+// thread is about to wait on — the receiver of a send, a joiner. Without an
+// interval the sink commits eagerly, so there is nothing held open.
+func (s *historySink) CommitBoundary(ctx context.Context) error {
+	if s.out.node.commitInterval <= 0 {
+		return nil
+	}
 	return s.out.commit(ctx)
 }

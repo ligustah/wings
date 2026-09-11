@@ -282,6 +282,9 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 	if c.cfg.JobTimeout > 0 {
 		env[envJobTimeout] = c.cfg.JobTimeout.String()
 	}
+	if c.cfg.CommitInterval > 0 {
+		env[envCommitInterval] = c.cfg.CommitInterval.String()
+	}
 
 	c.log.Info("wings: starting worker", "machine", m.ID())
 	if err := m.Start(ctx, remoteBin, env); err != nil {

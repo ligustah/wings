@@ -361,7 +361,7 @@ func abandoned(t *testing.T, c *Cluster) []string {
 func TestTwoAttemptsOfOneJobRecordToDifferentPlaces(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 1})
 
-	n, err := newWorkerNode(t.Context(), c.shared, "attempts", 1, 0, nil)
+	n, err := newWorkerNode(t.Context(), c.shared, "attempts", 1, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("newWorkerNode: %v", err)
 	}

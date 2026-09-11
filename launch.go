@@ -30,7 +30,7 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 	var out []*workerConn
 	for range n {
 		id := c.workerID("inproc")
-		node, err := newWorkerNode(ctx, client, id, c.cfg.Concurrency, c.cfg.JobTimeout, c.log)
+		node, err := newWorkerNode(ctx, client, id, c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.CommitInterval, c.log)
 		if err != nil {
 			return nil, closePartial(ctx, out, err)
 		}
@@ -95,7 +95,7 @@ func (c *Cluster) launchLocalProcess(ctx context.Context, n int) ([]*workerConn,
 // worker — and copies nothing.
 func (c *Cluster) spawnLocalShared(ctx context.Context, exe, id, broker string) (*workerConn, error) {
 	cmd := exec.Command(exe)
-	cmd.Env = append(os.Environ(), sharedWorkerEnv(id, broker, c.cfg.Concurrency, c.cfg.JobTimeout)...)
+	cmd.Env = append(os.Environ(), sharedWorkerEnv(id, broker, c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.CommitInterval)...)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -140,7 +140,7 @@ func (c *Cluster) spawnLocalShared(ctx context.Context, exe, id, broker string) 
 
 func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerConn, error) {
 	cmd := exec.Command(exe)
-	cmd.Env = append(os.Environ(), workerEnv(id, "127.0.0.1:0", dir, c.cfg.Concurrency, c.cfg.JobTimeout)...)
+	cmd.Env = append(os.Environ(), workerEnv(id, "127.0.0.1:0", dir, c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.CommitInterval)...)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -187,7 +187,7 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 
 // workerEnv is the whole coordinator-to-worker contract, carried explicitly
 // because a worker process shares nothing with the Config that set it.
-func workerEnv(id, listen, dir string, concurrency int, jobTimeout time.Duration) []string {
+func workerEnv(id, listen, dir string, concurrency int, jobTimeout, commitInterval time.Duration) []string {
 	env := []string{
 		envMode + "=" + modeWorker,
 		envWorkerID + "=" + id,
@@ -201,12 +201,15 @@ func workerEnv(id, listen, dir string, concurrency int, jobTimeout time.Duration
 	if jobTimeout > 0 {
 		env = append(env, envJobTimeout+"="+jobTimeout.String())
 	}
+	if commitInterval > 0 {
+		env = append(env, envCommitInterval+"="+commitInterval.String())
+	}
 	return env
 }
 
 // sharedWorkerEnv is workerEnv for a worker that dials the coordinator's engine
 // at broker instead of running its own, so it is given no dir or listen address.
-func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout time.Duration) []string {
+func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout, commitInterval time.Duration) []string {
 	env := []string{
 		envMode + "=" + modeWorker,
 		envWorkerID + "=" + id,
@@ -218,6 +221,9 @@ func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout time.Duratio
 	}
 	if jobTimeout > 0 {
 		env = append(env, envJobTimeout+"="+jobTimeout.String())
+	}
+	if commitInterval > 0 {
+		env = append(env, envCommitInterval+"="+commitInterval.String())
 	}
 	return env
 }

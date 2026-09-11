@@ -97,3 +97,48 @@ func TestACommitIntervalDoesNotStallABoundedChannel(t *testing.T) {
 		t.Fatalf("the run took %v with a %v commit interval; the flush-at-park did not keep the channel flowing", took, interval)
 	}
 }
+
+// THE POINT: the CommitInterval reaches the WORKERS, the fsync path that matters
+// most — a worker runs the bulk of the jobs. A forked producer on a worker sends
+// under a long interval, so its channel sends coalesce into far fewer commits
+// rather than one fsync each; yet the values still reach the coordinator's reader,
+// flushed as the producer's thread ends (and by its heartbeats), so the reader
+// sums them all well within the interval. Were the worker sink to ignore the
+// interval it would fsync per send; were it to coalesce without flushing at the
+// boundaries, the values would never arrive.
+func TestACommitIntervalCoalescesAWorkersSendsYetDelivers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	const interval = 10 * time.Second
+	const n = 50
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1, CommitInterval: interval})
+
+	var got int
+	started := time.Now()
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int]()
+		producer := ctx.Go(counts, writeFeed{Values: w, Count: n})
+		for {
+			v, ok, err := r.Recv(ctx)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			got += v
+		}
+		_, err := producer.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if want := n * (n + 1) / 2; got != want {
+		t.Fatalf("the reader summed %d, want %d", got, want)
+	}
+	if took := time.Since(started); took > interval/2 {
+		t.Fatalf("the run took %v with a %v commit interval; the worker's boundary flush did not deliver its sends", took, interval)
+	}
+}

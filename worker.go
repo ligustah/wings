@@ -32,7 +32,10 @@ type workerNode struct {
 	id          string
 	concurrency int
 	timeout     time.Duration
-	log         *slog.Logger
+	// commitInterval coalesces each attempt's transactional commits; zero commits
+	// every event. Read from WINGS_COMMIT_INTERVAL, or set directly in process.
+	commitInterval time.Duration
+	log            *slog.Logger
 
 	// slots bounds how many threads run here at once. See slots.go.
 	slots *slots
@@ -66,7 +69,7 @@ type workerNode struct {
 }
 
 // newWorkerNode declares a worker's streams on client and returns its loop.
-func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, concurrency int, timeout time.Duration, log *slog.Logger) (*workerNode, error) {
+func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, concurrency int, timeout, commitInterval time.Duration, log *slog.Logger) (*workerNode, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -74,12 +77,13 @@ func newWorkerNode(ctx context.Context, client *dsclient.Client, id string, conc
 		concurrency = runtime.NumCPU()
 	}
 	n := &workerNode{
-		id:          id,
-		concurrency: concurrency,
-		timeout:     timeout,
-		log:         log.With("worker", id),
-		client:      client,
-		slots:       newSlots(concurrency),
+		id:             id,
+		concurrency:    concurrency,
+		timeout:        timeout,
+		commitInterval: commitInterval,
+		log:            log.With("worker", id),
+		client:         client,
+		slots:          newSlots(concurrency),
 	}
 	if err := n.declareStreams(ctx); err != nil {
 		return nil, err
@@ -592,6 +596,7 @@ func isWorkerProcess() bool { return os.Getenv(envMode) == modeWorker }
 func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	concurrency, _ := strconv.Atoi(os.Getenv(envConcurrency))
 	jobTimeout, _ := time.ParseDuration(os.Getenv(envJobTimeout))
+	commitInterval, _ := time.ParseDuration(os.Getenv(envCommitInterval))
 	if v, err := strconv.Atoi(os.Getenv(envCompression)); err == nil {
 		streamCompression = dswire.Compression(v)
 	}
@@ -608,7 +613,7 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	}
 	defer closeStore()
 
-	n, err := newWorkerNode(ctx, client, id, concurrency, jobTimeout, log)
+	n, err := newWorkerNode(ctx, client, id, concurrency, jobTimeout, commitInterval, log)
 	if err != nil {
 		return err
 	}
