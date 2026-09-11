@@ -43,6 +43,20 @@ const (
 	modeWrite handleMode = "w"
 )
 
+// complement is the role the run keeps when it shares the other side: sharing a
+// writer leaves it reading, sharing a reader leaves it writing. Sharing both (a
+// fresh local channel) leaves it both.
+func complement(mode handleMode) handleMode {
+	switch mode {
+	case modeWrite:
+		return modeRead
+	case modeRead:
+		return modeWrite
+	default:
+		return modeBoth
+	}
+}
+
 // NewChannel creates a shared channel and returns its two ends: a [Reader] to
 // receive and a [Writer] to send and close. Hand one end to another thread or
 // run and keep the other, the way [io.Pipe] splits a pipe. Without options the
@@ -92,7 +106,7 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	if t.run.fragment {
 		// Fragment run: any thread of it may use this, so link now; a replay's
 		// live run already announced what was on it.
-		if _, err := t.run.export(ctx, name, true, t.qualified()); err != nil {
+		if _, err := t.run.export(ctx, name, true, t.qualified(), modeBoth); err != nil {
 			// A channel that cannot be shared is unusable here; report on first
 			// use, where an error can be returned.
 			t.run.mu.Lock()
@@ -141,7 +155,7 @@ func (c *Channel[T]) share(mode handleMode) ([]byte, error) {
 			sender = et.qualified()
 		}
 		var err error
-		if id, err = c.run.export(context.Background(), c.name, replay, sender); err != nil {
+		if id, err = c.run.export(context.Background(), c.name, replay, sender, complement(mode)); err != nil {
 			return nil, err
 		}
 		if cs := c.run.channel(c.name); cs != nil {

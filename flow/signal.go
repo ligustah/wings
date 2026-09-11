@@ -68,7 +68,7 @@ func Deliver[T any](ctx context.Context, host ChannelHost, run, name string, v T
 	if err != nil {
 		return fmt.Errorf("flow: encode signal %q: %w", name, err)
 	}
-	link, err := host.Link(ctx, signalSender, signalID(run, name))
+	link, err := host.Link(ctx, signalSender, signalID(run, name), LinkWrite)
 	if err != nil {
 		return fmt.Errorf("flow: reach signal %q of run %s: %w", name, run, err)
 	}

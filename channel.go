@@ -777,7 +777,7 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 // clusterChannels is the [flow.ChannelHost] for runs on the coordinator.
 type clusterChannels struct{ c *Cluster }
 
-func (h clusterChannels) Link(ctx context.Context, run, id string) (flow.ChannelLink, error) {
+func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMode) (flow.ChannelLink, error) {
 	client, err := h.c.sharedClient()
 	if err != nil {
 		return nil, err
@@ -838,7 +838,7 @@ func threadOrMain(ctx context.Context) string {
 	return flow.MainThread
 }
 
-func (h nodeChannels) Link(ctx context.Context, _ string, id string) (flow.ChannelLink, error) {
+func (h nodeChannels) Link(ctx context.Context, _ string, id string, _ flow.LinkMode) (flow.ChannelLink, error) {
 	out := outboxFor(h.job.id, h.job.attempt, id)
 	// Not the attempt's context: a half-made outbox is the next attempt's
 	// problem. Created whether or not anything is sent, since it is the subscription.

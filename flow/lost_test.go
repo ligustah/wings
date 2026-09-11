@@ -22,8 +22,8 @@ type countingHost struct {
 	sends map[uint64]int // value seq → times announced
 }
 
-func (h *countingHost) Link(ctx context.Context, run, id string) (flow.ChannelLink, error) {
-	l, err := h.ChannelHost.Link(ctx, run, id)
+func (h *countingHost) Link(ctx context.Context, run, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
+	l, err := h.ChannelHost.Link(ctx, run, id, mode)
 	if err != nil {
 		return nil, err
 	}

@@ -50,12 +50,24 @@ type ChannelLink interface {
 	Close() error
 }
 
+// LinkMode is the role of a link a [ChannelHost] opens: whether the linking run
+// sends values on the channel, consumes them, or — a channel created here and
+// not handed off — both. A host that keeps a value stream and a consume stream
+// apart uses it to wire each link to the right one.
+type LinkMode string
+
+const (
+	LinkBoth  LinkMode = ""
+	LinkRead  LinkMode = "r"
+	LinkWrite LinkMode = "w"
+)
+
 // ChannelHost carries channels between runs. A run given one with
 // [WithChannelHost] can share its channels and use channels handed to it.
 type ChannelHost interface {
-	// Link connects run to the channel id ("<owning run>/<channel name>"). Called
-	// once per attempt per channel a run shares or uses.
-	Link(ctx context.Context, run, id string) (ChannelLink, error)
+	// Link connects run to the channel id ("<owning run>/<channel name>") in the
+	// given role. Called once per attempt per channel a run shares or uses.
+	Link(ctx context.Context, run, id string, mode LinkMode) (ChannelLink, error)
 }
 
 // ChannelValueReader is an optional [ChannelHost] capability: reading back the
@@ -112,7 +124,7 @@ func (r *runState) linkContext() context.Context {
 // host now — except on a replay, where the host was told the first time and what
 // this thread thinks is untaken may be a value another thread has not yet
 // replayed taking.
-func (r *runState) export(ctx context.Context, name string, replay bool, sender string) (string, error) {
+func (r *runState) export(ctx context.Context, name string, replay bool, sender string, mode handleMode) (string, error) {
 	id := r.channelID(name)
 	cs := r.channel(name)
 	if cs == nil {
@@ -127,7 +139,7 @@ func (r *runState) export(ctx context.Context, name string, replay bool, sender 
 	if r.host == nil {
 		return "", fmt.Errorf("flow: channel %s cannot leave this run: the run has no channel host", name)
 	}
-	link, err := r.host.Link(ctx, r.name, id)
+	link, err := r.host.Link(ctx, r.name, id, LinkMode(mode))
 	if err != nil {
 		return "", fmt.Errorf("flow: share channel %s: %w", name, err)
 	}
@@ -195,7 +207,7 @@ func (r *runState) attach(ctx context.Context, id string, capacity int, mode han
 	if r.host == nil {
 		return nil, fmt.Errorf("flow: channel %s belongs to another run, and this run has no channel host to reach it", id)
 	}
-	link, err := r.host.Link(ctx, r.name, id)
+	link, err := r.host.Link(ctx, r.name, id, LinkMode(mode))
 	if err != nil {
 		return nil, fmt.Errorf("flow: reach channel %s: %w", id, err)
 	}
@@ -270,7 +282,7 @@ type MemChannelHost struct {
 func NewMemChannelHost() *MemChannelHost { return &MemChannelHost{chans: map[string]*memChannel{}} }
 
 // Link implements [ChannelHost].
-func (h *MemChannelHost) Link(_ context.Context, _, id string) (ChannelLink, error) {
+func (h *MemChannelHost) Link(_ context.Context, _, id string, _ LinkMode) (ChannelLink, error) {
 	if id == "" {
 		return nil, errors.New("flow: a channel id is required")
 	}
