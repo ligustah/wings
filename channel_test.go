@@ -48,10 +48,10 @@ var counts = flow.Define(func(ctx flow.Context, in writeFeed) (int, error) {
 	return in.Count, in.Values.Close(ctx)
 }, flow.WithName("test.counts"))
 
-// THE POINT: a finished run's channel data is reclaimed. A settled job's outbox
-// is dropped once its output is home and merged; and once the run completes — so
-// it will never resume and replay receives from them — its canonical streams are
-// dropped too, rather than kept for the cluster's life.
+// THE POINT: a finished run's channel data is reclaimed. A forked activity's
+// channels go as it returns, and once the run completes — so it will never resume
+// and replay receives from them — whatever is left goes too, rather than being
+// kept for the cluster's life.
 func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")
@@ -77,34 +77,16 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 		t.Fatalf("consumer summed %d, want 15", got)
 	}
 
-	client, err := c.sharedClient()
-	if err != nil {
-		t.Fatalf("shared client: %v", err)
-	}
-
-	// All channel streams go once the run completes: every outbox (the two forked
-	// jobs' by the per-job settle path, the workflow's own export outbox by
-	// forgetRun) and then each channel's data streams — canonical, value and
-	// consume — once its last feeding outbox is gone. A completed run will not
-	// resume, so nothing reads them again.
+	// Every channel's data streams — its value and consume streams — go once the
+	// run completes: its forked activities' as each returns, whatever is left at the
+	// run's end (forgetRun). A completed run will not resume, so nothing reads them.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		names, err := client.ListStreams(t.Context())
-		if err != nil {
-			t.Fatalf("list streams: %v", err)
-		}
-		outboxes := 0
-		for _, n := range names {
-			if o, ok := parseOutput(n); ok && o.Prefix == chanoutPrefix {
-				outboxes++
-			}
-		}
-		data := channelDataStreams(t, c)
-		if outboxes == 0 && data == 0 {
+		if channelDataStreams(t, c) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("after the run completed, %d outboxes and %d channel data streams remain; not all reclaimed", outboxes, data)
+			t.Fatalf("after the run completed, %d channel data streams remain; not all reclaimed", channelDataStreams(t, c))
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -313,8 +295,8 @@ func TestAnInProcessCallsChannelIsReclaimedWhenItReturns(t *testing.T) {
 
 // recvFan forks a producer and receives on its own thread, like the trainer's
 // Train where main receives the boards' sends. Called directly, the receiver is
-// the run's own thread, so its wants go to the run's coordinator outbox
-// (chanout.<run>.0.<id>) rather than a job's.
+// the run's own thread, so the channel is the coordinator's own rather than a
+// forked job's.
 var recvFan = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
 	r, w := ctx.NewChannel[int]()
 	prod := ctx.Go(counts, writeFeed{Values: w, Count: 5})
@@ -336,9 +318,9 @@ var recvFan = flow.Define(func(ctx flow.Context, _ struct{}) (int, error) {
 }, flow.WithName("test.recvFan"))
 
 // THE POINT: a channel the caller thread itself receives on is reclaimed when the
-// call returns, not only at run end — even though the receiver's wants live in the
-// run's own coordinator outbox, which is not a job that ever settles. This is the
-// trainer's shape (main receives the boards' decisions inside a called activity).
+// call returns, not only at run end — even though it is the coordinator's own
+// channel, not a forked job's that settles. This is the trainer's shape (main
+// receives the boards' decisions inside a called activity).
 func TestACallersReceiveChannelIsReclaimedWhenTheCallReturns(t *testing.T) {
 	reclaimHold.release = make(chan struct{})
 	var once sync.Once
@@ -360,8 +342,8 @@ func TestACallersReceiveChannelIsReclaimedWhenTheCallReturns(t *testing.T) {
 		})
 	}()
 
-	// The channel must first appear — its wants live in the run's own outbox — and
-	// then be reclaimed while the run is still held open on heldOpen.
+	// The channel must first appear — its data streams come home — and then be
+	// reclaimed while the run is still held open on heldOpen.
 	waitForChannel := func(want bool, deadline time.Duration, what string) {
 		t.Helper()
 		end := time.Now().Add(deadline)
@@ -409,20 +391,17 @@ func streamsWithPrefix(t *testing.T, c *Cluster, prefix string) int {
 }
 
 // channelDataStreams counts a channel's durable streams still on shared storage:
-// the canonical stream plus the value and consume streams that hold its data. A
-// reclaimed channel leaves none of the three, so this is what a reclaim test waits
-// to reach zero. The prefixes are distinct — "wings.chan." does not match
-// "wings.chanval."/"wings.chancons." — so the three counts do not overlap.
+// the value and consume streams that hold its data. A reclaimed channel leaves
+// neither, so this is what a reclaim test waits to reach zero.
 func channelDataStreams(t *testing.T, c *Cluster) int {
 	t.Helper()
-	return streamsWithPrefix(t, c, chanPrefix) +
-		streamsWithPrefix(t, c, chanvalPrefix) +
+	return streamsWithPrefix(t, c, chanvalPrefix) +
 		streamsWithPrefix(t, c, chanconsPrefix)
 }
 
 // THE POINT: RetainChannelData keeps a returned activity's channel data — the
-// canonical stream that holds the one copy of its values — for replaying it step
-// by step while debugging, rather than dropping it when the activity returns.
+// value and consume streams that hold the one copy of its values — for replaying
+// it step by step while debugging, rather than dropping it when the activity returns.
 func TestRetainChannelDataKeepsReturnedValues(t *testing.T) {
 	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 4, RetainChannelData: true})
 
@@ -438,14 +417,14 @@ func TestRetainChannelDataKeepsReturnedValues(t *testing.T) {
 	if got != 15 {
 		t.Fatalf("fanSum returned %d, want 15", got)
 	}
-	if streamsWithPrefix(t, c, chanPrefix) == 0 {
+	if channelDataStreams(t, c) == 0 {
 		t.Fatal("RetainChannelData was set but the channel data was dropped anyway")
 	}
 }
 
 // THE POINT: a channel a worker created (not the coordinator) is attributed to
-// its run through the job that owns it, so the run's completion reclaims its
-// canonical stream the same way it does the coordinator's own channels.
+// its run by the name of its data streams, so the run's completion reclaims it the
+// same way it does the coordinator's own channels.
 func TestAWorkerCreatedChannelStreamIsReclaimed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")

@@ -885,22 +885,13 @@ func (c *Cluster) forget(p *pendingJob) {
 			c.dropOutputsOf(job, keep, writers)
 		})
 	}
-	// A job done for good will send no more on its shared channels, so its
-	// outboxes can be merged home and dropped rather than tailed for the cluster's
-	// life. Only chased for a job the relay actually tailed an outbox for.
-	if !c.closed && c.hadOutbox(streamPart(p.job.ID)) {
-		job, w := p.job.ID, p.ran[p.job.Attempt]
-		c.wg.Go(func() {
-			c.finishChannels(job, w)
-		})
-	}
 	// The activity has returned, so the channels it created hold nothing a replay
 	// needs — its result is recorded, and replay re-inserts it rather than running
 	// the activity again. Retire them mid-run, so a long run of short activities
-	// does not accumulate their channel data. Dropped as their last feeder leaves.
+	// does not accumulate their channel data.
 	if !c.closed && !c.cfg.RetainChannelData && p.origin.Run != "" && p.origin.Thread != "" {
-		job := p.job.ID
-		c.wg.Go(func() { c.retireJobChannels(job) })
+		job, origin := p.job.ID, p.origin
+		c.wg.Go(func() { c.retireJobChannels(job, origin) })
 	}
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
@@ -976,34 +967,12 @@ func (c *Cluster) forgetRun(run string) {
 			delete(c.ranAs, key)
 		}
 	}
-	// A run's own shared-channel outboxes (wings.chanout.<run>.0.<id>) are the
-	// coordinator's, not a placed job's, so the per-job settle path never
-	// finalizes them and they were tailed for the cluster's life. The run is over
-	// now — everything it sent is merged into the canonical streams — so mark them
-	// final and let the relay drop them.
-	if !c.closed && c.hadOutbox(streamPart(run)) {
-		c.wg.Go(func() { c.finishChannels(run, nil) })
-	}
-	// The run is finished for good and will not resume, so its channels' canonical
-	// streams — kept otherwise so a resume can replay receives — are now dead.
-	// Retire them once their last feeding outbox is dropped (see dropOutbox).
+	// The run is finished for good and will not resume, so its channels' value and
+	// consume streams — kept otherwise so a resume can replay receives — are now
+	// dead. Retire whatever its per-activity reclaim left (retireRunChannels).
 	if !c.closed && !c.cfg.RetainChannelData {
 		c.wg.Go(func() { c.retireRunChannels(run) })
 	}
-}
-
-// runOfJob names the run and thread a live job belongs to, for attributing a
-// worker job's shared-channel outbox: to the run whose completion retires the
-// channel, and to the thread that created it (so a settled job retires only what
-// it created, not what it merely sent on). Only a live job is resolvable; a
-// settled one has left the pending set.
-func (c *Cluster) runOfJob(job string) (run, thread string, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if p, ok := c.pending[job]; ok && p.origin.Run != "" {
-		return p.origin.Run, p.origin.Thread, true
-	}
-	return "", "", false
 }
 
 // settle publishes a job's outcome to everyone waiting on it, exactly once.

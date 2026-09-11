@@ -13,29 +13,28 @@ import (
 	"github.com/ligustah/wings/flow"
 )
 
-// A channel shared between runs on different machines is a durable stream
-// relayed through the coordinator (the flow package's ChannelHost is the seam).
-// Each run has an outbox per channel — wings.chanout.<job>.<attempt>.<channel> —
-// written as part of the attempt's transaction, so a send's record comes home
-// with the history that produced it, together, under the transaction pull
-// (pull.go); each thread has its own transactional producer ([coordOutputs],
-// [attemptOutputs]), so a send's record and its event commit atomically and
-// isolated from the run's other threads — a worker thread holds a value until its
-// event so no concurrent commit can tear the two ([attemptOutputs.stage]) — and a
-// value reaches an outbox exactly once, so a replay never resends it. The
-// coordinator's relay merges every outbox into one canonical stream,
-// wings.chan.<channel>, admitting each record once and advancing the outbox's read
-// position in the same commit (a durable, restart-idempotent merge cursor), with
-// no dedup — history is the record. A run receives by reading the canonical
-// stream — its own on the coordinator, a pushed copy on a worker.
-// A run marks its outbox with a Link record when it subscribes, so even a pure
-// receiver that sends nothing leaves an outbox the relay can see; the canonical
-// stream is never dropped, so a restarted coordinator replays receives from it.
+// A channel shared between runs on different machines is relayed through the
+// coordinator (the flow package's ChannelHost is the seam). Each channel has two
+// durable streams named by its id alone — a value stream wings.chanval.<channel>
+// carrying the writer's values and closes, and a consume stream
+// wings.chancons.<channel> carrying the reader's consume reports. A send writes to
+// one of these as part of the writing thread's transaction, so a send's record and
+// the event that justifies it commit atomically and come home together under the
+// transaction pull (pull.go); a worker thread holds a value until its event so no
+// concurrent commit can tear the two ([attemptOutputs.stage]), and a value reaches
+// the stream exactly once, so a replay never resends it. A run receives by reading
+// the value stream directly — its own copy on the coordinator, a copy pushed to it
+// on a worker (subscribeChannel); the coordinator folds the value and consume
+// streams into the counts a blocked sender or receiver waits on (foldChannel).
+// The streams are named without a job or attempt, so a writer moved to a new
+// attempt keeps appending to the same one (fencing stays on the producer id). They
+// are dropped when the channel is retired — its creating thread, job, or run has
+// finished, so no run will read it again and every send is home (retireCanonicals).
 
 const (
-	chanoutPrefix = "wings.chanout."
-	// chanPrefix is the canonical stream, pushed to workers; not an output
-	// family, so a worker's copy is not mirrored back.
+	// chanPrefix is the prefix of a channel's relay key (chanStreamFor) — the name
+	// the relay groups its bookkeeping under. No stream of that name exists; the
+	// value and consume streams hold the data.
 	chanPrefix = "wings.chan."
 	// chanvalPrefix and chanconsPrefix name a channel's value stream and consume
 	// stream: the writer's values and closes on the one, the reader's consume
@@ -52,9 +51,8 @@ const (
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
 // chanValues names a channel's value stream (the writer's values and closes);
-// chanConsumes its consume stream (the reader's consume reports). Both are
-// derivable from a channel's outbox name too, since streamPart is idempotent:
-// chanvalPrefix+o.Name equals chanValues(id) for an outbox of id.
+// chanConsumes its consume stream (the reader's consume reports). streamPart is
+// idempotent, so chanvalPrefix+o.Name equals chanValues(id) for a parsed stream.
 func chanValues(id string) string   { return chanvalPrefix + streamPart(id) }
 func chanConsumes(id string) string { return chanconsPrefix + streamPart(id) }
 
@@ -101,29 +99,20 @@ type pendingSend struct {
 	item   flow.ChannelItem
 }
 
-// pushGroup names the mirror that pushes a channel's canonical stream to one
-// worker. A moved receiver's pre-push and its live push share it, so the live
-// push resumes where the pre-push stopped rather than copying the stream twice.
+// pushGroup names the mirror that pushes a channel's value stream to one worker.
+// A moved receiver's pre-push and its live push share it, so the live push
+// resumes where the pre-push stopped rather than copying the stream twice.
 func pushGroup(workerID, id string) string { return "wings.push." + workerID + "." + streamPart(id) }
-
-func outboxFor(run string, attempt int, id string) string {
-	return outputName{Prefix: chanoutPrefix, Job: run, Attempt: attempt, Name: id}.String()
-}
 
 // --- relay, on the coordinator ---
 
-// relayChannel is the relay's state for one channel: the canonical stream, a
-// producer that merges outboxes into it transactionally (so each outbox's read
-// position advances in the same commit as the records it yielded — a durable,
-// restart-idempotent merge cursor), and the counts a holder waits on, folded from
-// what is on the canonical. Per-thread transactional sends (see
-// [coordOutputs.stage], [attemptOutputs.buffer]) mean a value reaches an outbox
-// exactly once and a replay never resends it, so the merge admits every record
-// rather than deduping — history is the record, which is why there is no ledger.
+// relayChannel is the relay's counts for one channel — how many values have
+// arrived, how many the reader has reported consuming, and whether it is closed —
+// folded straight from the channel's value and consume streams (foldChannel), the
+// one durable copy of each. A holder blocked on the channel waits on these (see
+// [settledOn]); there is nothing else to keep, since the value and consume streams
+// are the record and the reader reads the value stream directly.
 type relayChannel struct {
-	stream   *dsclient.Stream[flow.ChannelItem]
-	producer dsclient.Producer
-
 	mu       sync.Mutex
 	nvalues  uint64
 	nconsume uint64
@@ -138,9 +127,8 @@ func (rc *relayChannel) counts() (closed bool, values, consumed uint64) {
 	return rc.closed, rc.nvalues, rc.nconsume
 }
 
-// countLocked folds one merged record into the channel's counts. A Link marker is
-// a subscription sign with no value and is not counted (nor put on the canonical).
-// Call with mu held.
+// countLocked folds one record into the channel's counts. A Link marker is a
+// subscription sign with no value and is not counted. Call with mu held.
 func (rc *relayChannel) countLocked(it flow.ChannelItem) {
 	switch {
 	case it.Link:
@@ -153,53 +141,32 @@ func (rc *relayChannel) countLocked(it flow.ChannelItem) {
 	}
 }
 
-// mergeGroup names an outbox's durable read position on the canonical, under which
-// the merge transaction stages how far the outbox has been consumed.
-func mergeGroup(outbox string) string { return "wings.merge." + outbox }
-
-// canonProducerID names the producer the relay merges a channel's outboxes into
-// its canonical stream with.
-func canonProducerID(id string) string { return "wings.merge." + streamPart(id) }
-
 type channelRelay struct {
 	poke chan struct{}
 
-	mu       sync.Mutex
-	channels map[string]*relayChannel // by canonical stream
-	// creating serializes first-time setup of a canonical's relayChannel, one lock
-	// per canonical: opening the merge producer twice under the same id fences the
-	// first, so only one goroutine may open it. Keyed by canonical stream name.
-	creating map[string]*sync.Mutex
-	tailed   map[string]bool // outboxes being read
+	mu sync.Mutex
+	// channels holds each channel's counts, keyed by chanStreamFor(id) — a stable
+	// per-channel key the relay groups its bookkeeping under (no stream of that name
+	// exists; the value and consume streams hold the data). A channel appears here
+	// as its value or consume stream comes home and is folded, so the retire paths
+	// select the channels to reclaim by scanning these keys (createdByThread).
+	channels map[string]*relayChannel
 	// folded names the value and consume streams whose counts the relay is folding,
 	// so each is folded once. Keyed by stream name.
 	folded map[string]bool
-	// finalJob names jobs that have settled and whose output is fully home, so
-	// their outboxes are complete: once its tail has merged the last of one into
-	// the canonical stream it drops it and stops. Keyed by streamPart(job).
-	finalJob map[string]bool
-	// outboxJobs names jobs the relay has ever tailed an outbox for, so a settled
-	// job with no shared channel is not chased. Keyed by streamPart(job).
-	outboxJobs map[string]bool
-	// feeders counts the outboxes still feeding each canonical stream — the
-	// coordinator's own plus one per forked sender — so the canonical is dropped
-	// only when the last of them is gone. Keyed by canonical stream name.
-	feeders map[string]int
-	// canonByRun names the canonical streams of a run's channels, so the run's
-	// completion can retire whatever is left. Keyed by run name.
-	canonByRun map[string]map[string]bool
-	// canonByJob names the canonical streams a placed job created, observed as its
-	// outboxes are found, so the job's settle retires exactly them. Keyed by job.
-	canonByJob map[string]map[string]bool
-	// doneCanon names canonical streams whose owning run has completed, so the
-	// last feeder to leave drops them. Keyed by canonical stream name.
-	doneCanon map[string]bool
-	// tailStop cancels a tailed outbox's reads, so retiring its channel wakes the
-	// tail to drop it at once rather than after its next poll. Keyed by outbox name.
-	tailStop map[string]context.CancelFunc
+	// retiredJob records the origin — run and creating thread — of a forked
+	// activity whose channels have been retired, so a value or consume stream the
+	// relay discovers only after the job settled — too late to be among the folded
+	// channels when the retire ran — is still recognized as a retired channel's and
+	// dropped rather than folded and left (channelRetired). Keyed by job.
+	retiredJob map[string]flow.Origin
+	// retiredRun names runs that have finished, so a channel stream under a finished
+	// run's prefix that the relay folds only after the run's cleanup is still
+	// recognized as dead and dropped (channelRetired). Keyed by run.
+	retiredRun map[string]bool
 	// consumed is each channel's consume count, kept outside mu so a job unloading
 	// on a send can snapshot it while holding the cluster lock without the relay's.
-	// Keyed by canonical stream name, value uint64.
+	// Keyed by the channel key (chanStreamFor), value uint64.
 	consumed sync.Map
 }
 
@@ -207,74 +174,11 @@ func (c *Cluster) startChannelRelay() {
 	c.relay = &channelRelay{
 		poke:       make(chan struct{}, 1),
 		channels:   map[string]*relayChannel{},
-		creating:   map[string]*sync.Mutex{},
-		tailed:     map[string]bool{},
 		folded:     map[string]bool{},
-		finalJob:   map[string]bool{},
-		outboxJobs: map[string]bool{},
-		feeders:    map[string]int{},
-		canonByRun: map[string]map[string]bool{},
-		canonByJob: map[string]map[string]bool{},
-		doneCanon:  map[string]bool{},
-		tailStop:   map[string]context.CancelFunc{},
+		retiredJob: map[string]flow.Origin{},
+		retiredRun: map[string]bool{},
 	}
 	c.wg.Go(c.runChannelRelay)
-}
-
-// noteRunChannel records that canonical belongs to run, so the run's completion
-// can retire it. Called from the coordinator's channel host, which alone has the
-// run and the channel id unmangled.
-func (r *channelRelay) noteRunChannel(run, canonical string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	byRun := r.canonByRun[run]
-	if byRun == nil {
-		byRun = map[string]bool{}
-		r.canonByRun[run] = byRun
-	}
-	byRun[canonical] = true
-}
-
-// noteJobChannel records that canonical was created by a placed job, so the
-// job's settle retires exactly the channels it created — the same reclaim scope
-// a returned in-process call gets, keyed by what the coordinator observed rather
-// than inferred from the stream's name.
-func (r *channelRelay) noteJobChannel(job, canonical string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	byJob := r.canonByJob[job]
-	if byJob == nil {
-		byJob = map[string]bool{}
-		r.canonByJob[job] = byJob
-	}
-	byJob[canonical] = true
-}
-
-func (r *channelRelay) jobFinal(job string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.finalJob[job]
-}
-
-// canonDone reports that a channel has been retired: its owning activity or run
-// has finished, so no more will be sent on it and every outbox feeding it is
-// complete. The run's own outbox (chanout.<run>.0.<id>) settles no job, so this
-// is the only thing that ends it before the run does.
-func (r *channelRelay) canonDone(canonical string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.doneCanon[canonical]
-}
-
-// hadOutbox reports whether the relay has ever tailed an outbox for a job, so
-// only such a job's settle chases its channel outboxes.
-func (c *Cluster) hadOutbox(job string) bool {
-	if c.relay == nil {
-		return false
-	}
-	c.relay.mu.Lock()
-	defer c.relay.mu.Unlock()
-	return c.relay.outboxJobs[job]
 }
 
 func (c *Cluster) pokeRelay() {
@@ -287,8 +191,11 @@ func (c *Cluster) pokeRelay() {
 	}
 }
 
-// runChannelRelay finds outboxes on the coordinator's storage and reads each
-// into its channel's canonical stream.
+// runChannelRelay finds each channel's value and consume streams on the
+// coordinator's storage and folds them into the counts a blocked sender or
+// receiver waits on. It also reclaims: a stream whose channel has already been
+// retired (its creator gone) is dropped rather than folded — a retire before the
+// stream came home, or a pull that re-created a dropped stream once.
 func (c *Cluster) runChannelRelay() {
 	client, err := c.sharedClient()
 	if err != nil {
@@ -301,31 +208,28 @@ func (c *Cluster) runChannelRelay() {
 		if err == nil {
 			for _, name := range names {
 				o, ok := parseOutput(name)
-				if !ok {
+				if !ok || (o.Prefix != chanvalPrefix && o.Prefix != chanconsPrefix) {
 					continue
 				}
 				if c.wasDropped(name) {
-					// A retired channel's value or consume stream is dropped for good;
-					// a pull whose destination was chosen before the drop can re-create
-					// it once, so drop the reappearance rather than leak it. Other
-					// dropped streams (an outbox mid-drop) are left for their own path.
-					if o.Prefix == chanvalPrefix || o.Prefix == chanconsPrefix {
-						if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
-							c.log.Warn("wings: could not re-drop a reclaimed channel stream", "stream", name, "err", err)
-						}
+					// Retired for good, but a pull whose destination was chosen before the
+					// drop re-created it; re-drop the reappearance (it stays marked dropped,
+					// so the pull copies no more to it).
+					if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
+						c.log.Warn("wings: could not re-drop a reclaimed channel stream", "stream", name, "err", err)
 					}
 					continue
 				}
-				switch o.Prefix {
-				case chanoutPrefix:
-					c.tailOutbox(client, name, o.Name)
-				case chanvalPrefix, chanconsPrefix:
-					// Counts are folded straight off the value and consume streams: the
-					// writer's values and closes, the reader's consumes. o.Name is the
-					// id, streamPart-mangled, which the count key (chanStreamFor) and the
-					// stream names (chanValues/chanConsumes) reproduce idempotently.
-					c.foldChannel(client, name, o.Name, o.Prefix == chanvalPrefix)
+				if c.channelRetired(o.Name) {
+					// Came home only after its creating thread's retire, too late to be
+					// among the folded channels then; retire it now rather than fold and
+					// leave it (dropChannelData marks it dropped, so the pull stops).
+					c.dropChannelData(chanPrefix + o.Name)
+					continue
 				}
+				// o.Name is the id, streamPart-mangled, which the count key (chanStreamFor)
+				// and the stream names (chanValues/chanConsumes) reproduce idempotently.
+				c.foldChannel(client, name, o.Name, o.Prefix == chanvalPrefix)
 			}
 		} else if c.ctx.Err() != nil {
 			return
@@ -339,233 +243,44 @@ func (c *Cluster) runChannelRelay() {
 	}
 }
 
-// relayFor returns the relay's state for a channel, creating the canonical
-// stream and replaying what is on it so a restarted coordinator does not re-admit
-// what its predecessor already wrote.
-func (c *Cluster) relayFor(client *dsclient.Client, id string) (*relayChannel, error) {
-	canonical := chanStreamFor(id)
+// channelRetired reports whether a channel, named by its streamPart-mangled id,
+// belongs to a thread or run whose channels have been retired — so a value or
+// consume stream discovered after that retire (it came home late) is reclaimed at
+// once rather than folded and left. Checked against retired jobs (by creating
+// thread) and retired runs (by prefix).
+func (c *Cluster) channelRetired(idMangled string) bool {
 	r := c.relay
-	r.mu.Lock()
-	if rc, ok := r.channels[canonical]; ok {
-		r.mu.Unlock()
-		return rc, nil
-	}
-	cm := r.creating[canonical]
-	if cm == nil {
-		cm = &sync.Mutex{}
-		r.creating[canonical] = cm
-	}
-	r.mu.Unlock()
-
-	// One creator per canonical: opening the merge producer is what bumps its epoch,
-	// so two concurrent tails opening it would fence each other and stall the merge.
-	cm.Lock()
-	defer cm.Unlock()
-	r.mu.Lock()
-	if rc, ok := r.channels[canonical]; ok {
-		r.mu.Unlock()
-		return rc, nil
-	}
-	r.mu.Unlock()
-
-	if err := ensureStream(c.ctx, client, canonical); err != nil {
-		return nil, err
-	}
-	st, err := eventStream[flow.ChannelItem](client, canonical)
-	if err != nil {
-		return nil, err
-	}
-	p, err := client.Producer(c.ctx, canonProducerID(id))
-	if err != nil {
-		return nil, fmt.Errorf("wings: open a producer for %s: %w", canonical, err)
-	}
-	// Counts are folded from the value and consume streams (foldChannel), not from
-	// the canonical, so the relayChannel starts empty and the merge only keeps the
-	// canonical for an outbox's drain and drop on settle. The merge cursors
-	// (GetOffset) still resume each outbox where its predecessor left off.
-	rc := &relayChannel{stream: st, producer: p}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if existing, ok := r.channels[canonical]; ok {
-		return existing, nil
+	key := chanPrefix + idMangled
+	for _, origin := range r.retiredJob {
+		if createdByThread(key, origin.Run, origin.Thread) {
+			return true
+		}
 	}
-	r.channels[canonical] = rc
-	return rc, nil
+	for run := range r.retiredRun {
+		if strings.HasPrefix(key, chanPrefix+streamPart(run)+"_") {
+			return true
+		}
+	}
+	return false
 }
 
-// tailOutbox starts reading one outbox into its channel, once.
-func (c *Cluster) tailOutbox(client *dsclient.Client, name, id string) {
-	o, _ := parseOutput(name)
-	job := o.Job
-
-	r := c.relay
-	tailCtx, tailStop := context.WithCancel(c.ctx)
-	r.mu.Lock()
-	if r.tailed[name] || c.closed {
-		r.mu.Unlock()
-		tailStop()
-		return
-	}
-	r.tailed[name] = true
-	r.outboxJobs[job] = true
-	r.feeders[chanStreamFor(id)]++
-	r.tailStop[name] = tailStop
-	r.mu.Unlock()
-
-	// A worker-created channel is known to the coordinator only by this outbox;
-	// attribute its canonical stream to the job's run (so the run's end retires
-	// whatever is left) and, when this job created it rather than merely sending or
-	// receiving on it, to the job (so the job's settle retires exactly what it
-	// created). The coordinator's own channels are attributed in
-	// clusterChannels.Link instead; runOfJob names a live placed job, so it skips
-	// them. Resolved off the lock to keep c.mu after r.mu.
-	if run, thread, ok := c.runOfJob(job); ok {
-		canonical := chanStreamFor(id)
-		r.noteRunChannel(run, canonical)
-		if createdByThread(canonical, run, thread) {
-			r.noteJobChannel(job, canonical)
-		}
-	}
-
-	c.wg.Go(func() {
-		defer c.forgetTail(name, tailStop)
-		rc, err := c.relayFor(client, id)
-		if err != nil {
-			c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
-			return
-		}
-		// Resume where this outbox was last merged, so a restarted coordinator does
-		// not re-admit what its predecessor already put on the canonical.
-		pos, _, err := client.GetOffset(c.ctx, chanStreamFor(id), mergeGroup(name))
-		if err != nil {
-			if c.ctx.Err() != nil {
-				return
-			}
-			c.log.Warn("wings: cannot read a channel merge cursor", "channel", id, "err", err)
-			return
-		}
-		from := int64(pos)
-		for c.ctx.Err() == nil {
-			// Re-opened each pass: a handle opened before the mirror's first
-			// append binds to the empty stream and never sees later writes — a
-			// moved attempt's outbox is exactly that window. A fresh handle sees
-			// what is there now.
-			st, err := eventStream[flow.ChannelItem](client, name)
-			if err != nil {
-				if c.ctx.Err() != nil || c.wasDropped(name) {
-					return
-				}
-				if ok, _ := client.StreamExists(c.ctx, name); !ok {
-					return
-				}
-				if pause(c.ctx, time.Second) != nil {
-					return
-				}
-				continue
-			}
-			readCtx, cancel := context.WithTimeout(tailCtx, followPoll)
-			recs, err := st.ReadBlocking(readCtx, from, recordBatch)
-			// A wake (tailCtx ended while c.ctx lives) means the channel was retired.
-			woke := tailCtx.Err() != nil && c.ctx.Err() == nil
-			expired := readCtx.Err() != nil && !woke
-			cancel()
-			if err != nil && !woke {
-				if c.ctx.Err() != nil {
-					return
-				}
-				if expired {
-					// Caught up (nothing new before the poll timed out). Everything
-					// this outbox holds is merged into the canonical stream now, so
-					// drop it once nothing more will be written to it: the job has
-					// settled and its output is home (jobFinal), or the channel has
-					// been retired (canonDone) — the wake below is the prompt path for
-					// that, this the backstop for a tail registered after the retire.
-					// The canonical stream stays for a resume to replay from.
-					if c.relay.jobFinal(job) || c.relay.canonDone(chanStreamFor(id)) {
-						c.dropOutbox(name)
-						return
-					}
-					continue
-				}
-				if c.wasDropped(name) {
-					return
-				}
-				if ok, _ := client.StreamExists(c.ctx, name); !ok {
-					return
-				}
-				if pause(c.ctx, time.Second) != nil {
-					return
-				}
-				continue
-			}
-			if from, err = c.mergeOutbox(rc, id, name, from, recs); err != nil {
-				if c.ctx.Err() == nil {
-					c.log.Warn("wings: cannot relay a shared channel", "channel", id, "err", err)
-				}
-				return
-			}
-			if woke {
-				// Retired: drain what the outbox still holds into the canonical, so a
-				// value the run's own thread sent is not lost, then drop it.
-				for {
-					rest, err := st.Read(c.ctx, from, recordBatch)
-					if err != nil || len(rest) == 0 {
-						break
-					}
-					if from, err = c.mergeOutbox(rc, id, name, from, rest); err != nil {
-						break
-					}
-				}
-				c.dropOutbox(name)
-				return
-			}
-		}
-	})
-}
-
-// mergeOutbox appends an outbox batch to the canonical stream and advances the
-// outbox's durable read position in the same transaction — so a restart resumes
-// exactly where it committed, never re-admitting a record — then wakes receivers.
-// Link markers are a subscription sign only and are not forwarded or counted.
-func (c *Cluster) mergeOutbox(rc *relayChannel, id, outbox string, from int64, recs []dsclient.OffsetRecord[flow.ChannelItem]) (int64, error) {
-	items := make([]flow.ChannelItem, 0, len(recs))
-	for _, rec := range recs {
-		from = rec.Offset + 1
-		if !rec.Record.Link {
-			items = append(items, rec.Record)
-		}
-	}
-	if len(items) == 0 {
-		// Only subscription markers: nothing to put on the canonical, and the cursor
-		// advances durably the next time a real record is merged (a marker re-read on
-		// restart is skipped again).
-		return from, nil
-	}
+// relayFor returns the relay's counts for a channel, making an empty set on first
+// use. Counts are folded from the value and consume streams (foldChannel), so a
+// restarted coordinator re-folds to the same totals — each record is on those
+// streams exactly once — and nothing here is durable.
+func (c *Cluster) relayFor(id string) *relayChannel {
 	canonical := chanStreamFor(id)
-
-	rc.mu.Lock()
-	tx, err := rc.producer.BeginTimeout(c.ctx, rc.producer.TransactionTimeout())
-	if err != nil {
-		rc.mu.Unlock()
-		return from, fmt.Errorf("wings: begin merge of %s: %w", canonical, err)
+	r := c.relay
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rc, ok := r.channels[canonical]; ok {
+		return rc
 	}
-	if _, err := dsclient.Output(tx, rc.stream).Append(c.ctx, items); err != nil {
-		_ = tx.Abort(context.WithoutCancel(c.ctx))
-		rc.mu.Unlock()
-		return from, fmt.Errorf("wings: merge into %s: %w", canonical, err)
-	}
-	if err := tx.StageOffset(c.ctx, canonical, mergeGroup(outbox), uint64(from)); err != nil {
-		_ = tx.Abort(context.WithoutCancel(c.ctx))
-		rc.mu.Unlock()
-		return from, fmt.Errorf("wings: record merge cursor of %s: %w", outbox, err)
-	}
-	if err := tx.Commit(c.ctx); err != nil {
-		rc.mu.Unlock()
-		return from, fmt.Errorf("wings: commit merge of %s: %w", canonical, err)
-	}
-	rc.mu.Unlock()
-	return from, nil
+	rc := &relayChannel{}
+	r.channels[canonical] = rc
+	return rc
 }
 
 // foldChannel folds a channel's value or consume stream into its counts, waking
@@ -584,18 +299,12 @@ func (c *Cluster) foldChannel(client *dsclient.Client, name, id string, values b
 	r.mu.Unlock()
 
 	c.wg.Go(func() {
-		rc, err := c.relayFor(client, id)
-		if err != nil {
-			if c.ctx.Err() == nil {
-				c.log.Warn("wings: cannot fold a shared channel's counts", "channel", id, "err", err)
-			}
-			return
-		}
+		rc := c.relayFor(id)
 		var from int64
 		for c.ctx.Err() == nil {
-			// Re-opened each pass, as the outbox tail is: a handle opened before the
-			// first append binds to the empty stream and never sees later writes — a
-			// moved writer's first append to the stable stream is that window.
+			// Re-opened each pass: a handle opened before the first append binds to the
+			// empty stream and never sees later writes — a moved writer's first append
+			// to the stable stream is that window.
 			st, err := eventStream[flow.ChannelItem](client, name)
 			if err != nil {
 				if c.ctx.Err() != nil || pause(c.ctx, time.Second) != nil {
@@ -633,126 +342,39 @@ func (c *Cluster) foldChannel(client *dsclient.Client, name, id string, values b
 	})
 }
 
-// forgetTail drops a tail's cancel registration as it exits and releases the
-// context, whether it left on its own or was woken to retire.
-func (c *Cluster) forgetTail(name string, stop context.CancelFunc) {
-	r := c.relay
-	r.mu.Lock()
-	if r.tailStop[name] != nil {
-		delete(r.tailStop, name)
-	}
-	r.mu.Unlock()
-	stop()
-}
-
-// finishChannels marks a settled job's shared-channel outboxes for the relay to
-// drop, but only once the job's output is fully home, so the relay has all of
-// each outbox to merge into the canonical stream before it goes. In-process work
-// writes straight to shared storage, so there is nothing to wait for. Called off
-// the settle path for a job the relay has tailed an outbox for.
-func (c *Cluster) finishChannels(job string, w *workerConn) {
-	if c.relay == nil {
-		return
-	}
-	client, err := c.sharedClient()
-	if err != nil {
-		return
-	}
-	if w != nil && w.client != client {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), outputDrain)
-		caught := false
-		for {
-			// The outbox comes home by the transaction pull now (pull.go), so wait
-			// on the pulled level rather than the mirror: the coordinator's copy of
-			// the job's streams must be as complete as the worker's before the relay
-			// drops the outbox.
-			done, err := c.pulledLevel(ctx, w, job)
-			if err != nil {
-				break // cannot confirm the copy is home
-			}
-			if done {
-				caught = true
-				break
-			}
-			select {
-			case <-ctx.Done():
-			case <-time.After(outputPoll):
-				continue
-			}
-			break
-		}
-		cancel()
-		if !caught {
-			// Leave the outbox rather than risk dropping sends still on their way
-			// home; a resume still reads them, and this only forgoes the cleanup.
-			return
-		}
-	}
-	r := c.relay
-	r.mu.Lock()
-	r.finalJob[streamPart(job)] = true
-	r.mu.Unlock()
-	c.pokeRelay()
-}
-
-// dropOutbox deletes a settled channel's outbox and lets its tail stop. tailed
-// keeps the name, so no discovery pass starts a fresh tail on the gone stream.
-// Dropping it drops the canonical stream too once this was its last feeder and
-// the owning run has finished (dropRetiredCanonical).
-func (c *Cluster) dropOutbox(name string) {
-	client, err := c.sharedClient()
-	if err != nil {
-		return
-	}
-	c.markDropped([]string{name})
-	if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
-		c.log.Warn("wings: could not drop a settled channel outbox", "stream", name, "err", err)
-	}
-	c.unmarkDropped([]string{name})
-
-	o, _ := parseOutput(name)
-	canonical := chanPrefix + o.Name
-	r := c.relay
-	r.mu.Lock()
-	if r.feeders[canonical] > 0 {
-		r.feeders[canonical]--
-	}
-	retire := r.feeders[canonical] == 0 && r.doneCanon[canonical]
-	r.mu.Unlock()
-	if retire {
-		c.dropCanonical(canonical)
-	}
-}
-
-// retireRunChannels marks a finished run's canonical streams for retirement and
-// drops any whose feeding outboxes are already gone; the rest go as their last
-// feeder's outbox is dropped (dropOutbox). A completed run will not resume, so
-// its canonical streams — kept otherwise so a resume can replay receives — are
-// dead. Covers the run's coordinator-created channels (noteRunChannel).
+// retireRunChannels retires every channel a finished run created. A completed run
+// will not resume, so its channels' data — kept otherwise so a resume can replay
+// receives — is dead. The run's channels are those whose key falls under its
+// prefix (a channel id is "<run>/<thread>.ch<n>", so streamPart maps it to
+// "<run>_<thread>_ch<n>"); the "_" after the run guards against a run whose name
+// is another's prefix. Selects for [retireCanonicals].
 func (c *Cluster) retireRunChannels(run string) {
 	r := c.relay
 	if r == nil {
 		return
 	}
+	prefix := chanPrefix + streamPart(run) + "_"
 	r.mu.Lock()
-	cs := make([]string, 0, len(r.canonByRun[run]))
-	for canonical := range r.canonByRun[run] {
-		cs = append(cs, canonical)
+	r.retiredRun[run] = true
+	var cs []string
+	for canonical := range r.channels {
+		if strings.HasPrefix(canonical, prefix) {
+			cs = append(cs, canonical)
+		}
 	}
-	delete(r.canonByRun, run)
 	r.mu.Unlock()
 	c.retireCanonicals(cs)
 }
 
-// createdByThread reports whether canonical is the stream of a channel that
-// thread created. A channel's id is "<run>/<thread>.ch<n>", so its stream name
-// is the thread's channel prefix followed by the digits of n — and a sub-thread's
-// channel ("<thread>.<k>.ch<n>") has a digit, not "ch", after the prefix, so it
-// does not match its parent. This is what tells a channel a job created from one
-// it merely sends or receives on: only the creator retires it.
-func createdByThread(canonical, run, thread string) bool {
+// createdByThread reports whether key is the relay key of a channel that thread
+// created. A channel's id is "<run>/<thread>.ch<n>", so its key is the thread's
+// channel prefix followed by the digits of n — and a sub-thread's channel
+// ("<thread>.<k>.ch<n>") has a digit, not "ch", after the prefix, so it does not
+// match its parent. This is what tells a channel a job created from one it merely
+// sends or receives on: only the creator retires it.
+func createdByThread(key, run, thread string) bool {
 	prefix := chanPrefix + streamPart(run) + "_" + streamPart(thread) + "_ch"
-	rest, ok := strings.CutPrefix(canonical, prefix)
+	rest, ok := strings.CutPrefix(key, prefix)
 	if !ok || rest == "" {
 		return false
 	}
@@ -767,20 +389,25 @@ func createdByThread(canonical, run, thread string) bool {
 // retireJobChannels retires the channels a forked activity created. The remote
 // activity has returned (its job settled), so its result is recorded and its
 // channels' data is dead — a replay re-inserts the result rather than re-entering
-// the activity. The channels are those observed to be created under the job
-// (noteJobChannel, gated by createdByThread), the same reclaim a returned
-// in-process call gets by explicit id. Selects for [retireCanonicals].
-func (c *Cluster) retireJobChannels(job string) {
+// the activity. The channels are those created by the activity's thread, found by
+// name among the folded channels (createdByThread). origin is the job's run and
+// creating thread; it is remembered so a value or consume stream the relay
+// discovers only after this settle — too late to be folded when the retire ran —
+// is still recognized as the job's and dropped (channelRetired). Selects for
+// [retireCanonicals].
+func (c *Cluster) retireJobChannels(job string, origin flow.Origin) {
 	r := c.relay
-	if r == nil {
+	if r == nil || origin.Run == "" || origin.Thread == "" {
 		return
 	}
 	r.mu.Lock()
-	cs := make([]string, 0, len(r.canonByJob[job]))
-	for canonical := range r.canonByJob[job] {
-		cs = append(cs, canonical)
+	r.retiredJob[job] = origin
+	var cs []string
+	for canonical := range r.channels {
+		if createdByThread(canonical, origin.Run, origin.Thread) {
+			cs = append(cs, canonical)
+		}
 	}
-	delete(r.canonByJob, job)
 	r.mu.Unlock()
 	c.retireCanonicals(cs)
 }
@@ -790,90 +417,54 @@ func (c *Cluster) retireJobChannels(job string) {
 // same reclaim as a forked activity's, keyed by explicit id because a direct call
 // shares its caller's thread rather than getting one of its own. Selects for
 // [retireCanonicals].
-func (c *Cluster) retireChannels(run string, ids []string) {
-	r := c.relay
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	byRun := r.canonByRun[run]
-	var cs []string
+func (c *Cluster) retireChannels(ids []string) {
+	cs := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if canonical := chanStreamFor(id); byRun[canonical] {
-			cs = append(cs, canonical)
-		}
+		cs = append(cs, chanStreamFor(id))
 	}
-	r.mu.Unlock()
 	c.retireCanonicals(cs)
 }
 
-// retireCanonicals is the one way the relay retires a canonical stream: mark each
-// done and drop those with no feeding outbox left; the rest go as their last
-// feeder's outbox is dropped (dropOutbox), so a channel still fed by a live sender
-// waits for its data to arrive home. Every reclaim — a returned in-process call
-// ([Cluster.retireChannels]), a settled forked activity ([Cluster.retireJobChannels]),
-// a finished run ([Cluster.retireRunChannels]) — selects its channels and calls this.
+// retireCanonicals is the one way the relay retires a channel: drop its value and
+// consume streams and forget its counts. A channel is retired only once its
+// creator has finished, and by then every send is home — a worker's ride the
+// creating thread's transaction and are pulled before the job settles, and the
+// creator awaits the threads it shared the channel to — so there is nothing left
+// to wait for. Every reclaim — a returned in-process call ([Cluster.retireChannels]),
+// a settled forked activity ([Cluster.retireJobChannels]), a finished run
+// ([Cluster.retireRunChannels]) — selects its channels and calls this.
 func (c *Cluster) retireCanonicals(canonicals []string) {
-	r := c.relay
-	if r == nil || len(canonicals) == 0 {
-		return
-	}
-	r.mu.Lock()
-	retired := make(map[string]bool, len(canonicals))
-	var drop []string
-	var wake []context.CancelFunc
 	for _, canonical := range canonicals {
-		r.doneCanon[canonical] = true
-		retired[canonical] = true
-		if r.feeders[canonical] == 0 {
-			drop = append(drop, canonical)
-		}
-	}
-	// Wake the tails feeding a retired channel so they drop their outboxes at once,
-	// rather than after their next poll; the last one gone drops the canonical.
-	for name, stop := range r.tailStop {
-		if o, ok := parseOutput(name); ok && retired[chanPrefix+o.Name] {
-			wake = append(wake, stop)
-		}
-	}
-	r.mu.Unlock()
-	for _, stop := range wake {
-		stop()
-	}
-	for _, canonical := range drop {
-		c.dropCanonical(canonical)
+		c.dropChannelData(canonical)
 	}
 }
 
-// dropCanonical deletes a retired channel's streams — its canonical stream and
-// the value and consume streams that hold its data — and forgets the relay's
-// state for it. Called when the channel's activity has finished and its last
-// outbox is gone, so no run will read it again and every send is home.
+// dropChannelData deletes a retired channel's data — its value and consume
+// streams — and forgets the relay's counts for it. Called when the channel's
+// creator has finished, so no run will read it again and every send is home. key
+// is the channel's relay key (chanStreamFor(id)); no stream of that name exists,
+// it only names the relay's bookkeeping.
 //
 // The value and consume streams are pulled home, so a pull whose destination was
 // chosen before the drop can re-create one once; they are marked dropped for good
-// (unlike the coordinator-only canonical, which is unmarked once gone) so the pull
-// copies no more to them (pulledStream declines a dropped name) and the relay's
-// reaper re-drops a reappearance.
-func (c *Cluster) dropCanonical(canonical string) {
+// so the pull copies no more to them (pulledStream declines a dropped name) and
+// the relay's reaper re-drops a reappearance.
+func (c *Cluster) dropChannelData(key string) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return
 	}
-	suffix := strings.TrimPrefix(canonical, chanPrefix)
+	suffix := strings.TrimPrefix(key, chanPrefix)
 	values, consumes := chanvalPrefix+suffix, chanconsPrefix+suffix
-	c.markDropped([]string{canonical, values, consumes})
-	for _, name := range []string{canonical, values, consumes} {
+	c.markDropped([]string{values, consumes})
+	for _, name := range []string{values, consumes} {
 		if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {
 			c.log.Warn("wings: could not drop a finished run's channel stream", "stream", name, "err", err)
 		}
 	}
-	c.unmarkDropped([]string{canonical})
 	r := c.relay
 	r.mu.Lock()
-	delete(r.channels, canonical)
-	delete(r.feeders, canonical)
-	delete(r.doneCanon, canonical)
+	delete(r.channels, key)
 	r.mu.Unlock()
 }
 
@@ -930,18 +521,6 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMo
 	client, err := h.c.sharedClient()
 	if err != nil {
 		return nil, err
-	}
-	// The outbox carries no data now — values go to the value stream, consumes to
-	// the consume stream — but it is still created, empty, as a feeder the relay
-	// accounts for when it retires the canonical stream. The run is paired with the
-	// unmangled id only here, so record it for the run's completion to retire the
-	// channel; a coordinator run is attributed this way, not from the outbox name.
-	out := outboxFor(run, 0, id)
-	if err := ensureStream(ctx, client, out); err != nil {
-		return nil, err
-	}
-	if h.c.relay != nil {
-		h.c.relay.noteRunChannel(run, chanStreamFor(id))
 	}
 	h.c.pokeRelay()
 
@@ -1002,36 +581,19 @@ func threadOrMain(ctx context.Context) string {
 }
 
 func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
-	out := outboxFor(h.job.id, h.job.attempt, id)
-	// Not the attempt's context: a half-made outbox is the next attempt's
-	// problem. Created whether or not anything is sent, since it is the subscription.
-	if err := ensureStream(context.WithoutCancel(ctx), h.n.client, out); err != nil {
-		return nil, err
-	}
-	outbox, err := eventStream[flow.ChannelItem](h.n.client, out)
-	if err != nil {
-		return nil, err
-	}
-	// The outbox carries no data now — values go to the value stream, consumes to
-	// the consume stream — but the coordinator still learns a worker's channel only
-	// from it: its name carries the job, so a marker written through the linking
-	// thread's producer and committed now comes home by the pull (pull.go) and tells
-	// the relay which run to attribute and reclaim the channel for. A pure creator's
-	// or receiver's outbox would otherwise produce no transaction and go unseen.
 	// The value and consume streams open on first send, off the share path a fork
-	// waits on, so linking stays cheap.
+	// waits on, so linking stays cheap; a worker's channel is learned by the relay
+	// from its value or consume stream coming home, not from any per-run stream.
 	valLazy, consLazy := valConsLazy(h.n.client, id)
-	mctx := context.WithoutCancel(ctx)
-	linker := h.job.txns.For(threadOrMain(ctx))
-	if err := linker.append(mctx, outbox, []flow.ChannelItem{{Link: true}}); err != nil {
-		return nil, err
-	}
 	if mode == flow.LinkRead {
 		// A reader's values are the writer's, pushed here from the coordinator's copy
 		// of the value stream. The coordinator starts that push when a channel's
 		// consume stream appears on a worker, so creating it now — a reader does, a
 		// writer never does — announces this worker as the reader to push to, and only
 		// the reader, so the writer's own worker is never pushed its own values back.
+		// Written through the linking thread's producer so it comes home by the pull.
+		mctx := context.WithoutCancel(ctx)
+		linker := h.job.txns.For(threadOrMain(ctx))
 		cons, err := consLazy.get(mctx)
 		if err != nil {
 			return nil, err
@@ -1039,9 +601,9 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 		if err := linker.append(mctx, cons, []flow.ChannelItem{{Link: true}}); err != nil {
 			return nil, err
 		}
-	}
-	if err := linker.commit(mctx); err != nil {
-		return nil, err
+		if err := linker.commit(mctx); err != nil {
+			return nil, err
+		}
 	}
 	return &channelLink{
 		// Each record goes into the writing thread's own transaction, so it commits
@@ -1074,8 +636,8 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 // call that created these channels has returned, so retire them. Done off the
 // caller so the call is not held for storage work; the run's end retires whatever
 // is left.
-func (h clusterChannels) RetireChannels(_ context.Context, run string, ids []string) {
-	h.c.wg.Go(func() { h.c.retireChannels(run, ids) })
+func (h clusterChannels) RetireChannels(_ context.Context, _ string, ids []string) {
+	h.c.wg.Go(func() { h.c.retireChannels(ids) })
 }
 
 // ChannelValues implements [flow.ChannelValueReader] for a run on the
@@ -1153,8 +715,8 @@ func channelValues(ctx context.Context, client *dsclient.Client, id string, curs
 	}
 }
 
-// channelLink is a run's connection to one shared channel: sends go to the run's
-// outbox, items come from the canonical stream.
+// channelLink is a run's connection to one shared channel: sends go to the
+// channel's value or consume stream, items come from its value stream (in).
 type channelLink struct {
 	send   func(ctx context.Context, sender string, it flow.ChannelItem) error
 	client *dsclient.Client
@@ -1166,8 +728,8 @@ func (l *channelLink) Send(ctx context.Context, sender string, it flow.ChannelIt
 }
 
 func (l *channelLink) Items(ctx context.Context, yield func(flow.ChannelItem) bool) error {
-	// The canonical stream appears when the relay has something for it, or the
-	// push reaches this worker; until then, look again.
+	// The value stream appears once the writer first sends, or the push reaches
+	// this worker; until then, look again.
 	var st *dsclient.Stream[flow.ChannelItem]
 	var from int64
 	for ctx.Err() == nil {

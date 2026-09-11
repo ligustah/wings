@@ -2,10 +2,12 @@ package wings
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
 
+	"github.com/ligustah/commitlog"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 
@@ -60,14 +62,24 @@ func (s *inspectionStore) openEvents(name string) (*dsclient.Stream[*protos.Even
 }
 
 // originOf reads a job history's opening RunStart to learn the run and thread it
-// records. ok is false for a history with no RunStart in its head.
+// records. ok is false for a history with no RunStart in its head, and for one
+// being reclaimed — an abandoned attempt's history, dropped on settle, is still
+// listed for a moment after its log is gone (see dropOutputsOf); reading it then
+// yields [commitlog.ErrCommitLogDeleted], which is not an error for the inspector:
+// the live attempt's history remains, so skip this one.
 func (s *inspectionStore) originOf(ctx context.Context, name string) (run, thread string, ok bool, err error) {
 	st, err := s.openEvents(name)
 	if err != nil {
+		if errors.Is(err, commitlog.ErrCommitLogDeleted) {
+			return "", "", false, nil
+		}
 		return "", "", false, err
 	}
 	recs, err := st.Read(ctx, 0, jobHeadWindow)
 	if err != nil {
+		if errors.Is(err, commitlog.ErrCommitLogDeleted) {
+			return "", "", false, nil
+		}
 		return "", "", false, fmt.Errorf("wings: read history head %s: %w", name, err)
 	}
 	for _, r := range recs {

@@ -88,7 +88,7 @@ func parseOutput(stream string) (outputName, bool) {
 			return outputName{Prefix: prefix, Name: rest}, true
 		}
 	}
-	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
+	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {
 			continue
