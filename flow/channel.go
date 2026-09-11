@@ -194,7 +194,7 @@ var ErrChannelClosed = errors.New("flow: send on a closed channel")
 // value is queued. On a closed channel it sends nothing and returns
 // [ErrChannelClosed] rather than panicking.
 func (c *Channel[T]) Send(ctx Context, v T) error {
-	t, cs, err := c.bind(ctx)
+	t, cs, err := c.bind(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -292,7 +292,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 	var zero T
 
-	t, cs, err := c.bind(ctx)
+	t, cs, err := c.bind(ctx, true)
 	if err != nil {
 		return zero, false, err
 	}
@@ -388,7 +388,7 @@ func (c *Channel[T]) decode(item *chanItem) (T, error) {
 // Close says nothing more will be sent. Receives drain what is queued and then
 // report the channel closed. Recorded and ordered like a send.
 func (c *Channel[T]) Close(ctx Context) error {
-	t, cs, err := c.bind(ctx)
+	t, cs, err := c.bind(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -480,8 +480,10 @@ func unmarshalSide[T any](ch **Channel[T], b []byte) error {
 	return nil
 }
 
-// bind resolves the calling thread and this channel's shared state.
-func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
+// bind resolves the calling thread and this channel's shared state, pinning the
+// used side to that thread: read is true for a receive, false for a send or close,
+// so a channel keeps a single reader and a single writer (see [chanState.claimSide]).
+func (c *Channel[T]) bind(ctx Context, read bool) (*threadState, *chanState, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.run == nil && c.id == "" {
@@ -504,6 +506,9 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 			c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
 		}
 		cs.noteRole(c.mode)
+		if err := cs.claimSide(c.name, t.qualified(), read); err != nil {
+			return nil, nil, err
+		}
 		return t, cs, nil
 	}
 	if t.run != c.run {
@@ -514,6 +519,9 @@ func (c *Channel[T]) bind(ctx Context) (*threadState, *chanState, error) {
 		return nil, nil, fmt.Errorf("flow: channel %s is not part of this run", c.name)
 	}
 	cs.noteRole(c.mode)
+	if err := cs.claimSide(c.name, t.qualified(), read); err != nil {
+		return nil, nil, err
+	}
 	return t, cs, nil
 }
 
@@ -529,6 +537,26 @@ func (cs *chanState) noteRole(mode handleMode) {
 	cs.mu.Lock()
 	cs.reads = true
 	cs.mu.Unlock()
+}
+
+// claimSide pins one side of the channel to the calling thread on first use: the
+// first thread to receive owns receiving, the first to send or close owns sending.
+// A later thread on the same side is an error — a channel has a single reader and
+// a single writer. name is the channel's name for the message; qualified is the
+// caller's "<run>/<thread>". read selects the receive side.
+func (cs *chanState) claimSide(name, qualified string, read bool) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	owner, side := &cs.writeOwner, "sent on"
+	if read {
+		owner, side = &cs.readOwner, "received from"
+	}
+	if *owner != "" && *owner != qualified {
+		return fmt.Errorf("flow: channel %s is already %s by thread %q and cannot be used from thread %q; "+
+			"a channel has a single reader and a single writer, so fan in by selecting over several channels into one", name, side, *owner, qualified)
+	}
+	*owner = qualified
+	return nil
 }
 
 // chanItem is one value in flight, tagged with where it came from so a receive
@@ -574,6 +602,14 @@ type chanState struct {
 	// [chanState.noteRole].
 	attached bool
 	reads    bool
+	// readOwner and writeOwner are the qualified ids of the one thread that receives
+	// on and the one that sends on (or closes) this channel: a channel has a single
+	// reader and a single writer, so a second thread on either side is rejected
+	// (see [chanState.claimSide]). The two may differ — a producer thread and a
+	// consumer thread — but fan-in is not a channel with many writers; it is a
+	// thread that selects over several channels into one. In-memory and per attempt.
+	readOwner  string
+	writeOwner string
 	// floor is len(items) after the last prune; the queue is compacted once it has
 	// grown enough past it that pruning stays amortised. See [chanState.prune].
 	floor int

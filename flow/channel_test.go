@@ -280,11 +280,11 @@ func TestWriterAndReaderCarryValues(t *testing.T) {
 	}
 }
 
-// THE POINT: which of two concurrent senders arrives first is the operating
-// system's decision, not the run's — so a replay that took "whatever is
+// THE POINT: which of two ready producers the consumer takes first is the
+// operating system's decision, not the run's — so a replay that took "whatever is
 // there" would take a different value than the run it is replaying, and every
-// decision the run made from that value would be wrong. The receive is
-// recorded, and a replay waits for exactly the item it took last time.
+// decision the run made from that value would be wrong. The select and the
+// receive are recorded, and a replay takes exactly the item it took last time.
 func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 	resetOrders()
 	const n = 4
@@ -294,15 +294,21 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 	name := flow.NewName()
 	store := flow.NewMemStore()
 	err := flow.Run(t.Context(), name, func(ctx flow.Context) error {
-		r, w := ctx.NewChannel[int]()
-
-		// Two producers racing. Each sends its own numbers as fast as it can,
-		// so the interleaving is genuinely up to the scheduler.
+		// Two producers racing, each the sole writer of its own channel — one
+		// channel has one writer. The consumer selects over both, so which it takes
+		// when both are ready is still genuinely up to the scheduler.
+		type source struct {
+			r flow.Reader[int]
+			w flow.Writer[int]
+		}
+		var sources []source
 		var producers []*flow.Future[int]
 		for p := range 2 {
+			sr, sw := ctx.NewChannel[int]()
+			sources = append(sources, source{sr, sw})
 			producers = append(producers, ctx.Spawn(func(ctx flow.Context) (int, error) {
 				for i := range n {
-					if err := w.Send(ctx, p*100+i); err != nil {
+					if err := sw.Send(ctx, p*100+i); err != nil {
 						return 0, err
 					}
 				}
@@ -312,14 +318,22 @@ func TestAReplayedReceiveTakesTheSameValueItTookBefore(t *testing.T) {
 
 		var order []int
 		for range 2 * n {
-			v, ok, err := r.Recv(ctx)
-			if err != nil {
+			sel := ctx.Select()
+			for _, s := range sources {
+				sel = sel.Recv(s.r, func(v int, ok bool, err error) error {
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return errors.New("channel closed early")
+					}
+					order = append(order, v)
+					return nil
+				})
+			}
+			if err := sel.Do(ctx); err != nil {
 				return err
 			}
-			if !ok {
-				return errors.New("channel closed early")
-			}
-			order = append(order, v)
 		}
 		for _, p := range producers {
 			if _, err := p.Await(ctx); err != nil {

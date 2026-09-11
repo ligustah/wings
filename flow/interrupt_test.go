@@ -226,19 +226,19 @@ func TestASendOnAClosedChannelIsRefused(t *testing.T) {
 	}
 }
 
-// THE POINT: a send under way when the channel closes is not refused: what
-// it offered is drained by the receiver that comes, which finds the channel
-// closed only after.
+// THE POINT: a value sent before the channel closes is not lost to the close:
+// the receiver drains what was sent and finds the channel closed only after. The
+// writer sends then closes on its own thread — one writer per channel — and the
+// receiver, a different thread, sees the value ahead of the close.
 func TestASendUnderWayAtTheCloseIsDrained(t *testing.T) {
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		r, w := ctx.NewChannel[int]()
 		sender := ctx.Spawn(func(ctx flow.Context) (int, error) {
-			return 1, w.Send(ctx, 1)
+			if err := w.Send(ctx, 1); err != nil {
+				return 0, err
+			}
+			return 1, w.Close(ctx)
 		})
-		time.Sleep(50 * time.Millisecond)
-		if err := w.Close(ctx); err != nil {
-			return err
-		}
 		v, more, err := r.Recv(ctx)
 		if err != nil || !more || v != 1 {
 			return fmt.Errorf("the receive got %d, %v, %v; want the value the sender offered", v, more, err)

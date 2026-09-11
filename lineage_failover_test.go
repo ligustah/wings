@@ -289,6 +289,7 @@ var parentOfSpawn = flow.Define(func(ctx flow.Context, in report) (int, error) {
 	if err := in.Seen.Send(ctx, sighting{Worker: where(ctx)}); err != nil {
 		return 0, err
 	}
+	fromChild, toParent := ctx.NewChannel[sighting](flow.WithCapacity(1))
 	child := ctx.Spawn(func(ctx flow.Context) (int, error) {
 		r, err := ctx.Effect(func() (int, error) { return rand.IntN(1<<30) + 1, nil })
 		if err != nil {
@@ -297,12 +298,19 @@ var parentOfSpawn = flow.Define(func(ctx flow.Context, in report) (int, error) {
 		if err := ctx.Heartbeat(1); err != nil {
 			return 0, err
 		}
-		if err := in.Seen.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
+		if err := toParent.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
 			return 0, err
 		}
 		time.Sleep(3 * time.Second)
 		return r, nil
 	})
+	s, _, err := fromChild.Recv(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := in.Seen.Send(ctx, s); err != nil {
+		return 0, err
+	}
 	return child.Await(ctx)
 }, flow.WithName("test.parentOfSpawn"))
 
