@@ -91,10 +91,10 @@ func (l *lazyStream) get(ctx context.Context) (*dsclient.Stream[flow.ChannelItem
 // each created off the critical path when first sent to.
 func valConsLazy(client *dsclient.Client, id string) (val, cons *lazyStream) {
 	return &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
-			return openChannelStream(context.WithoutCancel(ctx), client, chanValues(id))
-		}}, &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
-			return openChannelStream(context.WithoutCancel(ctx), client, chanConsumes(id))
-		}}
+		return openChannelStream(context.WithoutCancel(ctx), client, chanValues(id))
+	}}, &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
+		return openChannelStream(context.WithoutCancel(ctx), client, chanConsumes(id))
+	}}
 }
 
 // openChannelStream ensures a channel stream exists on client and opens it.
@@ -170,6 +170,9 @@ type channelRelay struct {
 	// folded names the value and consume streams whose counts the relay is folding,
 	// so each is folded once. Keyed by stream name.
 	folded map[string]bool
+	// folding cancels each stream's fold goroutine, so a retired channel's fold is
+	// stopped rather than left spinning on the dropped stream. Keyed by stream name.
+	folding map[string]context.CancelFunc
 	// retiredJob records the origin — run and creating thread — of a forked
 	// activity whose channels have been retired, so a value or consume stream the
 	// relay discovers only after the job settled — too late to be among the folded
@@ -191,6 +194,7 @@ func (c *Cluster) startChannelRelay() {
 		poke:       make(chan struct{}, 1),
 		channels:   map[string]*relayChannel{},
 		folded:     map[string]bool{},
+		folding:    map[string]context.CancelFunc{},
 		retiredJob: map[string]flow.Origin{},
 		retiredRun: map[string]bool{},
 	}
@@ -312,31 +316,42 @@ func (c *Cluster) foldChannel(client *dsclient.Client, name, id string, values b
 		return
 	}
 	r.folded[name] = true
+	// A per-fold context so dropChannelData can stop this goroutine when the channel
+	// is retired; without it the fold spun on the deleted stream for the cluster's
+	// life, one leaked goroutine per channel ever folded.
+	fctx, cancel := context.WithCancel(c.ctx)
+	if r.folding == nil {
+		r.folding = map[string]context.CancelFunc{}
+	}
+	r.folding[name] = cancel
 	r.mu.Unlock()
 
 	c.wg.Go(func() {
+		// The consume fold owns this channel's consumed count; drop it as the fold ends
+		// so a retired channel leaves none behind (the value fold's delete is a no-op).
+		defer c.relay.consumed.Delete(chanStreamFor(id))
 		rc := c.relayFor(id)
 		var from int64
-		for c.ctx.Err() == nil {
+		for fctx.Err() == nil {
 			// Re-opened each pass: a handle opened before the first append binds to the
 			// empty stream and never sees later writes — a moved writer's first append
 			// to the stable stream is that window.
 			st, err := eventStream[flow.ChannelItem](client, name)
 			if err != nil {
-				if c.ctx.Err() != nil || pause(c.ctx, time.Second) != nil {
+				if fctx.Err() != nil || pause(fctx, time.Second) != nil {
 					return
 				}
 				continue
 			}
-			readCtx, cancel := context.WithTimeout(c.ctx, followPoll)
+			readCtx, cancel := context.WithTimeout(fctx, followPoll)
 			recs, err := st.ReadBlocking(readCtx, from, recordBatch)
 			expired := readCtx.Err() != nil
 			cancel()
 			if err != nil {
-				if c.ctx.Err() != nil {
+				if fctx.Err() != nil {
 					return
 				}
-				if !expired && pause(c.ctx, time.Second) != nil {
+				if !expired && pause(fctx, time.Second) != nil {
 					return
 				}
 				continue
@@ -480,6 +495,13 @@ func (c *Cluster) dropChannelData(key string) {
 	}
 	r := c.relay
 	r.mu.Lock()
+	for _, name := range []string{values, consumes} {
+		if cancel := r.folding[name]; cancel != nil {
+			cancel()
+			delete(r.folding, name)
+		}
+		delete(r.folded, name)
+	}
 	delete(r.channels, key)
 	r.mu.Unlock()
 }

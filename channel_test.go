@@ -129,6 +129,53 @@ func TestASettledJobsChannelOutboxIsDropped(t *testing.T) {
 	}
 }
 
+// THE POINT: retiring a channel stops the goroutines folding its value and
+// consume streams and clears their bookkeeping, rather than leaving a fold
+// spinning on the dropped stream for the cluster's life. Once the run completes
+// and its channels are reclaimed, the relay folds nothing.
+func TestARetiredChannelStopsFolding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 2, Concurrency: 1})
+
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int]()
+		producer := ctx.Go(counts, writeFeed{Values: w, Count: 5})
+		consumer := ctx.Go(sums, feed{Values: r})
+		if _, err := producer.Await(ctx); err != nil {
+			return err
+		}
+		_, err := consumer.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Reclaim is async (forgetRun retires the run's channels off the caller), so poll:
+	// each retire cancels the fold goroutines and clears folded/folding.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		folded, folding := foldingSizes(c)
+		if folded == 0 && folding == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the run completed, the relay still tracks %d folded / %d folding streams; a retired channel's fold was left behind", folded, folding)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// foldingSizes snapshots how many streams the relay is folding, under its lock.
+func foldingSizes(c *Cluster) (folded, folding int) {
+	r := c.relay
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.folded), len(r.folding)
+}
+
 // sumsSlow receives everything on its channel and returns the total, pausing
 // between receives so its worker can be killed while it is partway through —
 // leaving some receives recorded and the rest still to come.
