@@ -68,6 +68,10 @@ type outputName struct {
 }
 
 func (o outputName) String() string {
+	if o.Prefix == chanvalPrefix || o.Prefix == chanconsPrefix {
+		// A channel stream is named by its id alone: no job, no attempt.
+		return o.Prefix + streamPart(o.Name)
+	}
 	return o.Prefix + streamPart(o.Job) + "." + strconv.Itoa(o.Attempt) + "." + streamPart(o.Name)
 }
 
@@ -76,6 +80,14 @@ func (o outputName) in(prefix string) outputName { o.Prefix = prefix; return o }
 
 // parseOutput takes a stream name apart and reports whether it is one of ours.
 func parseOutput(stream string) (outputName, bool) {
+	for _, prefix := range []string{chanvalPrefix, chanconsPrefix} {
+		if rest, ok := strings.CutPrefix(stream, prefix); ok {
+			// Stable channel stream: the id alone, with no job or attempt, so the
+			// job/attempt filters (dropOutputsOf, per-job pulledLevel) skip it — it is
+			// shared across a channel's life and must not be dropped on a move.
+			return outputName{Prefix: prefix, Name: rest}, true
+		}
+	}
 	for _, prefix := range []string{recordingPrefix, historyPrefix, priorPrefix, chanoutPrefix} {
 		rest, ok := strings.CutPrefix(stream, prefix)
 		if !ok {

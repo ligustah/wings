@@ -37,6 +37,14 @@ const (
 	// chanPrefix is the canonical stream, pushed to workers; not an output
 	// family, so a worker's copy is not mirrored back.
 	chanPrefix = "wings.chan."
+	// chanvalPrefix and chanconsPrefix name a channel's value stream and consume
+	// stream: the writer's values and closes on the one, the reader's consume
+	// reports and its Link marker on the other. Both are named by the channel id
+	// alone — no job, no attempt — so a writer moved to a new attempt keeps
+	// appending to the same stream (fencing stays on the attempt's producer id, not
+	// the stream name). Pulled home like any output, so parseOutput knows them.
+	chanvalPrefix  = "wings.chanval."
+	chanconsPrefix = "wings.chancons."
 
 	relayInterval = 500 * time.Millisecond
 )
