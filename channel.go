@@ -51,6 +51,46 @@ const (
 
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
+// chanValues names a channel's value stream (the writer's values and closes);
+// chanConsumes its consume stream (the reader's consume reports). Both are
+// derivable from a channel's outbox name too, since streamPart is idempotent:
+// chanvalPrefix+o.Name equals chanValues(id) for an outbox of id.
+func chanValues(id string) string   { return chanvalPrefix + streamPart(id) }
+func chanConsumes(id string) string { return chanconsPrefix + streamPart(id) }
+
+// lazyStream opens a channel stream on first use, so a Link that may never send
+// pays nothing and adds no latency to the path that shares it (which a fork
+// waits on) — the stream is made when the first record is sent, off that path.
+type lazyStream struct {
+	once sync.Once
+	open func(context.Context) (*dsclient.Stream[flow.ChannelItem], error)
+	st   *dsclient.Stream[flow.ChannelItem]
+	err  error
+}
+
+func (l *lazyStream) get(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
+	l.once.Do(func() { l.st, l.err = l.open(ctx) })
+	return l.st, l.err
+}
+
+// valConsLazy returns lazy value and consume streams for a channel on client,
+// each created off the critical path when first sent to.
+func valConsLazy(client *dsclient.Client, id string) (val, cons *lazyStream) {
+	return &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
+			return openChannelStream(context.WithoutCancel(ctx), client, chanValues(id))
+		}}, &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
+			return openChannelStream(context.WithoutCancel(ctx), client, chanConsumes(id))
+		}}
+}
+
+// openChannelStream ensures a channel stream exists on client and opens it.
+func openChannelStream(ctx context.Context, client *dsclient.Client, name string) (*dsclient.Stream[flow.ChannelItem], error) {
+	if err := ensureStream(ctx, client, name); err != nil {
+		return nil, err
+	}
+	return eventStream[flow.ChannelItem](client, name)
+}
+
 // pendingSend is a shared-channel value a thread has announced but whose event is
 // not yet recorded. A worker thread's producer holds it until that thread's next
 // event stages it (see [attemptOutputs.stage], [attemptOutputs.appendEvents]), so
@@ -826,22 +866,44 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, _ flow.LinkMo
 	}
 	h.c.pokeRelay()
 
+	// Alongside the outbox (still merged into the canonical stream the reader reads),
+	// a send's records also go to the channel's stable value or consume stream, which
+	// the reader and backpressure move onto next.
+	valLazy, consLazy := valConsLazy(client, id)
 	send := func(ctx context.Context, _ string, it flow.ChannelItem) error {
-		_, err := outbox.Append(ctx, []flow.ChannelItem{it})
+		// A signal owns no thread and so no transaction; it only ever sends a value,
+		// written straight through to both streams.
+		st, err := valLazy.get(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := outbox.Append(ctx, []flow.ChannelItem{it}); err != nil {
+			return err
+		}
+		_, err = st.Append(ctx, []flow.ChannelItem{it})
 		return err
 	}
 	if run != flow.SignalSender {
 		// A record goes into the writing thread's own transaction (sender names it),
 		// so it commits with the event that justifies it and no sibling thread's
-		// commit can tear the two apart (see [coordOutputs.stage], flow.Committer). A
-		// signal (SignalSender) owns no thread and so no transaction, and is written
-		// straight through.
+		// commit can tear the two apart (see [coordOutputs.stage], flow.Committer).
 		send = func(ctx context.Context, sender string, it flow.ChannelItem) error {
 			outputs, err := h.c.coordOutputsFor(sender)
 			if err != nil {
 				return err
 			}
-			return outputs.stage(ctx, outbox, it)
+			lazy := valLazy
+			if it.Consumed {
+				lazy = consLazy
+			}
+			st, err := lazy.get(ctx)
+			if err != nil {
+				return err
+			}
+			if err := outputs.stage(ctx, outbox, it); err != nil {
+				return err
+			}
+			return outputs.stage(ctx, st, it)
 		}
 	}
 	return &channelLink{
@@ -892,6 +954,11 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, _ flow.Link
 	if err := linker.commit(mctx); err != nil {
 		return nil, err
 	}
+	// Alongside the outbox (which the relay still merges into the canonical stream the
+	// reader reads), a send's records also go to the channel's stable value or consume
+	// stream, which the reader and backpressure move onto next. Those streams are
+	// opened on first send, off the share path a fork waits on, so linking stays cheap.
+	valLazy, consLazy := valConsLazy(h.n.client, id)
 	return &channelLink{
 		// Each record goes into the writing thread's own transaction, so it commits
 		// with the event that justifies it and no sibling thread's commit can tear the
@@ -900,10 +967,22 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, _ flow.Link
 		// transactional, so it is pulled, not mirrored.
 		send: func(ctx context.Context, _ string, it flow.ChannelItem) error {
 			out := h.job.txns.For(threadOrMain(ctx))
+			extra := valLazy
+			if it.Consumed {
+				extra = consLazy
+			}
+			es, err := extra.get(ctx)
+			if err != nil {
+				return err
+			}
 			if it.Closed || it.Consumed {
-				return out.append(ctx, outbox, []flow.ChannelItem{it})
+				if err := out.append(ctx, outbox, []flow.ChannelItem{it}); err != nil {
+					return err
+				}
+				return out.append(ctx, es, []flow.ChannelItem{it})
 			}
 			out.stage(outbox, it)
+			out.stage(es, it)
 			return nil
 		},
 		client: h.n.client,
