@@ -70,6 +70,17 @@ func (h clusterLogs) Log(ctx context.Context, run, thread string, rec *protos.Lo
 
 var _ flow.LogHost = clusterLogs{}
 
+// nodeLogs is the [flow.LogHost] for a job's run on a worker: it writes each line
+// into the logging thread's attempt transaction, so the line rides home to the
+// coordinator on the same pull as the history marker that dedupes it (pulledStream).
+type nodeLogs struct{ txns *attemptTxns }
+
+func (h nodeLogs) Log(ctx context.Context, run, thread string, rec *protos.LogRecord) error {
+	return h.txns.For(thread).appendLog(ctx, logStreamName(run, thread), rec)
+}
+
+var _ flow.LogHost = nodeLogs{}
+
 // LogLine is one durable log line read back from a run's log.
 type LogLine struct {
 	Thread  string

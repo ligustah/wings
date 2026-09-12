@@ -105,6 +105,58 @@ func TestAForkedThreadsLogSurvivesItsHistoryDrop(t *testing.T) {
 	}
 }
 
+// logsOnWorker logs a line, so a test can fork it onto a worker and check the line
+// is pulled home to the coordinator.
+var logsOnWorker = flow.Define(func(ctx flow.Context, _ int) (int, error) {
+	ctx.Logger().Info("hello from a worker")
+	return 1, nil
+}, flow.WithName("test.logsOnWorker"))
+
+var _ = flow.Main(logsOnWorker)
+
+// THE POINT: a thread that logs on a worker has its log pulled home, so a run's
+// logs are complete on the coordinator wherever its threads ran.
+func TestAWorkersLogIsPulledToTheCoordinator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 1, Concurrency: 1})
+	name := flow.NewName()
+
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		_, err := ctx.Go(logsOnWorker, 0).Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The child ran on a worker; its log is pulled home asynchronously.
+	found := func() bool {
+		lines, err := c.RunLogs(t.Context(), name)
+		if err != nil {
+			t.Fatalf("RunLogs: %v", err)
+		}
+		for _, l := range lines {
+			if l.Message == "hello from a worker" {
+				return true
+			}
+		}
+		return false
+	}
+	ok := false
+	for range 100 {
+		if found() {
+			ok = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ok {
+		t.Fatal("the worker's log line was never pulled to the coordinator")
+	}
+}
+
 // THE POINT: RunLogs reads a run's durable log back across its threads, so a
 // finished run's logs can be inspected.
 func TestRunLogsReadsBackARunsLog(t *testing.T) {

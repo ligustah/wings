@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
+	"github.com/ligustah/durable_streams/dswire"
 
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
@@ -53,6 +54,10 @@ type attemptOutputs struct {
 	producer dsclient.Producer
 	tx       dsclient.Tx
 	opened   time.Time
+	// logStream is the thread's durable log, opened once and written inside the
+	// same transaction as its history so a line and its marker commit together and
+	// the pull carries them home as one.
+	logStream *dsclient.Stream[*protos.LogRecord]
 	// err is sticky: after a failed commit the attempt fails rather than write a
 	// record with a hole, and its retry resumes from the last commit that took.
 	err error
@@ -114,6 +119,35 @@ func (a *attemptOutputs) append[T any](ctx context.Context, s *dsclient.Stream[T
 	}
 	if _, err := dsclient.Output(a.tx, s).Append(ctx, values); err != nil {
 		a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
+		return a.err
+	}
+	return nil
+}
+
+// appendLog writes a durable log line into the thread's open transaction, opening
+// the thread's log stream once. It never commits: the [protos.LogEvent] marker the
+// caller records next drives the commit, so a line and its marker are whole in one
+// transaction and the pull carries both home (see [nodeLogs.Log], [pulledStream]).
+func (a *attemptOutputs) appendLog(ctx context.Context, name string, rec *protos.LogRecord) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.begin(ctx); err != nil {
+		return err
+	}
+	if a.logStream == nil {
+		if err := ensureLogStream(context.WithoutCancel(ctx), a.node.client, name); err != nil {
+			return err
+		}
+		st, err := a.node.client.OpenStream[*protos.LogRecord](name, dsclient.WithCodec[*protos.LogRecord](
+			dswire.ReflectCodec[*protos.LogRecord]{New: func() *protos.LogRecord { return &protos.LogRecord{} }},
+		))
+		if err != nil {
+			return fmt.Errorf("wings: open log %s: %w", name, err)
+		}
+		a.logStream = st
+	}
+	if _, err := dsclient.Output(a.tx, a.logStream).Append(ctx, []*protos.LogRecord{rec}); err != nil {
+		a.err = fmt.Errorf("wings: write log of job %s: %w", a.job, err)
 		return a.err
 	}
 	return nil

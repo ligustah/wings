@@ -117,6 +117,15 @@ func (c *Cluster) pulledStream(sourceLog string) (string, bool) {
 	if !ok {
 		name = sourceLog
 	}
+	// A thread's log is pulled home under its own name, but is not a parseOutput
+	// stream, so a settled job's history drop leaves it (see dropOutputsOf) and the
+	// lines outlive the history.
+	if strings.HasPrefix(name, logPrefix) {
+		if c.wasDropped(name) {
+			return "", false
+		}
+		return name, true
+	}
 	o, ok := parseOutput(name)
 	if !ok {
 		return "", false

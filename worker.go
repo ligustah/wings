@@ -456,6 +456,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	runOpts := []flow.RunOption{
 		flow.WithStore(&historyStore{txns: txns, job: job.ID, attempt: job.Attempt}),
 		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
+		flow.WithLogHost(nodeLogs{txns: txns}),
 		flow.WithBlockingBeat(blockingBeat(txns.budget, n.commitInterval)),
 		flow.Once(),
 	}
