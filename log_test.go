@@ -105,6 +105,40 @@ func TestAForkedThreadsLogSurvivesItsHistoryDrop(t *testing.T) {
 	}
 }
 
+// THE POINT: a line logged from inside a run's Blocking step (off-thread work) is
+// written to the run's durable log like any other — buffered off-thread and flushed
+// through the coordinator host with the step's result.
+func TestABlockingStepsLogIsDurable(t *testing.T) {
+	c := start(t, Config{Target: InProcess()})
+	name := flow.NewName()
+
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		log := ctx.Logger()
+		_, err := ctx.Blocking(func() (int, error) {
+			log.Info("crunching off-thread", "n", 3)
+			return 3, nil
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lines, err := c.RunLogs(t.Context(), name)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	found := false
+	for _, l := range lines {
+		if l.Message == "crunching off-thread" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the blocking step's log line was not durable: %+v", lines)
+	}
+}
+
 // logsOnWorker logs a line, so a test can fork it onto a worker and check the line
 // is pulled home to the coordinator.
 var logsOnWorker = flow.Define(func(ctx flow.Context, _ int) (int, error) {

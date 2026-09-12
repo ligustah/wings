@@ -47,13 +47,21 @@ func (c Context) Blocking[T any](f func() (T, error)) (T, error) {
 		return out, nil
 	}
 
+	t.beginBlockingLog()
 	out, ferr := runOffThread(c, t, f)
+	t.endBlockingLog()
 	var payload []byte
 	if ferr == nil {
 		payload, err = dswire.EncodeRecord(codec, out)
 		if err != nil {
 			return zero, fmt.Errorf("flow: encode blocking result: %w", err)
 		}
+	}
+	// Flush the lines f logged off-thread into this thread's transaction before the
+	// result event, so the lines and the event that dedupes the whole step commit
+	// together (see threadState.flushBlockingLog).
+	if err := t.flushBlockingLog(); err != nil {
+		return zero, err
 	}
 	t.record(&protos.EffectEvent{Result: packResult(payload, ferr)})
 	if err := t.err(); err != nil {

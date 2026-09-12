@@ -138,6 +138,16 @@ type threadState struct {
 	sink    Sink
 	sinkErr error // the first persistence failure, if any
 
+	// blockingLog buffers log lines written from within a Blocking step's off-thread
+	// f, which cannot touch the thread's history or transaction itself. They flush
+	// into the thread's transaction with the step's result event, so they commit
+	// atomically and a replay — which skips f — needs no per-line marker. Its own
+	// lock: f's goroutine appends while the calling thread is parked in the step, and
+	// the calling thread drains it once f has returned. blocking gates the capture.
+	blockingMu  sync.Mutex
+	blocking    bool
+	blockingLog []*protos.LogRecord
+
 	// counter names the next child thread; the nth fork is always "<id>.<n>"
 	// whatever order the children are scheduled in.
 	counter uint64

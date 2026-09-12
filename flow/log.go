@@ -59,6 +59,13 @@ func (h *logHandler) Enabled(_ context.Context, level slog.Level) bool {
 // stashed on the thread to surface at its next operation, since slog discards
 // the error this returns.
 func (h *logHandler) Handle(ctx context.Context, rec slog.Record) error {
+	// A line written from within a Blocking step runs off the run thread, where the
+	// history and transaction below are unsafe to touch; buffer it to flush with the
+	// step's result (blockingLog), and record no marker of its own.
+	if h.t.captureBlockingLog(h.line(rec)) {
+		return nil
+	}
+
 	ev, err := h.t.expect[*protos.LogEvent]()
 	if err != nil {
 		h.t.fail(err)
@@ -77,6 +84,58 @@ func (h *logHandler) Handle(ctx context.Context, rec slog.Record) error {
 	}
 	h.t.record(&protos.LogEvent{})
 	return h.t.err()
+}
+
+// beginBlockingLog starts capturing lines written off-thread during a Blocking
+// step; endBlockingLog stops it. Between the two, Handle buffers into blockingLog
+// instead of recording a per-line marker and writing straight to the host.
+func (t *threadState) beginBlockingLog() {
+	t.blockingMu.Lock()
+	t.blocking = true
+	t.blockingMu.Unlock()
+}
+
+func (t *threadState) endBlockingLog() {
+	t.blockingMu.Lock()
+	t.blocking = false
+	t.blockingMu.Unlock()
+}
+
+// captureBlockingLog buffers a line while a Blocking step is in flight, reporting
+// true; otherwise it reports false and Handle takes the normal on-thread path.
+func (t *threadState) captureBlockingLog(rec *protos.LogRecord) bool {
+	t.blockingMu.Lock()
+	defer t.blockingMu.Unlock()
+	if !t.blocking {
+		return false
+	}
+	t.blockingLog = append(t.blockingLog, rec)
+	return true
+}
+
+// flushBlockingLog writes the lines a Blocking step buffered into the thread's
+// transaction, so they commit with the result event recorded next — one dedup point
+// for the whole step, since a replay skips f and never re-buffers them. With no host
+// they go to [slog.Default], matching a hostless Logger. Called on the run thread
+// once f has returned, so nothing appends to the buffer while it drains.
+func (t *threadState) flushBlockingLog() error {
+	t.blockingMu.Lock()
+	lines := t.blockingLog
+	t.blockingLog = nil
+	t.blockingMu.Unlock()
+
+	host := t.run.opts.logHost
+	for _, line := range lines {
+		if host == nil {
+			slog.Default().LogAttrs(t.base(), slog.Level(line.GetLevel()), line.GetMessage(), slogAttrs(line.GetAttrs())...)
+			continue
+		}
+		if err := host.Log(context.WithoutCancel(t.base()), t.run.name, t.id, line); err != nil {
+			t.fail(err)
+			return err
+		}
+	}
+	return t.err()
 }
 
 func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
