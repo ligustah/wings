@@ -288,6 +288,20 @@ func newCoordStore(c *Cluster, client *dsclient.Client) *coordStore {
 	}
 }
 
+// Drop commits the thread's tail before its history stream goes. A coalesced log
+// line lives in the same transaction as the history marker but on the log stream,
+// which outlives the history; without this flush a join that drops a short-lived
+// forked thread's history under a CommitInterval would abandon the transaction —
+// and the log line with it — before the run's end commits it.
+func (s *coordStore) Drop(ctx context.Context, run, thread string) error {
+	if out, err := s.c.coordOutputsFor(run + "/" + thread); err == nil {
+		if err := out.commit(context.WithoutCancel(ctx)); err != nil {
+			return err
+		}
+	}
+	return s.Store.Drop(ctx, run, thread)
+}
+
 func (s *coordStore) Sink(ctx context.Context, run, thread string) (flow.Sink, error) {
 	out, err := s.c.coordOutputsFor(run + "/" + thread)
 	if err != nil {
