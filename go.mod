@@ -8,12 +8,12 @@ require (
 	github.com/ligustah/commitlog v0.106.0
 	github.com/ligustah/commitlog/blockv3 v0.1.0
 	github.com/ligustah/commitlog/compress v0.1.0
-	github.com/ligustah/durable_streams v0.166.0
-	github.com/ligustah/durable_streams/broker v0.267.0
-	github.com/ligustah/durable_streams/broker/client v0.65.0
-	github.com/ligustah/durable_streams/broker/protos v0.47.0
-	github.com/ligustah/durable_streams/dsclient v0.55.0
-	github.com/ligustah/durable_streams/dswire v0.36.0
+	github.com/ligustah/durable_streams v0.168.0
+	github.com/ligustah/durable_streams/broker v0.269.0
+	github.com/ligustah/durable_streams/broker/client v0.66.0
+	github.com/ligustah/durable_streams/broker/protos v0.48.0
+	github.com/ligustah/durable_streams/dsclient v0.56.0
+	github.com/ligustah/durable_streams/dswire v0.37.0
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.83.2
@@ -44,7 +44,7 @@ require (
 	github.com/hashicorp/raft v1.7.3 // indirect
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
-	github.com/ligustah/durable_streams/dsembedded v0.88.0 // indirect
+	github.com/ligustah/durable_streams/dsembedded v0.90.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
