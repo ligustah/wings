@@ -329,7 +329,7 @@ func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 				return false
 			}
 			// put drops a copy already here; not announced back to the link.
-			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false)
+			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false, true)
 		}
 		return true
 	})

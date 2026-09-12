@@ -119,7 +119,7 @@ func TestUnboundedChannelSendNeverBlocks(t *testing.T) {
 // not hold its whole traffic in memory (the second in-memory copy).
 func TestChanStateConsumeDropsItemData(t *testing.T) {
 	cs := newChanState(4)
-	item, err := cs.put(context.Background(), "main", 0, []byte("payload"), false)
+	item, err := cs.put(context.Background(), "main", 0, []byte("payload"), false, false)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestChanStatePrunesReceivedItems(t *testing.T) {
 	cs := newChanState(unbounded)
 	const n = 5000
 	for i := 0; i < n; i++ {
-		it, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false)
+		it, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false, false)
 		if err != nil {
 			t.Fatalf("put: %v", err)
 		}
@@ -158,7 +158,7 @@ func TestChanStateFindIndexTracksItems(t *testing.T) {
 	cs := newChanState(unbounded)
 	const n = 5000
 	for i := 0; i < n; i++ {
-		if _, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false); err != nil {
+		if _, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false, false); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 	}
@@ -196,14 +196,14 @@ func TestChanStateWriterOnlyDropsSentBytes(t *testing.T) {
 	cs.attached = true
 	cs.noteRole(modeWrite) // a writer handle leaves reads unset
 
-	it, err := cs.put(context.Background(), "w/main", 0, []byte("payload"), false)
+	it, err := cs.put(context.Background(), "w/main", 0, []byte("payload"), false, false)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if it.data != nil {
 		t.Fatalf("a writer-only run kept %d bytes of a sent value", len(it.data))
 	}
-	if again, _ := cs.put(context.Background(), "w/main", 0, []byte("payload"), false); again != it {
+	if again, _ := cs.put(context.Background(), "w/main", 0, []byte("payload"), false, false); again != it {
 		t.Fatalf("a replayed send was not deduped to the queued item")
 	}
 
@@ -211,7 +211,7 @@ func TestChanStateWriterOnlyDropsSentBytes(t *testing.T) {
 	rs := newChanState(unbounded)
 	rs.attached = true
 	rs.noteRole(modeBoth)
-	kept, err := rs.put(context.Background(), "w/main", 0, []byte("payload"), false)
+	kept, err := rs.put(context.Background(), "w/main", 0, []byte("payload"), false, false)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}

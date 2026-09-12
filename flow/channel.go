@@ -103,12 +103,16 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	}
 	name := t.newChannelName()
 	t.run.declareChannel(name, capacity)
-	if t.run.fragment {
-		// Fragment run: any thread of it may use this, so link now; a replay's
-		// live run already announced what was on it.
-		if _, err := t.run.export(ctx, name, true, t.qualified(), modeBoth); err != nil {
-			// A channel that cannot be shared is unusable here; report on first
-			// use, where an error can be returned.
+	// With a host, every channel is stream-backed: link it at creation so its values
+	// go to the stream from the first send and nothing but a bounded prefetch is held
+	// in memory (wings always supplies a host). Without one — a standalone flow.Run
+	// with no durable channel transport — the channel stays in-process, its received
+	// values recorded inline for replay. A replay's live run already announced what
+	// was on it.
+	if t.run.host != nil {
+		if _, err := t.run.export(ctx, name, t.peek() != nil, t.qualified(), modeBoth); err != nil {
+			// A channel that cannot be shared is unusable here; report on first use,
+			// where an error can be returned.
 			t.run.mu.Lock()
 			delete(t.run.channels, name)
 			t.run.mu.Unlock()
@@ -224,7 +228,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		// one transaction (pull.go), so it is durably queued — queue it locally
 		// again without re-announcing. The relay delivers the one copy; the host
 		// will hand it back here through the pump.
-		item, err := cs.put(ctx, t.qualified(), seq, data, false)
+		item, err := cs.put(ctx, t.qualified(), seq, data, false, false)
 		if err != nil {
 			return err
 		}
@@ -263,7 +267,7 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 	// separate durable writes, not one transaction — never leaves an event with
 	// nothing queued; a torn send there has no event and replays afresh. The value
 	// itself is not recorded here: only the receiver's copy is (see Recv).
-	item, err := cs.put(ctx, t.qualified(), seq, data, true)
+	item, err := cs.put(ctx, t.qualified(), seq, data, true, false)
 	if err != nil {
 		return err
 	}
@@ -664,13 +668,17 @@ func (cs *chanState) announceReader(ctx context.Context) error {
 }
 
 // put queues a value and reports the item it queued. On a shared channel a new
-// item is announced to the host first, when announce says so.
-func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []byte, announce bool) (*chanItem, error) {
+// item is announced to the host first, when announce says so. viaPump marks the
+// call as the pump delivering a value the host holds, as against the writer queuing
+// its own send: the writer keeps only the identity (its bytes are on the stream),
+// the pump supplies the bytes the reader takes.
+func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []byte, announce, viaPump bool) (*chanItem, error) {
 	cs.mu.Lock()
 	// Already queued under this identity by a previous attempt's send now
 	// replaying, or returned from the host as the copy of one sent here: reuse
-	// it, or a receive naming that identity would find two.
+	// it — but let the pump fill the bytes onto a placeholder the writer queued.
 	if it := cs.find(from, seq); it != nil {
+		cs.fillLocked(it, data, viaPump)
 		cs.mu.Unlock()
 		return it, nil
 	}
@@ -686,16 +694,18 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	if it := cs.find(from, seq); it != nil {
+		cs.fillLocked(it, data, viaPump)
 		return it, nil
 	}
 	// Room is what this run has been told, true a moment ago: two senders on
 	// two machines can each take the last place, and the channel is briefly one
 	// over. Bounded and rare, and the alternative is a round trip per send.
 	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.roomFor(nil)}
-	if cs.attached && !cs.reads {
-		// A writer-only run never receives here, so its own queued value is read by
-		// no one — the host holds the canonical copy a receiver reads. Keep the
-		// identity to dedupe a replayed send; drop the bytes the wave would pile up.
+	if (cs.attached && !cs.reads) || (cs.link != nil && !viaPump) {
+		// The writer's own bytes are on the stream, so it keeps only the identity —
+		// to dedupe a replayed send and to hold a place for backpressure. The reader
+		// gets the bytes from the pump (viaPump). A writer-only run never receives, so
+		// this covers it too.
 		item.data = nil
 	}
 	if cs.claimed[itemKey(from, seq)] {
@@ -710,6 +720,17 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	cs.byKey[itemKey(from, seq)] = item
 	cs.broadcast()
 	return item, nil
+}
+
+// fillLocked gives a placeholder its value when the pump delivers it from the
+// stream: the writer queued the item by identity alone, its bytes on the stream. A
+// taken item (a replayed receive claimed it, reading its value from the offset)
+// keeps none. Call with mu held.
+func (cs *chanState) fillLocked(it *chanItem, data []byte, viaPump bool) {
+	if viaPump && !it.taken && it.data == nil && data != nil {
+		it.data = data
+		cs.broadcast()
+	}
 }
 
 func itemKey(from string, seq uint64) string { return fmt.Sprintf("%s#%d", from, seq) }
@@ -898,6 +919,12 @@ func (cs *chanState) awaitAny(ctx context.Context, t *threadState, id string, re
 		for _, it := range cs.items {
 			if it.taken {
 				continue
+			}
+			if it.data == nil {
+				// A placeholder the writer queued whose bytes the pump has not yet
+				// delivered from the stream; wait for them rather than hand back an empty
+				// value or skip ahead of it, which would break the channel's order.
+				break
 			}
 			it.taken = true
 			cs.broadcast()

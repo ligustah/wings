@@ -3,7 +3,6 @@ package flow_test
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -246,16 +245,38 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 	}
 }
 
-// THE POINT: a channel cannot leave a run that has no host, and the error
-// arrives at the call rather than as a hang somewhere else.
-func TestAChannelCannotLeaveARunWithoutAHost(t *testing.T) {
+// THE POINT: a run given no channel host gets a default in-memory one, so a channel
+// is usable without configuration — every channel is stream-backed (all channels
+// shared), the in-memory host standing in where there is no durable store.
+func TestAChannelWorksWithoutAnExplicitHost(t *testing.T) {
+	const n = 3
+	sum := 0
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
-		r, _ := ctx.NewChannel[int]()
-		_, err := consumer(ctx, feed{Values: r})
-		return err
+		r, w := ctx.NewChannel[int]()
+		for i := 1; i <= n; i++ {
+			if err := w.Send(ctx, i); err != nil {
+				return err
+			}
+		}
+		if err := w.Close(ctx); err != nil {
+			return err
+		}
+		for {
+			v, ok, err := r.Recv(ctx)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+			sum += v
+		}
 	}, flow.WithStore(flow.NewMemStore()), flow.Once())
-	if err == nil || !strings.Contains(err.Error(), "no channel host") {
-		t.Fatalf("got %v, want an error naming the missing host", err)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sum != n*(n+1)/2 {
+		t.Fatalf("received sum %d, want %d", sum, n*(n+1)/2)
 	}
 }
 
