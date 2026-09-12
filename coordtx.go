@@ -171,7 +171,7 @@ func (a *coordOutputs) appendLog(ctx context.Context, name string, rec *protos.L
 		return err
 	}
 	if a.logStream == nil {
-		if err := ensureStream(context.WithoutCancel(ctx), a.client, name); err != nil {
+		if err := ensureLogStream(context.WithoutCancel(ctx), a.client, name); err != nil {
 			return err
 		}
 		st, err := a.client.OpenStream[*protos.LogRecord](name, dsclient.WithCodec[*protos.LogRecord](
