@@ -536,6 +536,19 @@ func (t *threadState) commitBoundary(ctx context.Context) error {
 	return c.CommitBoundary(context.WithoutCancel(ctx))
 }
 
+// keepAlive holds a thread's transaction open across a stretch that records
+// nothing of its own: it commits what has been written so the backend does not
+// reap the transaction, and where a liveness sink is installed (a worker's
+// [Progress]) reports a beat so the thread is not judged stalled. Best-effort, like
+// the commits above. Used by [Context.Blocking]; a thread with neither a
+// coalescing sink nor a Progress has nothing to do here.
+func (t *threadState) keepAlive(ctx context.Context) error {
+	if st := progressFrom(ctx); st != nil && st.sink != nil {
+		return st.sink.Heartbeat(context.WithoutCancel(ctx), nil)
+	}
+	return t.commitBoundary(ctx)
+}
+
 // nextChild names the next thread this one forks, from the fork counter rather
 // than start order, so a replay re-adopts the child a previous attempt created.
 func (t *threadState) nextChild() string {

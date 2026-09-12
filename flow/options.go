@@ -22,6 +22,11 @@ type runOptions struct {
 	once          bool
 	retainHistory bool
 
+	// blockingBeat is how often [Context.Blocking] commits the calling thread's
+	// transaction and reports liveness while its work runs off-thread. The executor
+	// sets it to suit its transaction timeout and heartbeat bound; zero takes the default.
+	blockingBeat time.Duration
+
 	// input is the run body's input, recorded; inputType what it expects. Set
 	// by a [Workflow], not by callers.
 	input     []byte
@@ -48,6 +53,7 @@ func newRunOptions(fns []RunOption) runOptions {
 		maxAttempts:  10,
 		initialDelay: time.Second,
 		maxDelay:     time.Minute,
+		blockingBeat: defaultBlockingBeat,
 	}
 	for _, fn := range fns {
 		fn(&o)
@@ -60,6 +66,21 @@ type RunOption func(*runOptions)
 
 // WithStore says where this run's history is kept. Required.
 func WithStore(s Store) RunOption { return func(o *runOptions) { o.store = s } }
+
+// defaultBlockingBeat is the fallback [Context.Blocking] keep-alive period when an
+// executor sets none; well under the backend's default transaction timeout.
+const defaultBlockingBeat = 15 * time.Second
+
+// WithBlockingBeat sets how often [Context.Blocking] commits the calling thread's
+// transaction and reports liveness while its work runs. Pick it below both the
+// transaction timeout and any heartbeat bound. Zero keeps the default.
+func WithBlockingBeat(d time.Duration) RunOption {
+	return func(o *runOptions) {
+		if d > 0 {
+			o.blockingBeat = d
+		}
+	}
+}
 
 // WithExecutor says where the run's calls go. Defaults to [Local].
 func WithExecutor(e Executor) RunOption { return func(o *runOptions) { o.executor = e } }
