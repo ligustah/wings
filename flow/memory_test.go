@@ -3,10 +3,61 @@ package flow
 import (
 	"context"
 	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ligustah/wings/flow/protos"
 )
+
+// feedLink is a [ChannelLink] that hands the pump a fixed run of value items and
+// then idles, counting how many the pump actually took (yield returned true). The
+// pump's prefetch gate blocks yield when the buffer is full, so fed stops climbing
+// there until the reader drains.
+type feedLink struct {
+	items []ChannelItem
+	fed   int32
+}
+
+func (l *feedLink) Send(context.Context, string, ChannelItem) error { return nil }
+func (l *feedLink) Close() error                                    { return nil }
+func (l *feedLink) Items(ctx context.Context, yield func(ChannelItem) bool) error {
+	for _, it := range l.items {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !yield(it) {
+			return nil
+		}
+		atomic.AddInt32(&l.fed, 1)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func heldData(cs *chanState) int {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	n := 0
+	for _, it := range cs.items {
+		if it.data != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
 
 // discardSink persists nothing it is handed — like a real store that has
 // serialized the event to disk and no longer holds the Go object. It leaves
@@ -167,6 +218,64 @@ func TestChanStateWriterOnlyDropsSentBytes(t *testing.T) {
 	if kept.data == nil {
 		t.Fatalf("a read-capable run dropped a value it may receive")
 	}
+}
+
+// THE POINT: the reader's pump holds only a bounded prefetch in memory. A sender
+// races far ahead on an unbounded channel, but the pump stops pulling from the
+// stream at the window and leaves the backlog there — yet still delivers every
+// value once the reader drains, in order.
+func TestChanStatePumpBoundsPrefetch(t *testing.T) {
+	cs := newChanState(unbounded)
+	cs.attached, cs.reads = true, true // a read-capable attached channel keeps values
+
+	const n = channelPrefetch * 4
+	items := make([]ChannelItem, n)
+	for i := range items {
+		items[i] = ChannelItem{From: "w/main", Seq: uint64(i), Data: []byte("x")}
+	}
+	link := &feedLink{items: items}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go cs.pump(ctx, link)
+
+	// It fills to the window and stops — the whole stream is not mirrored in.
+	waitFor(t, "the prefetch window to fill", func() bool { return heldData(cs) >= channelPrefetch })
+	time.Sleep(50 * time.Millisecond) // a broken gate would overrun in this window
+	if h := heldData(cs); h > channelPrefetch {
+		t.Fatalf("the pump buffered %d value items, want at most %d", h, channelPrefetch)
+	}
+	if fed := atomic.LoadInt32(&link.fed); fed > channelPrefetch {
+		t.Fatalf("the pump pulled %d values from the stream, want at most %d before the reader drains", fed, channelPrefetch)
+	}
+
+	// Draining opens places; the pump advances and eventually delivers them all, in
+	// order, never holding more than the window at once.
+	for got := 0; got < n; {
+		cs.mu.Lock()
+		var next *chanItem
+		for _, it := range cs.items {
+			if it.data != nil && !it.consumed {
+				next = it
+				break
+			}
+		}
+		cs.mu.Unlock()
+		if next == nil {
+			waitFor(t, "the pump to deliver the next value", func() bool { return heldData(cs) > 0 })
+			continue
+		}
+		if next.seq != uint64(got) {
+			t.Fatalf("received value %d out of order: seq %d", got, next.seq)
+		}
+		next.taken = true
+		cs.consume(next)
+		got++
+		if h := heldData(cs); h > channelPrefetch {
+			t.Fatalf("mid-drain the pump held %d value items, want at most %d", h, channelPrefetch)
+		}
+	}
+	waitFor(t, "the pump to finish the stream", func() bool { return atomic.LoadInt32(&link.fed) == n })
 }
 
 // THE POINT: a live thread does not keep the values it records. Its history is

@@ -275,6 +275,41 @@ func (r *runState) closeLinks() {
 	}
 }
 
+// channelPrefetch bounds how many value-carrying items the reader's pump holds in
+// memory at once: it stops pulling from the durable stream once this many are
+// buffered and unconsumed, and resumes as the run body consumes them. So a reader
+// that falls behind leaves the backlog on the stream (disk, retention-bounded)
+// rather than mirroring it all into RAM. Independent of channel capacity, which only
+// governs whether the sender parks.
+const channelPrefetch = 64
+
+// awaitPrefetchRoom blocks until fewer than channelPrefetch value-carrying items are
+// buffered, or ctx ends (then it returns false). Only items still holding their bytes
+// count — a consumed, claimed, or writer-dropped item has none — so the bound tracks
+// resident memory, not queue length. Consuming a value frees a place and wakes it.
+func (cs *chanState) awaitPrefetchRoom(ctx context.Context) bool {
+	for {
+		cs.mu.Lock()
+		held := 0
+		for _, it := range cs.items {
+			if it.data != nil {
+				held++
+			}
+		}
+		if held < channelPrefetch {
+			cs.mu.Unlock()
+			return true
+		}
+		wait := cs.changed
+		cs.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
 // pump delivers the channel's record, as it arrives on the link, into local state.
 func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 	_ = link.Items(ctx, func(it ChannelItem) bool {
@@ -288,6 +323,11 @@ func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
 			// The reader consumed this value; free the place in a sender's own mirror.
 			cs.free(it.From, it.Seq)
 		default:
+			// Hold only a bounded read-ahead in memory; the durable stream keeps the rest
+			// until the reader catches up. A closing link ends the wait and the pump.
+			if !cs.awaitPrefetchRoom(ctx) {
+				return false
+			}
 			// put drops a copy already here; not announced back to the link.
 			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false)
 		}

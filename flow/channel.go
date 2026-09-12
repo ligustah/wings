@@ -752,6 +752,9 @@ func (cs *chanState) consume(item *chanItem) {
 	if len(cs.items) >= 2*cs.floor+64 {
 		cs.prune()
 	}
+	// Freeing the bytes opens a prefetch place; wake the pump so it pulls the next
+	// value from the stream (see awaitPrefetchRoom).
+	cs.broadcast()
 	cs.mu.Unlock()
 }
 
