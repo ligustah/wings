@@ -16,13 +16,62 @@ import (
 // A coordinator thread's history and the shared-channel outboxes it writes go
 // through one transactional producer per thread, so a send's event and its
 // outbox record commit together and no sibling thread's commit can tear them
-// apart (see [flow.Committer]). The coordinator's counterpart to a worker's
-// [attemptOutputs]. A coordinator run retries in place over reused producers, so
-// each thread's producer resets when its own history shows a higher attempt (see
-// [coordOutputs.resetTo]); a thread's RunStart marker resets it before the thread
-// sends anything new.
+// apart (see [flow.Committer]). One goroutine — the thread that owns it — ever
+// touches the producer, so its writes are fully serialized. The coordinator's
+// counterpart to a worker's [attemptOutputs]. A coordinator run retries in place
+// over reused producers, so each thread's producer resets when its own history
+// shows a higher attempt (see [coordOutputs.resetTo]); a thread's RunStart marker
+// resets it before the thread sends anything new.
 
 const coordPrefix = "wings.coord."
+
+// defaultTxBudget is how long a thread's transaction may stay open before the
+// backend reaps it. Generous because a stream has a single producer, so a
+// long-held transaction blocks no one; a thread that runs long without writing
+// keeps its transaction alive through [flow.Context.Blocking] rather than by a
+// tighter bound.
+const defaultTxBudget = 5 * time.Minute
+
+// coordTxBudget forces the coordinator's per-transaction timeout, overriding the
+// default. Zero uses the default; a var so a test can shrink it to reproduce a
+// reap without a long wait.
+var coordTxBudget time.Duration
+
+// txBudget is the per-transaction timeout a thread opens with: generous by
+// default, widened to outlast a large commit interval so coalescing is not cut
+// short by a reap. This is the reap ceiling, not how often a thread commits — a
+// thread that runs long without writing keeps its transaction alive through
+// [flow.Context.Blocking].
+func txBudget(commitInterval time.Duration) time.Duration {
+	b := defaultTxBudget
+	if want := 3 * commitInterval; want > b {
+		b = want
+	}
+	return b
+}
+
+// coordBudget is txBudget for the coordinator, forced by coordTxBudget for a test.
+func coordBudget(commitInterval time.Duration) time.Duration {
+	if coordTxBudget > 0 {
+		return coordTxBudget
+	}
+	return txBudget(commitInterval)
+}
+
+// blockingBeat is how often [flow.Context.Blocking] commits the calling thread's
+// transaction and reports liveness while its work runs: a fraction of the
+// transaction budget, so it commits well before a reap, and never longer than the
+// commit interval, so coalesced writes still land on time.
+func blockingBeat(budget, commitInterval time.Duration) time.Duration {
+	if budget <= 0 {
+		budget = defaultTxBudget
+	}
+	beat := budget / 4
+	if commitInterval > 0 && commitInterval < beat {
+		beat = commitInterval
+	}
+	return beat
+}
 
 // coordOutputs is one coordinator thread's transactional producer and its open
 // transaction, shared by the thread's history sink and the shared-channel links
@@ -34,7 +83,7 @@ type coordOutputs struct {
 	budget time.Duration
 	// commitInterval coalesces plain history commits: a transaction older than this
 	// commits on the next append, so events between commit at most once per interval.
-	// Zero commits every event. Channel writes commit at once regardless (coordSink).
+	// Zero commits every event. A parked or blocking thread flushes regardless.
 	commitInterval time.Duration
 
 	mu       sync.Mutex
@@ -70,7 +119,7 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 		}
 		a.producer = p
 		if a.budget <= 0 {
-			a.budget = p.TransactionTimeout()
+			a.budget = coordBudget(a.commitInterval)
 		}
 	}
 	tx, err := a.producer.BeginTimeout(ctx, a.budget)
@@ -90,12 +139,11 @@ func (a *coordOutputs) commitDue() bool {
 	return a.commitInterval <= 0 || time.Since(a.opened) >= a.commitInterval
 }
 
-// stage writes a shared-channel record into the thread's open transaction without
-// committing. A value announced before its send event waits for that event's
-// commit; a consume report sent after its receive commits under the receive's own
-// [coordSink.Commit]. Only the writing thread touches this producer, so a record
-// is never torn from the event that justifies it.
-func (a *coordOutputs) stage(ctx context.Context, s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) error {
+// append writes a shared-channel record into the thread's open transaction. It
+// never commits: a value precedes the send event that justifies it, so the commit
+// is left to the event ([coordSink.Append]), which keeps the two whole in one
+// transaction.
+func (a *coordOutputs) append(ctx context.Context, s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.begin(ctx); err != nil {
@@ -108,9 +156,10 @@ func (a *coordOutputs) stage(ctx context.Context, s *dsclient.Stream[flow.Channe
 	return nil
 }
 
-// stageEvent stages a thread's event into its transaction; the caller commits. A
-// value staged earlier in the same transaction goes home with it.
-func (a *coordOutputs) stageEvent(ctx context.Context, s *dsclient.Stream[*protos.Event], ev *protos.Event) error {
+// appendEvent writes a thread's event into its transaction. It never commits; the
+// caller ([coordSink]) decides when, so a coalescing interval holds several events
+// in one transaction.
+func (a *coordOutputs) appendEvent(ctx context.Context, s *dsclient.Stream[*protos.Event], ev *protos.Event) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.begin(ctx); err != nil {
@@ -156,7 +205,7 @@ func (a *coordOutputs) commitIfDue(ctx context.Context) error {
 // resetTo drops a failed attempt's transaction and clears its error once a higher
 // attempt is seen, so the retry writes afresh over the reused producer. The
 // thread's RunStart marker carries the new attempt, so the reset happens before
-// the thread stages anything new.
+// the thread writes anything new.
 func (a *coordOutputs) resetTo(ctx context.Context, attempt uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -247,22 +296,23 @@ func (s *coordSink) Append(ctx context.Context, ev *protos.Event) error {
 		}
 		s.stream = st
 	}
-	// Stage the event, then commit unless a CommitInterval is holding the transaction
-	// open to coalesce writes. What must be durable at once — a channel send's value,
-	// or a thread's writes as it blocks — is flushed by [coordSink.Commit] and
-	// [coordSink.CommitBoundary]; between those, work in flight coalesces and a
+	// Append the event — after any value a send announced just before it, so the two
+	// are whole in one transaction — then commit unless a CommitInterval is holding
+	// the transaction open to coalesce. What must be durable at once — a channel
+	// send's value, or a thread's writes as it parks — is flushed by [coordSink.Commit]
+	// and [coordSink.CommitBoundary]; between those, work in flight coalesces and a
 	// coordinator restart replays whatever the last commit did not cover.
-	if err := s.out.stageEvent(ctx, s.stream, ev); err != nil {
+	if err := s.out.appendEvent(ctx, s.stream, ev); err != nil {
 		return err
 	}
 	return s.out.commitIfDue(ctx)
 }
 
 // Commit implements [flow.Committer]: it commits a channel send's event with the
-// value it staged, or a consume report with the receive that justified it. Under
-// a CommitInterval it coalesces, committing only once the transaction has aged
-// past the interval; a parked thread's [coordSink.CommitBoundary] flushes what is
-// left open so nothing waits on it forever.
+// value it announced, or a consume report with the receive that justified it.
+// Under a CommitInterval it coalesces, committing only once the transaction has
+// aged past the interval; a parked thread's [coordSink.CommitBoundary] flushes what
+// is left open so nothing waits on it forever.
 func (s *coordSink) Commit(ctx context.Context) error { return s.out.commitIfDue(ctx) }
 
 // CommitBoundary implements [flow.BoundaryCommitter]: it force-commits as the

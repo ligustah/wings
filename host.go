@@ -82,6 +82,7 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 		flow.WithStore(newCoordStore(c, client)),
 		flow.WithPlacer(clusterPlacer{c}),
 		flow.WithChannelHost(clusterChannels{c}),
+		flow.WithBlockingBeat(blockingBeat(coordBudget(c.cfg.CommitInterval), c.cfg.CommitInterval)),
 	)
 	if c.cfg.RetainHistory {
 		all = append(all, flow.RetainHistory())

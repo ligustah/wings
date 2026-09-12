@@ -58,8 +58,8 @@ func Record[E any](ctx context.Context, name string) (*Recorder[E], error) {
 		return nil, err
 	}
 	// The recording belongs to the thread that makes it: its writes go in that
-	// thread's transaction, so a flush never tears a sibling thread's staged send,
-	// and the history event that names the recording commits with it.
+	// thread's own transaction, which no sibling commits, and the history event
+	// that names the recording commits with it.
 	_, thread, _ := flow.Self(ctx)
 	if thread == "" {
 		thread = flow.MainThread

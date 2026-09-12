@@ -19,11 +19,13 @@ import (
 // and attempt number follow.
 const attemptWorkloadPrefix = "wings.job."
 
-// Everything one attempt writes — its run history, recordings, byte streams —
-// goes under one transactional producer and becomes visible together, so a
-// moved job's leftovers cannot disagree. Committed at each heartbeat and step
-// (so progress the coordinator is told is never ahead of what it can copy), on
-// return, and by age before the backend times the transaction out.
+// Each thread of one attempt writes its run history, recordings, and
+// shared-channel outbox under its own transactional producer, which it alone
+// commits, so a moved job's leftovers cannot disagree and no sibling's commit
+// tears a send from its event. Committed at clear boundaries between whole
+// events: the event's own append (coalesced under a CommitInterval), a channel
+// wait, the thread's heartbeat, and its end. A thread that runs long without
+// writing keeps its transaction alive through [flow.Context.Blocking].
 
 // historyPrefix is the history of the run an attempt executes as; its Name part
 // is always "history".
@@ -59,14 +61,6 @@ type attemptOutputs struct {
 	// push out first.
 	flushers map[int]func() error
 	nextFl   int
-
-	// pending holds shared-channel values this thread has announced but not yet
-	// recorded, staged into the transaction only by the event that justifies each
-	// (appendEvents). A concurrent commit — a heartbeat, an unload — then never makes
-	// a value durable without its event, a tear a replay would resend; and an
-	// interrupted send's value is simply dropped, never committed. Only a single
-	// thread writes here, so it needs no keying.
-	pending []pendingSend
 }
 
 func newAttemptOutputs(n *workerNode, job string, attempt int, thread string, budget time.Duration) *attemptOutputs {
@@ -97,7 +91,7 @@ func (a *attemptOutputs) begin(ctx context.Context) error {
 		}
 		a.producer = p
 		if a.budget <= 0 {
-			a.budget = p.TransactionTimeout()
+			a.budget = txBudget(a.node.commitInterval)
 		}
 	}
 	tx, err := a.producer.BeginTimeout(ctx, a.budget)
@@ -109,7 +103,9 @@ func (a *attemptOutputs) begin(ctx context.Context) error {
 	return nil
 }
 
-// append writes values to s inside the attempt's transaction.
+// append writes values to s inside the thread's transaction. It never commits: a
+// value precedes the send event that justifies it, so the commit is left to the
+// event ([historySink.Append]), which keeps the two whole in one transaction.
 func (a *attemptOutputs) append[T any](ctx context.Context, s *dsclient.Stream[T], values []T) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -120,54 +116,22 @@ func (a *attemptOutputs) append[T any](ctx context.Context, s *dsclient.Stream[T
 		a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
 		return a.err
 	}
-	// Commit by age, so the backend does not time the transaction out and abort it.
-	if time.Since(a.opened) > a.budget/2 {
-		return a.commitLocked(ctx)
-	}
 	return nil
 }
 
-// stage holds a shared-channel value until the event that justifies it is
-// recorded (appendEvents), so no commit in between can make the value durable
-// without its event.
-func (a *attemptOutputs) stage(s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.pending = append(a.pending, pendingSend{stream: s, item: it})
-}
-
-// flushPendingLocked stages the held values into the open transaction. Call with
-// mu held and a transaction open.
-func (a *attemptOutputs) flushPendingLocked(ctx context.Context) error {
-	for _, p := range a.pending {
-		if _, err := dsclient.Output(a.tx, p.stream).Append(ctx, []flow.ChannelItem{p.item}); err != nil {
-			a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
-			return a.err
-		}
-	}
-	a.pending = nil
-	return nil
-}
-
-// appendEvents stages the thread's held values and then its events into the
-// transaction under one lock hold, so each value commits with the event that
-// justifies it; it commits by age so the backend does not time the transaction
-// out.
+// appendEvents writes a thread's events into its transaction — after any value a
+// send announced just before, so the two are whole. It never commits; the caller
+// ([historySink]) decides when, so a coalescing interval holds several events in
+// one transaction.
 func (a *attemptOutputs) appendEvents(ctx context.Context, s *dsclient.Stream[*protos.Event], values []*protos.Event) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.begin(ctx); err != nil {
 		return err
 	}
-	if err := a.flushPendingLocked(ctx); err != nil {
-		return err
-	}
 	if _, err := dsclient.Output(a.tx, s).Append(ctx, values); err != nil {
 		a.err = fmt.Errorf("wings: write output of job %s: %w", a.job, err)
 		return a.err
-	}
-	if time.Since(a.opened) > a.budget/2 {
-		return a.commitLocked(ctx)
 	}
 	return nil
 }
@@ -196,7 +160,7 @@ func (a *attemptOutputs) commitDue() bool {
 // commitIfDue commits only once the open transaction has aged past the worker's
 // commitInterval, so a run of channel sends between commits coalesces into one.
 // What must not wait for the interval — a value someone is blocked on, a reported
-// checkpoint — is flushed by [historySink.CommitBoundary] and [attemptTxns.commitAll].
+// checkpoint — is flushed by [historySink.CommitBoundary] and [progressOf.Heartbeat].
 func (a *attemptOutputs) commitIfDue(ctx context.Context) error {
 	a.mu.Lock()
 	if !a.commitDue() {
@@ -283,20 +247,6 @@ func (t *attemptTxns) For(thread string) *attemptOutputs {
 		t.byThread[thread] = a
 	}
 	return a
-}
-
-// commitAll commits every thread's open transaction, so a reported checkpoint is
-// never ahead of what any thread has made durable.
-func (t *attemptTxns) commitAll(ctx context.Context) error {
-	t.mu.Lock()
-	outs := slices.Collect(maps.Values(t.byThread))
-	t.mu.Unlock()
-	for _, a := range outs {
-		if err := a.commit(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // finishAll commits what every thread has left once the attempt is over, on its
@@ -445,13 +395,21 @@ func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
 	}
 	batch := append(s.held, ev)
 	s.held = nil
-	return s.out.appendEvents(ctx, s.stream, batch)
+	// Append after any value a send announced just before it, so the two are whole
+	// in one transaction, then commit unless a CommitInterval is holding the
+	// transaction open to coalesce. A value someone is blocked on, or a thread as it
+	// parks, is flushed by Commit and CommitBoundary; between those, work in flight
+	// coalesces and a restart replays whatever the last commit did not cover.
+	if err := s.out.appendEvents(ctx, s.stream, batch); err != nil {
+		return err
+	}
+	return s.out.commitIfDue(ctx)
 }
 
 // Commit implements [flow.Committer]: it commits the thread's transaction, so a
-// shared-channel send's event and its outbox record — both staged in this
+// shared-channel send's event and its outbox record — both written into this
 // thread's producer — go home together (pull.go). A consume report the thread
-// staged just before this also commits here, with the receive that justified it.
+// wrote just before this also commits here, with the receive that justified it.
 // Under a CommitInterval it coalesces, committing only once the transaction has
 // aged past the interval; a parked thread's [historySink.CommitBoundary] flushes
 // what is left so nothing waits on it forever.

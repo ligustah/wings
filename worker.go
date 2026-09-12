@@ -155,12 +155,12 @@ type progressOf struct {
 	txns    *attemptTxns
 }
 
-// Heartbeat commits what every thread of the attempt has written before
-// reporting progress, so a checkpoint never claims more than a retry can be
-// handed — a thread's progress is never reported ahead of another thread's
-// durable writes.
+// Heartbeat commits the calling thread's own transaction before reporting
+// progress, so that thread's checkpoint never claims more than a retry can be
+// handed. Only the thread that beats writes into its producer, so committing it
+// here is on that single writer — no cross-thread commit.
 func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
-	if err := p.txns.commitAll(ctx); err != nil {
+	if err := p.txns.For(threadOrMain(ctx)).commit(ctx); err != nil {
 		return err
 	}
 	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
@@ -456,6 +456,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	runOpts := []flow.RunOption{
 		flow.WithStore(&historyStore{txns: txns, job: job.ID, attempt: job.Attempt}),
 		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
+		flow.WithBlockingBeat(blockingBeat(txns.budget, n.commitInterval)),
 		flow.Once(),
 	}
 	var payload []byte

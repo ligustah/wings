@@ -20,9 +20,10 @@ import (
 // wings.chancons.<channel> carrying the reader's consume reports. A send writes to
 // one of these as part of the writing thread's transaction, so a send's record and
 // the event that justifies it commit atomically and come home together under the
-// transaction pull (pull.go); a worker thread holds a value until its event so no
-// concurrent commit can tear the two ([attemptOutputs.stage]), and a value reaches
-// the stream exactly once, so a replay never resends it. A run receives by reading
+// transaction pull (pull.go); a worker thread holds a value out of its transaction
+// until its event (stage), and a coordinator's append never commits before its
+// event, so either way no commit takes a value home without its event and a value
+// reaches the stream exactly once, so a replay never resends it. A run receives by reading
 // the value stream directly — its own copy on the coordinator, a copy pushed to it
 // on a worker (subscribeChannel); the coordinator folds the value and consume
 // streams into the counts a blocked sender or receiver waits on (foldChannel).
@@ -103,16 +104,6 @@ func openChannelStream(ctx context.Context, client *dsclient.Client, name string
 		return nil, err
 	}
 	return eventStream[flow.ChannelItem](client, name)
-}
-
-// pendingSend is a shared-channel value a thread has announced but whose event is
-// not yet recorded. A worker thread's producer holds it until that thread's next
-// event stages it (see [attemptOutputs.stage], [attemptOutputs.appendEvents]), so
-// no commit in between — a heartbeat, an unload — makes a value durable without
-// its event, a tear a replay would resend.
-type pendingSend struct {
-	stream *dsclient.Stream[flow.ChannelItem]
-	item   flow.ChannelItem
 }
 
 // pushGroup names the mirror that pushes a channel's value stream to one worker.
@@ -226,11 +217,15 @@ func (c *Cluster) runChannelRelay() {
 	for {
 		names, err := client.ListStreams(c.ctx)
 		if err == nil {
+			var present []string
 			for _, name := range names {
 				o, ok := parseOutput(name)
 				if !ok || (o.Prefix != chanvalPrefix && o.Prefix != chanconsPrefix) {
 					continue
 				}
+				// A channel stream still on storage: its run's and job's tombstones must
+				// stay, since a late one under them may yet be discovered here.
+				present = append(present, chanPrefix+o.Name)
 				if c.wasDropped(name) {
 					// Retired for good, but a pull whose destination was chosen before the
 					// drop re-created it; re-drop the reappearance (it stays marked dropped,
@@ -251,6 +246,10 @@ func (c *Cluster) runChannelRelay() {
 				// and the stream names (chanValues/chanConsumes) reproduce idempotently.
 				c.foldChannel(client, name, o.Name, o.Prefix == chanvalPrefix)
 			}
+			// A complete listing: evict the retire tombstones of runs and jobs whose
+			// streams are all gone, so retiredRun/retiredJob do not grow for the
+			// coordinator's life.
+			c.evictQuiescentTombstones(present)
 		} else if c.ctx.Err() != nil {
 			return
 		}
@@ -280,6 +279,50 @@ func (c *Cluster) channelRetired(idMangled string) bool {
 	}
 	for run := range r.retiredRun {
 		if strings.HasPrefix(key, chanPrefix+streamPart(run)+"_") {
+			return true
+		}
+	}
+	return false
+}
+
+// evictQuiescentTombstones drops the retire tombstones of runs and jobs none of
+// whose channel streams are still on storage. A tombstone (retiredRun,
+// retiredJob) exists only to recognize a stream that comes home after its creator
+// retired (channelRetired). Once the relay has discovered that stream and dropped
+// it, it is gone from a listing, and no later one can arrive — the creator's pulls
+// all finished before it retired, so nothing re-creates its streams — leaving the
+// tombstone dead weight. present is every channel stream this sweep listed;
+// retaining a tombstone whose streams still appear keeps recognizing them, and
+// dropping the rest bounds the maps over a long-lived coordinator.
+func (c *Cluster) evictQuiescentTombstones(present []string) {
+	r := c.relay
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for run := range r.retiredRun {
+		prefix := chanPrefix + streamPart(run) + "_"
+		if !anyHasPrefix(present, prefix) {
+			delete(r.retiredRun, run)
+		}
+	}
+	for job, origin := range r.retiredJob {
+		if !anyCreatedByThread(present, origin) {
+			delete(r.retiredJob, job)
+		}
+	}
+}
+
+func anyHasPrefix(keys []string, prefix string) bool {
+	for _, k := range keys {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func anyCreatedByThread(keys []string, origin flow.Origin) bool {
+	for _, k := range keys {
+		if createdByThread(k, origin.Run, origin.Thread) {
 			return true
 		}
 	}
@@ -578,7 +621,7 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, mode flow.Lin
 	if run != flow.SignalSender {
 		// A record goes into the writing thread's own transaction (sender names it),
 		// so it commits with the event that justifies it and no sibling thread's
-		// commit can tear the two apart (see [coordOutputs.stage], flow.Committer).
+		// commit can tear the two apart (see [coordOutputs.append], flow.Committer).
 		send = func(ctx context.Context, sender string, it flow.ChannelItem) error {
 			outputs, err := h.c.coordOutputsFor(sender)
 			if err != nil {
@@ -592,7 +635,10 @@ func (h clusterChannels) Link(ctx context.Context, run, id string, mode flow.Lin
 			if err != nil {
 				return err
 			}
-			return outputs.stage(ctx, st, it)
+			// append never commits: a value precedes its send event, and a consume
+			// report or close rides the event it pairs with, so the event's commit
+			// takes both home together.
+			return outputs.append(ctx, st, it)
 		}
 	}
 	return &channelLink{
@@ -644,10 +690,9 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 		}
 	}
 	return &channelLink{
-		// Each record goes into the writing thread's own transaction, so it commits
-		// with the event that justifies it and no sibling thread's commit can tear the
-		// two apart (pull.go, [attemptOutputs.stage]). A value waits for its send event;
-		// a close or consume report rides the event it pairs with. The stream is
+		// Each record goes into the writing thread's own transaction, which the send
+		// event that follows commits, so the value and its event stay whole and no
+		// sibling thread's commit can tear them apart (pull.go). The stream is
 		// transactional, so it is pulled, not mirrored.
 		send: func(ctx context.Context, _ string, it flow.ChannelItem) error {
 			out := h.job.txns.For(threadOrMain(ctx))
@@ -659,11 +704,7 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 			if err != nil {
 				return err
 			}
-			if it.Closed || it.Consumed {
-				return out.append(ctx, es, []flow.ChannelItem{it})
-			}
-			out.stage(es, it)
-			return nil
+			return out.append(ctx, es, []flow.ChannelItem{it})
 		},
 		client: h.n.client,
 		in:     linkStreams(id, mode),

@@ -98,6 +98,45 @@ func TestACommitIntervalDoesNotStallABoundedChannel(t *testing.T) {
 	}
 }
 
+// THE POINT: under a CommitInterval a thread's transaction is held open to
+// coalesce; a long step that records no event would let the backend's timeout reap
+// it. [flow.Context.Blocking] runs that step off-thread while the thread commits on
+// a timer (the coordinator installs no Progress, so its keep-alive is a plain
+// commit, not a heartbeat), so the transaction stays young and the next event still
+// appends. Before Blocking, the event after such a step failed with "cannot append
+// to a transaction that is being finalized" and killed the run.
+func TestACommitIntervalSurvivesALongBlockingStep(t *testing.T) {
+	// A small per-transaction budget so the backend's reaper (which sweeps every few
+	// seconds) would time the held transaction out during the step rather than after
+	// its multi-minute default. The step outlasts several sweeps.
+	defer func(b time.Duration) { coordTxBudget = b }(coordTxBudget)
+	coordTxBudget = 500 * time.Millisecond
+
+	c := start(t, Config{Target: InProcess(), CommitInterval: 100 * time.Millisecond})
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		// An event opens the transaction; the interval holds it open.
+		if _, err := ctx.Effect(func() (int, error) { return 1, nil }); err != nil {
+			return err
+		}
+		// A step that records nothing for far longer than the budget: Blocking commits
+		// on its beat so the transaction is never reaped.
+		if _, err := ctx.Blocking(func() (int, error) {
+			time.Sleep(8 * time.Second)
+			return 2, nil
+		}); err != nil {
+			return err
+		}
+		// The event after the long step must find a live transaction to append to.
+		if _, err := ctx.Effect(func() (int, error) { return 3, nil }); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 // THE POINT: the CommitInterval reaches the WORKERS, the fsync path that matters
 // most — a worker runs the bulk of the jobs. A forked producer on a worker sends
 // under a long interval, so its channel sends coalesce into far fewer commits
