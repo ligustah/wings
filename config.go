@@ -144,7 +144,8 @@ type Config struct {
 	// it blocks (so a value reaches whoever waits on it), on each heartbeat or
 	// checkpoint, and when it ends, so delivery and reported progress stay correct;
 	// only work in flight coalesces. Passed to workers as WINGS_COMMIT_INTERVAL. The
-	// zero value commits every event, so a restart loses nothing.
+	// zero value uses a 1s default; set a negative value to commit every event, so a
+	// restart loses nothing at the cost of an fsync per event.
 	CommitInterval time.Duration
 
 	// Build controls cross-compilation of the worker binary. Used only by [Remote].
@@ -186,6 +187,23 @@ func (c Config) attempts() int {
 		return max(c.MaxAttempts, 1)
 	}
 	return 5
+}
+
+// defaultCommitInterval is what an unset CommitInterval resolves to.
+const defaultCommitInterval = time.Second
+
+// commitInterval resolves CommitInterval: unset (zero) takes the 1s default, a
+// negative value means commit every event (eager), and a positive value is used
+// as given. Resolved once on the coordinator, then passed to workers verbatim, so
+// an unset env on a worker still means eager rather than re-defaulting.
+func (c Config) commitInterval() time.Duration {
+	if c.CommitInterval < 0 {
+		return 0
+	}
+	if c.CommitInterval == 0 {
+		return defaultCommitInterval
+	}
+	return c.CommitInterval
 }
 
 func (c *Config) workers() int {

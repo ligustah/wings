@@ -30,12 +30,15 @@ var movesItsSpawn = flow.Define(func(ctx flow.Context, _ int) (flow.None, error)
 		if err != nil {
 			return sighting{}, err
 		}
-		// A commit point: the effect is in the history the coordinator
-		// holds before the worker goes.
-		if err := ctx.Heartbeat(1); err != nil {
+		if err := cw.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
 			return sighting{}, err
 		}
-		if err := cw.Send(ctx, sighting{Worker: where(ctx), Value: r}); err != nil {
+		// A commit point after the send: under a CommitInterval the send would
+		// otherwise coalesce, and the thread then waits on ctx.Done() — a park the
+		// flow layer cannot see — so nothing would flush it to the waiting parent.
+		// The heartbeat commits both the effect (for the retry to replay) and the
+		// send, so both are in the history the coordinator holds before the worker goes.
+		if err := ctx.Heartbeat(1); err != nil {
 			return sighting{}, err
 		}
 		if ctx.Attempt() == 0 {
