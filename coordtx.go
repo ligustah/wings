@@ -89,6 +89,9 @@ type coordOutputs struct {
 	mu       sync.Mutex
 	producer dsclient.Producer
 	tx       dsclient.Tx
+	// logStream is the thread's durable log, opened once and written inside the
+	// same transaction as its history so a line and its marker commit together.
+	logStream *dsclient.Stream[*protos.LogRecord]
 	// opened is when the current transaction began, for commitInterval.
 	opened  time.Time
 	attempt uint64
@@ -151,6 +154,36 @@ func (a *coordOutputs) append(ctx context.Context, s *dsclient.Stream[flow.Chann
 	}
 	if _, err := dsclient.Output(a.tx, s).Append(ctx, []flow.ChannelItem{it}); err != nil {
 		a.err = fmt.Errorf("wings: write output of %s: %w", a.id, err)
+		return a.err
+	}
+	return nil
+}
+
+// appendLog writes a durable log line into the thread's open transaction, opening
+// the thread's log stream once. It never commits: the [protos.LogEvent] marker the
+// caller records next drives the commit, so a line and its marker are whole in one
+// transaction (see [clusterLogs.Log]). The log stream is not a parseOutput stream,
+// so a settled job's history drop leaves it, and the lines outlive the history.
+func (a *coordOutputs) appendLog(ctx context.Context, name string, rec *protos.LogRecord) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.begin(ctx); err != nil {
+		return err
+	}
+	if a.logStream == nil {
+		if err := ensureStream(context.WithoutCancel(ctx), a.client, name); err != nil {
+			return err
+		}
+		st, err := a.client.OpenStream[*protos.LogRecord](name, dsclient.WithCodec[*protos.LogRecord](
+			dswire.ReflectCodec[*protos.LogRecord]{New: func() *protos.LogRecord { return &protos.LogRecord{} }},
+		))
+		if err != nil {
+			return fmt.Errorf("wings: open log %s: %w", name, err)
+		}
+		a.logStream = st
+	}
+	if _, err := dsclient.Output(a.tx, a.logStream).Append(ctx, []*protos.LogRecord{rec}); err != nil {
+		a.err = fmt.Errorf("wings: write log of %s: %w", a.id, err)
 		return a.err
 	}
 	return nil
