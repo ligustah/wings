@@ -157,6 +157,47 @@ func TestAWorkersLogIsPulledToTheCoordinator(t *testing.T) {
 	}
 }
 
+// THE POINT: Config.LogLevel sets the floor for the whole run — a line below it
+// writes nothing, so the durable log holds only what was at or above the level.
+func TestConfigLogLevelFiltersTheDurableLog(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), LogLevel: slog.LevelWarn})
+	name := flow.NewName()
+
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		log := ctx.Logger()
+		log.Info("below the floor")
+		log.Warn("at the floor")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lines, err := c.RunLogs(t.Context(), name)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	if len(lines) != 1 || lines[0].Message != "at the floor" {
+		t.Fatalf("log = %+v, want only the Warn \"at the floor\" line", lines)
+	}
+}
+
+func TestLogBytesResolves(t *testing.T) {
+	cases := []struct {
+		set  int64
+		want int64
+	}{
+		{0, defaultLogBytes},
+		{-1, 0},
+		{8 << 20, 8 << 20},
+	}
+	for _, tc := range cases {
+		if got := (Config{LogBytes: tc.set}).logBytes(); got != tc.want {
+			t.Errorf("Config{LogBytes: %d}.logBytes() = %d, want %d", tc.set, got, tc.want)
+		}
+	}
+}
+
 // THE POINT: RunLogs reads a run's durable log back across its threads, so a
 // finished run's logs can be inspected.
 func TestRunLogsReadsBackARunsLog(t *testing.T) {

@@ -457,6 +457,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		flow.WithStore(&historyStore{txns: txns, job: job.ID, attempt: job.Attempt}),
 		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
 		flow.WithLogHost(nodeLogs{txns: txns}),
+		flow.WithLogLevel(logLevel),
 		flow.WithBlockingBeat(blockingBeat(txns.budget, n.commitInterval)),
 		flow.Once(),
 	}
@@ -601,6 +602,12 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	commitInterval, _ := time.ParseDuration(os.Getenv(envCommitInterval))
 	if v, err := strconv.Atoi(os.Getenv(envCompression)); err == nil {
 		streamCompression = dswire.Compression(v)
+	}
+	if v, err := strconv.Atoi(os.Getenv(envLogLevel)); err == nil {
+		logLevel = slog.Level(v)
+	}
+	if v, err := strconv.ParseInt(os.Getenv(envLogBytes), 10, 64); err == nil {
+		logBudgetBytes = v
 	}
 	id := os.Getenv(envWorkerID)
 	if id == "" {

@@ -194,6 +194,8 @@ func workerEnv(id, listen, dir string, concurrency int, jobTimeout, commitInterv
 		envListen + "=" + listen,
 		envDir + "=" + dir,
 		envCompression + "=" + strconv.Itoa(int(streamCompression)),
+		envLogLevel + "=" + strconv.Itoa(int(logLevel)),
+		envLogBytes + "=" + strconv.FormatInt(logBudgetBytes, 10),
 	}
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))
@@ -215,6 +217,8 @@ func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout, commitInter
 		envWorkerID + "=" + id,
 		envBroker + "=" + broker,
 		envCompression + "=" + strconv.Itoa(int(streamCompression)),
+		envLogLevel + "=" + strconv.Itoa(int(logLevel)),
+		envLogBytes + "=" + strconv.FormatInt(logBudgetBytes, 10),
 	}
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))

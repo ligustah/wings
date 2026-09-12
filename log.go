@@ -19,15 +19,20 @@ import (
 // log lines outlive the history a purge removes.
 const logPrefix = "wings.log."
 
-// logRetentionBytes bounds one thread's log: past it, the oldest whole segments
-// are dropped, so a long run's logs stay bounded rather than growing without end
-// (the log outlives the history, so nothing else reclaims it). logSegmentBytes is
-// the eviction granularity — a few of them fit under the budget, and the true
-// ceiling is the budget plus the active segment that is never dropped.
-const (
-	logRetentionBytes = 32 << 20
-	logSegmentBytes   = 4 << 20
-)
+// logBudgetBytes bounds one thread's log: past it, the oldest whole segments are
+// dropped, so a long run's logs stay bounded rather than growing without end (the
+// log outlives the history, so nothing else reclaims it). Zero or less is
+// unbounded. Set once at startup — from [Config.LogBytes] on the coordinator, from
+// WINGS_LOG_BYTES on a worker — so both ends of a moved thread agree. logSegmentBytes
+// is the eviction granularity; the true ceiling is the budget plus the active segment.
+var logBudgetBytes int64 = defaultLogBytes
+
+const logSegmentBytes = 4 << 20
+
+// logLevel is the lowest level [flow.Context.Logger] records. Fixed per process and
+// passed to workers, so a thread filters the same wherever it runs and a replay
+// filters as the first attempt did. Set at startup like logBudgetBytes.
+var logLevel = slog.LevelInfo
 
 func logStreamName(run, thread string) string {
 	return logPrefix + streamPart(run) + "." + streamPart(thread)
@@ -44,10 +49,12 @@ func ensureLogStream(ctx context.Context, client *dsclient.Client, name string) 
 		return nil
 	}
 	cfg := &dsclient.StreamConfig{
-		Compression:    streamCompression,
-		BlockFormat:    streamBlockFormat,
-		RetentionBytes: logRetentionBytes,
-		SegmentBytes:   logSegmentBytes,
+		Compression:  streamCompression,
+		BlockFormat:  streamBlockFormat,
+		SegmentBytes: logSegmentBytes,
+	}
+	if logBudgetBytes > 0 {
+		cfg.RetentionBytes = logBudgetBytes
 	}
 	if err := client.CreateStream(ctx, name, cfg); err != nil {
 		return fmt.Errorf("wings: create %s: %w", name, err)

@@ -17,6 +17,8 @@ const (
 	envWorkerID       = "WINGS_WORKER_ID"
 	envCompression    = "WINGS_COMPRESSION"
 	envCommitInterval = "WINGS_COMMIT_INTERVAL"
+	envLogLevel       = "WINGS_LOG_LEVEL"
+	envLogBytes       = "WINGS_LOG_BYTES"
 
 	modeWorker = "worker"
 
@@ -148,6 +150,19 @@ type Config struct {
 	// restart loses nothing at the cost of an fsync per event.
 	CommitInterval time.Duration
 
+	// LogLevel is the lowest level [flow.Context.Logger] records; a line below it
+	// writes neither the log stream nor the history marker that dedupes it. Fixed for
+	// the life of a run and passed to workers as WINGS_LOG_LEVEL, so a thread filters
+	// the same wherever it runs and a replay filters as its first attempt did. The
+	// zero value logs Info and above.
+	LogLevel slog.Level
+
+	// LogBytes bounds one thread's durable log: past it the oldest whole segments are
+	// dropped, so a run's logs stay bounded even though they outlive the history a
+	// purge removes. Passed to workers as WINGS_LOG_BYTES. The zero value uses a
+	// 32 MiB budget; a negative value keeps every line.
+	LogBytes int64
+
 	// Build controls cross-compilation of the worker binary. Used only by [Remote].
 	Build BuildConfig
 
@@ -204,6 +219,23 @@ func (c Config) commitInterval() time.Duration {
 		return defaultCommitInterval
 	}
 	return c.CommitInterval
+}
+
+// defaultLogBytes is the per-thread log budget an unset LogBytes resolves to.
+const defaultLogBytes = 32 << 20
+
+// logBytes resolves LogBytes: unset (zero) takes the 32 MiB default, a negative
+// value keeps every line (no budget), a positive value is used as given. Resolved on
+// the coordinator and passed to workers verbatim, so 0 in the worker env means
+// unbounded rather than re-defaulting.
+func (c Config) logBytes() int64 {
+	if c.LogBytes < 0 {
+		return 0
+	}
+	if c.LogBytes == 0 {
+		return defaultLogBytes
+	}
+	return c.LogBytes
 }
 
 func (c *Config) workers() int {

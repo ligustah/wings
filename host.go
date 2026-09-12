@@ -83,6 +83,7 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 		flow.WithPlacer(clusterPlacer{c}),
 		flow.WithChannelHost(clusterChannels{c}),
 		flow.WithLogHost(clusterLogs{c}),
+		flow.WithLogLevel(logLevel),
 		flow.WithBlockingBeat(blockingBeat(coordBudget(c.cfg.commitInterval()), c.cfg.commitInterval())),
 	)
 	if c.cfg.RetainHistory {
