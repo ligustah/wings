@@ -20,9 +20,8 @@ import (
 // wings.chancons.<channel> carrying the reader's consume reports. A send writes to
 // one of these as part of the writing thread's transaction, so a send's record and
 // the event that justifies it commit atomically and come home together under the
-// transaction pull (pull.go); a worker thread holds a value out of its transaction
-// until its event (stage), and a coordinator's append never commits before its
-// event, so either way no commit takes a value home without its event and a value
+// transaction pull (pull.go). The append never commits before the event that
+// justifies it, so no commit takes a value home without its event and a value
 // reaches the stream exactly once, so a replay never resends it. A run receives by reading
 // the value stream directly — its own copy on the coordinator, a copy pushed to it
 // on a worker (subscribeChannel); the coordinator folds the value and consume
@@ -669,27 +668,7 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 	// waits on, so linking stays cheap; a worker's channel is learned by the relay
 	// from its value or consume stream coming home, not from any per-run stream.
 	valLazy, consLazy := valConsLazy(h.n.client, id)
-	if mode == flow.LinkRead {
-		// A reader's values are the writer's, pushed here from the coordinator's copy
-		// of the value stream. The coordinator starts that push when a channel's
-		// consume stream appears on a worker, so creating it now — a reader does, a
-		// writer never does — announces this worker as the reader to push to, and only
-		// the reader, so the writer's own worker is never pushed its own values back.
-		// Written through the linking thread's producer so it comes home by the pull.
-		mctx := context.WithoutCancel(ctx)
-		linker := h.job.txns.For(threadOrMain(ctx))
-		cons, err := consLazy.get(mctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := linker.append(mctx, cons, []flow.ChannelItem{{Link: true}}); err != nil {
-			return nil, err
-		}
-		if err := linker.commit(mctx); err != nil {
-			return nil, err
-		}
-	}
-	return &channelLink{
+	link := &channelLink{
 		// Each record goes into the writing thread's own transaction, which the send
 		// event that follows commits, so the value and its event stay whole and no
 		// sibling thread's commit can tear them apart (pull.go). The stream is
@@ -708,7 +687,30 @@ func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.L
 		},
 		client: h.n.client,
 		in:     linkStreams(id, mode),
-	}, nil
+	}
+	if mode != flow.LinkWrite {
+		// A reader's values are the writer's, pushed here from the coordinator's copy
+		// of the value stream, a push the coordinator starts when this channel's consume
+		// stream appears on a worker. So the reader announces itself by creating that
+		// stream — but only when it first receives (AnnounceReader), since a run shares
+		// its channels for a spawned thread before any thread has taken the read role, so
+		// a link opened Both cannot tell yet. Written through the receiving thread's
+		// producer and committed at once, so it comes home by the pull without waiting on
+		// an event the blocked reader has yet to record.
+		link.announce = func(ctx context.Context) error {
+			mctx := context.WithoutCancel(ctx)
+			linker := h.job.txns.For(threadOrMain(ctx))
+			cons, err := consLazy.get(mctx)
+			if err != nil {
+				return err
+			}
+			if err := linker.append(mctx, cons, []flow.ChannelItem{{Link: true}}); err != nil {
+				return err
+			}
+			return linker.commit(mctx)
+		}
+	}
+	return link, nil
 }
 
 // RetireChannels implements [flow.ChannelRetirer]: the run body's in-process
@@ -802,10 +804,23 @@ type channelLink struct {
 	send   func(ctx context.Context, sender string, it flow.ChannelItem) error
 	client *dsclient.Client
 	in     []string
+	// announce, set for a read-capable link on a worker, marks this worker as a
+	// reader so the coordinator pushes the channel's values here. Nil for a
+	// write-only link and on the coordinator, which reads the canonical copy direct.
+	announce func(ctx context.Context) error
 }
 
 func (l *channelLink) Send(ctx context.Context, sender string, it flow.ChannelItem) error {
 	return l.send(ctx, sender, it)
+}
+
+// AnnounceReader implements the flow reader-announce hook: the reader calls it as
+// it first waits for a value, once (see [flow] chanState.announceReader).
+func (l *channelLink) AnnounceReader(ctx context.Context) error {
+	if l.announce == nil {
+		return nil
+	}
+	return l.announce(ctx)
 }
 
 func (l *channelLink) Items(ctx context.Context, yield func(flow.ChannelItem) bool) error {

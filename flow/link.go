@@ -50,6 +50,16 @@ type ChannelLink interface {
 	Close() error
 }
 
+// readerAnnouncer is an optional [ChannelLink] capability: a host that pushes a
+// shared channel's values to the reader's worker needs to know which worker
+// reads. The reader calls this the first time it waits for a value — the role is
+// unknown when a run eagerly shares its channels for a spawned thread, so it
+// cannot be settled at link time. A host that reads its records straight from the
+// canonical store needs no push and implements nothing.
+type readerAnnouncer interface {
+	AnnounceReader(ctx context.Context) error
+}
+
 // LinkMode is the role of a link a [ChannelHost] opens: whether the linking run
 // sends values on the channel, consumes them, or — a channel created here and
 // not handed off — both. A host that keeps a value stream and a consume stream
@@ -158,6 +168,12 @@ func (r *runState) export(ctx context.Context, name string, replay bool, sender 
 		}
 	}
 	closed := cs.closed
+	// A reader already waiting when the link is established: the run received on
+	// the channel before it was shared for a spawned thread, so its Recv could not
+	// announce (no link then). Announce now, so the host pushes the writer's values
+	// here. Gated on a claimed read side, not read-capability, so a run that only
+	// ever sends on a Both handle does not announce and get its own values pushed back.
+	reader := cs.readOwner != ""
 	cs.broadcast()
 	cs.mu.Unlock()
 
@@ -174,6 +190,11 @@ func (r *runState) export(ctx context.Context, name string, replay bool, sender 
 		}
 	}
 	go cs.pump(r.linkContext(), link)
+	if reader {
+		if err := cs.announceReader(ctx); err != nil {
+			return "", fmt.Errorf("flow: announce reader of channel %s: %w", name, err)
+		}
+	}
 	return id, nil
 }
 

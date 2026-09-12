@@ -336,6 +336,13 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return v, true, t.err()
 	}
 
+	// About to wait for a value on a shared channel: tell the host this worker
+	// reads, so it pushes the writer's values here. Only now is the read role
+	// known — an eagerly shared channel links before any thread has received.
+	if err := cs.announceReader(ctx); err != nil {
+		return zero, false, err
+	}
+
 	item, err := cs.awaitAny(ctx, t, c.sharedID(), recvSeq)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -621,6 +628,9 @@ type chanState struct {
 	// channel — the pump mirrors that record into items — so no per-receive state
 	// is kept here.
 	link ChannelLink
+	// announced is set once the reader has told the host it reads here, so the
+	// announce is made once (see [chanState.announceReader]).
+	announced bool
 }
 
 func newChanState(capacity int) *chanState {
@@ -631,6 +641,26 @@ func newChanState(capacity int) *chanState {
 func (cs *chanState) broadcast() {
 	close(cs.changed)
 	cs.changed = make(chan struct{})
+}
+
+// announceReader tells the host, once, that this worker reads the channel, so a
+// host that pushes values to a reader's worker knows to start. Called as the
+// reader first waits for a value; the role is unknown when a run eagerly shares
+// its channels for a spawned thread, so it cannot be settled at link time. A
+// purely local channel (no link) and a host that needs no push do nothing.
+func (cs *chanState) announceReader(ctx context.Context) error {
+	cs.mu.Lock()
+	link := cs.link
+	if link == nil || cs.announced {
+		cs.mu.Unlock()
+		return nil
+	}
+	cs.announced = true
+	cs.mu.Unlock()
+	if a, ok := link.(readerAnnouncer); ok {
+		return a.AnnounceReader(ctx)
+	}
+	return nil
 }
 
 // put queues a value and reports the item it queued. On a shared channel a new
