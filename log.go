@@ -3,6 +3,10 @@ package wings
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
 
@@ -65,3 +69,93 @@ func (h clusterLogs) Log(ctx context.Context, run, thread string, rec *protos.Lo
 }
 
 var _ flow.LogHost = clusterLogs{}
+
+// LogLine is one durable log line read back from a run's log.
+type LogLine struct {
+	Thread  string
+	Time    time.Time
+	Level   slog.Level
+	Message string
+	Attrs   map[string]string
+}
+
+// ThreadLog returns one thread's durable log lines, oldest first. A thread that
+// logged nothing yields none.
+func (c *Cluster) ThreadLog(ctx context.Context, run, thread string) ([]LogLine, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	return readLog(ctx, client, logStreamName(run, thread), thread)
+}
+
+// RunLogs returns a run's durable log lines across every thread that logged,
+// oldest first within each thread. The lines outlive the history, so a finished
+// run's logs read back even after its history is dropped.
+func (c *Cluster) RunLogs(ctx context.Context, run string) ([]LogLine, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("wings: list streams: %w", err)
+	}
+	prefix := logPrefix + streamPart(run) + "."
+	sort.Strings(names)
+	var out []LogLine
+	for _, name := range names {
+		thread, ok := strings.CutPrefix(name, prefix)
+		if !ok {
+			continue
+		}
+		lines, err := readLog(ctx, client, name, thread)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lines...)
+	}
+	return out, nil
+}
+
+func readLog(ctx context.Context, client *dsclient.Client, name, thread string) ([]LogLine, error) {
+	ok, err := client.StreamExists(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("wings: check %s: %w", name, err)
+	}
+	if !ok {
+		return nil, nil
+	}
+	st, err := eventStream[*protos.LogRecord](client, name)
+	if err != nil {
+		return nil, err
+	}
+	var out []LogLine
+	for from := int64(0); ; {
+		recs, err := st.Read(ctx, from, 512)
+		if err != nil {
+			return nil, fmt.Errorf("wings: read %s: %w", name, err)
+		}
+		if len(recs) == 0 {
+			return out, nil
+		}
+		for _, r := range recs {
+			lr := r.Record
+			var attrs map[string]string
+			if len(lr.GetAttrs()) > 0 {
+				attrs = make(map[string]string, len(lr.GetAttrs()))
+				for _, a := range lr.GetAttrs() {
+					attrs[a.GetKey()] = a.GetValue()
+				}
+			}
+			out = append(out, LogLine{
+				Thread:  thread,
+				Time:    time.Unix(0, lr.GetTimeUnixNano()),
+				Level:   slog.Level(lr.GetLevel()),
+				Message: lr.GetMessage(),
+				Attrs:   attrs,
+			})
+			from = r.Offset + 1
+		}
+	}
+}

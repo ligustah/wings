@@ -104,3 +104,34 @@ func TestAForkedThreadsLogSurvivesItsHistoryDrop(t *testing.T) {
 		t.Fatalf("child log = %+v, want one \"from the child\" line", recs)
 	}
 }
+
+// THE POINT: RunLogs reads a run's durable log back across its threads, so a
+// finished run's logs can be inspected.
+func TestRunLogsReadsBackARunsLog(t *testing.T) {
+	c := start(t, Config{Target: InProcess()})
+	name := flow.NewName()
+
+	err := c.Run(t.Context(), name, func(ctx flow.Context) error {
+		ctx.Logger().Info("from main")
+		_, err := ctx.Spawn(func(ctx flow.Context) (int, error) {
+			ctx.Logger().Warn("from child")
+			return 1, nil
+		}).Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lines, err := c.RunLogs(t.Context(), name)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	got := map[string]slog.Level{}
+	for _, l := range lines {
+		got[l.Message] = l.Level
+	}
+	if got["from main"] != slog.LevelInfo || got["from child"] != slog.LevelWarn {
+		t.Fatalf("RunLogs returned %+v, want an Info \"from main\" and a Warn \"from child\"", lines)
+	}
+}
