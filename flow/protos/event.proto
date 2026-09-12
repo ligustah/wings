@@ -51,7 +51,36 @@ message Event {
     EffectEvent effect = 30;
     WaitInterruptedEvent interrupted = 31;
     SelectEvent select = 32;
+    LogEvent log = 33;
   }
+}
+
+// LogEvent marks in history that the thread logged, so a replay does not emit
+// the line a second time. The line itself — level, message, attributes, time —
+// is a LogRecord on the thread's own log stream, not here, so it survives a
+// history purge; this marker carries only its presence, consumed in order like
+// any other event.
+message LogEvent {}
+
+// LogRecord is one durable log line on a thread's log stream. It is the whole
+// line, so the log stream reads back on its own without the history a purge may
+// have dropped.
+message LogRecord {
+  int64 time_unix_nano = 1;
+
+  // The slog.Level the line was logged at.
+  int32 level = 2;
+
+  string message = 3;
+
+  // The line's attributes, groups flattened into dotted keys, values rendered
+  // to their string form.
+  repeated LogAttr attrs = 4;
+}
+
+message LogAttr {
+  string key = 1;
+  string value = 2;
 }
 
 message CallEvent {

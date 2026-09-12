@@ -493,6 +493,17 @@ func (t *threadState) err() error {
 	return t.sinkErr
 }
 
+// fail records the thread's first error from a path that cannot return one to
+// the body — a log call, whose slog.Handler.Handle error slog discards — so it
+// surfaces at the thread's next operation like a persistence failure.
+func (t *threadState) fail(err error) {
+	t.run.mu.Lock()
+	defer t.run.mu.Unlock()
+	if t.sinkErr == nil {
+		t.sinkErr = err
+	}
+}
+
 // commit flushes the sink's pending writes, so a shared-channel send's event and
 // its outbox record commit together (see [Committer]). A no-op for a sink that
 // commits each append on its own. Runs off the caller's cancellation: what is

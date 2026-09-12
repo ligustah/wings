@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"log/slog"
 	"reflect"
 	"time"
 )
@@ -12,6 +13,8 @@ type runOptions struct {
 	placer   Placer
 	parker   Parker
 	host     ChannelHost
+	logHost  LogHost
+	logLevel slog.Level
 	clock    Clock
 
 	version       int
