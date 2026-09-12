@@ -96,12 +96,11 @@ type Config struct {
 	// A bare port or ":port" or "0.0.0.0:port" binds every interface.
 	UI string
 
-	// RetainHistory keeps a forked thread's history after it is joined, instead
-	// of dropping it, so a finished run's whole thread tree stays inspectable in
-	// the UI. It covers a thread that runs in the coordinator's own process, and
-	// the kept history of a job that was retried or moved (a job that succeeds on
-	// its first attempt keeps its history regardless, since nothing drops it). Off
-	// by default.
+	// RetainHistory keeps a forked thread's history after it is joined, instead of
+	// dropping it, so a finished run's whole thread tree stays inspectable in the UI.
+	// It covers a thread that runs in the coordinator's own process and one placed on
+	// a worker alike; by default either is dropped once the thread has returned, its
+	// result being recorded in the caller. Off by default.
 	RetainHistory bool
 
 	// RetainChannelData keeps a settled activity's shared-channel streams, instead

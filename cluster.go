@@ -46,6 +46,10 @@ type Cluster struct {
 	sharedOnce sync.Once
 	sharedErr  error
 	sharedStop func() error
+	// sharedUp is set once the embedded instance is running, so a background
+	// reclaim can tell there is a home to reclaim from without starting one — a
+	// coordinator that never brought its engine up pulled nothing home.
+	sharedUp atomic.Bool
 	// engine is the instance itself, for what only the engine can do: pull
 	// a worker's transactions. See pull.go.
 	engine *embed.InProcess
@@ -596,6 +600,7 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 		c.shared = dsclient.Wrap(b.Client())
 		c.sharedStop = b.Close
 		c.engine = b
+		c.sharedUp.Store(true)
 	})
 	return c.shared, c.sharedErr
 }
@@ -627,6 +632,7 @@ func (c *Cluster) closeShared() error {
 	// The client wraps the engine's backend, which Close also releases; only one may.
 	err := c.sharedStop()
 	c.sharedStop, c.shared = nil, nil
+	c.sharedUp.Store(false)
 	return err
 }
 
@@ -874,11 +880,17 @@ func (c *Cluster) forget(p *pendingJob) {
 	}
 	c.unblockLocked(p)
 	delete(c.pending, p.job.ID)
-	// Abandoned attempts left outputs nobody holds a handle to; drop them. Not
-	// while stopping: this can run on a caller's uncounted goroutine, and closed
-	// is set under this lock before Stop waits, so seeing it clear means the add
-	// to the wait group lands first.
-	if p.job.Attempt > 0 && !c.closed {
+	// The job has settled for good — its result is recorded in the caller, and a
+	// replay never re-enters a returned call — so its history is dead, along with any
+	// abandoned earlier attempts'. Drop it, mirroring how the flow layer drops an
+	// in-process thread's history once it is joined (flow.Future.Await); the kept
+	// attempt's recordings stay for the handles it returned, and RetainHistory keeps
+	// the history too, for inspection (dropOutputsOf honours both). Not while
+	// stopping: this can run on a caller's uncounted goroutine, and closed is set
+	// under this lock before Stop waits, so seeing it clear means the add to the wait
+	// group lands first. Only when the engine is up: with nothing brought home there
+	// is nothing to reclaim, and starting it here would race a teardown.
+	if !c.closed && c.sharedUp.Load() {
 		job, keep := p.job.ID, p.job.Attempt
 		writers := maps.Clone(p.ran)
 		c.wg.Go(func() {

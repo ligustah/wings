@@ -553,8 +553,11 @@ func (c *Cluster) priorsOf(ctx context.Context, w *workerConn, job string) ([]Re
 	return out, nil
 }
 
-// dropOutputsOf deletes what a job's abandoned attempts wrote, on both sides;
-// the kept attempt's output stays until the caller discards it. Order matters:
+// dropOutputsOf deletes what a settled job wrote, on both sides: every abandoned
+// attempt's output, and the kept attempt's history too — dead once the job has
+// returned (its result is recorded and a replay never re-enters it), unless
+// RetainHistory keeps it for inspection. The kept attempt's recordings stay until
+// the caller discards them. Order matters:
 // decline the stream, forget the copy, then delete source-first, or a running
 // copy would put a deleted destination back. writers says which worker ran each
 // attempt, so only that worker is asked to delete its stream.
@@ -581,9 +584,9 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 		if !ok || o.Job != streamPart(job) {
 			continue
 		}
-		// The kept attempt's recordings stay; its history is for a next attempt
-		// that will not come, so it goes too — unless RetainHistory keeps it, so
-		// the inspector can still show a moved thread's execution.
+		// The kept attempt's recordings stay; its history is dead once the job has
+		// returned — no attempt will replay it — so it goes too, unless RetainHistory
+		// keeps it so the inspector can still show the thread's execution.
 		if o.Attempt == keep && (o.Prefix != historyPrefix || c.cfg.RetainHistory) {
 			continue
 		}

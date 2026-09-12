@@ -75,9 +75,10 @@ func TestRetainHistoryKeepsAMovedThreadsHistory(t *testing.T) {
 // not a coordinator flow.thread stream, so the plain store shows only main. The
 // inspection store reads the job histories back into the run's fork tree, so a
 // finished run's forked threads — what they ran and the events they recorded —
-// are all inspectable.
+// are all inspectable. A returned job's history is otherwise reclaimed as the run
+// goes, so this keeps it with RetainHistory, which is what the inspector wants.
 func TestInspectionStoreSurfacesForkedThreads(t *testing.T) {
-	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 2})
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 2, RetainHistory: true})
 
 	run := flow.NewName()
 	err := c.Run(t.Context(), run, func(ctx flow.Context) error {
