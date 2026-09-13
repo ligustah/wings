@@ -82,9 +82,6 @@ func RunLineage(ctx context.Context, run string, root Root, lineage []string, op
 		return nil, err
 	}
 	ro.root, ro.rootID = root, lineage[0]
-	if ro.host == nil {
-		return nil, errors.New("flow: RunLineage requires a ChannelHost: the run's channels are shared with the rest of it")
-	}
 	// One runState for every thread here, ancestor and target alike: they are
 	// threads of one run, and the channels between them live on it.
 	rs := newRunState(run, ro)
@@ -339,15 +336,15 @@ func Share(ctx context.Context) error {
 	}
 	r := t.run
 	r.mu.Lock()
-	names := make([]string, 0, len(r.channels))
-	for name := range r.channels {
-		names = append(names, name)
+	chans := make(map[string]*chanState, len(r.channels))
+	for name, cs := range r.channels {
+		chans[name] = cs
 	}
 	r.mu.Unlock()
-	for _, name := range names {
-		if _, err := r.export(ctx, name, t.peek() != nil, t.qualified(), modeBoth); err != nil {
-			return err
-		}
+	// Every channel is stream-backed from creation, so this only ensures each has
+	// its pumps running — idempotent, and the streams are already reachable by id.
+	for name, cs := range chans {
+		cs.activate(r.linkContext(), r.store, r.channelID(name), modeBoth)
 	}
 	return nil
 }

@@ -3,7 +3,6 @@ package wings
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/ligustah/durable_streams/dsclient"
 
 	"github.com/ligustah/wings/flow"
+	"github.com/ligustah/wings/flow/protos"
 )
 
 // A channel shared between runs on different machines is relayed through the
@@ -41,69 +41,20 @@ const (
 	// reports and its Link marker on the other. Both are named by the channel id
 	// alone — no job, no attempt — so a writer moved to a new attempt keeps
 	// appending to the same stream (fencing stays on the attempt's producer id, not
-	// the stream name). Pulled home like any output, so parseOutput knows them.
-	chanvalPrefix  = "wings.chanval."
-	chanconsPrefix = "wings.chancons."
+	// the stream name). Pulled home like any output, so parseOutput knows them. They
+	// defer to flow's names so a channel's streams have one name everywhere.
+	chanvalPrefix  = flow.ChannelValuePrefix
+	chanconsPrefix = flow.ChannelConsumePrefix
 
 	relayInterval = 500 * time.Millisecond
 )
 
 func chanStreamFor(id string) string { return chanPrefix + streamPart(id) }
 
-// chanValues names a channel's value stream (the writer's values and closes);
-// chanConsumes its consume stream (the reader's consume reports). streamPart is
-// idempotent, so chanvalPrefix+o.Name equals chanValues(id) for a parsed stream.
-func chanValues(id string) string   { return chanvalPrefix + streamPart(id) }
-func chanConsumes(id string) string { return chanconsPrefix + streamPart(id) }
-
-// linkStreams names the streams a link's pump follows for its role: a reader
-// reads the value stream (values and closes), a writer the consume stream (the
-// consume reports that free its bounded buffer), a channel kept whole both. A
-// writer that read the value stream would only re-see its own values and never
-// learn what the reader took, so its buffer would never free.
-func linkStreams(id string, mode flow.LinkMode) []string {
-	switch mode {
-	case flow.LinkRead:
-		return []string{chanValues(id)}
-	case flow.LinkWrite:
-		return []string{chanConsumes(id)}
-	default:
-		return []string{chanValues(id), chanConsumes(id)}
-	}
-}
-
-// lazyStream opens a channel stream on first use, so a Link that may never send
-// pays nothing and adds no latency to the path that shares it (which a fork
-// waits on) — the stream is made when the first record is sent, off that path.
-type lazyStream struct {
-	once sync.Once
-	open func(context.Context) (*dsclient.Stream[flow.ChannelItem], error)
-	st   *dsclient.Stream[flow.ChannelItem]
-	err  error
-}
-
-func (l *lazyStream) get(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
-	l.once.Do(func() { l.st, l.err = l.open(ctx) })
-	return l.st, l.err
-}
-
-// valConsLazy returns lazy value and consume streams for a channel on client,
-// each created off the critical path when first sent to.
-func valConsLazy(client *dsclient.Client, id string) (val, cons *lazyStream) {
-	return &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
-		return openChannelStream(context.WithoutCancel(ctx), client, chanValues(id))
-	}}, &lazyStream{open: func(ctx context.Context) (*dsclient.Stream[flow.ChannelItem], error) {
-		return openChannelStream(context.WithoutCancel(ctx), client, chanConsumes(id))
-	}}
-}
-
-// openChannelStream ensures a channel stream exists on client and opens it.
-func openChannelStream(ctx context.Context, client *dsclient.Client, name string) (*dsclient.Stream[flow.ChannelItem], error) {
-	if err := ensureStream(ctx, client, name); err != nil {
-		return nil, err
-	}
-	return eventStream[flow.ChannelItem](client, name)
-}
+// chanValues names a channel's value stream (the writer's values and closes).
+// streamPart is idempotent, so chanvalPrefix+o.Name equals chanValues(id) for a
+// parsed stream.
+func chanValues(id string) string { return chanvalPrefix + streamPart(id) }
 
 // pushGroup names the mirror that pushes a channel's value stream to one worker.
 // A moved receiver's pre-push and its live push share it, so the live push
@@ -135,12 +86,12 @@ func (rc *relayChannel) counts() (closed bool, values, consumed uint64) {
 
 // countLocked folds one record into the channel's counts. A Link marker is a
 // subscription sign with no value and is not counted. Call with mu held.
-func (rc *relayChannel) countLocked(it flow.ChannelItem) {
+func (rc *relayChannel) countLocked(it *protos.ChannelItem) {
 	switch {
-	case it.Link:
-	case it.Closed:
+	case it == nil, it.GetLink():
+	case it.GetClosed():
 		rc.closed = true
-	case it.Consumed:
+	case it.GetConsumed():
 		rc.nconsume++
 	default:
 		rc.nvalues++
@@ -242,7 +193,7 @@ func (c *Cluster) runChannelRelay() {
 					continue
 				}
 				// o.Name is the id, streamPart-mangled, which the count key (chanStreamFor)
-				// and the stream names (chanValues/chanConsumes) reproduce idempotently.
+				// and the value stream name (chanValues) reproduce idempotently.
 				c.foldChannel(client, name, o.Name, o.Prefix == chanvalPrefix)
 			}
 			// A complete listing: evict the retire tombstones of runs and jobs whose
@@ -378,7 +329,7 @@ func (c *Cluster) foldChannel(client *dsclient.Client, name, id string, values b
 			// Re-opened each pass: a handle opened before the first append binds to the
 			// empty stream and never sees later writes — a moved writer's first append
 			// to the stable stream is that window.
-			st, err := eventStream[flow.ChannelItem](client, name)
+			st, err := eventStream[*protos.Event](client, name)
 			if err != nil {
 				if fctx.Err() != nil || pause(fctx, time.Second) != nil {
 					return
@@ -401,9 +352,7 @@ func (c *Cluster) foldChannel(client *dsclient.Client, name, id string, values b
 			rc.mu.Lock()
 			for _, rec := range recs {
 				from = rec.Offset + 1
-				if !rec.Record.Link {
-					rc.countLocked(rec.Record)
-				}
+				rc.countLocked(rec.Record.GetChannelItem())
 			}
 			consumed := rc.nconsume
 			rc.mu.Unlock()
@@ -592,66 +541,6 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 	})
 }
 
-// --- hosts ---
-
-// clusterChannels is the [flow.ChannelHost] for runs on the coordinator.
-type clusterChannels struct{ c *Cluster }
-
-func (h clusterChannels) Link(ctx context.Context, run, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
-	client, err := h.c.sharedClient()
-	if err != nil {
-		return nil, err
-	}
-	h.c.pokeRelay()
-
-	// A send's records go to the channel's stable value or consume stream: the reader
-	// reads values off the value stream, backpressure folds consumes off the other.
-	valLazy, consLazy := valConsLazy(client, id)
-	send := func(ctx context.Context, _ string, it flow.ChannelItem) error {
-		// A signal owns no thread and so no transaction; it only ever sends a value,
-		// written straight through.
-		st, err := valLazy.get(ctx)
-		if err != nil {
-			return err
-		}
-		_, err = st.Append(ctx, []flow.ChannelItem{it})
-		return err
-	}
-	if run != flow.SignalSender {
-		// A record goes into the writing thread's own transaction (sender names it),
-		// so it commits with the event that justifies it and no sibling thread's
-		// commit can tear the two apart (see [coordOutputs.append], flow.Committer).
-		send = func(ctx context.Context, sender string, it flow.ChannelItem) error {
-			outputs, err := h.c.coordOutputsFor(sender)
-			if err != nil {
-				return err
-			}
-			lazy := valLazy
-			if it.Consumed {
-				lazy = consLazy
-			}
-			st, err := lazy.get(ctx)
-			if err != nil {
-				return err
-			}
-			// append never commits: a value precedes its send event, and a consume
-			// report or close rides the event it pairs with, so the event's commit
-			// takes both home together.
-			return outputs.append(ctx, st, it)
-		}
-	}
-	return &channelLink{
-		send:   send,
-		client: client,
-		in:     linkStreams(id, mode),
-	}, nil
-}
-
-// nodeChannels is the [flow.ChannelHost] for a job's run on a worker.
-type nodeChannels struct {
-	n   *workerNode
-	job *jobState
-}
 
 // threadOrMain is the id of the thread running on ctx, falling back to the main
 // thread when ctx is not inside a run body — so a channel write always routes to
@@ -663,244 +552,6 @@ func threadOrMain(ctx context.Context) string {
 	return flow.MainThread
 }
 
-func (h nodeChannels) Link(ctx context.Context, _ string, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
-	// The value and consume streams open on first send, off the share path a fork
-	// waits on, so linking stays cheap; a worker's channel is learned by the relay
-	// from its value or consume stream coming home, not from any per-run stream.
-	valLazy, consLazy := valConsLazy(h.n.client, id)
-	link := &channelLink{
-		// Each record goes into the writing thread's own transaction, which the send
-		// event that follows commits, so the value and its event stay whole and no
-		// sibling thread's commit can tear them apart (pull.go). The stream is
-		// transactional, so it is pulled, not mirrored.
-		send: func(ctx context.Context, _ string, it flow.ChannelItem) error {
-			out := h.job.txns.For(threadOrMain(ctx))
-			stream := valLazy
-			if it.Consumed {
-				stream = consLazy
-			}
-			es, err := stream.get(ctx)
-			if err != nil {
-				return err
-			}
-			return out.append(ctx, es, []flow.ChannelItem{it})
-		},
-		client: h.n.client,
-		in:     linkStreams(id, mode),
-	}
-	if mode != flow.LinkWrite {
-		// A reader's values are the writer's, pushed here from the coordinator's copy
-		// of the value stream, a push the coordinator starts when this channel's consume
-		// stream appears on a worker. So the reader announces itself by creating that
-		// stream — but only when it first receives (AnnounceReader), since a run shares
-		// its channels for a spawned thread before any thread has taken the read role, so
-		// a link opened Both cannot tell yet. Written through the receiving thread's
-		// producer and committed at once, so it comes home by the pull without waiting on
-		// an event the blocked reader has yet to record.
-		link.announce = func(ctx context.Context) error {
-			mctx := context.WithoutCancel(ctx)
-			linker := h.job.txns.For(threadOrMain(ctx))
-			cons, err := consLazy.get(mctx)
-			if err != nil {
-				return err
-			}
-			if err := linker.append(mctx, cons, []flow.ChannelItem{{Link: true}}); err != nil {
-				return err
-			}
-			return linker.commit(mctx)
-		}
-	}
-	return link, nil
-}
-
-// RetireChannels implements [flow.ChannelRetirer]: the run body's in-process
-// call that created these channels has returned, so retire them. Done off the
-// caller so the call is not held for storage work; the run's end retires whatever
-// is left.
-func (h clusterChannels) RetireChannels(_ context.Context, _ string, ids []string) {
-	h.c.wg.Go(func() { h.c.retireChannels(ids) })
-}
-
-// ChannelValues implements [flow.ChannelValueReader] for a run on the
-// coordinator, reading values off the channel's value stream on shared storage.
-func (h clusterChannels) ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
-	client, err := h.c.sharedClient()
-	if err != nil {
-		return nil, err
-	}
-	return channelValues(ctx, client, id, cursor, n)
-}
-
-// ChannelValues implements [flow.ChannelValueReader] for a job's run on a
-// worker, reading values off the value stream pushed to the worker.
-func (h nodeChannels) ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
-	return channelValues(ctx, h.n.client, id, cursor, n)
-}
-
-// channelValues reads the values on a channel's value stream at or after cursor,
-// which is a stream offset. A replay reads back a received value this way rather
-// than keeping its own copy, so the value stream is the one copy. It returns as
-// soon as a read yields values, so a replay is not delayed waiting to fill n; it
-// blocks only when nothing is there yet — the value stream is pushed to a moved
-// receiver's worker and may lag its replay, and the caller knows the value it
-// wants was received, so it is still coming — returning empty only if ctx ends. n
-// bounds how many values one read gathers ahead into the cache.
-func channelValues(ctx context.Context, client *dsclient.Client, id string, cursor int64, n int) ([]flow.ChannelValueAt, error) {
-	values := chanValues(id)
-	var st *dsclient.Stream[flow.ChannelItem]
-	from := cursor
-	for {
-		if st == nil {
-			ok, err := client.StreamExists(ctx, values)
-			if err != nil {
-				return nil, fmt.Errorf("wings: look for channel stream %s: %w", values, err)
-			}
-			if !ok {
-				if err := pause(ctx, 200*time.Millisecond); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			if st, err = eventStream[flow.ChannelItem](client, values); err != nil {
-				return nil, err
-			}
-		}
-		readCtx, cancel := context.WithTimeout(ctx, followPoll)
-		recs, err := st.ReadBlocking(readCtx, from, recordBatch)
-		expired := readCtx.Err() != nil
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if expired {
-				continue // caught up; the value is still on its way, so wait
-			}
-			return nil, fmt.Errorf("wings: read channel stream %s at %d: %w", values, from, err)
-		}
-		var out []flow.ChannelValueAt
-		for _, rec := range recs {
-			from = rec.Offset + 1
-			if it := rec.Record; !it.Consumed && !it.Closed {
-				out = append(out, flow.ChannelValueAt{From: it.From, Seq: it.Seq, Data: it.Data, Next: from})
-				if len(out) >= n {
-					break
-				}
-			}
-		}
-		// A consume report or a close carries no value; keep reading rather than hand
-		// the caller an empty result it would read as the value being gone.
-		if len(out) > 0 {
-			return out, nil
-		}
-	}
-}
-
-// channelLink is a run's connection to one shared channel: sends go to the
-// channel's value or consume stream, and items come from the streams in names —
-// a reader follows the value stream, a writer the consume stream (for the
-// consume reports that free its buffer), a channel kept whole both.
-type channelLink struct {
-	send   func(ctx context.Context, sender string, it flow.ChannelItem) error
-	client *dsclient.Client
-	in     []string
-	// announce, set for a read-capable link on a worker, marks this worker as a
-	// reader so the coordinator pushes the channel's values here. Nil for a
-	// write-only link and on the coordinator, which reads the canonical copy direct.
-	announce func(ctx context.Context) error
-}
-
-func (l *channelLink) Send(ctx context.Context, sender string, it flow.ChannelItem) error {
-	return l.send(ctx, sender, it)
-}
-
-// AnnounceReader implements the flow reader-announce hook: the reader calls it as
-// it first waits for a value, once (see [flow] chanState.announceReader).
-func (l *channelLink) AnnounceReader(ctx context.Context) error {
-	if l.announce == nil {
-		return nil
-	}
-	return l.announce(ctx)
-}
-
-func (l *channelLink) Items(ctx context.Context, yield func(flow.ChannelItem) bool) error {
-	if len(l.in) == 1 {
-		return l.follow(ctx, l.in[0], yield)
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var mu sync.Mutex
-	// The streams are independent, so their follows run concurrently; serialise the
-	// yields into the one pump, and end every follow once one asks to stop.
-	shared := func(it flow.ChannelItem) bool {
-		mu.Lock()
-		defer mu.Unlock()
-		if ctx.Err() != nil {
-			return false
-		}
-		if !yield(it) {
-			cancel()
-			return false
-		}
-		return true
-	}
-	var wg sync.WaitGroup
-	for _, name := range l.in {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = l.follow(ctx, name, shared)
-		}()
-	}
-	wg.Wait()
-	return ctx.Err()
-}
-
-// follow delivers one stream's records to yield in order, from the start. The
-// stream appears once the writer first sends, or the push reaches this worker;
-// until then, look again.
-func (l *channelLink) follow(ctx context.Context, name string, yield func(flow.ChannelItem) bool) error {
-	var st *dsclient.Stream[flow.ChannelItem]
-	var from int64
-	for ctx.Err() == nil {
-		if st == nil {
-			ok, err := l.client.StreamExists(ctx, name)
-			if err != nil || !ok {
-				if err := pause(ctx, 200*time.Millisecond); err != nil {
-					return err
-				}
-				continue
-			}
-			if st, err = eventStream[flow.ChannelItem](l.client, name); err != nil {
-				return err
-			}
-		}
-		readCtx, cancel := context.WithTimeout(ctx, followPoll)
-		recs, err := st.ReadBlocking(readCtx, from, recordBatch)
-		expired := readCtx.Err() != nil
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if !expired {
-				if err := pause(ctx, time.Second); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		for _, rec := range recs {
-			from = rec.Offset + 1
-			if !yield(rec.Record) {
-				return nil
-			}
-		}
-	}
-	return ctx.Err()
-}
-
-func (l *channelLink) Close() error { return nil }
 
 func pause(ctx context.Context, d time.Duration) error {
 	select {

@@ -55,7 +55,11 @@ func (c *Cluster) RunWorkflow[In, Out any](ctx context.Context, f flow.Func[In, 
 // run receives it through [flow.Context.Signal] under name. It is held until the
 // run asks for it, so the run need not be waiting yet.
 func (c *Cluster) Signal[In any](ctx context.Context, run, name string, v In) error {
-	return flow.Deliver(ctx, clusterChannels{c}, run, name, v)
+	client, err := c.sharedClient()
+	if err != nil {
+		return err
+	}
+	return flow.Deliver(ctx, flow.NewStore(client, flow.WithStoreCompression(streamCompression)), run, name, v)
 }
 
 func (c *Cluster) runWorkflow(ctx context.Context, name string, input []byte) error {
@@ -81,7 +85,6 @@ func (c *Cluster) runOptions(opts []flow.RunOption) ([]flow.RunOption, error) {
 	all := append(append([]flow.RunOption{}, opts...),
 		flow.WithStore(newCoordStore(c, client)),
 		flow.WithPlacer(clusterPlacer{c}),
-		flow.WithChannelHost(clusterChannels{c}),
 		flow.WithLogHost(clusterLogs{c}),
 		flow.WithLogLevel(logLevel),
 		flow.WithBlockingBeat(blockingBeat(coordBudget(c.cfg.commitInterval()), c.cfg.commitInterval())),

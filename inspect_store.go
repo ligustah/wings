@@ -187,8 +187,12 @@ func (s *inspectionStore) locate(ctx context.Context, run, thread string) (where
 	return where, known, nil
 }
 
-func (s *inspectionStore) Sink(ctx context.Context, run, thread string) (flow.Sink, error) {
-	return s.base.Sink(ctx, run, thread)
+func (s *inspectionStore) Begin(ctx context.Context, run, thread string) (flow.Tx, error) {
+	return s.base.Begin(ctx, run, thread)
+}
+
+func (s *inspectionStore) Follow(ctx context.Context, name string, from int64, yield func(flow.EventAt) bool) error {
+	return s.base.Follow(ctx, name, from, yield)
 }
 
 func (s *inspectionStore) Read(ctx context.Context, run, thread string, offset int64, n int) ([]flow.EventAt, error) {

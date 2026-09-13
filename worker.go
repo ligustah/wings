@@ -455,7 +455,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// run code is reached by replaying its ancestors (lineage.go).
 	runOpts := []flow.RunOption{
 		flow.WithStore(&historyStore{txns: txns, job: job.ID, attempt: job.Attempt}),
-		flow.WithPlacer(placer), flow.WithParker(slot), flow.WithChannelHost(nodeChannels{n: n, job: state}),
+		flow.WithPlacer(placer), flow.WithParker(slot),
 		flow.WithLogHost(nodeLogs{txns: txns}),
 		flow.WithLogLevel(logLevel),
 		flow.WithBlockingBeat(blockingBeat(txns.budget, n.commitInterval)),

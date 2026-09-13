@@ -2,124 +2,31 @@ package flow
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"sync"
 )
 
-// Sharing a channel between runs. flow says what a shared channel is; a
-// [ChannelHost] moves the bytes. A shared channel has one reader: the host keeps
-// the channel's records in one order, and the reader consumes them in that order
-// the way it drains a local channel, so no cross-machine arbitration is needed. A
-// sender counts room by the consume reports the host relays back.
+// A shared channel's records live on two durable streams named for its id:
+// [ChannelValueStream] carries the writer's values and closes,
+// [ChannelConsumeStream] the reader's consume reports and its link marker. flow
+// says what a channel is; the [Store] moves the records and the engine carries
+// the streams between machines. A channel has one reader and one writer: the
+// reader drains the value stream in order the way it drains a local channel — the
+// pump mirrors the stream into the queue — and a bounded sender frees its buffer
+// as the reader's consume reports come back on the other stream.
 
-// ChannelItem is one record of a shared channel: a value, a close, or the
-// reader's report that it consumed a value.
-type ChannelItem struct {
-	// From is the sender "<run>/<thread>" and Seq its nth send, identifying the
-	// value everywhere. On a consume report, From/Seq name the value consumed.
-	From string
-	Seq  uint64
-	Data []byte
-	// Closed marks a close rather than a value.
-	Closed bool
-	// Consumed reports that the single reader took the value named by From/Seq, so
-	// a sender counting room by what it has mirrored can free the place. Relayed to
-	// every link; a sender applies it to its own queued send.
-	Consumed bool
-	// Link marks a record written only so a run's outbox exists: the run has linked
-	// the channel but may send nothing. A host uses it to learn the outbox is there
-	// (see the wings relay); it carries no value and is never put on the channel's
-	// record.
-	Link bool
-}
-
-// ChannelLink is one run's connection to a shared channel.
-type ChannelLink interface {
-	// Send hands the host one record a thread made: a value, a close, or a consume
-	// report. sender is the qualified id ("<run>/<thread>") of the thread that made
-	// it, so a host that commits each thread's output in that thread's own
-	// transaction knows whose it is — a close carries no sender of its own and a
-	// consume report's From names the value consumed, not the reporter. Empty when
-	// no thread owns it (a signal).
-	Send(ctx context.Context, sender string, item ChannelItem) error
-	// Items delivers the channel's record from the beginning in the host's order,
-	// calling yield for each, returning when yield returns false or ctx ends.
-	Items(ctx context.Context, yield func(ChannelItem) bool) error
-	// Close releases the link; the channel is unaffected.
-	Close() error
-}
-
-// readerAnnouncer is an optional [ChannelLink] capability: a host that pushes a
-// shared channel's values to the reader's worker needs to know which worker
-// reads. The reader calls this the first time it waits for a value — the role is
-// unknown when a run eagerly shares its channels for a spawned thread, so it
-// cannot be settled at link time. A host that reads its records straight from the
-// canonical store needs no push and implements nothing.
-type readerAnnouncer interface {
-	AnnounceReader(ctx context.Context) error
-}
-
-// LinkMode is the role of a link a [ChannelHost] opens: whether the linking run
-// sends values on the channel, consumes them, or — a channel created here and
-// not handed off — both. A host that keeps a value stream and a consume stream
-// apart uses it to wire each link to the right one.
-type LinkMode string
-
-const (
-	LinkBoth  LinkMode = ""
-	LinkRead  LinkMode = "r"
-	LinkWrite LinkMode = "w"
-)
-
-// ChannelHost carries channels between runs. A run given one with
-// [WithChannelHost] can share its channels and use channels handed to it.
-type ChannelHost interface {
-	// Link connects run to the channel id ("<owning run>/<channel name>") in the
-	// given role. Called once per attempt per channel a run shares or uses.
-	Link(ctx context.Context, run, id string, mode LinkMode) (ChannelLink, error)
-}
-
-// ChannelValueReader is an optional [ChannelHost] capability: reading back the
-// values a channel carried, so a receiver's replay need not keep its own copy of
-// what it took — the host's record of the channel is the one copy. A receive on
-// a shared channel is recorded by identity alone (from and seq, see
-// [ChannelRecvEvent]); replay finds the bytes here. cursor is an opaque position
-// in the host's order, zero at the start; a read returns the value records at or
-// after it, each with the position to continue from.
-type ChannelValueReader interface {
-	ChannelValues(ctx context.Context, id string, cursor int64, n int) ([]ChannelValueAt, error)
-}
-
-// ChannelValueAt is one value a channel carried, with the cursor to read the
-// next from. From and Seq identify it, matching a [ChannelRecvEvent]'s from.
-type ChannelValueAt struct {
-	From string
-	Seq  uint64
-	Data []byte
-	Next int64
-}
-
-// ChannelRetirer is an optional [ChannelHost] capability: reclaiming the channels
-// a thread created during an in-process call, once the call returns. The call's
+// ChannelRetirer is an optional [Store] capability: reclaiming the channels a
+// thread created during an in-process call, once the call returns. The call's
 // result is recorded and a replay re-inserts it rather than re-entering the call,
 // so those channels hold nothing a later replay reads — the same reason a settled
 // job's channels are reclaimed. ids are the channels' shared ids ("<run>/<name>").
-// Best-effort and asynchronous: the host reclaims each when it is safe to (a
-// shared channel waits for its senders' data to arrive), and a run's end reclaims
-// whatever remains.
+// Best-effort and asynchronous: the store reclaims each when it is safe to.
 type ChannelRetirer interface {
 	RetireChannels(ctx context.Context, run string, ids []string)
 }
 
-// WithChannelHost lets this run share channels with other runs. Without one, a
-// channel that leaves the run in a call's input is an error at the call.
-func WithChannelHost(h ChannelHost) RunOption { return func(o *runOptions) { o.host = h } }
-
 // channelID names a channel of this run to other runs.
 func (r *runState) channelID(name string) string { return r.name + "/" + name }
 
-// linkContext is the context the run's links live on, ended by finish.
+// linkContext is the context the run's channel pumps live on, ended by finish.
 func (r *runState) linkContext() context.Context {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -129,113 +36,21 @@ func (r *runState) linkContext() context.Context {
 	return r.linkCtx
 }
 
-// export makes one of this run's channels reachable from other runs and returns
-// its id. What was sent before the channel left and not yet taken goes to the
-// host now — except on a replay, where the host was told the first time and what
-// this thread thinks is untaken may be a value another thread has not yet
-// replayed taking.
-func (r *runState) export(ctx context.Context, name string, replay bool, sender string, mode handleMode) (string, error) {
-	id := r.channelID(name)
-	cs := r.channel(name)
-	if cs == nil {
-		return "", fmt.Errorf("flow: channel %s is not part of this run", name)
-	}
-	cs.mu.Lock()
-	linked := cs.link != nil
-	cs.mu.Unlock()
-	if linked {
-		return id, nil
-	}
-	if r.host == nil {
-		return "", fmt.Errorf("flow: channel %s cannot leave this run: the run has no channel host", name)
-	}
-	link, err := r.host.Link(ctx, r.name, id, LinkMode(mode))
-	if err != nil {
-		return "", fmt.Errorf("flow: share channel %s: %w", name, err)
-	}
-
-	cs.mu.Lock()
-	if cs.link != nil {
-		cs.mu.Unlock()
-		_ = link.Close()
-		return id, nil
-	}
-	cs.link = link
-	var items []*chanItem
-	for _, it := range cs.items {
-		if !it.taken {
-			items = append(items, it)
-		}
-	}
-	closed := cs.closed
-	// A reader already waiting when the link is established: the run received on
-	// the channel before it was shared for a spawned thread, so its Recv could not
-	// announce (no link then). Announce now, so the host pushes the writer's values
-	// here. Gated on a claimed read side, not read-capability, so a run that only
-	// ever sends on a Both handle does not announce and get its own values pushed back.
-	reader := cs.readOwner != ""
-	cs.broadcast()
-	cs.mu.Unlock()
-
-	if !replay {
-		for _, it := range items {
-			if err := link.Send(ctx, it.from, ChannelItem{From: it.from, Seq: it.seq, Data: it.data}); err != nil {
-				return "", fmt.Errorf("flow: share channel %s: %w", name, err)
-			}
-		}
-		if closed {
-			if err := link.Send(ctx, sender, ChannelItem{Closed: true}); err != nil {
-				return "", fmt.Errorf("flow: share channel %s: %w", name, err)
-			}
-		}
-	}
-	go cs.pump(r.linkContext(), link)
-	if reader {
-		if err := cs.announceReader(ctx); err != nil {
-			return "", fmt.Errorf("flow: announce reader of channel %s: %w", name, err)
-		}
-	}
-	return id, nil
-}
-
-// encoding runs encode as thread t's, so a channel in the value is exported on
-// t's behalf and a replayed encode exports nothing anew. One encode at a time per
-// run, which is how [Channel.MarshalJSON] learns whose encode it is in.
-func (r *runState) encoding(t *threadState, encode func() ([]byte, error)) ([]byte, error) {
+// encoding serialises the run's encodes, one at a time, so a channel shared in a
+// value is named without racing another thread's encode.
+func (r *runState) encoding(encode func() ([]byte, error)) ([]byte, error) {
 	r.encMu.Lock()
 	defer r.encMu.Unlock()
-	r.encoder = t
-	defer func() { r.encoder = nil }()
 	return encode()
 }
 
-// encodingThread reports the thread whose encode is under way, and whether it is
-// replaying. Valid only on the goroutine holding encMu.
-func (r *runState) encodingThread() (t *threadState, replay bool) {
-	if r.encoder == nil {
-		return nil, false
-	}
-	return r.encoder, r.encoder.peek() != nil
-}
-
 // attach connects this run to a channel another run owns, once. mode is the
-// handle's role, set before the pump starts so a read-capable attach keeps the
-// values the pump delivers rather than racing noteRole to mark the channel read.
+// handle's role, deciding which of the channel's streams this run's pumps follow.
 func (r *runState) attach(ctx context.Context, id string, capacity int, mode handleMode) (*chanState, error) {
 	if cs := r.channel(id); cs != nil {
 		return cs, nil
 	}
-	if r.host == nil {
-		return nil, fmt.Errorf("flow: channel %s belongs to another run, and this run has no channel host to reach it", id)
-	}
-	link, err := r.host.Link(ctx, r.name, id, LinkMode(mode))
-	if err != nil {
-		return nil, fmt.Errorf("flow: reach channel %s: %w", id, err)
-	}
 	cs := newChanState(capacity)
-	cs.link = link
-	cs.attached = true
-	cs.reads = mode != modeWrite
 
 	r.mu.Lock()
 	if r.channels == nil {
@@ -243,35 +58,23 @@ func (r *runState) attach(ctx context.Context, id string, capacity int, mode han
 	}
 	if existing, ok := r.channels[id]; ok {
 		r.mu.Unlock()
-		_ = link.Close()
 		return existing, nil
 	}
 	r.channels[id] = cs
 	r.mu.Unlock()
 
-	go cs.pump(r.linkContext(), link)
+	cs.activate(r.linkContext(), r.store, id, mode)
 	return cs, nil
 }
 
-// closeLinks ends every link this run holds. Called when the attempt is over.
+// closeLinks stops the pumps this run's channels run. Called when the attempt is over.
 func (r *runState) closeLinks() {
 	r.mu.Lock()
 	stop := r.linkStop
 	r.linkStop, r.linkCtx = nil, nil
-	var links []ChannelLink
-	for _, cs := range r.channels {
-		cs.mu.Lock()
-		if cs.link != nil {
-			links = append(links, cs.link)
-		}
-		cs.mu.Unlock()
-	}
 	r.mu.Unlock()
 	if stop != nil {
 		stop()
-	}
-	for _, l := range links {
-		_ = l.Close()
 	}
 }
 
@@ -310,122 +113,65 @@ func (cs *chanState) awaitPrefetchRoom(ctx context.Context) bool {
 	}
 }
 
-// pump delivers the channel's record, as it arrives on the link, into local state.
-func (cs *chanState) pump(ctx context.Context, link ChannelLink) {
-	_ = link.Items(ctx, func(it ChannelItem) bool {
+// activate makes a channel stream-backed: it remembers the channel's id and store
+// and starts the pumps that follow its streams, once. mode is this run's role —
+// reader, writer, or both — deciding which streams it follows: a reader follows
+// the value stream (values and closes), a writer follows the consume stream (the
+// reader's reports that free a bounded buffer), a channel used both ways both.
+func (cs *chanState) activate(ctx context.Context, store Store, id string, mode handleMode) {
+	cs.mu.Lock()
+	if cs.started {
+		cs.mu.Unlock()
+		return
+	}
+	cs.started = true
+	cs.store = store
+	cs.id = id
+	cs.mu.Unlock()
+
+	if mode != modeWrite {
+		go cs.pumpValues(ctx, store, id)
+	}
+	if mode != modeRead {
+		go cs.pumpConsumes(ctx, store, id)
+	}
+}
+
+// pumpValues follows the channel's value stream, mirroring its values into the
+// queue in order and shutting the channel on a close. It holds only a bounded
+// read-ahead in memory; the durable stream keeps the rest until the reader
+// catches up. A closing context ends the wait and the pump.
+func (cs *chanState) pumpValues(ctx context.Context, store Store, id string) {
+	_ = store.Follow(ctx, ChannelValueStream(id), 0, func(ea EventAt) bool {
+		it := ea.Event.GetChannelItem()
+		if it == nil {
+			return true
+		}
 		switch {
-		case it.Link:
-			// Only announces an outbox exists (a reader marking a consume stream); it
-			// carries no value and never joins the channel's record.
-		case it.Closed:
+		case it.GetClosed():
 			cs.shut()
-		case it.Consumed:
-			// The reader consumed this value; free the place in a sender's own mirror.
-			cs.free(it.From, it.Seq)
+		case it.GetLink(), it.GetConsumed():
+			// A link marker or a consume report has no value and never joins the
+			// channel's record; the value stream should carry neither, but skip them.
 		default:
-			// Hold only a bounded read-ahead in memory; the durable stream keeps the rest
-			// until the reader catches up. A closing link ends the wait and the pump.
 			if !cs.awaitPrefetchRoom(ctx) {
 				return false
 			}
-			// put drops a copy already here; not announced back to the link.
-			_, _ = cs.put(ctx, it.From, it.Seq, it.Data, false, true)
+			// Fills a placeholder the writer queued by identity, or queues the value
+			// for a reader attached to a channel another run writes.
+			cs.put(ctx, it.GetFrom(), it.GetSeq(), it.GetData(), true)
 		}
 		return true
 	})
 }
 
-// MemChannelHost carries channels between runs in one process, in memory. For
-// tests, and for runs that all live in one program.
-type MemChannelHost struct {
-	mu    sync.Mutex
-	chans map[string]*memChannel
-}
-
-// NewMemChannelHost returns an empty in-memory host.
-func NewMemChannelHost() *MemChannelHost { return &MemChannelHost{chans: map[string]*memChannel{}} }
-
-// Link implements [ChannelHost].
-func (h *MemChannelHost) Link(_ context.Context, _, id string, _ LinkMode) (ChannelLink, error) {
-	if id == "" {
-		return nil, errors.New("flow: a channel id is required")
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	ch := h.chans[id]
-	if ch == nil {
-		ch = &memChannel{ledger: NewLedger(), changed: make(chan struct{})}
-		h.chans[id] = ch
-	}
-	return &memLink{ch: ch}, nil
-}
-
-// ChannelValues implements [ChannelValueReader] over the in-memory record.
-// cursor is an index into it; each returned value carries the next index.
-func (h *MemChannelHost) ChannelValues(_ context.Context, id string, cursor int64, n int) ([]ChannelValueAt, error) {
-	h.mu.Lock()
-	ch := h.chans[id]
-	h.mu.Unlock()
-	if ch == nil {
-		return nil, nil
-	}
-	ch.mu.Lock()
-	defer ch.mu.Unlock()
-	var out []ChannelValueAt
-	for i := cursor; i < int64(len(ch.items)) && len(out) < n; i++ {
-		it := ch.items[i]
-		if it.Consumed || it.Closed {
-			continue
+// pumpConsumes follows the channel's consume stream, freeing a bounded sender's
+// mirrored place as the reader reports taking each value.
+func (cs *chanState) pumpConsumes(ctx context.Context, store Store, id string) {
+	_ = store.Follow(ctx, ChannelConsumeStream(id), 0, func(ea EventAt) bool {
+		if it := ea.Event.GetChannelItem(); it.GetConsumed() {
+			cs.free(it.GetFrom(), it.GetSeq())
 		}
-		out = append(out, ChannelValueAt{From: it.From, Seq: it.Seq, Data: it.Data, Next: i + 1})
-	}
-	return out, nil
+		return true
+	})
 }
-
-type memChannel struct {
-	ledger *Ledger
-
-	mu      sync.Mutex
-	items   []ChannelItem // the record
-	changed chan struct{}
-}
-
-type memLink struct{ ch *memChannel }
-
-func (l *memLink) Send(_ context.Context, _ string, it ChannelItem) error {
-	ch := l.ch
-	ch.mu.Lock()
-	defer ch.mu.Unlock()
-	recs := ch.ledger.Offer(it)
-	if len(recs) == 0 {
-		return nil
-	}
-	ch.items = append(ch.items, recs...)
-	close(ch.changed)
-	ch.changed = make(chan struct{})
-	return nil
-}
-
-func (l *memLink) Items(ctx context.Context, yield func(ChannelItem) bool) error {
-	ch := l.ch
-	next := 0
-	for {
-		ch.mu.Lock()
-		items := ch.items[next:]
-		wait := ch.changed
-		ch.mu.Unlock()
-		for _, it := range items {
-			next++
-			if !yield(it) {
-				return nil
-			}
-		}
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (l *memLink) Close() error { return nil }

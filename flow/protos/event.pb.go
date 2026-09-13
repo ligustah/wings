@@ -237,6 +237,7 @@ type Event struct {
 	//	*Event_Interrupted
 	//	*Event_Select
 	//	*Event_Log
+	//	*Event_ChannelItem
 	Payload       isEvent_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -433,6 +434,15 @@ func (x *Event) GetLog() *LogEvent {
 	return nil
 }
 
+func (x *Event) GetChannelItem() *ChannelItem {
+	if x != nil {
+		if x, ok := x.Payload.(*Event_ChannelItem); ok {
+			return x.ChannelItem
+		}
+	}
+	return nil
+}
+
 type isEvent_Payload interface {
 	isEvent_Payload()
 }
@@ -493,6 +503,10 @@ type Event_Log struct {
 	Log *LogEvent `protobuf:"bytes,33,opt,name=log,proto3,oneof"`
 }
 
+type Event_ChannelItem struct {
+	ChannelItem *ChannelItem `protobuf:"bytes,34,opt,name=channel_item,json=channelItem,proto3,oneof"`
+}
+
 func (*Event_Join) isEvent_Payload() {}
 
 func (*Event_Call) isEvent_Payload() {}
@@ -521,6 +535,105 @@ func (*Event_Select) isEvent_Payload() {}
 
 func (*Event_Log) isEvent_Payload() {}
 
+func (*Event_ChannelItem) isEvent_Payload() {}
+
+// ChannelItem is one record on a shared channel's stream: a value, a close, or
+// the reader's report that it consumed a value. A channel's value stream carries
+// the writer's values and closes; its consume stream the reader's consume reports
+// and its link marker. It rides an Event's payload so every stream — history and
+// channel alike — is a stream of Events the store moves uniformly.
+type ChannelItem struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The sender "<run>/<thread>" and its nth send, identifying the value
+	// everywhere. On a consume report, from/seq name the value consumed.
+	From string `protobuf:"bytes,1,opt,name=from,proto3" json:"from,omitempty"`
+	Seq  uint64 `protobuf:"varint,2,opt,name=seq,proto3" json:"seq,omitempty"`
+	Data []byte `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
+	// Set on a close rather than a value.
+	Closed bool `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	// Set when the single reader reports taking the value named by from/seq, so a
+	// sender counting room by its own mirror may free the place.
+	Consumed bool `protobuf:"varint,5,opt,name=consumed,proto3" json:"consumed,omitempty"`
+	// Set on a record written only so a run's outbox exists: the reader has linked
+	// the channel but may send nothing. It carries no value and never joins the
+	// channel's record; a host uses it to learn the consume stream is there.
+	Link          bool `protobuf:"varint,6,opt,name=link,proto3" json:"link,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChannelItem) Reset() {
+	*x = ChannelItem{}
+	mi := &file_flow_protos_event_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChannelItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChannelItem) ProtoMessage() {}
+
+func (x *ChannelItem) ProtoReflect() protoreflect.Message {
+	mi := &file_flow_protos_event_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChannelItem.ProtoReflect.Descriptor instead.
+func (*ChannelItem) Descriptor() ([]byte, []int) {
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ChannelItem) GetFrom() string {
+	if x != nil {
+		return x.From
+	}
+	return ""
+}
+
+func (x *ChannelItem) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *ChannelItem) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *ChannelItem) GetClosed() bool {
+	if x != nil {
+		return x.Closed
+	}
+	return false
+}
+
+func (x *ChannelItem) GetConsumed() bool {
+	if x != nil {
+		return x.Consumed
+	}
+	return false
+}
+
+func (x *ChannelItem) GetLink() bool {
+	if x != nil {
+		return x.Link
+	}
+	return false
+}
+
 // LogEvent marks in history that the thread logged, so a replay does not emit
 // the line a second time. The line itself — level, message, attributes, time —
 // is a LogRecord on the thread's own log stream, not here, so it survives a
@@ -534,7 +647,7 @@ type LogEvent struct {
 
 func (x *LogEvent) Reset() {
 	*x = LogEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[1]
+	mi := &file_flow_protos_event_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -546,7 +659,7 @@ func (x *LogEvent) String() string {
 func (*LogEvent) ProtoMessage() {}
 
 func (x *LogEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[1]
+	mi := &file_flow_protos_event_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -559,7 +672,7 @@ func (x *LogEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEvent.ProtoReflect.Descriptor instead.
 func (*LogEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{1}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{2}
 }
 
 // LogRecord is one durable log line on a thread's log stream. It is the whole
@@ -580,7 +693,7 @@ type LogRecord struct {
 
 func (x *LogRecord) Reset() {
 	*x = LogRecord{}
-	mi := &file_flow_protos_event_proto_msgTypes[2]
+	mi := &file_flow_protos_event_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -592,7 +705,7 @@ func (x *LogRecord) String() string {
 func (*LogRecord) ProtoMessage() {}
 
 func (x *LogRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[2]
+	mi := &file_flow_protos_event_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -605,7 +718,7 @@ func (x *LogRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogRecord.ProtoReflect.Descriptor instead.
 func (*LogRecord) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{2}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *LogRecord) GetTimeUnixNano() int64 {
@@ -646,7 +759,7 @@ type LogAttr struct {
 
 func (x *LogAttr) Reset() {
 	*x = LogAttr{}
-	mi := &file_flow_protos_event_proto_msgTypes[3]
+	mi := &file_flow_protos_event_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -658,7 +771,7 @@ func (x *LogAttr) String() string {
 func (*LogAttr) ProtoMessage() {}
 
 func (x *LogAttr) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[3]
+	mi := &file_flow_protos_event_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -671,7 +784,7 @@ func (x *LogAttr) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogAttr.ProtoReflect.Descriptor instead.
 func (*LogAttr) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{3}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *LogAttr) GetKey() string {
@@ -698,7 +811,7 @@ type CallEvent struct {
 
 func (x *CallEvent) Reset() {
 	*x = CallEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[4]
+	mi := &file_flow_protos_event_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -710,7 +823,7 @@ func (x *CallEvent) String() string {
 func (*CallEvent) ProtoMessage() {}
 
 func (x *CallEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[4]
+	mi := &file_flow_protos_event_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -723,7 +836,7 @@ func (x *CallEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallEvent.ProtoReflect.Descriptor instead.
 func (*CallEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{4}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CallEvent) GetName() string {
@@ -762,7 +875,7 @@ type ForkEvent struct {
 
 func (x *ForkEvent) Reset() {
 	*x = ForkEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[5]
+	mi := &file_flow_protos_event_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -774,7 +887,7 @@ func (x *ForkEvent) String() string {
 func (*ForkEvent) ProtoMessage() {}
 
 func (x *ForkEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[5]
+	mi := &file_flow_protos_event_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -787,7 +900,7 @@ func (x *ForkEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForkEvent.ProtoReflect.Descriptor instead.
 func (*ForkEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{5}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ForkEvent) GetParentThreadId() string {
@@ -833,7 +946,7 @@ type JoinEvent struct {
 
 func (x *JoinEvent) Reset() {
 	*x = JoinEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[6]
+	mi := &file_flow_protos_event_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -845,7 +958,7 @@ func (x *JoinEvent) String() string {
 func (*JoinEvent) ProtoMessage() {}
 
 func (x *JoinEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[6]
+	mi := &file_flow_protos_event_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -858,7 +971,7 @@ func (x *JoinEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JoinEvent.ProtoReflect.Descriptor instead.
 func (*JoinEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{6}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *JoinEvent) GetThreadId() string {
@@ -885,7 +998,7 @@ type SleepEvent struct {
 
 func (x *SleepEvent) Reset() {
 	*x = SleepEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[7]
+	mi := &file_flow_protos_event_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -897,7 +1010,7 @@ func (x *SleepEvent) String() string {
 func (*SleepEvent) ProtoMessage() {}
 
 func (x *SleepEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[7]
+	mi := &file_flow_protos_event_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -910,7 +1023,7 @@ func (x *SleepEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SleepEvent.ProtoReflect.Descriptor instead.
 func (*SleepEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{7}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *SleepEvent) GetDuration() *durationpb.Duration {
@@ -930,7 +1043,7 @@ type GetTimeEvent struct {
 
 func (x *GetTimeEvent) Reset() {
 	*x = GetTimeEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[8]
+	mi := &file_flow_protos_event_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -942,7 +1055,7 @@ func (x *GetTimeEvent) String() string {
 func (*GetTimeEvent) ProtoMessage() {}
 
 func (x *GetTimeEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[8]
+	mi := &file_flow_protos_event_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -955,7 +1068,7 @@ func (x *GetTimeEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTimeEvent.ProtoReflect.Descriptor instead.
 func (*GetTimeEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{8}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GetTimeEvent) GetTime() *timestamppb.Timestamp {
@@ -985,7 +1098,7 @@ type WaitInterruptedEvent struct {
 
 func (x *WaitInterruptedEvent) Reset() {
 	*x = WaitInterruptedEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[9]
+	mi := &file_flow_protos_event_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -997,7 +1110,7 @@ func (x *WaitInterruptedEvent) String() string {
 func (*WaitInterruptedEvent) ProtoMessage() {}
 
 func (x *WaitInterruptedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[9]
+	mi := &file_flow_protos_event_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1010,7 +1123,7 @@ func (x *WaitInterruptedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitInterruptedEvent.ProtoReflect.Descriptor instead.
 func (*WaitInterruptedEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{9}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *WaitInterruptedEvent) GetWait() string {
@@ -1040,7 +1153,7 @@ type SelectEvent struct {
 
 func (x *SelectEvent) Reset() {
 	*x = SelectEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[10]
+	mi := &file_flow_protos_event_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1052,7 +1165,7 @@ func (x *SelectEvent) String() string {
 func (*SelectEvent) ProtoMessage() {}
 
 func (x *SelectEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[10]
+	mi := &file_flow_protos_event_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1065,7 +1178,7 @@ func (x *SelectEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SelectEvent.ProtoReflect.Descriptor instead.
 func (*SelectEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{10}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SelectEvent) GetChosen() uint64 {
@@ -1087,7 +1200,7 @@ type EffectEvent struct {
 
 func (x *EffectEvent) Reset() {
 	*x = EffectEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[11]
+	mi := &file_flow_protos_event_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1099,7 +1212,7 @@ func (x *EffectEvent) String() string {
 func (*EffectEvent) ProtoMessage() {}
 
 func (x *EffectEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[11]
+	mi := &file_flow_protos_event_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1112,7 +1225,7 @@ func (x *EffectEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EffectEvent.ProtoReflect.Descriptor instead.
 func (*EffectEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{11}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *EffectEvent) GetResult() *Result {
@@ -1134,7 +1247,7 @@ type ReturnEvent struct {
 
 func (x *ReturnEvent) Reset() {
 	*x = ReturnEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[12]
+	mi := &file_flow_protos_event_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1146,7 +1259,7 @@ func (x *ReturnEvent) String() string {
 func (*ReturnEvent) ProtoMessage() {}
 
 func (x *ReturnEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[12]
+	mi := &file_flow_protos_event_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1159,7 +1272,7 @@ func (x *ReturnEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReturnEvent.ProtoReflect.Descriptor instead.
 func (*ReturnEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{12}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ReturnEvent) GetResult() *Result {
@@ -1211,7 +1324,7 @@ type ChannelSendEvent struct {
 
 func (x *ChannelSendEvent) Reset() {
 	*x = ChannelSendEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[13]
+	mi := &file_flow_protos_event_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1223,7 +1336,7 @@ func (x *ChannelSendEvent) String() string {
 func (*ChannelSendEvent) ProtoMessage() {}
 
 func (x *ChannelSendEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[13]
+	mi := &file_flow_protos_event_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1236,7 +1349,7 @@ func (x *ChannelSendEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChannelSendEvent.ProtoReflect.Descriptor instead.
 func (*ChannelSendEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{13}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ChannelSendEvent) GetChannel() string {
@@ -1293,7 +1406,7 @@ type ChannelRecvEvent struct {
 
 func (x *ChannelRecvEvent) Reset() {
 	*x = ChannelRecvEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[14]
+	mi := &file_flow_protos_event_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1305,7 +1418,7 @@ func (x *ChannelRecvEvent) String() string {
 func (*ChannelRecvEvent) ProtoMessage() {}
 
 func (x *ChannelRecvEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[14]
+	mi := &file_flow_protos_event_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1318,7 +1431,7 @@ func (x *ChannelRecvEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChannelRecvEvent.ProtoReflect.Descriptor instead.
 func (*ChannelRecvEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{14}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ChannelRecvEvent) GetChannel() string {
@@ -1376,7 +1489,7 @@ type RunStartEvent struct {
 
 func (x *RunStartEvent) Reset() {
 	*x = RunStartEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[15]
+	mi := &file_flow_protos_event_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1388,7 +1501,7 @@ func (x *RunStartEvent) String() string {
 func (*RunStartEvent) ProtoMessage() {}
 
 func (x *RunStartEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[15]
+	mi := &file_flow_protos_event_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1401,7 +1514,7 @@ func (x *RunStartEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunStartEvent.ProtoReflect.Descriptor instead.
 func (*RunStartEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{15}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *RunStartEvent) GetAttempt() uint64 {
@@ -1467,7 +1580,7 @@ type RunEndEvent struct {
 
 func (x *RunEndEvent) Reset() {
 	*x = RunEndEvent{}
-	mi := &file_flow_protos_event_proto_msgTypes[16]
+	mi := &file_flow_protos_event_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1479,7 +1592,7 @@ func (x *RunEndEvent) String() string {
 func (*RunEndEvent) ProtoMessage() {}
 
 func (x *RunEndEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_flow_protos_event_proto_msgTypes[16]
+	mi := &file_flow_protos_event_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1492,7 +1605,7 @@ func (x *RunEndEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunEndEvent.ProtoReflect.Descriptor instead.
 func (*RunEndEvent) Descriptor() ([]byte, []int) {
-	return file_flow_protos_event_proto_rawDescGZIP(), []int{16}
+	return file_flow_protos_event_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *RunEndEvent) GetStatus() WorkflowStatus {
@@ -1520,7 +1633,7 @@ var File_flow_protos_event_proto protoreflect.FileDescriptor
 
 const file_flow_protos_event_proto_rawDesc = "" +
 	"\n" +
-	"\x17flow/protos/event.proto\x12\rwings.flow.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x16flow/protos/data.proto\"\xa9\a\n" +
+	"\x17flow/protos/event.proto\x12\rwings.flow.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x16flow/protos/data.proto\"\xea\a\n" +
 	"\x05Event\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x16\n" +
 	"\x06serial\x18\x02 \x01(\x04R\x06serial\x12\x18\n" +
@@ -1539,8 +1652,16 @@ const file_flow_protos_event_proto_rawDesc = "" +
 	"\x06effect\x18\x1e \x01(\v2\x1a.wings.flow.v1.EffectEventH\x00R\x06effect\x12G\n" +
 	"\vinterrupted\x18\x1f \x01(\v2#.wings.flow.v1.WaitInterruptedEventH\x00R\vinterrupted\x124\n" +
 	"\x06select\x18  \x01(\v2\x1a.wings.flow.v1.SelectEventH\x00R\x06select\x12+\n" +
-	"\x03log\x18! \x01(\v2\x17.wings.flow.v1.LogEventH\x00R\x03logB\t\n" +
-	"\apayload\"\n" +
+	"\x03log\x18! \x01(\v2\x17.wings.flow.v1.LogEventH\x00R\x03log\x12?\n" +
+	"\fchannel_item\x18\" \x01(\v2\x1a.wings.flow.v1.ChannelItemH\x00R\vchannelItemB\t\n" +
+	"\apayload\"\x8f\x01\n" +
+	"\vChannelItem\x12\x12\n" +
+	"\x04from\x18\x01 \x01(\tR\x04from\x12\x10\n" +
+	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x12\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\x12\x16\n" +
+	"\x06closed\x18\x04 \x01(\bR\x06closed\x12\x1a\n" +
+	"\bconsumed\x18\x05 \x01(\bR\bconsumed\x12\x12\n" +
+	"\x04link\x18\x06 \x01(\bR\x04link\"\n" +
 	"\n" +
 	"\bLogEvent\"\x8f\x01\n" +
 	"\tLogRecord\x12$\n" +
@@ -1635,70 +1756,72 @@ func file_flow_protos_event_proto_rawDescGZIP() []byte {
 }
 
 var file_flow_protos_event_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_flow_protos_event_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_flow_protos_event_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_flow_protos_event_proto_goTypes = []any{
 	(InterruptCause)(0),           // 0: wings.flow.v1.InterruptCause
 	(StartReason)(0),              // 1: wings.flow.v1.StartReason
 	(WorkflowStatus)(0),           // 2: wings.flow.v1.WorkflowStatus
 	(*Event)(nil),                 // 3: wings.flow.v1.Event
-	(*LogEvent)(nil),              // 4: wings.flow.v1.LogEvent
-	(*LogRecord)(nil),             // 5: wings.flow.v1.LogRecord
-	(*LogAttr)(nil),               // 6: wings.flow.v1.LogAttr
-	(*CallEvent)(nil),             // 7: wings.flow.v1.CallEvent
-	(*ForkEvent)(nil),             // 8: wings.flow.v1.ForkEvent
-	(*JoinEvent)(nil),             // 9: wings.flow.v1.JoinEvent
-	(*SleepEvent)(nil),            // 10: wings.flow.v1.SleepEvent
-	(*GetTimeEvent)(nil),          // 11: wings.flow.v1.GetTimeEvent
-	(*WaitInterruptedEvent)(nil),  // 12: wings.flow.v1.WaitInterruptedEvent
-	(*SelectEvent)(nil),           // 13: wings.flow.v1.SelectEvent
-	(*EffectEvent)(nil),           // 14: wings.flow.v1.EffectEvent
-	(*ReturnEvent)(nil),           // 15: wings.flow.v1.ReturnEvent
-	(*ChannelSendEvent)(nil),      // 16: wings.flow.v1.ChannelSendEvent
-	(*ChannelRecvEvent)(nil),      // 17: wings.flow.v1.ChannelRecvEvent
-	(*RunStartEvent)(nil),         // 18: wings.flow.v1.RunStartEvent
-	(*RunEndEvent)(nil),           // 19: wings.flow.v1.RunEndEvent
-	(*timestamppb.Timestamp)(nil), // 20: google.protobuf.Timestamp
-	(*Data)(nil),                  // 21: wings.flow.v1.Data
-	(*Result)(nil),                // 22: wings.flow.v1.Result
-	(*durationpb.Duration)(nil),   // 23: google.protobuf.Duration
+	(*ChannelItem)(nil),           // 4: wings.flow.v1.ChannelItem
+	(*LogEvent)(nil),              // 5: wings.flow.v1.LogEvent
+	(*LogRecord)(nil),             // 6: wings.flow.v1.LogRecord
+	(*LogAttr)(nil),               // 7: wings.flow.v1.LogAttr
+	(*CallEvent)(nil),             // 8: wings.flow.v1.CallEvent
+	(*ForkEvent)(nil),             // 9: wings.flow.v1.ForkEvent
+	(*JoinEvent)(nil),             // 10: wings.flow.v1.JoinEvent
+	(*SleepEvent)(nil),            // 11: wings.flow.v1.SleepEvent
+	(*GetTimeEvent)(nil),          // 12: wings.flow.v1.GetTimeEvent
+	(*WaitInterruptedEvent)(nil),  // 13: wings.flow.v1.WaitInterruptedEvent
+	(*SelectEvent)(nil),           // 14: wings.flow.v1.SelectEvent
+	(*EffectEvent)(nil),           // 15: wings.flow.v1.EffectEvent
+	(*ReturnEvent)(nil),           // 16: wings.flow.v1.ReturnEvent
+	(*ChannelSendEvent)(nil),      // 17: wings.flow.v1.ChannelSendEvent
+	(*ChannelRecvEvent)(nil),      // 18: wings.flow.v1.ChannelRecvEvent
+	(*RunStartEvent)(nil),         // 19: wings.flow.v1.RunStartEvent
+	(*RunEndEvent)(nil),           // 20: wings.flow.v1.RunEndEvent
+	(*timestamppb.Timestamp)(nil), // 21: google.protobuf.Timestamp
+	(*Data)(nil),                  // 22: wings.flow.v1.Data
+	(*Result)(nil),                // 23: wings.flow.v1.Result
+	(*durationpb.Duration)(nil),   // 24: google.protobuf.Duration
 }
 var file_flow_protos_event_proto_depIdxs = []int32{
-	20, // 0: wings.flow.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
-	9,  // 1: wings.flow.v1.Event.join:type_name -> wings.flow.v1.JoinEvent
-	7,  // 2: wings.flow.v1.Event.call:type_name -> wings.flow.v1.CallEvent
-	8,  // 3: wings.flow.v1.Event.fork:type_name -> wings.flow.v1.ForkEvent
-	10, // 4: wings.flow.v1.Event.sleep:type_name -> wings.flow.v1.SleepEvent
-	11, // 5: wings.flow.v1.Event.time:type_name -> wings.flow.v1.GetTimeEvent
-	15, // 6: wings.flow.v1.Event.return:type_name -> wings.flow.v1.ReturnEvent
-	18, // 7: wings.flow.v1.Event.run_start:type_name -> wings.flow.v1.RunStartEvent
-	19, // 8: wings.flow.v1.Event.run_end:type_name -> wings.flow.v1.RunEndEvent
-	16, // 9: wings.flow.v1.Event.channel_send:type_name -> wings.flow.v1.ChannelSendEvent
-	17, // 10: wings.flow.v1.Event.channel_recv:type_name -> wings.flow.v1.ChannelRecvEvent
-	14, // 11: wings.flow.v1.Event.effect:type_name -> wings.flow.v1.EffectEvent
-	12, // 12: wings.flow.v1.Event.interrupted:type_name -> wings.flow.v1.WaitInterruptedEvent
-	13, // 13: wings.flow.v1.Event.select:type_name -> wings.flow.v1.SelectEvent
-	4,  // 14: wings.flow.v1.Event.log:type_name -> wings.flow.v1.LogEvent
-	6,  // 15: wings.flow.v1.LogRecord.attrs:type_name -> wings.flow.v1.LogAttr
-	21, // 16: wings.flow.v1.CallEvent.params:type_name -> wings.flow.v1.Data
-	21, // 17: wings.flow.v1.ForkEvent.input:type_name -> wings.flow.v1.Data
-	22, // 18: wings.flow.v1.JoinEvent.result:type_name -> wings.flow.v1.Result
-	23, // 19: wings.flow.v1.SleepEvent.duration:type_name -> google.protobuf.Duration
-	20, // 20: wings.flow.v1.GetTimeEvent.time:type_name -> google.protobuf.Timestamp
-	0,  // 21: wings.flow.v1.WaitInterruptedEvent.cause:type_name -> wings.flow.v1.InterruptCause
-	22, // 22: wings.flow.v1.EffectEvent.result:type_name -> wings.flow.v1.Result
-	22, // 23: wings.flow.v1.ReturnEvent.result:type_name -> wings.flow.v1.Result
-	21, // 24: wings.flow.v1.ChannelSendEvent.value:type_name -> wings.flow.v1.Data
-	21, // 25: wings.flow.v1.ChannelRecvEvent.value:type_name -> wings.flow.v1.Data
-	1,  // 26: wings.flow.v1.RunStartEvent.reason:type_name -> wings.flow.v1.StartReason
-	21, // 27: wings.flow.v1.RunStartEvent.input:type_name -> wings.flow.v1.Data
-	2,  // 28: wings.flow.v1.RunEndEvent.status:type_name -> wings.flow.v1.WorkflowStatus
-	22, // 29: wings.flow.v1.RunEndEvent.result:type_name -> wings.flow.v1.Result
-	20, // 30: wings.flow.v1.RunEndEvent.scheduled_for:type_name -> google.protobuf.Timestamp
-	31, // [31:31] is the sub-list for method output_type
-	31, // [31:31] is the sub-list for method input_type
-	31, // [31:31] is the sub-list for extension type_name
-	31, // [31:31] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	21, // 0: wings.flow.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
+	10, // 1: wings.flow.v1.Event.join:type_name -> wings.flow.v1.JoinEvent
+	8,  // 2: wings.flow.v1.Event.call:type_name -> wings.flow.v1.CallEvent
+	9,  // 3: wings.flow.v1.Event.fork:type_name -> wings.flow.v1.ForkEvent
+	11, // 4: wings.flow.v1.Event.sleep:type_name -> wings.flow.v1.SleepEvent
+	12, // 5: wings.flow.v1.Event.time:type_name -> wings.flow.v1.GetTimeEvent
+	16, // 6: wings.flow.v1.Event.return:type_name -> wings.flow.v1.ReturnEvent
+	19, // 7: wings.flow.v1.Event.run_start:type_name -> wings.flow.v1.RunStartEvent
+	20, // 8: wings.flow.v1.Event.run_end:type_name -> wings.flow.v1.RunEndEvent
+	17, // 9: wings.flow.v1.Event.channel_send:type_name -> wings.flow.v1.ChannelSendEvent
+	18, // 10: wings.flow.v1.Event.channel_recv:type_name -> wings.flow.v1.ChannelRecvEvent
+	15, // 11: wings.flow.v1.Event.effect:type_name -> wings.flow.v1.EffectEvent
+	13, // 12: wings.flow.v1.Event.interrupted:type_name -> wings.flow.v1.WaitInterruptedEvent
+	14, // 13: wings.flow.v1.Event.select:type_name -> wings.flow.v1.SelectEvent
+	5,  // 14: wings.flow.v1.Event.log:type_name -> wings.flow.v1.LogEvent
+	4,  // 15: wings.flow.v1.Event.channel_item:type_name -> wings.flow.v1.ChannelItem
+	7,  // 16: wings.flow.v1.LogRecord.attrs:type_name -> wings.flow.v1.LogAttr
+	22, // 17: wings.flow.v1.CallEvent.params:type_name -> wings.flow.v1.Data
+	22, // 18: wings.flow.v1.ForkEvent.input:type_name -> wings.flow.v1.Data
+	23, // 19: wings.flow.v1.JoinEvent.result:type_name -> wings.flow.v1.Result
+	24, // 20: wings.flow.v1.SleepEvent.duration:type_name -> google.protobuf.Duration
+	21, // 21: wings.flow.v1.GetTimeEvent.time:type_name -> google.protobuf.Timestamp
+	0,  // 22: wings.flow.v1.WaitInterruptedEvent.cause:type_name -> wings.flow.v1.InterruptCause
+	23, // 23: wings.flow.v1.EffectEvent.result:type_name -> wings.flow.v1.Result
+	23, // 24: wings.flow.v1.ReturnEvent.result:type_name -> wings.flow.v1.Result
+	22, // 25: wings.flow.v1.ChannelSendEvent.value:type_name -> wings.flow.v1.Data
+	22, // 26: wings.flow.v1.ChannelRecvEvent.value:type_name -> wings.flow.v1.Data
+	1,  // 27: wings.flow.v1.RunStartEvent.reason:type_name -> wings.flow.v1.StartReason
+	22, // 28: wings.flow.v1.RunStartEvent.input:type_name -> wings.flow.v1.Data
+	2,  // 29: wings.flow.v1.RunEndEvent.status:type_name -> wings.flow.v1.WorkflowStatus
+	23, // 30: wings.flow.v1.RunEndEvent.result:type_name -> wings.flow.v1.Result
+	21, // 31: wings.flow.v1.RunEndEvent.scheduled_for:type_name -> google.protobuf.Timestamp
+	32, // [32:32] is the sub-list for method output_type
+	32, // [32:32] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_flow_protos_event_proto_init() }
@@ -1722,6 +1845,7 @@ func file_flow_protos_event_proto_init() {
 		(*Event_Interrupted)(nil),
 		(*Event_Select)(nil),
 		(*Event_Log)(nil),
+		(*Event_ChannelItem)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1729,7 +1853,7 @@ func file_flow_protos_event_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_flow_protos_event_proto_rawDesc), len(file_flow_protos_event_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   17,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

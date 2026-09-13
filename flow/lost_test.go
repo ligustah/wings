@@ -10,47 +10,48 @@ import (
 	"time"
 
 	"github.com/ligustah/wings/flow"
+	"github.com/ligustah/wings/flow/protos"
 )
 
-// countingHost records how many times each value is announced, so a test can
-// show a replay re-sends nothing: the host keeps what a send committed (a
-// faithful ChannelLink.Send, as the transactional wings host is — see pull.go),
-// and a replayed send reads the event back rather than announcing again.
-type countingHost struct {
-	flow.ChannelHost
+// countingStore records how many times each value is announced onto a channel's
+// value stream, so a test can show a replay re-sends nothing: a send that
+// completed wrote its value to the stream in the same transaction as its event
+// (pull.go), and a replayed send reads the event back rather than announcing again.
+type countingStore struct {
+	flow.Store
 	mu    sync.Mutex
 	sends map[uint64]int // value seq → times announced
 }
 
-func (h *countingHost) Link(ctx context.Context, run, id string, mode flow.LinkMode) (flow.ChannelLink, error) {
-	l, err := h.ChannelHost.Link(ctx, run, id, mode)
+func (s *countingStore) Begin(ctx context.Context, run, thread string) (flow.Tx, error) {
+	tx, err := s.Store.Begin(ctx, run, thread)
 	if err != nil {
 		return nil, err
 	}
-	return &countingLink{ChannelLink: l, host: h}, nil
+	return &countingTx{Tx: tx, store: s}, nil
 }
 
-func (h *countingHost) announces(seq uint64) int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.sends[seq]
+func (s *countingStore) announces(seq uint64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sends[seq]
 }
 
-type countingLink struct {
-	flow.ChannelLink
-	host *countingHost
+type countingTx struct {
+	flow.Tx
+	store *countingStore
 }
 
-func (l *countingLink) Send(ctx context.Context, sender string, it flow.ChannelItem) error {
-	if !it.Consumed && !it.Closed {
-		l.host.mu.Lock()
-		if l.host.sends == nil {
-			l.host.sends = map[uint64]int{}
+func (tx *countingTx) AppendTo(ctx context.Context, name string, ev *protos.Event) error {
+	if it := ev.GetChannelItem(); it != nil && !it.GetConsumed() && !it.GetClosed() && !it.GetLink() {
+		tx.store.mu.Lock()
+		if tx.store.sends == nil {
+			tx.store.sends = map[uint64]int{}
 		}
-		l.host.sends[it.Seq]++
-		l.host.mu.Unlock()
+		tx.store.sends[it.GetSeq()]++
+		tx.store.mu.Unlock()
 	}
-	return l.ChannelLink.Send(ctx, sender, it)
+	return tx.Tx.AppendTo(ctx, name, ev)
 }
 
 // lostAttempt is a placer that runs a function thread from its own history,
@@ -58,12 +59,11 @@ func (l *countingLink) Send(ctx context.Context, sender string, it flow.ChannelI
 // it has sent, and then resumes it — a worker's retry after a move.
 type lostAttempt struct {
 	store flow.Store
-	host  flow.ChannelHost
 	sent  chan struct{}
 }
 
 func (e *lostAttempt) opts() []flow.RunOption {
-	return []flow.RunOption{flow.WithStore(e.store), flow.WithPlacer(e), flow.WithChannelHost(e.host), flow.Once()}
+	return []flow.RunOption{flow.WithStore(e.store), flow.WithPlacer(e), flow.Once()}
 }
 
 func (e *lostAttempt) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
@@ -106,14 +106,14 @@ var (
 )
 
 // THE POINT: a sender's attempt ends after recording its sends and is moved on.
-// The value it committed is durably on record with its host, so the replay reads
-// each send back rather than announcing it again — no value is sent twice — and
-// the receiver still sees every one. A replay has no side effect on the channel.
+// The value it committed is durably on the value stream, so the replay reads each
+// send back rather than announcing it again — no value is sent twice — and the
+// receiver still sees every one. A replay has no side effect on the channel.
 func TestAReplayedSendIsNotAnnouncedAgain(t *testing.T) {
 	dyingRuns.Store(0)
 	dyingSent = make(chan struct{})
-	host := &countingHost{ChannelHost: flow.NewMemChannelHost()}
-	e := &lostAttempt{store: flow.NewMemStore(), host: host, sent: dyingSent}
+	store := &countingStore{Store: flow.NewMemStore()}
+	e := &lostAttempt{store: store, sent: dyingSent}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	var seen []int
@@ -147,7 +147,7 @@ func TestAReplayedSendIsNotAnnouncedAgain(t *testing.T) {
 	// its sends back from history and announced nothing. Sends are 0-numbered, so
 	// the three values are seq 0, 1 and 2.
 	for seq := uint64(0); seq <= 2; seq++ {
-		if n := host.announces(seq); n != 1 {
+		if n := store.announces(seq); n != 1 {
 			t.Fatalf("value #%d was announced %d times, want exactly once (a replay must not re-send)", seq, n)
 		}
 	}

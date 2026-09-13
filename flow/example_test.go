@@ -110,10 +110,10 @@ func ExampleContext_Select() {
 }
 
 func ExampleContext_Signal() {
-	host := flow.NewMemChannelHost()
+	store := flow.NewMemStore()
 	name := flow.NewName()
-	// Delivered before the run asks; the host holds it until it does.
-	if err := flow.Deliver(context.Background(), host, name, "approval", "shipped"); err != nil {
+	// Delivered before the run asks; the value stream holds it until it does.
+	if err := flow.Deliver(context.Background(), store, name, "approval", "shipped"); err != nil {
 		log.Fatal(err)
 	}
 	err := flow.Run(context.Background(), name, func(ctx flow.Context) error {
@@ -123,7 +123,7 @@ func ExampleContext_Signal() {
 		}
 		fmt.Println(v)
 		return nil
-	}, flow.WithStore(flow.NewMemStore()), flow.WithChannelHost(host))
+	}, flow.WithStore(store))
 	if err != nil {
 		log.Fatal(err)
 	}

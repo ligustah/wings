@@ -142,23 +142,6 @@ func (a *coordOutputs) commitDue() bool {
 	return a.commitInterval <= 0 || time.Since(a.opened) >= a.commitInterval
 }
 
-// append writes a shared-channel record into the thread's open transaction. It
-// never commits: a value precedes the send event that justifies it, so the commit
-// is left to the event ([coordSink.Append]), which keeps the two whole in one
-// transaction.
-func (a *coordOutputs) append(ctx context.Context, s *dsclient.Stream[flow.ChannelItem], it flow.ChannelItem) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.begin(ctx); err != nil {
-		return err
-	}
-	if _, err := dsclient.Output(a.tx, s).Append(ctx, []flow.ChannelItem{it}); err != nil {
-		a.err = fmt.Errorf("wings: write output of %s: %w", a.id, err)
-		return a.err
-	}
-	return nil
-}
-
 // appendLog writes a durable log line into the thread's open transaction, opening
 // the thread's log stream once. It never commits: the [protos.LogEvent] marker the
 // caller records next drives the commit, so a line and its marker are whole in one
@@ -270,10 +253,9 @@ func (a *coordOutputs) finish(ctx context.Context) error {
 	return a.commit(ctx)
 }
 
-// coordStore is the coordinator's [flow.Store]: it reads and drops through the
-// plain store but writes each thread's events inside that thread's transaction, so
-// a shared-channel send's event commits with its outbox record (see
-// [clusterChannels.Link], [flow.Committer]).
+// coordStore is the coordinator's [flow.Store]: it reads, follows and drops
+// through the plain store but writes each thread's events inside that thread's
+// transaction, so a shared-channel send's event commits with its channel record.
 type coordStore struct {
 	flow.Store
 	c      *Cluster
@@ -302,73 +284,86 @@ func (s *coordStore) Drop(ctx context.Context, run, thread string) error {
 	return s.Store.Drop(ctx, run, thread)
 }
 
-func (s *coordStore) Sink(ctx context.Context, run, thread string) (flow.Sink, error) {
+// Begin returns the thread's transaction. A retried coordinator run reuses the
+// producer, reset when the thread's history shows a higher attempt.
+func (s *coordStore) Begin(ctx context.Context, run, thread string) (flow.Tx, error) {
 	out, err := s.c.coordOutputsFor(run + "/" + thread)
 	if err != nil {
 		return nil, err
 	}
-	return &coordSink{
-		out:    out,
-		client: s.client,
-		name:   flow.ThreadStream(run, thread),
+	return &coordTx{
+		out:     out,
+		client:  s.client,
+		hist:    flow.ThreadStream(run, thread),
+		streams: map[string]*dsclient.Stream[*protos.Event]{},
 	}, nil
 }
 
-// coordSink appends a thread's events inside the thread's own transaction,
-// resetting the producer when it sees a higher attempt so a retried run writes
-// afresh (see [coordOutputs.resetTo]).
-type coordSink struct {
+// RetireChannels implements [flow.ChannelRetirer]: the run body's in-process call
+// that created these channels has returned, so retire them. Done off the caller so
+// the call is not held for storage work; the run's end retires whatever is left.
+func (s *coordStore) RetireChannels(_ context.Context, _ string, ids []string) {
+	s.c.wg.Go(func() { s.c.retireChannels(ids) })
+}
+
+// coordTx appends a thread's events — its history and any channel stream it writes
+// — inside the thread's own transaction, so a send's value and the event that
+// justifies it commit together (pull.go). It resets the producer when it sees a
+// higher attempt, so a retried run writes afresh (see [coordOutputs.resetTo]).
+type coordTx struct {
 	out    *coordOutputs
 	client *dsclient.Client
-	name   string
+	hist   string
 
-	mu     sync.Mutex
-	stream *dsclient.Stream[*protos.Event]
+	mu      sync.Mutex
+	streams map[string]*dsclient.Stream[*protos.Event]
 }
 
-func (s *coordSink) Append(ctx context.Context, ev *protos.Event) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.out.resetTo(ctx, ev.GetAttempt())
-	if s.stream == nil {
-		// Not the run's context: a half-made stream is the next attempt's problem.
-		if err := ensureStream(context.WithoutCancel(ctx), s.client, s.name); err != nil {
-			return err
-		}
-		st, err := s.client.OpenStream[*protos.Event](s.name, dsclient.WithCodec[*protos.Event](
-			dswire.ReflectCodec[*protos.Event]{New: func() *protos.Event { return &protos.Event{} }},
-		))
-		if err != nil {
-			return fmt.Errorf("wings: open history %s: %w", s.name, err)
-		}
-		s.stream = st
+func (tx *coordTx) stream(ctx context.Context, name string) (*dsclient.Stream[*protos.Event], error) {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if st := tx.streams[name]; st != nil {
+		return st, nil
 	}
-	// Append the event — after any value a send announced just before it, so the two
-	// are whole in one transaction — then commit unless a CommitInterval is holding
-	// the transaction open to coalesce. What must be durable at once — a channel
-	// send's value, or a thread's writes as it parks — is flushed by [coordSink.Commit]
-	// and [coordSink.CommitBoundary]; between those, work in flight coalesces and a
-	// coordinator restart replays whatever the last commit did not cover.
-	if err := s.out.appendEvent(ctx, s.stream, ev); err != nil {
+	// Not the run's context: a half-made stream is the next attempt's problem.
+	if err := ensureStream(context.WithoutCancel(ctx), tx.client, name); err != nil {
+		return nil, err
+	}
+	st, err := eventStream[*protos.Event](tx.client, name)
+	if err != nil {
+		return nil, fmt.Errorf("wings: open %s: %w", name, err)
+	}
+	tx.streams[name] = st
+	return st, nil
+}
+
+// Append writes an event to the thread's history stream and commits unless a
+// CommitInterval is holding the transaction open to coalesce. What must be durable
+// at once — a channel value, or a thread's writes as it parks — is flushed by
+// Flush; between those, work in flight coalesces and a restart replays whatever the
+// last commit did not cover.
+func (tx *coordTx) Append(ctx context.Context, ev *protos.Event) error {
+	tx.out.resetTo(ctx, ev.GetAttempt())
+	st, err := tx.stream(ctx, tx.hist)
+	if err != nil {
 		return err
 	}
-	return s.out.commitIfDue(ctx)
-}
-
-// Commit implements [flow.Committer]: it commits a channel send's event with the
-// value it announced, or a consume report with the receive that justified it.
-// Under a CommitInterval it coalesces, committing only once the transaction has
-// aged past the interval; a parked thread's [coordSink.CommitBoundary] flushes what
-// is left open so nothing waits on it forever.
-func (s *coordSink) Commit(ctx context.Context) error { return s.out.commitIfDue(ctx) }
-
-// CommitBoundary implements [flow.BoundaryCommitter]: it force-commits as the
-// thread waits, so a value coalesced under a CommitInterval reaches whoever the
-// thread is about to wait on. Without an interval the sink commits eagerly, so
-// there is nothing held open.
-func (s *coordSink) CommitBoundary(ctx context.Context) error {
-	if s.out.commitInterval <= 0 {
-		return nil
+	if err := tx.out.appendEvent(ctx, st, ev); err != nil {
+		return err
 	}
-	return s.out.commit(ctx)
+	return tx.out.commitIfDue(ctx)
 }
+
+// AppendTo writes an event to a named channel stream in the thread's transaction.
+// It never commits: a value precedes its send event, and a consume report or close
+// rides the event it pairs with, so the event's commit takes both home together.
+func (tx *coordTx) AppendTo(ctx context.Context, name string, ev *protos.Event) error {
+	st, err := tx.stream(ctx, name)
+	if err != nil {
+		return err
+	}
+	return tx.out.appendEvent(ctx, st, ev)
+}
+
+func (tx *coordTx) Commit(ctx context.Context) error { return tx.out.commitIfDue(ctx) }
+func (tx *coordTx) Flush(ctx context.Context) error  { return tx.out.commit(ctx) }

@@ -170,7 +170,7 @@ var _ = flow.Main(givesUpThenSpawns)
 // and does not stand where the parent gave up, nor take the thread it
 // gave up on for one to join.
 func TestAReplayToAForkPassesAWaitGivenUpOn(t *testing.T) {
-	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	p := &placingElsewhere{store: flow.NewMemStore()}
 	started := time.Now()
 	if err := flow.RunMain(t.Context(), givesUpThenSpawns, 3, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)

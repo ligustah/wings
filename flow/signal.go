@@ -7,6 +7,8 @@ import (
 	"uuid"
 
 	"github.com/ligustah/durable_streams/dswire"
+
+	"github.com/ligustah/wings/flow/protos"
 )
 
 // A signal is an external event delivered into a running workflow by name. It
@@ -54,11 +56,11 @@ func (c Context) Signal[T any](name string) (T, error) {
 
 // Deliver sends a signal to a running workflow: the run named run receives it
 // through [Context.Signal] under name. Sent from outside any run, through the
-// same [ChannelHost] the run uses. A signal delivered before the run asks for it
-// is held until it does.
-func Deliver[T any](ctx context.Context, host ChannelHost, run, name string, v T) error {
-	if host == nil {
-		return errors.New("flow: Deliver requires a ChannelHost")
+// same [Store] the run uses. A signal delivered before the run asks for it is
+// held on the channel's value stream until it does.
+func Deliver[T any](ctx context.Context, store Store, run, name string, v T) error {
+	if store == nil {
+		return errors.New("flow: Deliver requires a Store")
 	}
 	if run == "" || name == "" {
 		return errors.New("flow: Deliver requires a run and a name")
@@ -68,13 +70,17 @@ func Deliver[T any](ctx context.Context, host ChannelHost, run, name string, v T
 	if err != nil {
 		return fmt.Errorf("flow: encode signal %q: %w", name, err)
 	}
-	link, err := host.Link(ctx, signalSender, signalID(run, name), LinkWrite)
+	// A signal owns no thread; open a transaction for a synthetic sender and write
+	// the value straight onto the channel's value stream, committed at once. A fresh
+	// id per delivery, so two signals are two items on the stream.
+	tx, err := store.Begin(ctx, signalSender, name)
 	if err != nil {
-		return fmt.Errorf("flow: reach signal %q of run %s: %w", name, run, err)
+		return fmt.Errorf("flow: deliver signal %q to run %s: %w", name, run, err)
 	}
-	defer link.Close()
-	// A fresh id per delivery, so two signals are two items rather than one the
-	// host dedupes.
 	from := "signal/" + uuid.New().String()
-	return link.Send(ctx, from, ChannelItem{From: from, Data: data})
+	ev := &protos.Event{Payload: protos.PackEventPayload(&protos.ChannelItem{From: from, Data: data})}
+	if err := tx.AppendTo(ctx, ChannelValueStream(signalID(run, name)), ev); err != nil {
+		return fmt.Errorf("flow: deliver signal %q to run %s: %w", name, run, err)
+	}
+	return tx.Flush(ctx)
 }

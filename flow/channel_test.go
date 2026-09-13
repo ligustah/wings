@@ -57,9 +57,11 @@ func allEvents(store *flow.MemStore, run string) ([]*protos.Event, error) {
 	return all, nil
 }
 
-// A send records no value: only the receiver's copy is read back on replay, so
-// storing the sender's too kept every value on disk twice.
-func TestSendRecordsNoValue(t *testing.T) {
+// Neither a send nor a receive records an inline value: the one durable copy of
+// a channel value lives on the channel's value stream, and a replay reads it back
+// from there by the receive's recorded identity. Recording either side's copy in
+// history kept every value on disk twice.
+func TestChannelValueIsNotRecordedInHistory(t *testing.T) {
 	store := flow.NewMemStore()
 	err := flow.Run(context.Background(), "sendval", func(c flow.Context) error {
 		r, w := c.NewChannel[int](flow.WithCapacity(4))
@@ -89,9 +91,12 @@ func TestSendRecordsNoValue(t *testing.T) {
 		}
 		if r := ev.GetChannelRecv(); r != nil && !r.GetClosed() {
 			recvs++
-			if r.GetValue().GetSerialized() == nil {
-				t.Errorf("recv from %s#%d recorded no value; the receiver's copy is read back on replay",
+			if r.GetValue() != nil {
+				t.Errorf("recv from %s#%d recorded an inline value; the one copy is on the value stream",
 					r.GetFromThreadId(), r.GetFromSeq())
+			}
+			if r.GetFromThreadId() == "" {
+				t.Errorf("recv recorded no sender identity; a replay reads the value back by (from, seq)")
 			}
 		}
 	}

@@ -29,9 +29,7 @@ type runState struct {
 	parker Parker
 	clock  Clock
 	opts   runOptions
-	// host carries channels to and from other runs; nil when none are shared.
-	// linkCtx bounds the links and ends with the attempt.
-	host     ChannelHost
+	// linkCtx bounds the channel pumps and ends with the attempt.
 	linkCtx  context.Context
 	linkStop context.CancelFunc
 
@@ -47,10 +45,8 @@ type runState struct {
 	channels map[string]*chanState
 	over     bool // this attempt has returned
 
-	// encMu serialises the run's encodes, and encoder is the thread whose encode
-	// is under way. See encoding.
-	encMu   sync.Mutex
-	encoder *threadState
+	// encMu serialises the run's encodes. See encoding.
+	encMu sync.Mutex
 }
 
 func newRunState(name string, opts runOptions) *runState {
@@ -62,7 +58,6 @@ func newRunState(name string, opts runOptions) *runState {
 		parker: opts.parker,
 		clock:  opts.clock,
 		opts:   opts,
-		host:   opts.host,
 	}
 }
 
@@ -135,8 +130,8 @@ type threadState struct {
 	chanVals map[string]*chanValueCursor
 	serial   uint64
 
-	sink    Sink
-	sinkErr error // the first persistence failure, if any
+	tx         Tx
+	persistErr error // the first persistence failure, if any
 
 	// blockingLog buffers log lines written from within a Blocking step's off-thread
 	// f, which cannot touch the thread's history or transaction itself. They flush
@@ -198,9 +193,9 @@ func (t *threadState) nextRecv(channel string) uint64 {
 	return seq
 }
 
-// encode runs encode as this thread's. See runState.encoding.
+// encode serialises this encode with the run's others. See runState.encoding.
 func (t *threadState) encode(encode func() ([]byte, error)) ([]byte, error) {
-	return t.run.encoding(t, encode)
+	return t.run.encoding(encode)
 }
 
 type ctxKey struct{}
@@ -375,27 +370,35 @@ func (t *threadState) channelValue(ctx context.Context, pos uint64) ([]byte, err
 		return data, nil
 	}
 
-	reader, ok := t.run.host.(ChannelValueReader)
-	if !ok {
-		return nil, fmt.Errorf("flow: thread %q took a value from shared channel %s but its host cannot read one back", t.id, id)
+	// Scan the channel's value stream in order from where the last read left off,
+	// caching values passed on the way to the one wanted. The value stream is the
+	// one durable copy — a moved receiver's worker may still be catching up, so a
+	// follow that blocks until the wanted value arrives is right; ctx ending is the
+	// only way it does not turn up.
+	var found []byte
+	got := false
+	err := t.run.store.Follow(ctx, ChannelValueStream(id), cur.at, func(ea EventAt) bool {
+		cur.at = ea.Offset + 1
+		it := ea.Event.GetChannelItem()
+		if it == nil || it.GetConsumed() || it.GetClosed() || it.GetLink() {
+			return true
+		}
+		k := valueKey{from: it.GetFrom(), seq: it.GetSeq()}
+		if k == want {
+			found, got = it.GetData(), true
+			return false
+		}
+		cur.cache[k] = it.GetData()
+		return true
+	})
+	if got {
+		return found, nil
 	}
-	for {
-		values, err := reader.ChannelValues(ctx, id, cur.at, valuePrefetch)
-		if err != nil {
-			return nil, err
-		}
-		if len(values) == 0 {
-			return nil, fmt.Errorf("flow: the value thread %q took from channel %s (%s#%d) is gone",
-				t.id, id, want.from, want.seq)
-		}
-		for _, v := range values {
-			cur.at = v.Next
-			if (valueKey{from: v.From, seq: v.Seq}) == want {
-				return v.Data, nil
-			}
-			cur.cache[valueKey{from: v.From, seq: v.Seq}] = v.Data
-		}
+	if err != nil {
+		return nil, err
 	}
+	return nil, fmt.Errorf("flow: the value thread %q took from channel %s (%s#%d) is gone",
+		t.id, id, want.from, want.seq)
 }
 
 // record appends an event to this thread and hands it to the sink. A sink
@@ -438,13 +441,13 @@ func (t *threadState) marker[E protos.Events](payload E) {
 
 // persistLocked hands an event to the sink. Call with run.mu held.
 func (t *threadState) persistLocked(ev *protos.Event) {
-	if t.sink == nil || t.sinkErr != nil || t.run.over {
+	if t.tx == nil || t.persistErr != nil || t.run.over {
 		return
 	}
 	// Background, not the run's context: an event about what already happened
 	// must be written even while the run is torn down.
-	if err := t.sink.Append(context.Background(), ev); err != nil {
-		t.sinkErr = fmt.Errorf("flow: persist event: %w", err)
+	if err := t.tx.Append(context.Background(), ev); err != nil {
+		t.persistErr = fmt.Errorf("flow: persist event: %w", err)
 	}
 }
 
@@ -500,7 +503,7 @@ func (t *threadState) interrupt(wait string, err error) error {
 func (t *threadState) err() error {
 	t.run.mu.Lock()
 	defer t.run.mu.Unlock()
-	return t.sinkErr
+	return t.persistErr
 }
 
 // fail records the thread's first error from a path that cannot return one to
@@ -509,52 +512,44 @@ func (t *threadState) err() error {
 func (t *threadState) fail(err error) {
 	t.run.mu.Lock()
 	defer t.run.mu.Unlock()
-	if t.sinkErr == nil {
-		t.sinkErr = err
+	if t.persistErr == nil {
+		t.persistErr = err
 	}
 }
 
-// commit flushes the sink's pending writes, so a shared-channel send's event and
-// its outbox record commit together (see [Committer]). A no-op for a sink that
-// commits each append on its own. Runs off the caller's cancellation: what is
-// already recorded must be committed even as the attempt is torn down.
+// commit flushes the transaction's pending writes, so a shared-channel send's
+// event and its channel record commit together (see [Tx.Commit]). A no-op for a
+// store that commits each append on its own. Runs off the caller's cancellation:
+// what is already recorded must be committed even as the attempt is torn down.
 func (t *threadState) commit(ctx context.Context) error {
 	t.run.mu.Lock()
-	sink, serr, over := t.sink, t.sinkErr, t.run.over
+	tx, serr, over := t.tx, t.persistErr, t.run.over
 	t.run.mu.Unlock()
 	if serr != nil {
 		return serr
 	}
-	if sink == nil || over {
+	if tx == nil || over {
 		return nil
 	}
-	c, ok := sink.(Committer)
-	if !ok {
-		return nil
-	}
-	return c.Commit(context.WithoutCancel(ctx))
+	return tx.Commit(context.WithoutCancel(ctx))
 }
 
-// commitBoundary flushes the sink as the thread is about to wait, so a sink that
-// coalesces commits does not strand a value a parked producer left unsent (see
-// [BoundaryCommitter]). A no-op for a sink that commits eagerly. Best-effort like
-// [threadState.commit]: any failure is sticky in the sink and surfaces on the
-// thread's next write.
+// commitBoundary force-commits the transaction as the thread is about to wait,
+// so a store that coalesces commits does not strand a value a parked producer
+// left unsent (see [Tx.Flush]). A no-op for a store that commits eagerly.
+// Best-effort like [threadState.commit]: any failure is sticky and surfaces on
+// the thread's next write.
 func (t *threadState) commitBoundary(ctx context.Context) error {
 	t.run.mu.Lock()
-	sink, serr, over := t.sink, t.sinkErr, t.run.over
+	tx, serr, over := t.tx, t.persistErr, t.run.over
 	t.run.mu.Unlock()
 	if serr != nil {
 		return serr
 	}
-	if sink == nil || over {
+	if tx == nil || over {
 		return nil
 	}
-	c, ok := sink.(BoundaryCommitter)
-	if !ok {
-		return nil
-	}
-	return c.CommitBoundary(context.WithoutCancel(ctx))
+	return tx.Flush(context.WithoutCancel(ctx))
 }
 
 // keepAlive holds a thread's transaction open across a stretch that records

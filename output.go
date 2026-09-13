@@ -11,6 +11,7 @@ import (
 
 	"github.com/ligustah/durable_streams/dsclient"
 
+	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
 )
 
@@ -107,20 +108,9 @@ func parseOutput(stream string) (outputName, bool) {
 }
 
 // streamPart maps everything outside [A-Za-z0-9_-] to an underscore, so a
-// caller's output name is safe to join with dots.
-func streamPart(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
-			r == '-', r == '_':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	return b.String()
-}
+// caller's output name is safe to join with dots. It defers to [flow.StreamPart]
+// so a channel's streams have one name whether flow or the engine names them.
+func streamPart(s string) string { return flow.StreamPart(s) }
 
 // jobOutput stands up a stream for [Record] on the worker the coordinator will
 // keep it from.

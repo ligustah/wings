@@ -52,7 +52,33 @@ message Event {
     WaitInterruptedEvent interrupted = 31;
     SelectEvent select = 32;
     LogEvent log = 33;
+    ChannelItem channel_item = 34;
   }
+}
+
+// ChannelItem is one record on a shared channel's stream: a value, a close, or
+// the reader's report that it consumed a value. A channel's value stream carries
+// the writer's values and closes; its consume stream the reader's consume reports
+// and its link marker. It rides an Event's payload so every stream — history and
+// channel alike — is a stream of Events the store moves uniformly.
+message ChannelItem {
+  // The sender "<run>/<thread>" and its nth send, identifying the value
+  // everywhere. On a consume report, from/seq name the value consumed.
+  string from = 1;
+  uint64 seq = 2;
+  bytes data = 3;
+
+  // Set on a close rather than a value.
+  bool closed = 4;
+
+  // Set when the single reader reports taking the value named by from/seq, so a
+  // sender counting room by its own mirror may free the place.
+  bool consumed = 5;
+
+  // Set on a record written only so a run's outbox exists: the reader has linked
+  // the channel but may send nothing. It carries no value and never joins the
+  // channel's record; a host uses it to learn the consume stream is there.
+  bool link = 6;
 }
 
 // LogEvent marks in history that the thread logged, so a replay does not emit

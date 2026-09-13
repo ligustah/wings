@@ -3,6 +3,7 @@ package flow
 import (
 	"context"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,30 +11,51 @@ import (
 	"github.com/ligustah/wings/flow/protos"
 )
 
-// feedLink is a [ChannelLink] that hands the pump a fixed run of value items and
-// then idles, counting how many the pump actually took (yield returned true). The
-// pump's prefetch gate blocks yield when the buffer is full, so fed stops climbing
-// there until the reader drains.
-type feedLink struct {
-	items []ChannelItem
+// feedStore is a [Store] whose value-stream Follow hands the reader's pump a fixed
+// run of value items and then idles, counting how many the pump actually took
+// (yield returned true). The pump's prefetch gate blocks yield when the buffer is
+// full, so fed stops climbing there until the reader drains. Every other method is
+// a no-op: the test drives only the value pump.
+type feedStore struct {
+	items []*protos.ChannelItem
 	fed   int32
 }
 
-func (l *feedLink) Send(context.Context, string, ChannelItem) error { return nil }
-func (l *feedLink) Close() error                                    { return nil }
-func (l *feedLink) Items(ctx context.Context, yield func(ChannelItem) bool) error {
-	for _, it := range l.items {
+func (s *feedStore) Begin(context.Context, string, string) (Tx, error) { return nopTx{}, nil }
+func (s *feedStore) Read(context.Context, string, string, int64, int) ([]EventAt, error) {
+	return nil, nil
+}
+func (s *feedStore) Events(context.Context, string, string) ([]*protos.Event, error) {
+	return nil, nil
+}
+func (s *feedStore) Drop(context.Context, string, string) error { return nil }
+func (s *feedStore) Follow(ctx context.Context, name string, from int64, yield func(EventAt) bool) error {
+	if !strings.HasPrefix(name, ChannelValuePrefix) {
+		<-ctx.Done() // the consume stream never carries anything in this test
+		return ctx.Err()
+	}
+	for i := int(from); i < len(s.items); i++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !yield(it) {
+		ev := &protos.Event{Payload: protos.PackEventPayload(s.items[i])}
+		if !yield(EventAt{Event: ev, Offset: int64(i)}) {
 			return nil
 		}
-		atomic.AddInt32(&l.fed, 1)
+		atomic.AddInt32(&s.fed, 1)
 	}
 	<-ctx.Done()
 	return ctx.Err()
 }
+
+// nopTx is a transaction that persists nothing, for tests that drive a pump and
+// never read history back.
+type nopTx struct{}
+
+func (nopTx) Append(context.Context, *protos.Event) error         { return nil }
+func (nopTx) AppendTo(context.Context, string, *protos.Event) error { return nil }
+func (nopTx) Commit(context.Context) error                        { return nil }
+func (nopTx) Flush(context.Context) error                         { return nil }
 
 func heldData(cs *chanState) int {
 	cs.mu.Lock()
@@ -59,17 +81,19 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// discardSink persists nothing it is handed — like a real store that has
-// serialized the event to disk and no longer holds the Go object. It leaves
-// only what threadState itself keeps in memory, so a memory test sees that alone
-// and not the sink's own copies (which MemStore would keep).
-type discardSink struct{ n int }
+// discardTx persists nothing it is handed — like a real store that has serialized
+// the event to disk and no longer holds the Go object. It leaves only what
+// threadState itself keeps in memory, so a memory test sees that alone.
+type discardTx struct{ st *discardStore }
 
-func (s *discardSink) Append(_ context.Context, _ *protos.Event) error { s.n++; return nil }
+func (tx discardTx) Append(context.Context, *protos.Event) error { tx.st.n++; return nil }
+func (tx discardTx) AppendTo(context.Context, string, *protos.Event) error { return nil }
+func (tx discardTx) Commit(context.Context) error { return nil }
+func (tx discardTx) Flush(context.Context) error  { return nil }
 
-type discardStore struct{ sink discardSink }
+type discardStore struct{ n int }
 
-func (s *discardStore) Sink(context.Context, string, string) (Sink, error) { return &s.sink, nil }
+func (s *discardStore) Begin(context.Context, string, string) (Tx, error) { return discardTx{s}, nil }
 func (s *discardStore) Read(context.Context, string, string, int64, int) ([]EventAt, error) {
 	return nil, nil
 }
@@ -77,6 +101,10 @@ func (s *discardStore) Events(context.Context, string, string) ([]*protos.Event,
 	return nil, nil
 }
 func (s *discardStore) Drop(context.Context, string, string) error { return nil }
+func (s *discardStore) Follow(ctx context.Context, _ string, _ int64, _ func(EventAt) bool) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
 
 // THE POINT: an unbounded channel's Send never blocks, so a sender is never
 // parked (and so never unloaded, which would replay its whole job). One thread
@@ -116,12 +144,13 @@ func TestUnboundedChannelSendNeverBlocks(t *testing.T) {
 }
 
 // THE POINT: a consumed channel item drops its value, so a drained channel does
-// not hold its whole traffic in memory (the second in-memory copy).
+// not hold its whole traffic in memory (the second in-memory copy). The pump
+// delivers the value (viaPump), which is the only put that keeps the bytes.
 func TestChanStateConsumeDropsItemData(t *testing.T) {
 	cs := newChanState(4)
-	item, err := cs.put(context.Background(), "main", 0, []byte("payload"), false, false)
-	if err != nil {
-		t.Fatalf("put: %v", err)
+	item := cs.put(context.Background(), "main", 0, []byte("payload"), true)
+	if item.data == nil {
+		t.Fatalf("a pump-delivered value should keep its bytes for the reader")
 	}
 	cs.consume(item)
 	if item.data != nil {
@@ -136,10 +165,7 @@ func TestChanStatePrunesReceivedItems(t *testing.T) {
 	cs := newChanState(unbounded)
 	const n = 5000
 	for i := 0; i < n; i++ {
-		it, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false, false)
-		if err != nil {
-			t.Fatalf("put: %v", err)
-		}
+		it := cs.put(context.Background(), "main", uint64(i), []byte("x"), true)
 		it.taken = true
 		cs.consume(it)
 	}
@@ -158,9 +184,7 @@ func TestChanStateFindIndexTracksItems(t *testing.T) {
 	cs := newChanState(unbounded)
 	const n = 5000
 	for i := 0; i < n; i++ {
-		if _, err := cs.put(context.Background(), "main", uint64(i), []byte("x"), false, false); err != nil {
-			t.Fatalf("put: %v", err)
-		}
+		cs.put(context.Background(), "main", uint64(i), []byte("x"), true)
 	}
 	cs.mu.Lock()
 	for i := 0; i < n; i++ {
@@ -188,35 +212,28 @@ func TestChanStateFindIndexTracksItems(t *testing.T) {
 	}
 }
 
-// THE POINT: a run that only holds a write handle for a channel reached from
-// another run drops each sent value's bytes — nothing local ever reads them back
-// — while keeping the identity, so a replayed send is still deduped.
-func TestChanStateWriterOnlyDropsSentBytes(t *testing.T) {
+// THE POINT: a send keeps only the value's identity — the bytes are on the value
+// stream — so a channel's traffic is not held twice in memory. The pump fills the
+// bytes back when it reads them off the stream, and a replayed send dedupes to the
+// placeholder the first one queued.
+func TestChanStateSendKeepsIdentityNotBytes(t *testing.T) {
 	cs := newChanState(unbounded)
-	cs.attached = true
-	cs.noteRole(modeWrite) // a writer handle leaves reads unset
 
-	it, err := cs.put(context.Background(), "w/main", 0, []byte("payload"), false, false)
-	if err != nil {
-		t.Fatalf("put: %v", err)
-	}
+	it := cs.put(context.Background(), "w/main", 0, []byte("payload"), false)
 	if it.data != nil {
-		t.Fatalf("a writer-only run kept %d bytes of a sent value", len(it.data))
+		t.Fatalf("a send kept %d bytes; its value is on the stream, not in memory", len(it.data))
 	}
-	if again, _ := cs.put(context.Background(), "w/main", 0, []byte("payload"), false, false); again != it {
+	if again := cs.put(context.Background(), "w/main", 0, []byte("payload"), false); again != it {
 		t.Fatalf("a replayed send was not deduped to the queued item")
 	}
 
-	// A read-capable handle keeps the bytes: the run may receive them.
-	rs := newChanState(unbounded)
-	rs.attached = true
-	rs.noteRole(modeBoth)
-	kept, err := rs.put(context.Background(), "w/main", 0, []byte("payload"), false, false)
-	if err != nil {
-		t.Fatalf("put: %v", err)
+	// The pump delivers the bytes off the stream, filling the placeholder.
+	filled := cs.put(context.Background(), "w/main", 0, []byte("payload"), true)
+	if filled != it {
+		t.Fatalf("the pump queued a fresh item instead of filling the placeholder")
 	}
-	if kept.data == nil {
-		t.Fatalf("a read-capable run dropped a value it may receive")
+	if it.data == nil {
+		t.Fatalf("the pump did not fill the placeholder's bytes for the reader")
 	}
 }
 
@@ -226,18 +243,17 @@ func TestChanStateWriterOnlyDropsSentBytes(t *testing.T) {
 // value once the reader drains, in order.
 func TestChanStatePumpBoundsPrefetch(t *testing.T) {
 	cs := newChanState(unbounded)
-	cs.attached, cs.reads = true, true // a read-capable attached channel keeps values
 
 	const n = channelPrefetch * 4
-	items := make([]ChannelItem, n)
+	items := make([]*protos.ChannelItem, n)
 	for i := range items {
-		items[i] = ChannelItem{From: "w/main", Seq: uint64(i), Data: []byte("x")}
+		items[i] = &protos.ChannelItem{From: "w/main", Seq: uint64(i), Data: []byte("x")}
 	}
-	link := &feedLink{items: items}
+	store := &feedStore{items: items}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go cs.pump(ctx, link)
+	cs.activate(ctx, store, "run/ch", modeRead)
 
 	// It fills to the window and stops — the whole stream is not mirrored in.
 	waitFor(t, "the prefetch window to fill", func() bool { return heldData(cs) >= channelPrefetch })
@@ -245,7 +261,7 @@ func TestChanStatePumpBoundsPrefetch(t *testing.T) {
 	if h := heldData(cs); h > channelPrefetch {
 		t.Fatalf("the pump buffered %d value items, want at most %d", h, channelPrefetch)
 	}
-	if fed := atomic.LoadInt32(&link.fed); fed > channelPrefetch {
+	if fed := atomic.LoadInt32(&store.fed); fed > channelPrefetch {
 		t.Fatalf("the pump pulled %d values from the stream, want at most %d before the reader drains", fed, channelPrefetch)
 	}
 
@@ -275,7 +291,7 @@ func TestChanStatePumpBoundsPrefetch(t *testing.T) {
 			t.Fatalf("mid-drain the pump held %d value items, want at most %d", h, channelPrefetch)
 		}
 	}
-	waitFor(t, "the pump to finish the stream", func() bool { return atomic.LoadInt32(&link.fed) == n })
+	waitFor(t, "the pump to finish the stream", func() bool { return atomic.LoadInt32(&store.fed) == n })
 }
 
 // THE POINT: a live thread does not keep the values it records. Its history is
@@ -315,8 +331,8 @@ func TestRunDoesNotRetainRecordedValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if store.sink.n < n {
-		t.Fatalf("recorded %d events, want at least %d", store.sink.n, n)
+	if store.n < n {
+		t.Fatalf("recorded %d events, want at least %d", store.n, n)
 	}
 
 	if grew > int64(n*size/4) {

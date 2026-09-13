@@ -380,84 +380,138 @@ func (h *historyStore) Read(ctx context.Context, _, thread string, offset int64,
 	return out, nil
 }
 
-func (h *historyStore) Sink(ctx context.Context, _, thread string) (flow.Sink, error) {
-	return &historySink{
-		out:    h.txns.For(thread),
-		client: h.txns.node.client,
-		name:   historyName(h.job, h.attempt, thread),
+func (h *historyStore) Begin(ctx context.Context, _, thread string) (flow.Tx, error) {
+	return &workerTx{
+		out:     h.txns.For(thread),
+		client:  h.txns.node.client,
+		hist:    historyName(h.job, h.attempt, thread),
+		streams: map[string]*dsclient.Stream[*protos.Event]{},
 	}, nil
+}
+
+// Follow delivers a named stream's records from offset, waiting for the stream to
+// appear and for new records. The relay mirrors a shared channel's streams onto
+// this node under their global names, so a receiver here follows the same name a
+// coordinator or another worker wrote.
+func (h *historyStore) Follow(ctx context.Context, name string, from int64, yield func(flow.EventAt) bool) error {
+	for ctx.Err() == nil {
+		exists, err := h.txns.node.client.StreamExists(ctx, name)
+		if err != nil {
+			return fmt.Errorf("wings: check %s: %w", name, err)
+		}
+		if !exists {
+			if err := pause(ctx, 200*time.Millisecond); err != nil {
+				return err
+			}
+			continue
+		}
+		st, err := eventStream[*protos.Event](h.txns.node.client, name)
+		if err != nil {
+			return err
+		}
+		readCtx, cancel := context.WithTimeout(ctx, followPoll)
+		recs, err := st.ReadBlocking(readCtx, from, followBatch)
+		expired := readCtx.Err() != nil
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !expired {
+				if err := pause(ctx, time.Second); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		for _, r := range recs {
+			from = r.Offset + 1
+			if !yield(flow.EventAt{Event: r.Record, Offset: r.Offset}) {
+				return nil
+			}
+		}
+	}
+	return ctx.Err()
 }
 
 // Drop is a no-op: a joined thread's stream stays until the job settles, when
 // dropOutputsOf reclaims it; dropping it live would race the pull that copies it.
 func (h *historyStore) Drop(ctx context.Context, _, _ string) error { return nil }
 
-// historySink appends one thread's events inside that thread's transaction,
-// standing the stream up lazily on the first real event — so a thread that forks,
-// sleeps and calls nothing leaves nothing behind. A receive on a shared channel
-// arrives already recorded by identity alone (the flow layer keeps its value on
-// the channel host, not here); a local channel's receive keeps its value inline.
-type historySink struct {
+// followBatch is how many records a Follow reads at once.
+const followBatch = 256
+
+// workerTx appends one thread's events inside that thread's transaction, standing
+// the history stream up lazily on the first real event — so a thread that forks,
+// sleeps and calls nothing leaves nothing behind. It also writes the channel
+// streams a send touches, so a value and the send event that justifies it commit
+// together (pull.go). It resets nothing: a worker attempt writes its own names.
+type workerTx struct {
 	out    *attemptOutputs
 	client *dsclient.Client
-	name   string
+	hist   string
 
-	mu     sync.Mutex
-	stream *dsclient.Stream[*protos.Event]
-	held   []*protos.Event
+	mu      sync.Mutex
+	streams map[string]*dsclient.Stream[*protos.Event]
+	held    []*protos.Event
 }
 
-func (s *historySink) Append(ctx context.Context, ev *protos.Event) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// streamLocked returns the named stream, opening it once. Call with mu held.
+func (tx *workerTx) streamLocked(ctx context.Context, name string) (*dsclient.Stream[*protos.Event], error) {
+	if st := tx.streams[name]; st != nil {
+		return st, nil
+	}
+	// Not the attempt's context: a half-made stream is the next attempt's problem.
+	if err := ensureStream(context.WithoutCancel(ctx), tx.client, name); err != nil {
+		return nil, err
+	}
+	st, err := eventStream[*protos.Event](tx.client, name)
+	if err != nil {
+		return nil, err
+	}
+	tx.streams[name] = st
+	return st, nil
+}
 
-	if s.stream == nil {
+// Append writes an event to the thread's history stream and commits unless a
+// CommitInterval is holding the transaction open to coalesce. What must be durable
+// at once — a value someone is blocked on, or a thread as it parks — is flushed by
+// Flush; between those, work in flight coalesces and a restart replays whatever the
+// last commit did not cover.
+func (tx *workerTx) Append(ctx context.Context, ev *protos.Event) error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if _, open := tx.streams[tx.hist]; !open {
 		if ev.GetRunStart() != nil || ev.GetRunEnd() != nil {
 			// Hold the attempt markers until something worth a stream arrives.
-			s.held = append(s.held, ev)
+			tx.held = append(tx.held, ev)
 			return nil
 		}
-		// Not the attempt's context: a half-made stream is the next attempt's problem.
-		if err := ensureStream(context.WithoutCancel(ctx), s.client, s.name); err != nil {
-			return err
-		}
-		st, err := eventStream[*protos.Event](s.client, s.name)
-		if err != nil {
-			return err
-		}
-		s.stream = st
 	}
-	batch := append(s.held, ev)
-	s.held = nil
-	// Append after any value a send announced just before it, so the two are whole
-	// in one transaction, then commit unless a CommitInterval is holding the
-	// transaction open to coalesce. A value someone is blocked on, or a thread as it
-	// parks, is flushed by Commit and CommitBoundary; between those, work in flight
-	// coalesces and a restart replays whatever the last commit did not cover.
-	if err := s.out.appendEvents(ctx, s.stream, batch); err != nil {
+	st, err := tx.streamLocked(ctx, tx.hist)
+	if err != nil {
 		return err
 	}
-	return s.out.commitIfDue(ctx)
-}
-
-// Commit implements [flow.Committer]: it commits the thread's transaction, so a
-// shared-channel send's event and its outbox record — both written into this
-// thread's producer — go home together (pull.go). A consume report the thread
-// wrote just before this also commits here, with the receive that justified it.
-// Under a CommitInterval it coalesces, committing only once the transaction has
-// aged past the interval; a parked thread's [historySink.CommitBoundary] flushes
-// what is left so nothing waits on it forever.
-func (s *historySink) Commit(ctx context.Context) error {
-	return s.out.commitIfDue(ctx)
-}
-
-// CommitBoundary implements [flow.BoundaryCommitter]: it force-commits as the
-// thread waits, so a value coalesced under a CommitInterval reaches whoever the
-// thread is about to wait on — the receiver of a send, a joiner. Without an
-// interval the sink commits eagerly, so there is nothing held open.
-func (s *historySink) CommitBoundary(ctx context.Context) error {
-	if s.out.node.commitInterval <= 0 {
-		return nil
+	batch := append(tx.held, ev)
+	tx.held = nil
+	if err := tx.out.appendEvents(ctx, st, batch); err != nil {
+		return err
 	}
-	return s.out.commit(ctx)
+	return tx.out.commitIfDue(ctx)
 }
+
+// AppendTo writes an event to a named channel stream in the thread's transaction.
+// It never commits: a value precedes its send event, and a consume report or close
+// rides the event it pairs with, so the event's commit takes both home together.
+func (tx *workerTx) AppendTo(ctx context.Context, name string, ev *protos.Event) error {
+	tx.mu.Lock()
+	st, err := tx.streamLocked(ctx, name)
+	tx.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return tx.out.appendEvents(ctx, st, []*protos.Event{ev})
+}
+
+func (tx *workerTx) Commit(ctx context.Context) error { return tx.out.commitIfDue(ctx) }
+func (tx *workerTx) Flush(ctx context.Context) error  { return tx.out.commit(ctx) }

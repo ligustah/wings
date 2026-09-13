@@ -246,9 +246,9 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 		}
 	}
 
-	var sink Sink
+	var tx Tx
 	if !r.readonly {
-		if sink, err = store.Sink(ctx, r.name, r.id); err != nil {
+		if tx, err = store.Begin(ctx, r.name, r.id); err != nil {
 			return nil, err
 		}
 	}
@@ -257,7 +257,7 @@ func (r *threadRunner) execute(ctx context.Context) ([]byte, error) {
 	for {
 		attempt++
 
-		out, status, runErr := r.attempt(ctx, history, offsets, valueIdx, attempt, sink)
+		out, status, runErr := r.attempt(ctx, history, offsets, valueIdx, attempt, tx)
 
 		if r.readonly {
 			// One pass over the history is all a replay is.
@@ -369,7 +369,7 @@ func (r *threadRunner) describe() string {
 
 // attempt runs the body once over the given history and returns what it produced
 // and what became of it.
-func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, offsets, valueIdx []int64, attempt uint64, sink Sink) ([]byte, protos.WorkflowStatus, error) {
+func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, offsets, valueIdx []int64, attempt uint64, tx Tx) ([]byte, protos.WorkflowStatus, error) {
 	run := r.run
 	if run == nil {
 		run = newRunState(r.name, r.opts)
@@ -388,7 +388,7 @@ func (r *threadRunner) attempt(ctx context.Context, history []*protos.Event, off
 		events:   events,
 		offsets:  evOffsets,
 		valueIdx: evValueIdx,
-		sink:     sink,
+		tx:       tx,
 		readonly: r.readonly,
 		ctx:      ctx,
 	}
@@ -554,7 +554,7 @@ func (t *threadState) channelCount() uint64 {
 // [ChannelRetirer]; a channel created by a sub-thread it forked is that thread's,
 // numbered under it, and is not among these.
 func (t *threadState) retireCallChannels(ctx context.Context, start uint64) {
-	retirer, ok := t.run.host.(ChannelRetirer)
+	retirer, ok := t.run.store.(ChannelRetirer)
 	if !ok {
 		return
 	}

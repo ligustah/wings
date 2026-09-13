@@ -15,11 +15,11 @@ import (
 
 // placingElsewhere is a placer that sends every forked thread to "another
 // process": a function thread runs as a run of its own, and a thread of run
-// code is reached by replaying its lineage — both against the same store
-// and host, which is what a worker would have been given copies of.
+// code is reached by replaying its lineage — both against the same store,
+// which is what a worker would have been given a copy of. The store carries
+// the run's channels between the placed threads.
 type placingElsewhere struct {
 	store flow.Store
-	host  flow.ChannelHost
 
 	mu       sync.Mutex
 	lineages [][]string
@@ -27,7 +27,7 @@ type placingElsewhere struct {
 }
 
 func (p *placingElsewhere) opts() []flow.RunOption {
-	return []flow.RunOption{flow.WithStore(p.store), flow.WithChannelHost(p.host), flow.WithPlacer(p), flow.Once()}
+	return []flow.RunOption{flow.WithStore(p.store), flow.WithPlacer(p), flow.Once()}
 }
 
 func (p *placingElsewhere) Place(ctx context.Context, th flow.Thread, body func(flow.Context) ([]byte, error)) ([]byte, error) {
@@ -86,7 +86,7 @@ var spawned struct{ total, count int }
 // there, and runs it — sharing the run's channels with the workflow that
 // stayed home.
 func TestAThreadOfRunCodeRunsElsewhereByItsLineage(t *testing.T) {
-	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	p := &placingElsewhere{store: flow.NewMemStore()}
 	spawned.total, spawned.count = 0, 0
 	if err := flow.RunMain(t.Context(), spawnsAProducer, 10, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -137,7 +137,7 @@ var within struct{ awaited, received int }
 // itself placed elsewhere is reached by replaying both, and a channel made
 // before either left reaches all three processes.
 func TestLineagesNest(t *testing.T) {
-	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	p := &placingElsewhere{store: flow.NewMemStore()}
 	within.awaited, within.received = 0, 0
 	if err := flow.RunMain(t.Context(), spawnsWithin, 5, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -154,7 +154,7 @@ func TestLineagesNest(t *testing.T) {
 // A run started with a bare body has no root another process could start
 // from, and its threads of run code stay home.
 func TestAThreadOfABareRunStaysHome(t *testing.T) {
-	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	p := &placingElsewhere{store: flow.NewMemStore()}
 	var got int
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
 		var err error
@@ -204,7 +204,7 @@ var slowly int
 // target's fork has not outrun the histories, only the goroutine replaying
 // the ancestor. RunLineage waits for every thread on the path.
 func TestALineageWaitsForAnAncestorStillReplaying(t *testing.T) {
-	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	p := &placingElsewhere{store: flow.NewMemStore()}
 	slowly = 0
 	if err := flow.RunMain(t.Context(), spawnsSlowly, 41, p.opts()...); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -228,7 +228,7 @@ var _ = flow.Main(spawnsAPanic)
 // panic as its result, as one run in-process would, rather than the process
 // that replayed its way to it reporting that the histories fall short.
 func TestAPanicInAThreadRunElsewhereIsItsResult(t *testing.T) {
-	p := &placingElsewhere{store: flow.NewMemStore(), host: flow.NewMemChannelHost()}
+	p := &placingElsewhere{store: flow.NewMemStore()}
 	err := flow.RunMain(t.Context(), spawnsAPanic, 3, p.opts()...)
 	if err == nil || !strings.Contains(err.Error(), "the thread's result: flow: panic in forked work: on purpose, 3") {
 		t.Fatalf("the thread's result is %v, want its panic", err)

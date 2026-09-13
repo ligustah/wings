@@ -32,23 +32,21 @@ var consumer = flow.Define(func(ctx flow.Context, in feed) (int, error) {
 }, flow.WithName("test.consumer"))
 
 // sharedRuns is an executor that runs each call as a run of its own on the
-// same host, the way a worker does — so a channel in the input really
-// crosses from one run to another.
+// same store, the way a worker does — so a channel in the input really
+// crosses from one run to another over the store's streams.
 type sharedRuns struct {
 	store flow.Store
-	host  flow.ChannelHost
 }
 
 func (e sharedRuns) Invoke(ctx context.Context, name string, payload []byte) ([]byte, error) {
 	o := flow.OriginFrom(ctx)
 	return flow.RunCall(ctx, "child:"+o.Key(), name, payload,
-		flow.WithStore(e.store), flow.WithExecutor(e), flow.WithChannelHost(e.host), flow.Once())
+		flow.WithStore(e.store), flow.WithExecutor(e), flow.Once())
 }
 
 // THE POINT: a channel handed to another run in a call's input carries values
 // between the two runs, and what was sent before the handle left goes too.
 func TestAChannelReachesAnotherRun(t *testing.T) {
-	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	var got int
 	err := flow.Run(t.Context(), "parent", func(ctx flow.Context) error {
@@ -68,7 +66,7 @@ func TestAChannelReachesAnotherRun(t *testing.T) {
 		var err error
 		got, err = fut.Await(ctx)
 		return err
-	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -96,7 +94,6 @@ var writerProducer = flow.Define(func(ctx flow.Context, in writeFeed) (int, erro
 // (it never receives, so nothing local reads them back). The receiver reads
 // the values from the host's copy.
 func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
-	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	var got int
 	err := flow.Run(t.Context(), "reader", func(ctx flow.Context) error {
@@ -118,7 +115,7 @@ func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
 		}
 		got = total
 		return nil
-	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -132,7 +129,6 @@ func TestAWriterOnlyRunDeliversEveryValue(t *testing.T) {
 // fan-in is N single-reader channels drained by one selecting thread, and it
 // works the same whether the producers run here or on other machines.
 func TestSelectReadsOverHostedChannels(t *testing.T) {
-	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	var got int
 	err := flow.Run(t.Context(), "fanin", func(ctx flow.Context) error {
@@ -175,7 +171,7 @@ func TestSelectReadsOverHostedChannels(t *testing.T) {
 		}
 		got = total
 		return nil
-	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -203,7 +199,6 @@ var replayedRecv struct {
 // receive — a retry is handed the same values in the same order, from the
 // host rather than from a sender that is long finished.
 func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
-	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	replayedRecv.attempts.Store(0)
 	replayedRecv.seen = nil
@@ -229,7 +224,7 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 			return errors.New("fail once")
 		}
 		return nil
-	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host),
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store}),
 		flow.Backoff(0, 0))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -245,10 +240,10 @@ func TestAReplayedRunReceivesTheSameValuesFromASharedChannel(t *testing.T) {
 	}
 }
 
-// THE POINT: a run given no channel host gets a default in-memory one, so a channel
-// is usable without configuration — every channel is stream-backed (all channels
-// shared), the in-memory host standing in where there is no durable store.
-func TestAChannelWorksWithoutAnExplicitHost(t *testing.T) {
+// THE POINT: a channel is usable with only a store — every channel is
+// stream-backed, and a same-run channel routes through the store's streams like a
+// shared one, so no separate channel transport is configured.
+func TestAChannelWorksWithJustAStore(t *testing.T) {
 	const n = 3
 	sum := 0
 	err := flow.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
@@ -309,7 +304,6 @@ var told struct {
 // across runs: a send with no room waits for a receive in the other run to
 // make some, exactly as a send between threads waits.
 func TestASharedChannelHonoursItsCapacity(t *testing.T) {
-	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	told.release = make(chan struct{})
 	told.firstTake.Store(0)
@@ -330,7 +324,7 @@ func TestASharedChannelHonoursItsCapacity(t *testing.T) {
 		var err error
 		got, err = fut.Await(ctx)
 		return err
-	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -348,7 +342,6 @@ func TestASharedChannelHonoursItsCapacity(t *testing.T) {
 // channels, each drained by its own run; the sender distributes across them and
 // every value is received once, wherever the run lives.
 func TestFanOutIsOneChannelPerReceiver(t *testing.T) {
-	host := flow.NewMemChannelHost()
 	store := flow.NewMemStore()
 	var totals [2]int
 	err := flow.Run(t.Context(), "split", func(ctx flow.Context) error {
@@ -373,42 +366,11 @@ func TestFanOutIsOneChannelPerReceiver(t *testing.T) {
 		}
 		totals[1], err = second.Await(ctx)
 		return err
-	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store, host}), flow.WithChannelHost(host))
+	}, flow.WithStore(store), flow.WithExecutor(sharedRuns{store}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if totals[0]+totals[1] != 21 {
 		t.Fatalf("the two receivers summed %d and %d, want a total of 21", totals[0], totals[1])
-	}
-}
-
-// THE POINT: a host that starts with a record its predecessor wrote reaches the
-// same counts from it — values, consumes, and the close — so a restarted
-// coordinator tells a parked receive or send the same thing the first one would.
-func TestTheLedgerRestoresItsCountsFromTheRecord(t *testing.T) {
-	record := []flow.ChannelItem{
-		{From: "p/main", Seq: 0, Data: []byte("v")},
-		{From: "p/main", Seq: 1, Data: []byte("v")},
-		{Consumed: true, From: "p/main", Seq: 0},
-		{From: "p/main", Seq: 2, Data: []byte("v")},
-		{Closed: true},
-	}
-
-	a := flow.NewLedger()
-	for _, it := range record {
-		a.Restore(it)
-	}
-	if a.Values() != 3 || a.Consumed() != 1 || !a.Closed() {
-		t.Fatalf("restored values=%d consumed=%d closed=%v, want 3/1/true", a.Values(), a.Consumed(), a.Closed())
-	}
-	// Re-offering what is already on the record changes nothing: a restarted
-	// coordinator does not double-count its predecessor's writes.
-	for _, it := range record {
-		if out := a.Offer(it); len(out) != 0 {
-			t.Fatalf("re-offering a restored record appended %+v, want nothing", out)
-		}
-	}
-	if a.Values() != 3 || a.Consumed() != 1 {
-		t.Fatalf("counts changed on re-offer: values=%d consumed=%d", a.Values(), a.Consumed())
 	}
 }

@@ -12,7 +12,6 @@ type runOptions struct {
 	executor Executor
 	placer   Placer
 	parker   Parker
-	host     ChannelHost
 	logHost  LogHost
 	logLevel slog.Level
 	clock    Clock

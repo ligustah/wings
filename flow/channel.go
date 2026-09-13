@@ -43,20 +43,6 @@ const (
 	modeWrite handleMode = "w"
 )
 
-// complement is the role the run keeps when it shares the other side: sharing a
-// writer leaves it reading, sharing a reader leaves it writing. Sharing both (a
-// fresh local channel) leaves it both.
-func complement(mode handleMode) handleMode {
-	switch mode {
-	case modeWrite:
-		return modeRead
-	case modeRead:
-		return modeWrite
-	default:
-		return modeBoth
-	}
-}
-
 // NewChannel creates a shared channel and returns its two ends: a [Reader] to
 // receive and a [Writer] to send and close. Hand one end to another thread or
 // run and keep the other, the way [io.Pipe] splits a pipe. Without options the
@@ -103,20 +89,13 @@ func newChannel[T any](ctx Context, capacity int) *Channel[T] {
 	}
 	name := t.newChannelName()
 	t.run.declareChannel(name, capacity)
-	// With a host, every channel is stream-backed: link it at creation so its values
-	// go to the stream from the first send and nothing but a bounded prefetch is held
-	// in memory (wings always supplies a host). Without one — a standalone flow.Run
-	// with no durable channel transport — the channel stays in-process, its received
-	// values recorded inline for replay. A replay's live run already announced what
-	// was on it.
-	if t.run.host != nil {
-		if _, err := t.run.export(ctx, name, t.peek() != nil, t.qualified(), modeBoth); err != nil {
-			// A channel that cannot be shared is unusable here; report on first use,
-			// where an error can be returned.
-			t.run.mu.Lock()
-			delete(t.run.channels, name)
-			t.run.mu.Unlock()
-		}
+	// Every channel is stream-backed: start its pumps at creation so its values go
+	// to the value stream from the first send and nothing but a bounded prefetch is
+	// held in memory. The Store is where the records live — durable under a real
+	// store, in-process under a MemStore — so a same-run channel routes through it
+	// too, holding no traffic in memory.
+	if cs := t.run.channel(name); cs != nil {
+		cs.activate(t.run.linkContext(), t.run.store, t.run.channelID(name), modeBoth)
 	}
 	return &Channel[T]{
 		name:  name,
@@ -153,15 +132,10 @@ func (c *Channel[T]) share(mode handleMode) ([]byte, error) {
 	defer c.mu.Unlock()
 	id, capacity := c.id, c.capacity
 	if c.run != nil {
-		et, replay := c.run.encodingThread()
-		sender := ""
-		if et != nil {
-			sender = et.qualified()
-		}
-		var err error
-		if id, err = c.run.export(context.Background(), c.name, replay, sender, complement(mode)); err != nil {
-			return nil, err
-		}
+		// Every channel is stream-backed from creation, so sharing a side is just
+		// naming it: its records are already on the value and consume streams, which
+		// the receiving run reaches by the same id.
+		id = c.run.channelID(c.name)
 		if cs := c.run.channel(c.name); cs != nil {
 			capacity = cs.capacity
 		}
@@ -225,13 +199,10 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 			return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 		}
 		// Recorded on a previous attempt: the value came home with this event in
-		// one transaction (pull.go), so it is durably queued — queue it locally
-		// again without re-announcing. The relay delivers the one copy; the host
-		// will hand it back here through the pump.
-		item, err := cs.put(ctx, t.qualified(), seq, data, false, false)
-		if err != nil {
-			return err
-		}
+		// one transaction (pull.go), so it is durably on the value stream — queue a
+		// placeholder locally again without re-announcing. The pump reads the value
+		// back off the stream and fills it here.
+		item := cs.put(ctx, t.qualified(), seq, data, false)
 		// The backpressure wait was cut short by the body before: same outcome now.
 		if ierr, ok := t.interrupted("send"); ok {
 			return ierr
@@ -260,22 +231,21 @@ func (c *Channel[T]) Send(ctx Context, v T) error {
 		return fmt.Errorf("%w: %s", ErrChannelClosed, c.name)
 	}
 
-	// Announce the value, record the send, and commit the two together: the outbox
-	// record and this event go home in one transaction (pull.go), so a replay that
-	// finds the event knows the value is durably queued and need not re-announce.
-	// Announce before recording so a direct coordinator run — where the two are
-	// separate durable writes, not one transaction — never leaves an event with
-	// nothing queued; a torn send there has no event and replays afresh. The value
-	// itself is not recorded here: only the receiver's copy is (see Recv).
-	item, err := cs.put(ctx, t.qualified(), seq, data, true, false)
-	if err != nil {
-		return err
+	// Announce the value on the value stream, record the send, and commit the two
+	// together: under a transactional store the record and this event go home in one
+	// transaction (pull.go), so a replay that finds the event knows the value is
+	// durably queued and need not re-announce. Announce before recording so a
+	// non-transactional store never leaves an event with nothing queued; a torn send
+	// there has no event and replays afresh. The value is not recorded in history:
+	// it is read back off the value stream (see Recv).
+	valEv := &protos.Event{Payload: protos.PackEventPayload(&protos.ChannelItem{From: t.qualified(), Seq: seq, Data: data})}
+	if err := t.tx.AppendTo(ctx, ChannelValueStream(c.sharedID()), valEv); err != nil {
+		return fmt.Errorf("flow: send on channel %s: %w", c.name, err)
 	}
+	item := cs.put(ctx, t.qualified(), seq, data, false)
 	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq})
-	if cs.hosted() {
-		if err := t.commit(ctx); err != nil {
-			return err
-		}
+	if err := t.commit(ctx); err != nil {
+		return err
 	}
 	if err := t.err(); err != nil {
 		return err
@@ -340,10 +310,10 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		return v, true, t.err()
 	}
 
-	// About to wait for a value on a shared channel: tell the host this worker
-	// reads, so it pushes the writer's values here. Only now is the read role
-	// known — an eagerly shared channel links before any thread has received.
-	if err := cs.announceReader(ctx); err != nil {
+	// About to wait for a value: tell the engine this worker reads, so it pushes
+	// the writer's values here. Only now is the read role known — an eagerly shared
+	// channel activates before any thread has received.
+	if err := cs.announceReader(ctx, t); err != nil {
 		return zero, false, err
 	}
 
@@ -358,18 +328,15 @@ func (c *Channel[T]) Recv(ctx Context) (T, bool, error) {
 		t.record(&protos.ChannelRecvEvent{Channel: c.name, Closed: true})
 		return zero, false, t.err()
 	}
+	// The value's one durable copy is on the channel's value stream, read back on
+	// replay by (from, seq); the receive is recorded by identity alone. See
+	// [threadState.channelValue].
 	rec := &protos.ChannelRecvEvent{Channel: c.name, FromThreadId: item.from, FromSeq: item.seq}
-	// On a shared channel the host keeps the one copy of the value, read back from
-	// it on replay by (from, seq); only a purely local channel, which has no host
-	// record, records the bytes here. See [threadState.recordedValue].
-	if !cs.hosted() {
-		rec.Value = &protos.Data{Serialized: item.data}
-	}
 	t.record(rec)
 	// Report the take and commit it with the receive, so the consume report is
 	// never home without the receive that justified it (pull.go). A replay does not
 	// report again — the original report came home with the receive it replays.
-	if reported, err := cs.reportConsumed(ctx, t.qualified(), item); err != nil {
+	if reported, err := cs.reportConsumed(ctx, t, item); err != nil {
 		return zero, false, err
 	} else if reported {
 		if err := t.commit(ctx); err != nil {
@@ -422,17 +389,15 @@ func (c *Channel[T]) Close(ctx Context) error {
 		cs.shut()
 		return t.err()
 	}
-	if err := cs.announceClose(ctx, t.qualified()); err != nil {
+	if err := cs.announceClose(ctx, t); err != nil {
 		if ctx.Err() != nil {
 			err = t.interrupt("close", err)
 		}
 		return err
 	}
 	t.record(&protos.ChannelSendEvent{Channel: c.name, Seq: seq, Closed: true})
-	if cs.hosted() {
-		if err := t.commit(ctx); err != nil {
-			return err
-		}
+	if err := t.commit(ctx); err != nil {
+		return err
 	}
 	cs.shut()
 	return t.err()
@@ -516,7 +481,6 @@ func (c *Channel[T]) bind(ctx Context, read bool) (*threadState, *chanState, err
 		if c.codec == nil {
 			c.codec = dswire.ReflectCodec[T]{New: allocator[T]()}
 		}
-		cs.noteRole(c.mode)
 		if err := cs.claimSide(c.name, t.qualified(), read); err != nil {
 			return nil, nil, err
 		}
@@ -529,25 +493,10 @@ func (c *Channel[T]) bind(ctx Context, read bool) (*threadState, *chanState, err
 	if cs == nil {
 		return nil, nil, fmt.Errorf("flow: channel %s is not part of this run", c.name)
 	}
-	cs.noteRole(c.mode)
 	if err := cs.claimSide(c.name, t.qualified(), read); err != nil {
 		return nil, nil, err
 	}
 	return t, cs, nil
-}
-
-// noteRole records that a handle of this mode is bound here. A read-capable
-// handle means this run may receive on the channel, so its own queued sends are
-// kept; a run that only ever holds a writer never receives here, so [chanState.put]
-// can drop each sent value once the host has it. A locally created channel keeps
-// its sends regardless — it is not attached, so it is read-capable by default.
-func (cs *chanState) noteRole(mode handleMode) {
-	if mode == modeWrite {
-		return
-	}
-	cs.mu.Lock()
-	cs.reads = true
-	cs.mu.Unlock()
 }
 
 // claimSide pins one side of the channel to the calling thread on first use: the
@@ -606,13 +555,6 @@ type chanState struct {
 	// own echo and replays on every put, and a channel a worker only sends on keeps
 	// every send until it is retired, so a scan per send is quadratic over a wave.
 	byKey map[string]*chanItem
-	// attached is set when this runtime was reached from another run through the
-	// host, rather than created here. reads is set when a read-capable handle binds.
-	// A run that only holds a writer for an attached channel never receives on it,
-	// so put drops each sent value once the host has the canonical copy. See
-	// [chanState.noteRole].
-	attached bool
-	reads    bool
 	// readOwner and writeOwner are the qualified ids of the one thread that receives
 	// on and the one that sends on (or closes) this channel: a channel has a single
 	// reader and a single writer, so a second thread on either side is rejected
@@ -627,13 +569,16 @@ type chanState struct {
 	// claimed names items a replayed receive took before they were queued, so
 	// they are taken on arrival.
 	claimed map[string]bool
-	// link is set once the channel is shared with other runs. The single reader
-	// then consumes the host's ordered record the same way it drains a local
-	// channel — the pump mirrors that record into items — so no per-receive state
-	// is kept here.
-	link ChannelLink
-	// announced is set once the reader has told the host it reads here, so the
-	// announce is made once (see [chanState.announceReader]).
+	// started is set once the pumps that follow this channel's streams are running;
+	// store and id are how they and the channel's writes reach the streams. Every
+	// channel is stream-backed: the single reader drains the value stream the way it
+	// drains a local channel — the pump mirrors it into items — so no per-receive
+	// state is kept here.
+	started bool
+	store   Store
+	id      string
+	// announced is set once the reader has written its consume stream's link marker,
+	// so the announce is made once (see [chanState.announceReader]).
 	announced bool
 }
 
@@ -652,60 +597,48 @@ func (cs *chanState) broadcast() {
 // reader first waits for a value; the role is unknown when a run eagerly shares
 // its channels for a spawned thread, so it cannot be settled at link time. A
 // purely local channel (no link) and a host that needs no push do nothing.
-func (cs *chanState) announceReader(ctx context.Context) error {
+func (cs *chanState) announceReader(ctx context.Context, t *threadState) error {
 	cs.mu.Lock()
-	link := cs.link
-	if link == nil || cs.announced {
+	if cs.announced || cs.id == "" {
 		cs.mu.Unlock()
 		return nil
 	}
 	cs.announced = true
+	id := cs.id
 	cs.mu.Unlock()
-	if a, ok := link.(readerAnnouncer); ok {
-		return a.AnnounceReader(ctx)
+	// Write the consume stream's link marker and commit it, so it comes home and the
+	// engine starts pushing the channel's values to this worker. Committed at once,
+	// off any event the blocked reader has yet to record.
+	ev := &protos.Event{Payload: protos.PackEventPayload(&protos.ChannelItem{Link: true})}
+	if err := t.tx.AppendTo(context.WithoutCancel(ctx), ChannelConsumeStream(id), ev); err != nil {
+		return err
 	}
-	return nil
+	return t.tx.Flush(context.WithoutCancel(ctx))
 }
 
-// put queues a value and reports the item it queued. On a shared channel a new
-// item is announced to the host first, when announce says so. viaPump marks the
-// call as the pump delivering a value the host holds, as against the writer queuing
-// its own send: the writer keeps only the identity (its bytes are on the stream),
-// the pump supplies the bytes the reader takes.
-func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []byte, announce, viaPump bool) (*chanItem, error) {
-	cs.mu.Lock()
-	// Already queued under this identity by a previous attempt's send now
-	// replaying, or returned from the host as the copy of one sent here: reuse
-	// it — but let the pump fill the bytes onto a placeholder the writer queued.
-	if it := cs.find(from, seq); it != nil {
-		cs.fillLocked(it, data, viaPump)
-		cs.mu.Unlock()
-		return it, nil
-	}
-	link := cs.link
-	cs.mu.Unlock()
-
-	if link != nil && announce {
-		if err := link.Send(ctx, from, ChannelItem{From: from, Seq: seq, Data: data}); err != nil {
-			return nil, fmt.Errorf("flow: send on a shared channel: %w", err)
-		}
-	}
-
+// put queues an item and reports it. viaPump marks the call as the pump
+// delivering a value read back off the stream, as against the writer queuing its
+// own send: the writer keeps only the identity — its bytes are on the value
+// stream — and the pump supplies the bytes the reader takes, filling the writer's
+// placeholder or queuing a fresh item for a reader attached to another run's channel.
+func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []byte, viaPump bool) *chanItem {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+	// Already queued under this identity by a previous attempt's send now replaying,
+	// or by the writer's own send: reuse it, and let the pump fill the bytes onto the
+	// placeholder the writer queued.
 	if it := cs.find(from, seq); it != nil {
 		cs.fillLocked(it, data, viaPump)
-		return it, nil
+		return it
 	}
-	// Room is what this run has been told, true a moment ago: two senders on
-	// two machines can each take the last place, and the channel is briefly one
-	// over. Bounded and rare, and the alternative is a round trip per send.
+	// Room is what this run has been told, true a moment ago: two senders on two
+	// machines can each take the last place, and the channel is briefly one over.
+	// Bounded and rare, and the alternative is a round trip per send.
 	item := &chanItem{from: from, seq: seq, data: data, buffered: cs.roomFor(nil)}
-	if (cs.attached && !cs.reads) || (cs.link != nil && !viaPump) {
-		// The writer's own bytes are on the stream, so it keeps only the identity —
-		// to dedupe a replayed send and to hold a place for backpressure. The reader
-		// gets the bytes from the pump (viaPump). A writer-only run never receives, so
-		// this covers it too.
+	if !viaPump {
+		// The writer's own bytes are on the value stream, so it keeps only the
+		// identity — to dedupe a replayed send and hold a place for backpressure. The
+		// pump fills the bytes (viaPump) when it reads them back.
 		item.data = nil
 	}
 	if cs.claimed[itemKey(from, seq)] {
@@ -719,7 +652,7 @@ func (cs *chanState) put(ctx context.Context, from string, seq uint64, data []by
 	}
 	cs.byKey[itemKey(from, seq)] = item
 	cs.broadcast()
-	return item, nil
+	return item
 }
 
 // fillLocked gives a placeholder its value when the pump delivers it from the
@@ -820,15 +753,17 @@ func (cs *chanState) free(from string, seq uint64) {
 // sender counting room by its own mirror may free the place. Reports nothing on
 // an unbounded channel — no sender waits on room — or a local one. Returns whether
 // it reported, so the caller commits the report with the receive that justified it.
-func (cs *chanState) reportConsumed(ctx context.Context, sender string, item *chanItem) (bool, error) {
+func (cs *chanState) reportConsumed(ctx context.Context, t *threadState, item *chanItem) (bool, error) {
 	cs.mu.Lock()
-	link, report := cs.link, cs.capacity >= 0
+	report := cs.capacity >= 0
+	id := cs.id
 	from, seq := item.from, item.seq
 	cs.mu.Unlock()
-	if link == nil || !report {
+	if !report {
 		return false, nil
 	}
-	if err := link.Send(ctx, sender, ChannelItem{Consumed: true, From: from, Seq: seq}); err != nil {
+	ev := &protos.Event{Payload: protos.PackEventPayload(&protos.ChannelItem{Consumed: true, From: from, Seq: seq})}
+	if err := t.tx.AppendTo(ctx, ChannelConsumeStream(id), ev); err != nil {
 		return false, fmt.Errorf("flow: receive on a shared channel: %w", err)
 	}
 	return true, nil
@@ -836,14 +771,12 @@ func (cs *chanState) reportConsumed(ctx context.Context, sender string, item *ch
 
 // announceClose tells the host the channel is closed, if it is shared. sender is
 // the closing thread, since a close carries no sender of its own.
-func (cs *chanState) announceClose(ctx context.Context, sender string) error {
+func (cs *chanState) announceClose(ctx context.Context, t *threadState) error {
 	cs.mu.Lock()
-	link := cs.link
+	id := cs.id
 	cs.mu.Unlock()
-	if link == nil {
-		return nil
-	}
-	if err := link.Send(ctx, sender, ChannelItem{Closed: true}); err != nil {
+	ev := &protos.Event{Payload: protos.PackEventPayload(&protos.ChannelItem{Closed: true})}
+	if err := t.tx.AppendTo(ctx, ChannelValueStream(id), ev); err != nil {
 		return fmt.Errorf("flow: close a shared channel: %w", err)
 	}
 	return nil
@@ -862,15 +795,6 @@ func (cs *chanState) shut() {
 		cs.closed = true
 		cs.broadcast()
 	}
-}
-
-// hosted reports whether the channel is shared through a host, whose record of
-// it holds the values a replay reads back — rather than a purely local channel,
-// whose receives record their own copy.
-func (cs *chanState) hosted() bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.link != nil
 }
 
 // awaitTaken blocks until a sent item is received, returning at once if the
