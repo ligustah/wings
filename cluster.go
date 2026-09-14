@@ -97,7 +97,9 @@ type Cluster struct {
 	byOrigin map[string]*pendingJob
 	// ranAs remembers, per workflow call, the last job that ran it, kept past the
 	// job being forgotten: a thread of run code dispatched later needs that
-	// ancestor's history to replay through. In memory only.
+	// ancestor's history to replay through. Recorded only under RetainHistory, since
+	// otherwise the ancestor's history is dropped on settle and the entry would lead
+	// nowhere — so a run without RetainHistory grows this not at all. In memory only.
 	ranAs  map[string]string
 	closed bool
 	// coordOut is the transactional producer of each coordinator thread in flight,
@@ -167,8 +169,12 @@ type workerConn struct {
 	submits chan submission
 	appends atomic.Int64
 
-	// pushes names the shared channels being copied onto this worker. Guarded by Cluster.mu.
-	pushes map[string]bool
+	// pushes maps a shared channel's normalized stream suffix (streamPart of its id)
+	// to the cancel that stops copying it onto this worker, so a retired channel's
+	// push is torn down rather than left mirroring a deleted stream for the worker's
+	// life. Keyed by the suffix, not the raw id, so the two push callers dedupe and
+	// dropChannelData can find it. Guarded by Cluster.mu.
+	pushes map[string]context.CancelFunc
 
 	// ctx bounds every goroutine of this worker, so retiring one while the
 	// cluster runs on releases its resources without a goroutine still reading
@@ -910,9 +916,15 @@ func (c *Cluster) forget(p *pendingJob) {
 	if key := p.origin.Key(); key != "" {
 		if cur, ok := c.byOrigin[key]; ok && cur == p {
 			delete(c.byOrigin, key)
-			// A later thread of run code descending from this call replays
-			// through its history; ranAs remembers which job to ask. See threadHistory.
-			c.ranAs[key] = p.job.ID
+			// A later thread of run code descending from this call replays through its
+			// history; ranAs remembers which job to ask (see threadHistory). Only worth
+			// keeping when the history survives the settle: without RetainHistory the
+			// drop above reclaims it, so ranAs would only ever lead to threadHistory's
+			// flow.NewStore fallback — recording it then just grows the map for the
+			// coordinator's life. A non-terminating run therefore leaks nothing here.
+			if c.cfg.RetainHistory {
+				c.ranAs[key] = p.job.ID
+			}
 		}
 	}
 }

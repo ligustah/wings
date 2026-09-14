@@ -25,6 +25,47 @@ func TestForgetRunEvictsOnlyItsRun(t *testing.T) {
 	}
 }
 
+// THE POINT: a settling job records a ranAs entry only when its history survives
+// the settle — i.e. under RetainHistory. Without it the history is dropped, so the
+// entry would lead nowhere and only grow the map for the coordinator's life; a
+// long-running run therefore accumulates none.
+func TestForgetRecordsRanAsOnlyWhenHistoryIsKept(t *testing.T) {
+	origin := flow.Origin{Run: "r", Thread: "main.0", Step: 0}
+	key := origin.Key()
+
+	newCluster := func(retain bool) *Cluster {
+		return &Cluster{
+			ranAs:    map[string]string{},
+			pending:  map[string]*pendingJob{},
+			byOrigin: map[string]*pendingJob{},
+			// RetainChannelData keeps forget from spawning a channel reclaim that would
+			// reach a nil client on this bare cluster; sharedUp stays false so the
+			// history drop is likewise skipped. Neither is under test here.
+			cfg: Config{RetainChannelData: true, RetainHistory: retain},
+		}
+	}
+	settle := func(c *Cluster) {
+		p := &pendingJob{job: jobEnvelope{ID: "j1"}, origin: origin}
+		c.mu.Lock()
+		c.pending[p.job.ID] = p
+		c.byOrigin[key] = p
+		c.forget(p)
+		c.mu.Unlock()
+	}
+
+	c := newCluster(false)
+	settle(c)
+	if len(c.ranAs) != 0 {
+		t.Fatalf("without RetainHistory a settled job recorded %d ranAs entries, want 0: %v", len(c.ranAs), c.ranAs)
+	}
+
+	rc := newCluster(true)
+	settle(rc)
+	if rc.ranAs[key] != "j1" {
+		t.Fatalf("with RetainHistory a settled job should record ranAs[%s]=j1; got %v", key, rc.ranAs)
+	}
+}
+
 // THE POINT: a run that forks and completes leaves no lineage index behind, so
 // running many runs does not accumulate ranAs. (That forget populates ranAs in
 // the first place is covered by TestThreadHistoryFindsAForgottenAncestorViaRanAs.)

@@ -484,6 +484,16 @@ func (c *Cluster) dropChannelData(key string) {
 			c.log.Warn("wings: could not drop a finished run's channel stream", "stream", name, "err", err)
 		}
 	}
+	// Stop pushing this channel to any worker: the stream is gone, so the mirror
+	// would only spin against a deleted stream for the worker's life.
+	c.mu.Lock()
+	for _, w := range c.workers {
+		if cancel := w.pushes[suffix]; cancel != nil {
+			cancel()
+			delete(w.pushes, suffix)
+		}
+	}
+	c.mu.Unlock()
 	r := c.relay
 	r.mu.Lock()
 	for _, name := range []string{values, consumes} {
@@ -505,6 +515,7 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 	if err != nil {
 		return
 	}
+	part := streamPart(id)
 	c.mu.Lock()
 	var w *workerConn
 	for _, cand := range c.workers {
@@ -512,30 +523,33 @@ func (c *Cluster) subscribeChannel(workerID, id string) {
 			w = cand
 		}
 	}
-	if w == nil || w.client == shared || w.pushes[id] || c.closed {
+	if w == nil || w.client == shared || w.pushes[part] != nil || c.closed {
 		c.mu.Unlock()
 		return
 	}
 	if w.pushes == nil {
-		w.pushes = map[string]bool{}
+		w.pushes = map[string]context.CancelFunc{}
 	}
-	w.pushes[id] = true
+	// A per-push context under the worker's, so dropChannelData can stop this one
+	// channel's push when it retires without ending the worker's others.
+	pctx, pcancel := context.WithCancel(w.ctx)
+	w.pushes[part] = pcancel
 	c.mu.Unlock()
 	c.pokeRelay()
 
 	values := chanValues(id)
 	w.wg.Go(func() {
-		if err := ensureStream(w.ctx, shared, values); err != nil {
+		if err := ensureStream(pctx, shared, values); err != nil {
 			return
 		}
-		err := w.client.RunMirror(w.ctx, pushGroup(w.id, id), dsclient.MirrorSpec{
+		err := w.client.RunMirror(pctx, pushGroup(w.id, id), dsclient.MirrorSpec{
 			From:   shared,
 			Source: values,
 			Dest:   values,
 			Create: true,
 			Batch:  recordBatch,
 		})
-		if err != nil && w.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+		if err != nil && pctx.Err() == nil && !errors.Is(err, context.Canceled) {
 			c.log.Warn("wings: stopped pushing a shared channel to a worker", "worker", w.id, "channel", id, "err", err)
 		}
 	})

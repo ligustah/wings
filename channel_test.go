@@ -176,6 +176,67 @@ func foldingSizes(c *Cluster) (folded, folding int) {
 	return len(r.folded), len(r.folding)
 }
 
+// pushesTotal is how many channel pushes are set up across every worker, under
+// Cluster.mu.
+func pushesTotal(c *Cluster) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, w := range c.workers {
+		n += len(w.pushes)
+	}
+	return n
+}
+
+// THE POINT: a channel pushed onto a reader's worker stops being pushed when the
+// channel retires — the mirror is cancelled and its bookkeeping cleared, rather
+// than left copying a deleted stream onto the worker for the worker's whole life.
+func TestARetiredChannelStopsPushing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	c := start(t, Config{Target: LocalProcess(), Workers: 2, Concurrency: 1})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+			r, w := ctx.NewChannel[int]()
+			producer := ctx.Go(counts, writeFeed{Values: w, Count: 5})
+			consumer := ctx.Go(sumsSlow, feed{Values: r})
+			if _, err := producer.Await(ctx); err != nil {
+				return err
+			}
+			_, err := consumer.Await(ctx)
+			return err
+		})
+	}()
+
+	// The slow consumer keeps its worker draining long enough to see the push set up.
+	deadline := time.Now().Add(30 * time.Second)
+	for pushesTotal(c) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no channel push was ever set up; the test cannot show it is torn down")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Retirement (forgetRun) cancels the push and clears its entry.
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		if pushesTotal(c) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the run completed, %d channel pushes are still set up; a retired channel's push was left behind", pushesTotal(c))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // sumsSlow receives everything on its channel and returns the total, pausing
 // between receives so its worker can be killed while it is partway through —
 // leaving some receives recorded and the rest still to come.
