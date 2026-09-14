@@ -209,6 +209,14 @@ type P2P struct {
 	// ReplicationFactor is how many nodes hold a copy of each stream. Zero uses
 	// the default (3); a cluster smaller than this replicates to every node.
 	ReplicationFactor int
+
+	// Overlay, when set, hosts an embedded Tailscale control plane at this address
+	// and enrols every node — the coordinator and each worker — onto the resulting
+	// tailnet, so peers behind different NATs form one cluster. The coordinator
+	// runs the control plane in a child process, since it traps process-global
+	// signals. The address must be one the workers can reach to enrol; empty binds
+	// plain TCP on the host network.
+	Overlay string
 }
 
 // BuildConfig describes how to cross-compile the worker binary for a remote

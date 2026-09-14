@@ -339,6 +339,34 @@ func (n *p2pNode) close() {
 	}
 }
 
+// hostOverlay runs the embedded control plane in a child process and brings the
+// coordinator's own node up on the resulting tailnet, so the coordinator serves
+// and dials over the overlay and its worker children enrol from the same
+// credentials. It fills cfg's overlay wiring and remembers how to tear it down.
+func (c *Cluster) hostOverlay(dir string, cfg *p2pNodeConfig) error {
+	hs, err := startHostedHeadscale(c.ctx, filepath.Join(dir, "headscale"), c.cfg.P2P.Overlay)
+	if err != nil {
+		return fmt.Errorf("wings: host overlay control plane: %w", err)
+	}
+	overlay, err := startOverlayNode(c.ctx, filepath.Join(dir, "overlay"), hs.control, hs.authKey, coordinatorID)
+	if err != nil {
+		hs.stop()
+		return err
+	}
+	w, err := overlayHooks(overlay)
+	if err != nil {
+		overlay.Close()
+		hs.stop()
+		return err
+	}
+	cfg.listen, cfg.peerDialOptions, cfg.peerAddr = w.listen, w.peerDial, w.peerAddr
+	cfg.clientDialOptions = w.clientDial
+	cfg.raftListen, cfg.raftDial, cfg.raftAddr = w.raftListen, w.raftDial, w.raftAddr
+	c.overlayControl, c.overlayAuthKey = hs.control, hs.authKey
+	c.overlayStop = func() { overlay.Close(); hs.stop() }
+	return nil
+}
+
 // startWorkerP2PNode brings up a worker process's own node of the p2p cluster:
 // an observer that joins the coordinator at WINGS_P2P_JOIN and holds replicas,
 // so the worker's streams live on more than the coordinator. It waits until the

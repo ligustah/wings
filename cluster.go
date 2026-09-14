@@ -57,6 +57,12 @@ type Cluster struct {
 	// p2p is the coordinator's own node of the replicated cluster, brought up in
 	// place of the embedded instance when Config.P2P is set. Its client is shared.
 	p2p *p2pNode
+	// overlayControl and overlayAuthKey enrol a node onto the hosted tailnet, set
+	// when Config.P2P.Overlay is on; worker children get them in their environment.
+	overlayControl, overlayAuthKey string
+	// overlayStop tears the coordinator's own overlay node and the headscale child
+	// down; nil when the overlay is off.
+	overlayStop func()
 	// engineSrv serves the engine on loopback so worker child processes can dial
 	// it, for the shared-broker local target. Nil otherwise.
 	engineOnce sync.Once
@@ -636,7 +642,7 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 				c.sharedErr = fmt.Errorf("wings: p2p coordinator addresses: %w", err)
 				return
 			}
-			node, err := startP2PNode(c.ctx, p2pNodeConfig{
+			cfg := p2pNodeConfig{
 				id:       coordinatorID,
 				dir:      dir,
 				peerAddr: peerAddr,
@@ -647,19 +653,38 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 				bootstrap:         !clusterStateExists(dir),
 				replicationFactor: c.cfg.P2P.ReplicationFactor,
 				log:               c.log,
-			})
+			}
+			if c.cfg.P2P.Overlay != "" {
+				if err := c.hostOverlay(dir, &cfg); err != nil {
+					c.sharedErr = err
+					return
+				}
+			}
+			node, err := startP2PNode(c.ctx, cfg)
 			if err != nil {
+				if c.overlayStop != nil {
+					c.overlayStop()
+				}
 				c.sharedErr = fmt.Errorf("wings: start p2p coordinator node in %s: %w", dir, err)
 				return
 			}
 			if err := node.awaitReady(c.ctx); err != nil {
 				node.close()
+				if c.overlayStop != nil {
+					c.overlayStop()
+				}
 				c.sharedErr = fmt.Errorf("wings: p2p coordinator node not ready: %w", err)
 				return
 			}
 			c.p2p = node
 			c.shared = node.client
-			c.sharedStop = func() error { node.close(); return nil }
+			c.sharedStop = func() error {
+				node.close()
+				if c.overlayStop != nil {
+					c.overlayStop()
+				}
+				return nil
+			}
 			c.sharedUp.Store(true)
 			return
 		}

@@ -30,6 +30,8 @@ type CoordinatorOptions struct {
 // WorkerMain is the entire worker binary: a call to this plus an import of the
 // package whose [flow.Define] calls register the work. It does not return.
 func WorkerMain() {
+	maybeRunHeadscaleChild()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -52,6 +54,8 @@ func WorkerMain() {
 // flags, brings a cluster up, runs the chosen workflow, and takes it down again.
 // It does not return.
 func CoordinatorMain(opts CoordinatorOptions) {
+	maybeRunHeadscaleChild()
+
 	if len(opts.Worker) > 0 {
 		payload.Set(opts.Worker, opts.WorkerOS, opts.WorkerArch)
 	}
@@ -74,6 +78,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		compression      = flag.String("compression", "", "storage codec for the durable streams this cluster creates: none | snappy | s2 | zstd; empty uses the default (zstd)")
 		p2p              = flag.Bool("p2p", false, "peer-to-peer replication: the cluster's nodes form a durable-streams cluster and hold replicas of one another's streams, so a peer keeps the data when a node is lost")
 		p2pRF            = flag.Int("p2p-replication-factor", 0, "with -p2p, how many nodes hold a copy of each stream; 0 uses the default (3)")
+		p2pOverlay       = flag.String("p2p-overlay", "", "with -p2p, host an embedded Tailscale control plane at this address and enrol every node onto the resulting tailnet, so peers behind different NATs form one cluster; the address must be one the workers can reach")
 		verbose          = flag.Bool("v", false, "log at debug level")
 		workflow         = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
 		input            = flag.String("input", "", "the workflow's input as JSON, or @file to read it from a file; leave off to resume a run already in -dir")
@@ -150,7 +155,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		ReconnectTimeout:  *reconnectTimeout,
 		Compression:       comp,
 		Logger:            log,
-		P2P:               p2pConfig(*p2p, *p2pRF),
+		P2P:               p2pConfig(*p2p, *p2pRF, *p2pOverlay),
 		Scaling: Scaling{
 			Min:           *minWorkers,
 			Max:           *maxWorkers,
@@ -209,11 +214,11 @@ func CoordinatorMain(opts CoordinatorOptions) {
 }
 
 // p2pConfig turns the -p2p flags into a [Config.P2P], or nil when off.
-func p2pConfig(on bool, rf int) *P2P {
+func p2pConfig(on bool, rf int, overlay string) *P2P {
 	if !on {
 		return nil
 	}
-	return &P2P{ReplicationFactor: rf}
+	return &P2P{ReplicationFactor: rf, Overlay: overlay}
 }
 
 // listenAddr normalizes a UI/inspect listen address so it is easy to expose: a
