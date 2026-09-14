@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	streams "github.com/ligustah/durable_streams"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 
@@ -117,7 +116,7 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 		return nil
 	}
 	if a.producer == nil {
-		p, err := openProducer(ctx, a.client, a.producerID())
+		p, err := a.client.Producer(ctx, a.producerID())
 		if err != nil {
 			a.err = fmt.Errorf("wings: open a producer for %s: %w", a.id, err)
 			return a.err
@@ -127,7 +126,7 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 			a.budget = coordBudget(a.commitInterval)
 		}
 	}
-	tx, err := a.producer.BeginTimeout(ctx, a.budget)
+	tx, err := beginTx(ctx, a.producer, a.budget)
 	if err != nil {
 		a.err = fmt.Errorf("wings: begin a transaction for %s: %w", a.id, err)
 		return a.err
@@ -198,26 +197,26 @@ func (a *coordOutputs) appendEvent(ctx context.Context, s *dsclient.Stream[*prot
 func decided(err error) bool { return errors.Is(err, dswire.ErrCommitDecided) }
 
 const (
-	producerOpenTries   = 40
-	producerOpenBackoff = 150 * time.Millisecond
+	txBeginTries   = 40
+	txBeginBackoff = 150 * time.Millisecond
 )
 
-// openProducer opens a thread's transactional producer, waiting out the transient
-// window where the transaction-state partition has no reachable leader yet — a
-// cold start or a leadership handover, which [streams.ErrTxStateUnreachable] names
-// as its own so a caller retries rather than fails. Every other error is returned
-// at once.
-func openProducer(ctx context.Context, client *dsclient.Client, id string) (dsclient.Producer, error) {
+// beginTx opens a transaction on p, waiting out the window after a decided commit
+// where the identity's previous transaction is still being finalized. The broker
+// finishes that predecessor inline on the next Begin, but a completion still in
+// flight comes back as [dswire.ErrTransactionNotFinalized] — a "retry shortly"
+// that keeps the identity — so the same producer keeps its nonce and tries again.
+func beginTx(ctx context.Context, p dsclient.Producer, budget time.Duration) (dsclient.Tx, error) {
 	var err error
-	for try := 0; try < producerOpenTries; try++ {
-		var p dsclient.Producer
-		if p, err = client.Producer(ctx, id); err == nil || !errors.Is(err, streams.ErrTxStateUnreachable) {
-			return p, err
+	for try := 0; try < txBeginTries; try++ {
+		var tx dsclient.Tx
+		if tx, err = p.BeginTimeout(ctx, budget); err == nil || !errors.Is(err, dswire.ErrTransactionNotFinalized) {
+			return tx, err
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(producerOpenBackoff):
+		case <-time.After(txBeginBackoff):
 		}
 	}
 	return nil, err
@@ -229,15 +228,12 @@ func (a *coordOutputs) commitLocked(ctx context.Context) error {
 	}
 	tx := a.tx
 	a.tx = nil
-	if err := tx.Commit(ctx); err != nil {
-		if !decided(err) {
-			a.err = fmt.Errorf("wings: commit what %s wrote: %w", a.id, err)
-			return a.err
-		}
-		// Decided past its point of no return: the records are durable and the
-		// sweep delivers them, but this identity's nonce is spent, so the next
-		// transaction opens a fresh producer rather than re-presenting it.
-		a.producer = nil
+	// A commit decided past its point of no return is done: its records are
+	// durable and the sweep delivers them. The producer keeps its identity; the
+	// next begin finishes the predecessor inline (see beginTx).
+	if err := tx.Commit(ctx); err != nil && !decided(err) {
+		a.err = fmt.Errorf("wings: commit what %s wrote: %w", a.id, err)
+		return a.err
 	}
 	return nil
 }

@@ -89,7 +89,7 @@ func (a *attemptOutputs) begin(ctx context.Context) error {
 		return nil
 	}
 	if a.producer == nil {
-		p, err := openProducer(ctx, a.node.client, a.producerID())
+		p, err := a.node.client.Producer(ctx, a.producerID())
 		if err != nil {
 			a.err = fmt.Errorf("wings: open a producer for job %s: %w", a.job, err)
 			return a.err
@@ -99,7 +99,7 @@ func (a *attemptOutputs) begin(ctx context.Context) error {
 			a.budget = txBudget(a.node.commitInterval)
 		}
 	}
-	tx, err := a.producer.BeginTimeout(ctx, a.budget)
+	tx, err := beginTx(ctx, a.producer, a.budget)
 	if err != nil {
 		a.err = fmt.Errorf("wings: begin a transaction for job %s: %w", a.job, err)
 		return a.err
@@ -176,15 +176,12 @@ func (a *attemptOutputs) commitLocked(ctx context.Context) error {
 	}
 	tx := a.tx
 	a.tx = nil
-	if err := tx.Commit(ctx); err != nil {
-		if !decided(err) {
-			a.err = fmt.Errorf("wings: commit what job %s wrote: %w", a.job, err)
-			return a.err
-		}
-		// Decided past its point of no return: the records are durable and the
-		// sweep delivers them, but this identity's nonce is spent, so the next
-		// transaction opens a fresh producer rather than re-presenting it.
-		a.producer = nil
+	// A commit decided past its point of no return is done: its records are
+	// durable and the sweep delivers them. The producer keeps its identity; the
+	// next begin finishes the predecessor inline (see beginTx).
+	if err := tx.Commit(ctx); err != nil && !decided(err) {
+		a.err = fmt.Errorf("wings: commit what job %s wrote: %w", a.job, err)
+		return a.err
 	}
 	return nil
 }
