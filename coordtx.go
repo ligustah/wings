@@ -2,10 +2,12 @@ package wings
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	streams "github.com/ligustah/durable_streams"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 
@@ -115,7 +117,7 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 		return nil
 	}
 	if a.producer == nil {
-		p, err := a.client.Producer(ctx, a.producerID())
+		p, err := openProducer(ctx, a.client, a.producerID())
 		if err != nil {
 			a.err = fmt.Errorf("wings: open a producer for %s: %w", a.id, err)
 			return a.err
@@ -188,6 +190,39 @@ func (a *coordOutputs) appendEvent(ctx context.Context, s *dsclient.Stream[*prot
 	return nil
 }
 
+// decided reports whether a commit error in fact left the transaction committed:
+// the broker refuses a commit taken past its point of no return with
+// [dswire.ErrCommitDecided], its records are durable, and the reaper's sweep makes
+// them visible. Replaying such a transaction writes its output twice, so a caller
+// reads this as done, not as a failure to retry.
+func decided(err error) bool { return errors.Is(err, dswire.ErrCommitDecided) }
+
+const (
+	producerOpenTries   = 40
+	producerOpenBackoff = 150 * time.Millisecond
+)
+
+// openProducer opens a thread's transactional producer, waiting out the transient
+// window where the transaction-state partition has no reachable leader yet — a
+// cold start or a leadership handover, which [streams.ErrTxStateUnreachable] names
+// as its own so a caller retries rather than fails. Every other error is returned
+// at once.
+func openProducer(ctx context.Context, client *dsclient.Client, id string) (dsclient.Producer, error) {
+	var err error
+	for try := 0; try < producerOpenTries; try++ {
+		var p dsclient.Producer
+		if p, err = client.Producer(ctx, id); err == nil || !errors.Is(err, streams.ErrTxStateUnreachable) {
+			return p, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(producerOpenBackoff):
+		}
+	}
+	return nil, err
+}
+
 func (a *coordOutputs) commitLocked(ctx context.Context) error {
 	if a.tx == nil {
 		return a.err
@@ -195,8 +230,14 @@ func (a *coordOutputs) commitLocked(ctx context.Context) error {
 	tx := a.tx
 	a.tx = nil
 	if err := tx.Commit(ctx); err != nil {
-		a.err = fmt.Errorf("wings: commit what %s wrote: %w", a.id, err)
-		return a.err
+		if !decided(err) {
+			a.err = fmt.Errorf("wings: commit what %s wrote: %w", a.id, err)
+			return a.err
+		}
+		// Decided past its point of no return: the records are durable and the
+		// sweep delivers them, but this identity's nonce is spent, so the next
+		// transaction opens a fresh producer rather than re-presenting it.
+		a.producer = nil
 	}
 	return nil
 }

@@ -97,7 +97,7 @@ func (c *Cluster) hydrateLineage(ctx context.Context, w *workerConn, job jobEnve
 			return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(ctx); err != nil && !decided(err) {
 		return fmt.Errorf("wings: put the ancestors of job %s on worker %s: %w", job.ID, w.id, err)
 	}
 	return nil
