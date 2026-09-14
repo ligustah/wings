@@ -478,6 +478,7 @@ func (c *Cluster) dropChannelData(key string) {
 	}
 	suffix := strings.TrimPrefix(key, chanPrefix)
 	values, consumes := chanvalPrefix+suffix, chanconsPrefix+suffix
+	c.log.Debug("wings: dropping a finished run's channel data", "key", key, "values", values, "consumes", consumes)
 	c.markDropped([]string{values, consumes})
 	for _, name := range []string{values, consumes} {
 		if err := dropStream(context.WithoutCancel(c.ctx), client, name); err != nil {

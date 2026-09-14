@@ -93,6 +93,7 @@ func (c *Cluster) pull(w *workerConn) {
 				if lost {
 					c.log.Error("wings: coordinator's pull of a worker is wedged; treating the worker as lost",
 						"worker", w.id, "stalled_for", pullFaultGrace)
+					c.logStuckPull(w)
 					cancel()
 					<-done
 					c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "pull wedged"})
@@ -103,6 +104,7 @@ func (c *Cluster) pull(w *workerConn) {
 				if reconnect {
 					c.log.Warn("wings: coordinator's pull of a worker has made no progress; reconnecting",
 						"worker", w.id, "stalled_for", pullInterruptGrace)
+					c.logStuckPull(w)
 					interrupted = true
 					cancel()
 					err = <-done
@@ -299,6 +301,35 @@ func (c *Cluster) pullStatus(ctx context.Context, w *workerConn, job string) (ap
 		}
 	}
 	return applied, behind, nil
+}
+
+// logStuckPull records which of a worker's output streams the coordinator is
+// behind on, for a pull the watch judged stuck: a coordinator offset of -1 while
+// the worker holds records is a stream wings deleted out from under an in-flight
+// pull transaction, the join key against the broker's undecidable-participant
+// warning.
+func (c *Cluster) logStuckPull(w *workerConn) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return
+	}
+	names, err := w.client.ListStreams(w.ctx)
+	if err != nil {
+		return
+	}
+	for _, name := range names {
+		if o, ok := parseOutput(name); !ok || o.Prefix == priorPrefix {
+			continue
+		}
+		theirs, terr := committedThrough(w.ctx, w.client, name)
+		ours, oerr := committedThrough(w.ctx, client, name)
+		if terr != nil || oerr != nil || ours >= theirs {
+			continue
+		}
+		c.log.Warn("wings: coordinator is behind a worker on a stream",
+			"worker", w.id, "stream", name, "worker_committed", theirs,
+			"coordinator_committed", ours, "wings_dropped", c.wasDropped(name))
+	}
 }
 
 // committedThrough is the offset of a stream's last committed record, or -1 when

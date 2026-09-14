@@ -599,6 +599,8 @@ func (c *Cluster) dropOutputsOf(job string, keep int, writers map[int]*workerCon
 	}
 	for _, o := range stale {
 		name := o.String()
+		c.log.Debug("wings: dropping a settled job's output",
+			"job", job, "stream", name, "attempt", o.Attempt, "keep", keep)
 		if w := writers[o.Attempt]; reachable(w) {
 			if c.outputs != nil {
 				c.outputs.Forget(w.id, name)
