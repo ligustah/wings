@@ -31,6 +31,12 @@ const (
 	envP2POverlayControl = "WINGS_P2P_OVERLAY_CONTROL"
 	envP2POverlayAuthKey = "WINGS_P2P_OVERLAY_AUTHKEY"
 
+	// envSSLCert is Go's own SSL_CERT_FILE: it points crypto/x509 at an extra
+	// trusted cert. The overlay control plane serves a self-signed cert, and the
+	// pre-Noise control-key fetch verifies TLS, so every node that talks to it
+	// must trust that cert through this variable.
+	envSSLCert = "SSL_CERT_FILE"
+
 	modeWorker = "worker"
 
 	// readyPrefix precedes the address a worker prints once its broker serves,

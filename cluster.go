@@ -60,6 +60,9 @@ type Cluster struct {
 	// overlayControl and overlayAuthKey enrol a node onto the hosted tailnet, set
 	// when Config.P2P.Overlay is on; worker children get them in their environment.
 	overlayControl, overlayAuthKey string
+	// overlayCert is the control plane's self-signed cert file; every node must
+	// trust it (see envSSLCert). Worker children get its path in their environment.
+	overlayCert string
 	// overlayStop tears the coordinator's own overlay node and the headscale child
 	// down; nil when the overlay is off.
 	overlayStop func()

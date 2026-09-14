@@ -348,6 +348,14 @@ func (c *Cluster) hostOverlay(dir string, cfg *p2pNodeConfig) error {
 	if err != nil {
 		return fmt.Errorf("wings: host overlay control plane: %w", err)
 	}
+	// Every node must trust the control plane's self-signed cert: the tailnet's
+	// Noise layer secures the connection, but the pre-Noise control-key fetch
+	// verifies TLS. Set it before the node's first TLS; worker children get it in
+	// their environment (see p2pWorkerEnv).
+	if err := os.Setenv(envSSLCert, hs.certPath); err != nil {
+		hs.stop()
+		return fmt.Errorf("wings: trust overlay cert: %w", err)
+	}
 	overlay, err := startOverlayNode(c.ctx, filepath.Join(dir, "overlay"), hs.control, hs.authKey, coordinatorID)
 	if err != nil {
 		hs.stop()
@@ -362,7 +370,7 @@ func (c *Cluster) hostOverlay(dir string, cfg *p2pNodeConfig) error {
 	cfg.listen, cfg.peerDialOptions, cfg.peerAddr = w.listen, w.peerDial, w.peerAddr
 	cfg.clientDialOptions = w.clientDial
 	cfg.raftListen, cfg.raftDial, cfg.raftAddr = w.raftListen, w.raftDial, w.raftAddr
-	c.overlayControl, c.overlayAuthKey = hs.control, hs.authKey
+	c.overlayControl, c.overlayAuthKey, c.overlayCert = hs.control, hs.authKey, hs.certPath
 	c.overlayStop = func() { overlay.Close(); hs.stop() }
 	return nil
 }

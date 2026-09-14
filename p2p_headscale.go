@@ -3,11 +3,20 @@ package wings
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -74,7 +83,14 @@ func runHeadscaleProcess(_ context.Context) error {
 	if err := os.Chdir(dir); err != nil {
 		return fmt.Errorf("wings: enter headscale dir: %w", err)
 	}
-	if err := writeHeadscaleConfig(addr); err != nil {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("wings: overlay address %q: %w", addr, err)
+	}
+	if err := writeSelfSignedCert(host); err != nil {
+		return err
+	}
+	if err := writeHeadscaleConfig(addr, host); err != nil {
 		return err
 	}
 	if err := types.LoadConfig("config.yaml", true); err != nil {
@@ -92,7 +108,7 @@ func runHeadscaleProcess(_ context.Context) error {
 	if err != nil {
 		return err
 	}
-	creds, err := json.Marshal(overlayCreds{Control: "http://" + addr, AuthKey: key})
+	creds, err := json.Marshal(overlayCreds{Control: "https://" + addr, AuthKey: key})
 	if err != nil {
 		return fmt.Errorf("wings: encode overlay creds: %w", err)
 	}
@@ -117,28 +133,51 @@ func mintOverlayKey(app *hscontrol.Headscale) (string, error) {
 	return pak.Key, nil
 }
 
-// writeHeadscaleConfig writes the child's config and a placeholder DERP map into
-// the current directory, all as bare basenames. The DERP map lets the control
-// plane build node maps without fetching Tailscale's public one; nodes on one
-// host or LAN connect directly and never relay through it. Self-hosted DERP over
-// TLS is a later step.
-func writeHeadscaleConfig(addr string) error {
-	derp := "regions:\n" +
-		"  900:\n" +
-		"    regionid: 900\n" +
-		"    regioncode: wings\n" +
-		"    regionname: Wings\n" +
-		"    nodes:\n" +
-		"      - name: wings0\n" +
-		"        regionid: 900\n" +
-		"        hostname: 127.0.0.1\n" +
-		"        ipv4: 127.0.0.1\n" +
-		"        derpport: -1\n"
+// writeHeadscaleConfig writes the child's config and DERP map into the current
+// directory, all as bare basenames. The control plane and embedded DERP relay
+// serve HTTPS with the self-signed cert: nodes trust it for the control-key fetch
+// (see envSSLCert), Noise secures the control connection regardless, and the DERP
+// node skips cert verification, so the overlay is fully self-hosted — no public
+// CA, no third-party relay.
+func writeHeadscaleConfig(addr, host string) error {
+	stun, err := reserveUDPPort(host)
+	if err != nil {
+		return err
+	}
+	// grpc and metrics default to fixed ports (:50443, :9090); pin them to free
+	// loopback ports so a second instance, or an orphan of a crashed one, does not
+	// wedge on a port we never use (keys are minted in-process over the socket).
+	grpcAddr, err := freeLoopbackAddr()
+	if err != nil {
+		return err
+	}
+	metricsAddr, err := freeLoopbackAddr()
+	if err != nil {
+		return err
+	}
+	_, port, _ := net.SplitHostPort(addr)
+	derp := fmt.Sprintf("regions:\n"+
+		"  900:\n"+
+		"    regionid: 900\n"+
+		"    regioncode: wings\n"+
+		"    regionname: Wings\n"+
+		"    nodes:\n"+
+		"      - name: wings0\n"+
+		"        regionid: 900\n"+
+		"        hostname: %s\n"+
+		"        ipv4: %s\n"+
+		"        derpport: %s\n"+
+		"        stunport: %d\n"+
+		"        insecurefortests: true\n", host, host, port, stun)
 	if err := os.WriteFile("derp.yaml", []byte(derp), 0o600); err != nil {
 		return fmt.Errorf("wings: write derp map: %w", err)
 	}
-	cfg := fmt.Sprintf(`server_url: http://%s
+	cfg := fmt.Sprintf(`server_url: https://%s
 listen_addr: %s
+grpc_listen_addr: %s
+metrics_listen_addr: %s
+tls_cert_path: cert.pem
+tls_key_path: key.pem
 noise:
   private_key_path: noise.key
 prefixes:
@@ -147,7 +186,13 @@ prefixes:
   allocation: sequential
 derp:
   server:
-    enabled: false
+    enabled: true
+    region_id: 900
+    region_code: wings
+    region_name: Wings
+    stun_listen_addr: %s:%d
+    private_key_path: derp.key
+    automatically_add_embedded_derp_region: false
   urls: []
   paths:
     - derp.yaml
@@ -165,19 +210,79 @@ policy:
 unix_socket: hs.sock
 log:
   level: warn
-`, addr, addr)
+`, addr, addr, grpcAddr, metricsAddr, host, stun)
 	if err := os.WriteFile("config.yaml", []byte(cfg), 0o600); err != nil {
 		return fmt.Errorf("wings: write headscale config: %w", err)
 	}
 	return nil
 }
 
+// reserveUDPPort picks a UDP port on host the OS reports free, for the embedded
+// DERP server's STUN listener. It races a rebind like [freeLoopbackAddr], which
+// is fine: the DERP server binds it a moment later.
+func reserveUDPPort(host string) (int, error) {
+	c, err := net.ListenPacket("udp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return 0, fmt.Errorf("wings: reserve STUN port: %w", err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port, nil
+}
+
+// writeSelfSignedCert writes a self-signed TLS cert and key (cert.pem, key.pem)
+// for host into the current directory, so the control plane and DERP relay serve
+// HTTPS without a public CA. The tailnet's Noise layer secures the control
+// connection regardless, and the DERP node skips verification (the pre-auth key
+// and Noise already authenticate a peer), so the cert need not chain to any
+// authority.
+func writeSelfSignedCert(host string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("wings: overlay cert key: %w", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return fmt.Errorf("wings: overlay cert serial: %w", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: host},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		tmpl.IPAddresses = []net.IP{ip}
+	} else {
+		tmpl.DNSNames = []string{host}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		return fmt.Errorf("wings: create overlay cert: %w", err)
+	}
+	if err := os.WriteFile("cert.pem", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		return fmt.Errorf("wings: write overlay cert: %w", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("wings: marshal overlay key: %w", err)
+	}
+	if err := os.WriteFile("key.pem", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		return fmt.Errorf("wings: write overlay key: %w", err)
+	}
+	return nil
+}
+
 // hostedHeadscale is a running headscale child: the control URL and pre-auth key
-// its nodes enrol with, and a stop that kills it and waits.
+// its nodes enrol with, the path to the self-signed cert they must trust (the
+// control key fetch verifies it), and a stop that kills it and waits.
 type hostedHeadscale struct {
-	control string
-	authKey string
-	stop    func()
+	control  string
+	authKey  string
+	certPath string
+	stop     func()
 }
 
 // startHostedHeadscale spawns this same binary as a headscale child serving the
@@ -216,7 +321,7 @@ func startHostedHeadscale(ctx context.Context, dir, addr string) (*hostedHeadsca
 		stop()
 		return nil, err
 	}
-	return &hostedHeadscale{control: creds.Control, authKey: creds.AuthKey, stop: stop}, nil
+	return &hostedHeadscale{control: creds.Control, authKey: creds.AuthKey, certPath: filepath.Join(dir, "cert.pem"), stop: stop}, nil
 }
 
 // readOverlayCreds reads the child's stdout until its ready line, parses the

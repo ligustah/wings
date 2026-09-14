@@ -146,7 +146,7 @@ func (c *Cluster) launchP2PLocal(ctx context.Context, n int) ([]*workerConn, err
 func (c *Cluster) spawnLocalP2P(ctx context.Context, exe, id, dir string) (*workerConn, error) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), p2pWorkerEnv(id, dir, c.p2p.peerAddr, c.cfg.P2P.ReplicationFactor,
-		c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval(), c.overlayControl, c.overlayAuthKey)...)
+		c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval(), c.overlayControl, c.overlayAuthKey, c.overlayCert)...)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -372,7 +372,7 @@ func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout, commitInter
 // cluster: it is given the coordinator's peer address to join and the
 // replication factor, and a dir for its own replicas, rather than a broker to
 // dial or serve.
-func p2pWorkerEnv(id, dir, join string, rf, concurrency int, jobTimeout, commitInterval time.Duration, overlayControl, overlayAuthKey string) []string {
+func p2pWorkerEnv(id, dir, join string, rf, concurrency int, jobTimeout, commitInterval time.Duration, overlayControl, overlayAuthKey, overlayCert string) []string {
 	env := []string{
 		envMode + "=" + modeWorker,
 		envWorkerID + "=" + id,
@@ -387,6 +387,9 @@ func p2pWorkerEnv(id, dir, join string, rf, concurrency int, jobTimeout, commitI
 	}
 	if overlayControl != "" {
 		env = append(env, envP2POverlayControl+"="+overlayControl, envP2POverlayAuthKey+"="+overlayAuthKey)
+		if overlayCert != "" {
+			env = append(env, envSSLCert+"="+overlayCert)
+		}
 	}
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))
