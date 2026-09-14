@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
+	"github.com/ligustah/durable_streams/broker/cluster"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"tailscale.com/tsnet"
@@ -32,23 +34,46 @@ func startOverlayNode(ctx context.Context, dir, control, authKey, host string) (
 	return s, nil
 }
 
-// overlayHooks turns an up overlay node into the pieces startP2PNode needs to
-// serve and dial over it: a listener that binds the tailnet, dial options that
-// dial it, and the node's own tailnet address to advertise (a concrete address,
-// since a wildcard would advertise a host peers cannot dial back).
-func overlayHooks(s *tsnet.Server) (listen p2pListen, dial []grpc.DialOption, peerAddr string, err error) {
+// overlayWiring is everything startP2PNode needs to serve and dial over an
+// overlay node: the broker and raft listeners bind the tailnet, the peer and
+// raft dialers reach it, and the addresses advertise the node's own tailnet
+// address (concrete, since a wildcard would advertise a host peers cannot dial
+// back). Peer and raft each get their own listener on the node, at their own
+// port.
+type overlayWiring struct {
+	listen     p2pListen
+	peerDial   []grpc.DialOption
+	peerAddr   string
+	raftListen p2pListen
+	raftDial   cluster.DialFunc
+	raftAddr   string
+}
+
+// overlayHooks derives the wiring from an up overlay node.
+func overlayHooks(s *tsnet.Server) (overlayWiring, error) {
 	ip4, _ := s.TailscaleIPs()
 	if !ip4.IsValid() {
-		return nil, nil, "", fmt.Errorf("wings: overlay node has no tailnet address")
+		return overlayWiring{}, fmt.Errorf("wings: overlay node has no tailnet address")
 	}
-	listen = func(_ context.Context, addr string) (net.Listener, error) {
+	listen := func(_ context.Context, addr string) (net.Listener, error) {
 		return s.Listen("tcp", addr)
 	}
-	dial = []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(dctx context.Context, addr string) (net.Conn, error) {
-			return s.Dial(dctx, "tcp", addr)
-		}),
-	}
-	return listen, dial, fmt.Sprintf("%s:0", ip4), nil
+	addr := fmt.Sprintf("%s:0", ip4)
+	return overlayWiring{
+		listen: listen,
+		peerDial: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(dctx context.Context, a string) (net.Conn, error) {
+				return s.Dial(dctx, "tcp", a)
+			}),
+		},
+		peerAddr:   addr,
+		raftListen: listen,
+		raftDial: func(a string, timeout time.Duration) (net.Conn, error) {
+			dctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			return s.Dial(dctx, "tcp", a)
+		},
+		raftAddr: addr,
+	}, nil
 }

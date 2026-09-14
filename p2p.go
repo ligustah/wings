@@ -82,6 +82,12 @@ type p2pNodeConfig struct {
 	// reaches it — replication, join, forwarding and placement. A node on an
 	// overlay supplies a context dialer that rides it, matching listen.
 	peerDialOptions []grpc.DialOption
+
+	// raftListen and raftDial carry consensus over the overlay too; nil binds and
+	// dials raft over plain TCP. With raftListen set, raftAddr is advertise-only,
+	// resolved from the listener the node actually binds.
+	raftListen p2pListen
+	raftDial   cluster.DialFunc
 }
 
 // p2pListen creates the listener a p2p node serves its peer and client endpoint
@@ -156,15 +162,28 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 		}
 	}()
 
-	ident := peer.Identity{ID: peer.ID(cfg.id), PeerAddr: n.peerAddr, ClientAddr: n.peerAddr}
-	if n.node, err = embed.StartControlPlane(embed.ControlPlaneConfig{
-		Identity:    ident,
+	// On an overlay consensus binds and dials the tailnet too; the listener's own
+	// address is what peers dial, so raftAddr becomes advertise-only. The control
+	// plane closes the listener with the node.
+	cp := embed.ControlPlaneConfig{
+		Identity:    peer.Identity{ID: peer.ID(cfg.id), PeerAddr: n.peerAddr, ClientAddr: n.peerAddr},
 		RaftAddr:    raftAddr,
 		DataDir:     cfg.dir,
 		Bootstrap:   cfg.bootstrap,
 		Coordinator: engine.Coordinator,
 		Logger:      streamLogger(log),
-	}); err != nil {
+	}
+	if cfg.raftListen != nil {
+		raftLis, lerr := cfg.raftListen(nodeCtx, raftAddr)
+		if lerr != nil {
+			return nil, fmt.Errorf("wings: p2p raft listen on %s: %w", raftAddr, lerr)
+		}
+		cp.RaftAddr = raftLis.Addr().String()
+		cp.RaftListener = raftLis
+		cp.RaftDial = cfg.raftDial
+	}
+	ident := cp.Identity
+	if n.node, err = embed.StartControlPlane(cp); err != nil {
 		return nil, err
 	}
 	if n.node == nil {
@@ -288,10 +307,13 @@ func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pN
 		if overlay, err = startOverlayNode(ctx, filepath.Join(dir, "overlay"), control, os.Getenv(envP2POverlayAuthKey), id); err != nil {
 			return nil, err
 		}
-		if cfg.listen, cfg.peerDialOptions, cfg.peerAddr, err = overlayHooks(overlay); err != nil {
+		w, err := overlayHooks(overlay)
+		if err != nil {
 			overlay.Close()
 			return nil, err
 		}
+		cfg.listen, cfg.peerDialOptions, cfg.peerAddr = w.listen, w.peerDial, w.peerAddr
+		cfg.raftListen, cfg.raftDial, cfg.raftAddr = w.raftListen, w.raftDial, w.raftAddr
 	}
 
 	n, err := startP2PNode(ctx, cfg)

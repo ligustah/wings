@@ -264,20 +264,23 @@ func TestP2PWorkerJoinsOverOverlay(t *testing.T) {
 	key := authKey(t, app, "wings")
 
 	coordTS := tsNode(t, ctx, url, key, "coordinator")
-	listen, dial, peerAddr, err := overlayHooks(coordTS)
+	w, err := overlayHooks(coordTS)
 	if err != nil {
 		t.Fatalf("coordinator overlay hooks: %v", err)
 	}
 	coord, err := startP2PNode(ctx, p2pNodeConfig{
 		id:                "coordinator",
 		dir:               t.TempDir(),
-		peerAddr:          peerAddr,
+		peerAddr:          w.peerAddr,
 		bootstrap:         true,
 		replicationFactor: 2,
 		reconcile:         150 * time.Millisecond,
 		log:               quietP2PLogger(),
-		listen:            listen,
-		peerDialOptions:   dial,
+		listen:            w.listen,
+		peerDialOptions:   w.peerDial,
+		raftListen:        w.raftListen,
+		raftDial:          w.raftDial,
+		raftAddr:          w.raftAddr,
 	})
 	if err != nil {
 		t.Fatalf("start coordinator over overlay: %v", err)
