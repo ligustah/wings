@@ -192,6 +192,15 @@ func (n *p2pNode) awaitReady(ctx context.Context) error {
 	}
 }
 
+// leaderOf reports the cluster node currently leading a stream's single
+// partition, and whether the cluster has placed it at all. A placed but
+// leaderless partition (mid-election) reports ok false, since nothing serves it
+// yet. Wings streams are single-partition, so partition 0 is the whole stream.
+func (n *p2pNode) leaderOf(stream string) (id string, ok bool) {
+	leader, _, placed := n.manager.PartitionLeader(stream, 0)
+	return leader, placed && leader != ""
+}
+
 // close releases the node, mirroring a real shutdown: stop the background loops,
 // stop answering, leave the control plane, then close the engine. Idempotent.
 func (n *p2pNode) close() {

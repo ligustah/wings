@@ -374,6 +374,55 @@ func TestP2PReplicatesAcrossNodes(t *testing.T) {
 	}
 }
 
+// TestPickPreferring checks the locality tiebreaker in isolation: a preferred
+// worker wins only when it is available, not the one being moved away from, and
+// no more loaded than the balance choice — otherwise balance stands.
+func TestPickPreferring(t *testing.T) {
+	newWorker := func(id string, inflight int) *workerConn {
+		return &workerConn{id: id, inflight: inflight}
+	}
+	light := newWorker("light", 1)
+	heavy := newWorker("heavy", 5)
+	c := &Cluster{workers: []*workerConn{light, heavy}}
+
+	if got := c.pickPreferring(nil, nil); got != light {
+		t.Fatalf("no preference: got %v, want the least loaded (light)", workerID(got))
+	}
+	// Prefer heavy over the balance choice: it is more loaded, so balance wins.
+	if got := c.pickPreferring(nil, heavy); got != light {
+		t.Fatalf("prefer heavy: got %v, want light (balance outranks a costlier preference)", workerID(got))
+	}
+	// Prefer light, which is also the balance choice: it wins.
+	if got := c.pickPreferring(nil, light); got != light {
+		t.Fatalf("prefer light: got %v, want light", workerID(got))
+	}
+	// Equal load: the preference decides.
+	a, b := newWorker("a", 2), newWorker("b", 2)
+	c.workers = []*workerConn{a, b}
+	if got := c.pickPreferring(nil, b); got != b {
+		t.Fatalf("equal load: got %v, want the preferred b", workerID(got))
+	}
+	// A draining preferred worker is ignored.
+	b.draining = true
+	if got := c.pickPreferring(nil, b); got != a {
+		t.Fatalf("draining preference: got %v, want a", workerID(got))
+	}
+	// The preference is never the worker being moved away from.
+	b.draining = false
+	if got := c.pickPreferring(b, b); got != a {
+		t.Fatalf("prefer == avoid: got %v, want a", workerID(got))
+	}
+}
+
+// TestLeaderWorkerNotP2P shows the leader lookup is inert outside p2p: there is
+// no cluster to ask, so it never steers placement.
+func TestLeaderWorkerNotP2P(t *testing.T) {
+	c := &Cluster{workers: []*workerConn{{id: "w"}}}
+	if got := c.leaderWorker("anything"); got != nil {
+		t.Fatalf("leaderWorker off p2p: got %v, want nil", workerID(got))
+	}
+}
+
 func distinct(ss []string) []string {
 	seen := map[string]bool{}
 	var out []string

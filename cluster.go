@@ -269,6 +269,10 @@ type pendingJob struct {
 	beat    time.Time
 	// checkpoint is the last progress reported, handed to the next attempt.
 	checkpoint []byte
+	// channels are the shared channels this job's last run received from, read
+	// once when a lost worker's jobs are redispatched so the retry can prefer a
+	// peer that still leads the channel data. Set and read under mu; p2p only.
+	channels []string
 }
 
 // overdue reports whether a job has run out of time and which bound it hit, so
@@ -1126,6 +1130,16 @@ func (c *Cluster) redispatchFrom(dead *workerConn) {
 	c.log.Warn("wings: redispatching jobs from lost worker", "worker", dead.id, "jobs", len(orphans))
 
 	for _, p := range orphans {
+		// In p2p, learn which channels the lost attempt read so the retry can
+		// prefer a peer still leading that data. Off the lock, best effort:
+		// without it the move falls back to plain balance.
+		if c.p2p != nil {
+			if ids, err := c.receivedChannels(c.ctx, c.shared, p.job); err == nil && len(ids) > 0 {
+				c.mu.Lock()
+				p.channels = ids
+				c.mu.Unlock()
+			}
+		}
 		c.moveJob(p, fmt.Sprintf("worker %s was lost", dead.id))
 	}
 }
@@ -1177,7 +1191,7 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 			p.job.Func, c.cfg.attempts(), why))
 		return
 	}
-	w := c.pickBut(from)
+	w := c.pickPreferring(from, c.preferredWorkerLocked(p))
 	if w == nil {
 		// Nowhere to send it now. The fleet is kept at size, so a replacement is
 		// coming; the job waits with no worker and its clocks stopped until adopt
@@ -1459,6 +1473,53 @@ func (c *Cluster) pickBut(avoid *workerConn) *workerConn {
 		return best
 	}
 	return fallback
+}
+
+// pickPreferring is pickBut with a locality preference: if prefer is available,
+// not the worker being moved away from, and no more loaded than the balance
+// choice, it wins — so a job goes to a peer that holds its data when doing so
+// costs no balance. Otherwise the balance choice stands. Call with mu held.
+func (c *Cluster) pickPreferring(avoid, prefer *workerConn) *workerConn {
+	best := c.pickBut(avoid)
+	if prefer == nil || prefer == avoid || !prefer.available() {
+		return best
+	}
+	if best == nil || prefer.load() <= best.load() {
+		return prefer
+	}
+	return best
+}
+
+// leaderWorker is the worker whose p2p node leads a stream, or nil when this is
+// not p2p, the stream is unplaced or leaderless, or its leader is the
+// coordinator (which runs no work). Call with mu held: it reads c.workers.
+func (c *Cluster) leaderWorker(stream string) *workerConn {
+	if c.p2p == nil {
+		return nil
+	}
+	id, ok := c.p2p.leaderOf(stream)
+	if !ok {
+		return nil
+	}
+	for _, w := range c.workers {
+		if w.id == id {
+			return w
+		}
+	}
+	return nil
+}
+
+// preferredWorkerLocked is where a job's data lives: the worker leading the
+// first channel its last run received from, so a redispatch reads that channel
+// node-locally. Nil when the job shares no channel or its leader is gone. Call
+// with mu held.
+func (c *Cluster) preferredWorkerLocked(p *pendingJob) *workerConn {
+	for _, id := range p.channels {
+		if w := c.leaderWorker(chanValues(id)); w != nil {
+			return w
+		}
+	}
+	return nil
 }
 
 // submit places one job and returns a handle to its outcome.
