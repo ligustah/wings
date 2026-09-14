@@ -88,6 +88,32 @@ func TestP2PInProcessResumesAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestP2PChannelCrossesNodes(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 2, Concurrency: 1, P2P: &P2P{ReplicationFactor: 2}, Logger: quietP2PLogger()})
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(sums, feed{Values: r})
+		for _, v := range []int{1, 2, 3, 4} {
+			if err := w.Send(ctx, v); err != nil {
+				return err
+			}
+		}
+		if err := w.Close(ctx); err != nil {
+			return err
+		}
+		var err error
+		got, err = fut.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 10 {
+		t.Fatalf("summed %d, want 10", got)
+	}
+}
+
 // TestP2PRecoveryReadsResultStreams shows that in p2p mode, where no results
 // mirror is kept, settled results are recovered from the workers' own replicated
 // result streams — so a restarted coordinator still sees finished jobs as done.

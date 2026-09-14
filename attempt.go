@@ -395,7 +395,7 @@ func (h *historyStore) Begin(ctx context.Context, _, thread string) (flow.Tx, er
 // coordinator or another worker wrote.
 func (h *historyStore) Follow(ctx context.Context, name string, from int64, yield func(flow.EventAt) bool) error {
 	for ctx.Err() == nil {
-		exists, err := h.txns.node.client.StreamExists(ctx, name)
+		exists, err := flow.StreamAvailable(ctx, h.txns.node.client, name)
 		if err != nil {
 			return fmt.Errorf("wings: check %s: %w", name, err)
 		}

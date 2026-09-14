@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -15,6 +16,23 @@ import (
 
 	"github.com/ligustah/wings/flow/protos"
 )
+
+// StreamAvailable reports whether a stream can be opened for reading. On a
+// clustered backend it asks the agreed catalog ([dsclient.Client.StreamPlaced]),
+// so a node sees a stream led elsewhere rather than only the ones on its own
+// disk; on a backend that cannot answer placement it falls back to the node-local
+// check. Gate a read on this, not [dsclient.Client.StreamExists], which is
+// node-local and answers false on a cluster peer that holds no replica.
+func StreamAvailable(ctx context.Context, client *dsclient.Client, name string) (bool, error) {
+	placed, err := client.StreamPlaced(ctx, name)
+	if err == nil {
+		return placed, nil
+	}
+	if errors.Is(err, dswire.ErrPlacementUnknown) {
+		return client.StreamExists(ctx, name)
+	}
+	return false, err
+}
 
 // EventAt pairs an event with its offset on a stream, so a value dropped when
 // the history was loaded can be read back by offset later.
@@ -187,7 +205,7 @@ func (s *streamStore) ListThreads(ctx context.Context, run string) ([]string, er
 }
 
 func (s *streamStore) open(ctx context.Context, name string, create bool) (*dsclient.Stream[*protos.Event], error) {
-	ok, err := s.client.StreamExists(ctx, name)
+	ok, err := StreamAvailable(ctx, s.client, name)
 	if err != nil {
 		return nil, fmt.Errorf("flow: check %s: %w", name, err)
 	}
@@ -311,7 +329,7 @@ func (s *streamStore) Drop(ctx context.Context, run, thread string) error {
 // append to a stream a stale handle bound to empty is seen.
 func (s *streamStore) Follow(ctx context.Context, name string, from int64, yield func(EventAt) bool) error {
 	for ctx.Err() == nil {
-		ok, err := s.client.StreamExists(ctx, name)
+		ok, err := StreamAvailable(ctx, s.client, name)
 		if err != nil {
 			return fmt.Errorf("flow: check %s: %w", name, err)
 		}
