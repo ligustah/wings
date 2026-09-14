@@ -46,6 +46,65 @@ func quietP2PLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TestP2PLocalProcessRunsWork starts a p2p cluster on the local-process target —
+// a coordinator bootstrap node and worker child processes that each bring up
+// their own observer node and join it — and dispatches work, so the replication
+// wiring runs across real process boundaries, not one address space.
+func TestP2PLocalProcessRunsWork(t *testing.T) {
+	c := start(t, Config{
+		Target:      LocalProcess(),
+		Workers:     2,
+		Concurrency: 1,
+		P2P:         &P2P{ReplicationFactor: 2},
+		Logger:      quietP2PLogger(),
+	})
+
+	got, err := p2pSquare(c.Bind(t.Context()), 12)
+	if err != nil {
+		t.Fatalf("call work: %v", err)
+	}
+	if got != 144 {
+		t.Fatalf("p2pSquare(12) = %d, want 144", got)
+	}
+}
+
+// TestP2PLocalProcessChannelCrossesProcesses shows a channel carries values
+// between worker child processes over the replicated cluster, so a channel's
+// data reaches its reader through replication rather than the coordinator relay
+// even when writer and reader are separate processes.
+func TestP2PLocalProcessChannelCrossesProcesses(t *testing.T) {
+	c := start(t, Config{
+		Target:      LocalProcess(),
+		Workers:     2,
+		Concurrency: 1,
+		P2P:         &P2P{ReplicationFactor: 2},
+		Logger:      quietP2PLogger(),
+	})
+
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int]()
+		fut := ctx.Go(sums, feed{Values: r})
+		for _, v := range []int{1, 2, 3, 4} {
+			if err := w.Send(ctx, v); err != nil {
+				return err
+			}
+		}
+		if err := w.Close(ctx); err != nil {
+			return err
+		}
+		var err error
+		got, err = fut.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 10 {
+		t.Fatalf("summed %d, want 10", got)
+	}
+}
+
 // TestP2PInProcessResumesAcrossRestart shows a p2p cluster brought up a second
 // time over the same Dir resumes its control plane rather than forming a new one,
 // so it goes on dispatching work.

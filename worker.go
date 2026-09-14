@@ -614,10 +614,22 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		id = "worker"
 	}
 
-	// A shared broker: dial the coordinator's engine instead of running one, so
-	// this worker keeps no data of its own. Otherwise stand up a served broker.
-	client, addr, closeStore, err := workerStore(log)
-	if err != nil {
+	// Three ways a worker gets its streams. In p2p mode it runs its own node of
+	// the replicated cluster, joining the coordinator. Otherwise it dials the
+	// coordinator's shared engine, or stands up a served broker of its own.
+	var (
+		client     *dsclient.Client
+		addr       string
+		closeStore func()
+		err        error
+	)
+	if os.Getenv(envP2PJoin) != "" {
+		var wn *p2pNode
+		if wn, err = startWorkerP2PNode(ctx, id, log); err != nil {
+			return err
+		}
+		client, addr, closeStore = wn.client, wn.peerAddr, wn.close
+	} else if client, addr, closeStore, err = workerStore(log); err != nil {
 		return err
 	}
 	defer closeStore()

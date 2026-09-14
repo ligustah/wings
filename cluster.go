@@ -538,10 +538,14 @@ func (c *Cluster) placeHeld() {
 // launch brings up n workers for the configured target.
 func (c *Cluster) launch(ctx context.Context, n int) ([]*workerConn, error) {
 	if c.cfg.P2P != nil {
-		if c.cfg.Target.kind != targetInProcess {
-			return nil, fmt.Errorf("wings: p2p mode currently runs on the in-process target only")
+		switch c.cfg.Target.kind {
+		case targetInProcess:
+			return c.launchP2P(ctx, n)
+		case targetLocalProcess:
+			return c.launchP2PLocal(ctx, n)
+		default:
+			return nil, fmt.Errorf("wings: p2p mode runs on the in-process and local-process targets only")
 		}
-		return c.launchP2P(ctx, n)
 	}
 	switch c.cfg.Target.kind {
 	case targetInProcess:

@@ -112,6 +112,84 @@ func (c *Cluster) launchP2P(ctx context.Context, n int) ([]*workerConn, error) {
 	return out, nil
 }
 
+// launchP2PLocal runs each worker as a child copy of this binary that brings up
+// its own node of the replicated cluster, joining the coordinator, so the
+// cluster's stream data lives across real processes rather than one address
+// space. The coordinator reaches every worker's streams through its own routing
+// client, as with in-process p2p.
+func (c *Cluster) launchP2PLocal(ctx context.Context, n int) ([]*workerConn, error) {
+	// Brings up the coordinator's own node, whose peer address the children join.
+	if _, err := c.sharedClient(); err != nil {
+		return nil, err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("wings: locate this executable: %w", err)
+	}
+
+	var out []*workerConn
+	for range n {
+		id := c.workerID("p2p-local")
+		w, err := c.spawnLocalP2P(ctx, exe, id, filepath.Join(c.dir, id))
+		if err != nil {
+			return nil, closePartial(ctx, out, err)
+		}
+		out = append(out, w)
+	}
+	return out, nil
+}
+
+// spawnLocalP2P starts a worker child that joins the replicated cluster and
+// holds replicas. Its streams are cluster streams the coordinator reaches
+// through its routing client, so — as in shared-broker mode — there is nothing
+// to dial or copy from the child directly.
+func (c *Cluster) spawnLocalP2P(ctx context.Context, exe, id, dir string) (*workerConn, error) {
+	cmd := exec.Command(exe)
+	cmd.Env = append(os.Environ(), p2pWorkerEnv(id, dir, c.p2p.peerAddr, c.cfg.P2P.ReplicationFactor,
+		c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval())...)
+	cmd.Stderr = os.Stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("wings: worker %s stdout: %w", id, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("wings: start worker %s: %w", id, err)
+	}
+
+	// The child announces readiness once its node has joined and declared its
+	// streams cluster-wide; the coordinator then opens them through routing.
+	if _, err := awaitReady(ctx, stdout, id); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
+	// ownsClient false: the routing client belongs to the coordinator's node.
+	w, err := c.connect(id, client, false)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
+	w.proc = cmd.Process
+	w.dir = dir
+	w.exited = make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(w.exited)
+	}()
+
+	c.log.Info("wings: local p2p worker started", "worker", id, "pid", cmd.Process.Pid)
+	return w, nil
+}
+
 // launchLocalProcess runs each worker as a child copy of this binary — no
 // cross-compilation, which is what makes this the cheap way to test the process
 // boundary.
@@ -277,6 +355,35 @@ func sharedWorkerEnv(id, broker string, concurrency int, jobTimeout, commitInter
 		envCompression + "=" + strconv.Itoa(int(streamCompression)),
 		envLogLevel + "=" + strconv.Itoa(int(logLevel)),
 		envLogBytes + "=" + strconv.FormatInt(logBudgetBytes, 10),
+	}
+	if concurrency > 0 {
+		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))
+	}
+	if jobTimeout > 0 {
+		env = append(env, envJobTimeout+"="+jobTimeout.String())
+	}
+	if commitInterval > 0 {
+		env = append(env, envCommitInterval+"="+commitInterval.String())
+	}
+	return env
+}
+
+// p2pWorkerEnv is workerEnv for a worker that runs its own node of the p2p
+// cluster: it is given the coordinator's peer address to join and the
+// replication factor, and a dir for its own replicas, rather than a broker to
+// dial or serve.
+func p2pWorkerEnv(id, dir, join string, rf, concurrency int, jobTimeout, commitInterval time.Duration) []string {
+	env := []string{
+		envMode + "=" + modeWorker,
+		envWorkerID + "=" + id,
+		envDir + "=" + dir,
+		envP2PJoin + "=" + join,
+		envCompression + "=" + strconv.Itoa(int(streamCompression)),
+		envLogLevel + "=" + strconv.Itoa(int(logLevel)),
+		envLogBytes + "=" + strconv.FormatInt(logBudgetBytes, 10),
+	}
+	if rf > 0 {
+		env = append(env, envP2PRF+"="+strconv.Itoa(rf))
 	}
 	if concurrency > 0 {
 		env = append(env, envConcurrency+"="+strconv.Itoa(concurrency))

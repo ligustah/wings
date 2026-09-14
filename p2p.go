@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/ligustah/durable_streams/broker/cluster"
@@ -207,6 +208,37 @@ func (n *p2pNode) close() {
 	if n.engine != nil {
 		_ = n.engine.Close()
 	}
+}
+
+// startWorkerP2PNode brings up a worker process's own node of the p2p cluster:
+// an observer that joins the coordinator at WINGS_P2P_JOIN and holds replicas,
+// so the worker's streams live on more than the coordinator. It waits until the
+// node has joined and caught up before returning.
+func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pNode, error) {
+	dir := os.Getenv(envDir)
+	if dir == "" {
+		dir = defaultWorkerDataDir
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("wings: worker data dir: %w", err)
+	}
+	rf, _ := strconv.Atoi(os.Getenv(envP2PRF))
+	n, err := startP2PNode(ctx, p2pNodeConfig{
+		id:                id,
+		dir:               dir,
+		observer:          true,
+		join:              os.Getenv(envP2PJoin),
+		replicationFactor: rf,
+		log:               log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := n.awaitReady(ctx); err != nil {
+		n.close()
+		return nil, err
+	}
+	return n, nil
 }
 
 type nodeAddrs struct {

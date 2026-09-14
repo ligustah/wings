@@ -19,6 +19,11 @@ const (
 	envCommitInterval = "WINGS_COMMIT_INTERVAL"
 	envLogLevel       = "WINGS_LOG_LEVEL"
 	envLogBytes       = "WINGS_LOG_BYTES"
+	// envP2PJoin is the coordinator's peer address a p2p worker child joins; its
+	// presence is what tells the child to bring up its own cluster node rather
+	// than a broker of its own. envP2PRF carries the replication factor.
+	envP2PJoin = "WINGS_P2P_JOIN"
+	envP2PRF   = "WINGS_P2P_RF"
 
 	modeWorker = "worker"
 
