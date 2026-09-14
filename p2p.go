@@ -72,6 +72,11 @@ type p2pNodeConfig struct {
 	// A node wiring a userspace overlay supplies one that listens on it, so peers
 	// behind different NATs reach one another over the same network.
 	listen p2pListen
+
+	// peerDialOptions is how the node dials its peers and how the controller
+	// reaches it — replication, join, forwarding and placement. A node on an
+	// overlay supplies a context dialer that rides it, matching listen.
+	peerDialOptions []grpc.DialOption
 }
 
 // p2pListen creates the listener a p2p node serves its peer and client endpoint
@@ -171,6 +176,7 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 		Join:              cfg.join,
 		Observer:          cfg.observer,
 		ReconcileInterval: reconcile,
+		PeerDialOptions:   cfg.peerDialOptions,
 		Logger:            streamLogger(log),
 	}, n.node, engine, n.svc); err != nil {
 		return nil, err
