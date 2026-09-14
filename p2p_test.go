@@ -5,10 +5,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ligustah/durable_streams/broker/cluster"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/wings/flow"
 )
@@ -426,6 +428,77 @@ func TestP2PReplicatesAcrossNodes(t *testing.T) {
 	if len(recs) != len(want) {
 		t.Fatalf("read %d records, want %d", len(recs), len(want))
 	}
+}
+
+// TestP2PRetireDrainsReplicas exercises Phase 3's cordon-then-drain: a node
+// holding a replica is cordoned so nothing new lands on it and drained, and its
+// copy moves onto the free peer -- the stream stays on two brokers and no longer
+// on the drained one, so retiring a p2p worker does not drop a copy.
+func TestP2PRetireDrainsReplicas(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const reconcile = 150 * time.Millisecond
+	coord, err := startP2PNode(ctx, p2pNodeConfig{
+		id: "coordinator", dir: t.TempDir(), bootstrap: true,
+		replicationFactor: 2, reconcile: reconcile, log: quietP2PLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start coordinator: %v", err)
+	}
+	defer coord.close()
+
+	for _, id := range []string{"data-1", "data-2"} {
+		n, err := startP2PNode(ctx, p2pNodeConfig{
+			id: id, dir: t.TempDir(), observer: true, join: coord.peerAddr,
+			replicationFactor: 2, reconcile: reconcile, log: quietP2PLogger(),
+		})
+		if err != nil {
+			t.Fatalf("start %s: %v", id, err)
+		}
+		defer n.close()
+	}
+	if err := coord.awaitReady(ctx); err != nil {
+		t.Fatalf("await ready: %v", err)
+	}
+	waitFor(t, "three brokers registered", func() bool {
+		return len(coord.node.Registry().Unfenced()) == 3
+	})
+
+	const stream = "p2p.drain"
+	if err := coord.client.CreateStream(ctx, stream, &dsclient.StreamConfig{Partitions: 1}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	replicas, _, placed := coord.manager.AssignmentOf(stream, 0)
+	if !placed || len(distinct(replicas)) != 2 {
+		t.Fatalf("stream placed on %v, want 2 distinct replicas", replicas)
+	}
+
+	// Drain a data node that holds a replica; with a third broker free, its copy
+	// has somewhere to go.
+	var victim string
+	for _, id := range []string{"data-1", "data-2"} {
+		if slices.Contains(replicas, id) {
+			victim = id
+			break
+		}
+	}
+	if victim == "" {
+		t.Skipf("stream landed on %v; neither data node holds a replica to drain", replicas)
+	}
+
+	cat := cluster.NewCatalog(coord.node)
+	if _, err := cat.Cordon(victim, true); err != nil {
+		t.Fatalf("cordon %s: %v", victim, err)
+	}
+	if _, _, err := cat.Drain(victim); err != nil {
+		t.Fatalf("drain %s: %v", victim, err)
+	}
+
+	waitFor(t, "the stream's replica moved off the drained node", func() bool {
+		reps, _, ok := coord.manager.AssignmentOf(stream, 0)
+		return ok && len(distinct(reps)) == 2 && !slices.Contains(reps, victim)
+	})
 }
 
 // TestPickPreferring checks the locality tiebreaker in isolation: a preferred

@@ -194,6 +194,10 @@ func (c *Cluster) scaleDown(n int, idle []*workerConn) {
 		c.drainOutputs(context.WithoutCancel(c.ctx), w, "")
 	}
 
+	// In p2p a retiring worker is also a broker holding stream replicas; move them
+	// onto its peers while it still serves, before it is released below.
+	c.retireP2PNodes(context.WithoutCancel(c.ctx), retire)
+
 	c.mu.Lock()
 	c.workers = slices.DeleteFunc(c.workers, func(w *workerConn) bool {
 		return slices.Contains(retire, w)

@@ -247,6 +247,62 @@ func (n *p2pNode) awaitReady(ctx context.Context) error {
 	}
 }
 
+// p2pDrainTimeout bounds how long retiring a p2p node waits for its replicas to
+// move onto its peers before the node is released regardless.
+const p2pDrainTimeout = 2 * time.Minute
+
+// retireP2PNodes moves the stream replicas of nodes about to be retired onto
+// their peers first, so scaling down a p2p worker does not drop a copy. It
+// cordons every one so a drained replica never lands on another node on its way
+// out, then drains and waits for each. Best effort: a node that will not drain
+// in time is released anyway and repair restores its copies elsewhere. A no-op
+// off p2p, where a worker holds no replicas.
+func (c *Cluster) retireP2PNodes(ctx context.Context, retire []*workerConn) {
+	if c.p2p == nil || c.p2p.node == nil {
+		return
+	}
+	cat := cluster.NewCatalog(c.p2p.node)
+	for _, w := range retire {
+		if _, err := cat.Cordon(w.id, true); err != nil {
+			c.log.Warn("wings: could not cordon a retiring node", "broker", w.id, "err", err)
+		}
+	}
+	for _, w := range retire {
+		c.drainP2PNode(ctx, cat, w.id)
+	}
+}
+
+// drainP2PNode drains one already-cordoned broker and waits until it holds
+// nothing, or the drain bound passes.
+func (c *Cluster) drainP2PNode(ctx context.Context, cat *cluster.Catalog, brokerID string) {
+	if _, _, err := cat.Drain(brokerID); err != nil {
+		c.log.Warn("wings: could not drain a retiring node", "broker", brokerID, "err", err)
+		return
+	}
+	deadline := time.Now().Add(p2pDrainTimeout)
+	for {
+		remaining, _, err := cat.DrainProgress(brokerID)
+		if err != nil {
+			c.log.Warn("wings: could not read a retiring node's drain progress", "broker", brokerID, "err", err)
+			return
+		}
+		if remaining == 0 {
+			c.log.Info("wings: retiring node drained its replicas", "broker", brokerID)
+			return
+		}
+		if time.Now().After(deadline) {
+			c.log.Warn("wings: retiring node did not drain in time; releasing anyway",
+				"broker", brokerID, "remaining", remaining)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 // leaderOf reports the cluster node currently leading a stream's single
 // partition, and whether the cluster has placed it at all. A placed but
 // leaderless partition (mid-election) reports ok false, since nothing serves it
