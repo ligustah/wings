@@ -269,6 +269,35 @@ no authentication; the tunnel is the access control, and nothing wings starts is
 reachable from the internet. Spot instances (`-gcp.spot`) are supported: a
 preemption's 30-second notice is used to move the worker's jobs before it dies.
 
+## Peer-to-peer replication
+
+`-p2p` changes the model above: instead of each stream living only on its worker with
+the coordinator relaying between them, the nodes form one
+[durable-streams](https://github.com/ligustah/durable_streams) cluster and hold
+**replicas of one another's streams**. A stream survives the loss of any node up to
+its replication factor, and a peer already holds the data — no on-demand catch-up — so
+when leadership of a stream moves, compute follows it to a node that already has the
+replica rather than copying anything home. The coordinator stays the sole consensus
+node; workers are non-voting replica holders.
+
+It is orthogonal to `-target`: `-p2p` over `local` is a loopback cluster of child
+processes for testing, over `remote` a cluster across machines.
+
+| flag | meaning |
+|---|---|
+| `-p2p` | turn peer-to-peer replication on |
+| `-p2p-replication-factor` | nodes holding a copy of each stream (0 = default 3) |
+| `-p2p-overlay <addr>` | host an embedded overlay control plane here (see below) |
+
+For nodes on one host or LAN that is all. To span **different networks** — peers
+behind separate NATs — `-p2p-overlay <addr>` hosts a self-contained overlay: the
+coordinator runs an embedded [Tailscale](https://tailscale.com) control plane
+([Headscale](https://github.com/juanfont/headscale)) with its own DERP relay at
+`addr`, enrols every node onto the resulting tailnet, and all cluster traffic —
+replication, consensus, and job dispatch — rides it. Nodes connect directly when they
+can and relay through the coordinator's DERP when a NAT forbids a direct path. Nothing
+depends on a third-party service; `addr` only needs to be reachable by the workers.
+
 ## Configuration
 
 Used directly, without `wings build`:
