@@ -278,6 +278,7 @@ func TestP2PWorkerJoinsOverOverlay(t *testing.T) {
 		log:               quietP2PLogger(),
 		listen:            w.listen,
 		peerDialOptions:   w.peerDial,
+		clientDialOptions: w.clientDial,
 		raftListen:        w.raftListen,
 		raftDial:          w.raftDial,
 		raftAddr:          w.raftAddr,
@@ -319,6 +320,31 @@ func TestP2PWorkerJoinsOverOverlay(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("stream not placed on both nodes over the overlay (coordinator=%v worker=%v)", coordOK, workerOK)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Written on the coordinator, read back through the worker's routing client:
+	// data crosses the cluster over the overlay.
+	cs, err := coord.client.OpenStream[string](stream)
+	if err != nil {
+		t.Fatalf("coordinator open: %v", err)
+	}
+	if _, err := cs.Append(ctx, []string{"replicated"}); err != nil {
+		t.Fatalf("append on coordinator: %v", err)
+	}
+	ws, err := worker.client.OpenStream[string](stream)
+	if err != nil {
+		t.Fatalf("worker open: %v", err)
+	}
+	rdeadline := time.Now().Add(20 * time.Second)
+	for {
+		recs, rerr := ws.Read(ctx, 0, 1)
+		if rerr == nil && len(recs) == 1 && recs[0].Record == "replicated" {
+			break
+		}
+		if time.Now().After(rdeadline) {
+			t.Fatalf("worker did not read the coordinator's write over the overlay: recs=%v err=%v", recs, rerr)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

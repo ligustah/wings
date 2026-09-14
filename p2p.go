@@ -88,6 +88,11 @@ type p2pNodeConfig struct {
 	// resolved from the listener the node actually binds.
 	raftListen p2pListen
 	raftDial   cluster.DialFunc
+
+	// clientDialOptions is how the node's routing client dials the leaders it
+	// forwards to; on an overlay it dials them over it, so a read or write routed
+	// to another node rides the tailnet like everything else.
+	clientDialOptions []grpc.DialOption
 }
 
 // p2pListen creates the listener a p2p node serves its peer and client endpoint
@@ -217,6 +222,7 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 		Self:              cfg.id,
 		ReplicationFactor: int32(rf),
 		Reclaimed:         n.svc.HasReclaimed,
+		ClientDialOptions: cfg.clientDialOptions,
 	}); err != nil {
 		return nil, err
 	}
@@ -313,6 +319,7 @@ func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pN
 			return nil, err
 		}
 		cfg.listen, cfg.peerDialOptions, cfg.peerAddr = w.listen, w.peerDial, w.peerAddr
+		cfg.clientDialOptions = w.clientDial
 		cfg.raftListen, cfg.raftDial, cfg.raftAddr = w.raftListen, w.raftDial, w.raftAddr
 	}
 

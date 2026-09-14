@@ -43,6 +43,7 @@ func startOverlayNode(ctx context.Context, dir, control, authKey, host string) (
 type overlayWiring struct {
 	listen     p2pListen
 	peerDial   []grpc.DialOption
+	clientDial []grpc.DialOption
 	peerAddr   string
 	raftListen p2pListen
 	raftDial   cluster.DialFunc
@@ -58,15 +59,17 @@ func overlayHooks(s *tsnet.Server) (overlayWiring, error) {
 	listen := func(_ context.Context, addr string) (net.Listener, error) {
 		return s.Listen("tcp", addr)
 	}
+	dial := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(dctx context.Context, a string) (net.Conn, error) {
+			return s.Dial(dctx, "tcp", a)
+		}),
+	}
 	addr := fmt.Sprintf("%s:0", ip4)
 	return overlayWiring{
-		listen: listen,
-		peerDial: []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(func(dctx context.Context, a string) (net.Conn, error) {
-				return s.Dial(dctx, "tcp", a)
-			}),
-		},
+		listen:     listen,
+		peerDial:   dial,
+		clientDial: dial,
 		peerAddr:   addr,
 		raftListen: listen,
 		raftDial: func(a string, timeout time.Duration) (net.Conn, error) {
