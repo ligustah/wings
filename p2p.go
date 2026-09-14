@@ -67,6 +67,21 @@ type p2pNodeConfig struct {
 	replicationFactor int
 	reconcile         time.Duration
 	log               *slog.Logger
+
+	// listen creates the peer+client endpoint's listener; nil binds plain TCP.
+	// A node wiring a userspace overlay supplies one that listens on it, so peers
+	// behind different NATs reach one another over the same network.
+	listen p2pListen
+}
+
+// p2pListen creates the listener a p2p node serves its peer and client endpoint
+// on, given the address to advertise.
+type p2pListen func(ctx context.Context, addr string) (net.Listener, error)
+
+// tcpListen is the default p2pListen: a plain TCP bind, for an in-process or
+// local cluster with no overlay.
+func tcpListen(ctx context.Context, addr string) (net.Listener, error) {
+	return (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 }
 
 // startP2PNode assembles one clustered broker following broker/embed's wiring:
@@ -110,7 +125,11 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 	if peerAddr == "" {
 		peerAddr = "127.0.0.1:0"
 	}
-	lis, err := net.Listen("tcp", peerAddr)
+	listen := cfg.listen
+	if listen == nil {
+		listen = tcpListen
+	}
+	lis, err := listen(nodeCtx, peerAddr)
 	if err != nil {
 		return nil, fmt.Errorf("wings: p2p listen on %s: %w", peerAddr, err)
 	}

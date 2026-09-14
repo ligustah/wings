@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -298,6 +300,58 @@ func TestP2PSingleNodeRoundTrips(t *testing.T) {
 		if r.Record != want[i] {
 			t.Fatalf("record %d = %q, want %q", i, r.Record, want[i])
 		}
+	}
+}
+
+// TestP2PListenSeamCarriesTraffic shows startP2PNode serves its peer and client
+// endpoint on the listener the config supplies rather than a hardwired TCP bind:
+// a node brought up through an injected listener round-trips a stream, so the
+// seam a userspace overlay plugs into (Phase 4) carries real broker traffic.
+func TestP2PListenSeamCarriesTraffic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	n, err := startP2PNode(ctx, p2pNodeConfig{
+		id:                "coordinator",
+		dir:               t.TempDir(),
+		bootstrap:         true,
+		replicationFactor: 1,
+		reconcile:         150 * time.Millisecond,
+		log:               quietP2PLogger(),
+		listen: func(lctx context.Context, addr string) (net.Listener, error) {
+			calls.Add(1)
+			return (&net.ListenConfig{}).Listen(lctx, "tcp", addr)
+		},
+	})
+	if err != nil {
+		t.Fatalf("start bootstrap node: %v", err)
+	}
+	defer n.close()
+	if err := n.awaitReady(ctx); err != nil {
+		t.Fatalf("await ready: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("the injected listener was used %d times, want 1", got)
+	}
+
+	const stream = "p2p.seam"
+	if err := n.client.CreateStream(ctx, stream, &dsclient.StreamConfig{Partitions: 1}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	s, err := n.client.OpenStream[string](stream)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	if _, err := s.Append(ctx, []string{"x"}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	recs, err := s.Read(ctx, 0, 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Record != "x" {
+		t.Fatalf("read %+v, want one record %q", recs, "x")
 	}
 }
 
