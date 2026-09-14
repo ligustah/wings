@@ -88,6 +88,38 @@ func TestP2PInProcessResumesAcrossRestart(t *testing.T) {
 	}
 }
 
+// TestP2PRecoveryReadsResultStreams shows that in p2p mode, where no results
+// mirror is kept, settled results are recovered from the workers' own replicated
+// result streams — so a restarted coordinator still sees finished jobs as done.
+func TestP2PRecoveryReadsResultStreams(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, err := Start(ctx, Config{
+		Target:  InProcess(),
+		Workers: 2,
+		Dir:     t.TempDir(),
+		P2P:     &P2P{ReplicationFactor: 2},
+		Logger:  quietP2PLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(context.Background())
+
+	if _, err := p2pSquare(c.Bind(ctx), 9); err != nil {
+		t.Fatalf("call work: %v", err)
+	}
+
+	settled, err := c.mirroredResults(ctx)
+	if err != nil {
+		t.Fatalf("mirroredResults: %v", err)
+	}
+	if len(settled) == 0 {
+		t.Fatal("no settled results found in p2p mode; a restart would re-run finished jobs")
+	}
+}
+
 // TestP2PSingleNodeRoundTrips brings up one bootstrap node and shows a stream
 // created through the cluster catalog takes writes and reads them back.
 func TestP2PSingleNodeRoundTrips(t *testing.T) {

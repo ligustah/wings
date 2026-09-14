@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/wings/flow"
 )
 
@@ -181,12 +182,17 @@ func (c *Cluster) outstandingInJournal(ctx context.Context) ([]*recoveredJob, er
 	return out, nil
 }
 
-// mirroredResults reads every result previous coordinators mirrored, by job. A
-// mirrored result means the job is over.
+// mirroredResults reads every settled result a previous coordinator saw, by job.
+// A settled result means the job is over. In the default mode these come from the
+// store-and-forward mirror; in p2p mode there is no mirror, so they are read from
+// the workers' own result streams, which the cluster replicated and kept.
 func (c *Cluster) mirroredResults(ctx context.Context) (map[string]resultEnvelope, error) {
 	client, err := c.sharedClient()
 	if err != nil {
 		return nil, err
+	}
+	if c.cfg.P2P != nil {
+		return c.settledResults(ctx, client)
 	}
 	names, err := client.ListStreams(ctx)
 	if err != nil {
@@ -213,6 +219,42 @@ func (c *Cluster) mirroredResults(ctx context.Context) (map[string]resultEnvelop
 				from = rec.Offset + 1
 				if rec.Record.Result.Yield == nil {
 					out[rec.Record.Result.ID] = rec.Record.Result
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// settledResults is mirroredResults for p2p mode: it reads the workers' result
+// streams directly, since the cluster already holds them replicated. A yield is
+// not a settlement, so it is skipped as it is on the mirror.
+func (c *Cluster) settledResults(ctx context.Context, client *dsclient.Client) (map[string]resultEnvelope, error) {
+	names, err := client.ListStreams(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("wings: list streams: %w", err)
+	}
+	out := map[string]resultEnvelope{}
+	for _, name := range names {
+		if !strings.HasPrefix(name, resultStreamPrefix) {
+			continue
+		}
+		s, err := client.OpenStream[resultEnvelope](name)
+		if err != nil {
+			return nil, fmt.Errorf("wings: open %s: %w", name, err)
+		}
+		for from := int64(0); ; {
+			recs, err := s.Read(ctx, from, 512)
+			if err != nil {
+				return nil, fmt.Errorf("wings: read %s at %d: %w", name, from, err)
+			}
+			if len(recs) == 0 {
+				break
+			}
+			for _, rec := range recs {
+				from = rec.Offset + 1
+				if rec.Record.Yield == nil {
+					out[rec.Record.ID] = rec.Record
 				}
 			}
 		}

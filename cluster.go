@@ -453,8 +453,14 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 	if err != nil {
 		return
 	}
-	names := []string{mirrorStreamFor(w.id)}
-	if w.client == client {
+	var names []string
+	if c.cfg.P2P == nil {
+		names = append(names, mirrorStreamFor(w.id))
+	}
+	// The worker's own streams: in p2p they are cluster streams the coordinator
+	// can delete through its routing client even though the worker held them; in
+	// the shared/in-process case they live on the coordinator's client too.
+	if c.cfg.P2P != nil || w.client == client {
 		names = append(names, jobStreamFor(w.id), resultStreamFor(w.id), beatStreamFor(w.id), controlStreamFor(w.id), nestedStreamFor(w.id))
 	}
 	for _, name := range names {
@@ -578,8 +584,13 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 	if w.nested, err = client.OpenStream[jobEnvelope](nestedStreamFor(id)); err != nil {
 		return nil, fmt.Errorf("wings: open %s on worker %s: %w", nestedStreamFor(id), id, err)
 	}
-	if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
-		return nil, err
+	// In p2p mode the worker's result stream is already replicated across the
+	// cluster, so the coordinator reads it directly and keeps no store-and-forward
+	// copy; recovery reads the result streams themselves. See tail and recover.go.
+	if c.cfg.P2P == nil {
+		if w.mirror, err = c.openMirror(c.ctx, id); err != nil {
+			return nil, err
+		}
 	}
 	return w, nil
 }
@@ -695,7 +706,12 @@ func (c *Cluster) closeShared() error {
 // them, until the cluster stops or the worker is genuinely gone — a transient
 // read failure is not death, since the worker's queue survives a dropped connection.
 func (c *Cluster) tail(w *workerConn) {
-	from := w.mirror.next
+	// Without a mirror (p2p), delivery starts at the worker's stream head; the
+	// worker's node is fresh each launch, so there is nothing earlier to resume.
+	var from int64
+	if w.mirror != nil {
+		from = w.mirror.next
+	}
 
 	var (
 		trouble  time.Time // when the current run of failures began
@@ -812,14 +828,17 @@ func (c *Cluster) tail(w *workerConn) {
 
 		for _, r := range recs {
 			// Mirrored before delivery, so a result a caller saw completed is
-			// never one a recovery would see outstanding.
-			if err := w.mirror.append(w.ctx, r.Offset, r.Record); err != nil {
-				if w.ctx.Err() != nil {
-					return
+			// never one a recovery would see outstanding. In p2p the result stream
+			// is itself durable and replicated, so there is nothing to copy.
+			if w.mirror != nil {
+				if err := w.mirror.append(w.ctx, r.Offset, r.Record); err != nil {
+					if w.ctx.Err() != nil {
+						return
+					}
+					// Coordinator storage failing is not the worker's fault and a
+					// re-read would not fix it: report, but still deliver.
+					c.log.Error("wings: could not mirror result", "worker", w.id, "err", err)
 				}
-				// Coordinator storage failing is not the worker's fault and a
-				// re-read would not fix it: report, but still deliver.
-				c.log.Error("wings: could not mirror result", "worker", w.id, "err", err)
 			}
 			from = r.Offset + 1
 			c.deliver(r.Record)
