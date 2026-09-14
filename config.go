@@ -24,6 +24,12 @@ const (
 	// than a broker of its own. envP2PRF carries the replication factor.
 	envP2PJoin = "WINGS_P2P_JOIN"
 	envP2PRF   = "WINGS_P2P_RF"
+	// envP2POverlayControl and envP2POverlayAuthKey enrol a p2p worker child into
+	// a userspace Tailscale overlay: given both, the child brings its node up on a
+	// tsnet node reachable only through the overlay, so peers behind different NATs
+	// form one cluster. Absent, the child binds plain TCP.
+	envP2POverlayControl = "WINGS_P2P_OVERLAY_CONTROL"
+	envP2POverlayAuthKey = "WINGS_P2P_OVERLAY_AUTHKEY"
 
 	modeWorker = "worker"
 

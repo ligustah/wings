@@ -247,3 +247,76 @@ func TestP2PBrokerPlacesOverOverlay(t *testing.T) {
 		t.Fatalf("read %+v, want one record %q", recs, "placed")
 	}
 }
+
+// TestP2PWorkerJoinsOverOverlay drives the real worker bring-up: a coordinator
+// on the overlay, then startWorkerP2PNode reading the overlay env vars, so the
+// worker enrolls its own tsnet node and joins the coordinator across the tailnet
+// through the peer dialer. A replicated stream then places on both, proving the
+// worker joined and the controller reached both nodes over the overlay.
+func TestP2PWorkerJoinsOverOverlay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up an embedded control server, two tailnet nodes and a cluster")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	app, url := embedHeadscale(t)
+	key := authKey(t, app, "wings")
+
+	coordTS := tsNode(t, ctx, url, key, "coordinator")
+	listen, dial, peerAddr, err := overlayHooks(coordTS)
+	if err != nil {
+		t.Fatalf("coordinator overlay hooks: %v", err)
+	}
+	coord, err := startP2PNode(ctx, p2pNodeConfig{
+		id:                "coordinator",
+		dir:               t.TempDir(),
+		peerAddr:          peerAddr,
+		bootstrap:         true,
+		replicationFactor: 2,
+		reconcile:         150 * time.Millisecond,
+		log:               quietP2PLogger(),
+		listen:            listen,
+		peerDialOptions:   dial,
+	})
+	if err != nil {
+		t.Fatalf("start coordinator over overlay: %v", err)
+	}
+	defer coord.close()
+	if err := coord.awaitReady(ctx); err != nil {
+		t.Fatalf("coordinator await ready: %v", err)
+	}
+
+	// The worker child reads these to bring its own overlay node up and join.
+	t.Setenv(envDir, t.TempDir())
+	t.Setenv(envP2PJoin, coord.peerAddr)
+	t.Setenv(envP2PRF, "2")
+	t.Setenv(envP2POverlayControl, url)
+	t.Setenv(envP2POverlayAuthKey, key)
+
+	worker, err := startWorkerP2PNode(ctx, "worker", quietP2PLogger())
+	if err != nil {
+		t.Fatalf("worker join over overlay: %v", err)
+	}
+	defer worker.close()
+
+	const stream = "p2p.overlay.replicated"
+	if err := coord.client.CreateStream(ctx, stream, &dsclient.StreamConfig{Partitions: 1}); err != nil {
+		t.Fatalf("create replicated stream: %v", err)
+	}
+
+	// Both nodes must come to see the stream placed: that the controller reached
+	// each over the overlay to place a second replica.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, coordOK := coord.leaderOf(stream)
+		_, workerOK := worker.leaderOf(stream)
+		if coordOK && workerOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stream not placed on both nodes over the overlay (coordinator=%v worker=%v)", coordOK, workerOK)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}

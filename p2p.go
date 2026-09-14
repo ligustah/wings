@@ -22,6 +22,7 @@ import (
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 	"google.golang.org/grpc"
+	"tailscale.com/tsnet"
 )
 
 // defaultReplicationFactor is how many nodes hold a copy of each stream when the
@@ -46,6 +47,10 @@ type p2pNode struct {
 	client  *dsclient.Client
 	srv     *grpc.Server
 	cancel  context.CancelFunc
+
+	// overlay is the node's userspace Tailscale node when it serves over one;
+	// nil on the host network. Closed with the node.
+	overlay *tsnet.Server
 
 	peerAddr string
 	raftAddr string
@@ -248,6 +253,9 @@ func (n *p2pNode) close() {
 	if n.engine != nil {
 		_ = n.engine.Close()
 	}
+	if n.overlay != nil {
+		_ = n.overlay.Close()
+	}
 }
 
 // startWorkerP2PNode brings up a worker process's own node of the p2p cluster:
@@ -263,16 +271,38 @@ func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pN
 		return nil, fmt.Errorf("wings: worker data dir: %w", err)
 	}
 	rf, _ := strconv.Atoi(os.Getenv(envP2PRF))
-	n, err := startP2PNode(ctx, p2pNodeConfig{
+	cfg := p2pNodeConfig{
 		id:                id,
 		dir:               dir,
 		observer:          true,
 		join:              os.Getenv(envP2PJoin),
 		replicationFactor: rf,
 		log:               log,
-	})
+	}
+
+	// On an overlay the worker serves and dials over its own tsnet node rather
+	// than the host network, so it reaches a coordinator behind a different NAT.
+	var overlay *tsnet.Server
+	if control := os.Getenv(envP2POverlayControl); control != "" {
+		var err error
+		if overlay, err = startOverlayNode(ctx, filepath.Join(dir, "overlay"), control, os.Getenv(envP2POverlayAuthKey), id); err != nil {
+			return nil, err
+		}
+		if cfg.listen, cfg.peerDialOptions, cfg.peerAddr, err = overlayHooks(overlay); err != nil {
+			overlay.Close()
+			return nil, err
+		}
+	}
+
+	n, err := startP2PNode(ctx, cfg)
 	if err != nil {
+		if overlay != nil {
+			overlay.Close()
+		}
 		return nil, err
+	}
+	if overlay != nil {
+		n.overlay = overlay
 	}
 	if err := n.awaitReady(ctx); err != nil {
 		n.close()
