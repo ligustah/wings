@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	streams "github.com/ligustah/durable_streams"
 	"github.com/ligustah/durable_streams/dsclient"
 	"github.com/ligustah/durable_streams/dswire"
 
@@ -116,7 +117,7 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 		return nil
 	}
 	if a.producer == nil {
-		p, err := a.client.Producer(ctx, a.producerID())
+		p, err := openProducer(ctx, a.client, a.producerID())
 		if err != nil {
 			a.err = fmt.Errorf("wings: open a producer for %s: %w", a.id, err)
 			return a.err
@@ -200,6 +201,27 @@ const (
 	txBeginTries   = 40
 	txBeginBackoff = 150 * time.Millisecond
 )
+
+// openProducer opens a producer for id, retrying while the broker that
+// coordinates the id is still adopting its transaction-state partition. The
+// broker waits out its own bounded window and then refuses with the retryable
+// [streams.ErrTxStateUnreachable]; the refusal clears once leadership of the
+// partition settles, so the same open tries again.
+func openProducer(ctx context.Context, client *dsclient.Client, id string) (dsclient.Producer, error) {
+	var err error
+	for try := 0; try < txBeginTries; try++ {
+		var p dsclient.Producer
+		if p, err = client.Producer(ctx, id); err == nil || !errors.Is(err, streams.ErrTxStateUnreachable) {
+			return p, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(txBeginBackoff):
+		}
+	}
+	return nil, err
+}
 
 // beginTx opens a transaction on p, waiting out the window after a decided commit
 // where the identity's previous transaction is still being finalized. The broker

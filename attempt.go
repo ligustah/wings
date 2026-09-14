@@ -89,7 +89,7 @@ func (a *attemptOutputs) begin(ctx context.Context) error {
 		return nil
 	}
 	if a.producer == nil {
-		p, err := a.node.client.Producer(ctx, a.producerID())
+		p, err := openProducer(ctx, a.node.client, a.producerID())
 		if err != nil {
 			a.err = fmt.Errorf("wings: open a producer for job %s: %w", a.job, err)
 			return a.err
