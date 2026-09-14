@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ligustah/durable_streams/broker/affinity"
 	"github.com/ligustah/durable_streams/broker/cluster"
 	"github.com/ligustah/durable_streams/broker/daemon"
 	"github.com/ligustah/durable_streams/broker/embed"
@@ -96,7 +97,12 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 		}
 	}()
 
-	if n.svc, err = daemon.New(engine.Coordinator); err != nil {
+	// Report co-write statistics so the controller's rebalancer co-locates
+	// streams written together — a run's history and the channel outboxes its
+	// threads commit alongside it — onto one node, keeping those writes
+	// node-local and a peer holding the data. A non-correctness hint: in-memory,
+	// decayed and bounded, and every placement constraint outranks it.
+	if n.svc, err = daemon.New(engine.Coordinator, daemon.WithColocationStatistics(affinity.Config{})); err != nil {
 		return nil, fmt.Errorf("wings: p2p daemon: %w", err)
 	}
 

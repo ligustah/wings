@@ -173,6 +173,52 @@ func TestP2PChannelCrossesNodes(t *testing.T) {
 	}
 }
 
+// TestP2PColocationRunsFanOutChannels drives many channel-writing threads at
+// once on a p2p cluster, whose brokers report co-write statistics: each thread
+// commits its history and its channel outbox in one transaction, so the affinity
+// tracker sees an edge per thread. The point is that turning colocation on
+// leaves the transactional channel path correct — the affinity feed is a hint
+// alongside the commit, not a change to it — so every consumer still sums right.
+func TestP2PColocationRunsFanOutChannels(t *testing.T) {
+	c := start(t, Config{
+		Target:      InProcess(),
+		Workers:     3,
+		Concurrency: 2,
+		P2P:         &P2P{ReplicationFactor: 2},
+		Logger:      quietP2PLogger(),
+	})
+
+	const producers = 6
+	var got []int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		futs := make([]*flow.Future[int], producers)
+		for i := range producers {
+			r, w := ctx.NewChannel[int]()
+			futs[i] = ctx.Go(sums, feed{Values: r})
+			n := i + 1
+			ctx.Go(counts, writeFeed{Values: w, Count: n})
+		}
+		for _, f := range futs {
+			v, err := f.Await(ctx)
+			if err != nil {
+				return err
+			}
+			got = append(got, v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for i, v := range got {
+		n := i + 1
+		want := n * (n + 1) / 2
+		if v != want {
+			t.Fatalf("producer %d summed %d, want %d", n, v, want)
+		}
+	}
+}
+
 // TestP2PRecoveryReadsResultStreams shows that in p2p mode, where no results
 // mirror is kept, settled results are recovered from the workers' own replicated
 // result streams — so a restarted coordinator still sees finished jobs as done.
