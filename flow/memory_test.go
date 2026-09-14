@@ -81,6 +81,45 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// blockStore is a Store whose every Follow blocks until its context ends,
+// counting how many are running so a test can watch pumps start and stop.
+type blockStore struct{ running atomic.Int32 }
+
+func (s *blockStore) Begin(context.Context, string, string) (Tx, error) { return nopTx{}, nil }
+func (s *blockStore) Read(context.Context, string, string, int64, int) ([]EventAt, error) {
+	return nil, nil
+}
+func (s *blockStore) Events(context.Context, string, string) ([]*protos.Event, error) {
+	return nil, nil
+}
+func (s *blockStore) Drop(context.Context, string, string) error { return nil }
+func (s *blockStore) Follow(ctx context.Context, _ string, _ int64, _ func(EventAt) bool) error {
+	s.running.Add(1)
+	defer s.running.Add(-1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// THE POINT: retiring a channel stops its pumps at once, without ending the run's
+// other channels — so a run that creates channels in a call and lets them retire
+// does not hold a pump goroutine per channel for its whole life.
+func TestChanStateRetireStopsPumps(t *testing.T) {
+	cs := newChanState(unbounded)
+	store := &blockStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs.activate(ctx, store, "run/ch", modeBoth) // reader + writer pumps
+	waitFor(t, "both pumps to start", func() bool { return store.running.Load() == 2 })
+
+	cs.retire()
+	waitFor(t, "both pumps to stop after retire", func() bool { return store.running.Load() == 0 })
+
+	if ctx.Err() != nil {
+		t.Fatal("retire cancelled the run's context, not just the channel's pumps")
+	}
+}
+
 // discardTx persists nothing it is handed — like a real store that has serialized
 // the event to disk and no longer holds the Go object. It leaves only what
 // threadState itself keeps in memory, so a memory test sees that alone.

@@ -127,13 +127,31 @@ func (cs *chanState) activate(ctx context.Context, store Store, id string, mode 
 	cs.started = true
 	cs.store = store
 	cs.id = id
+	// A per-channel context under the run's, so retire can stop one channel's pumps
+	// without ending the run's others.
+	pctx, cancel := context.WithCancel(ctx)
+	cs.stop = cancel
 	cs.mu.Unlock()
 
 	if mode != modeWrite {
-		go cs.pumpValues(ctx, store, id)
+		go cs.pumpValues(pctx, store, id)
 	}
 	if mode != modeRead {
-		go cs.pumpConsumes(ctx, store, id)
+		go cs.pumpConsumes(pctx, store, id)
+	}
+}
+
+// retire stops the channel's pumps. Called when the call that created the channel
+// has returned: its result is recorded and a replay re-inserts it rather than
+// re-entering the call, so nothing reads the channel again — the same point at
+// which the store reclaims its streams (see [threadState.retireCallChannels]).
+func (cs *chanState) retire() {
+	cs.mu.Lock()
+	stop := cs.stop
+	cs.stop = nil
+	cs.mu.Unlock()
+	if stop != nil {
+		stop()
 	}
 }
 

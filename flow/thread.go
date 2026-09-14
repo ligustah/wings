@@ -92,6 +92,14 @@ func (r *runState) channel(name string) *chanState {
 	return r.channels[name]
 }
 
+// dropChannel forgets a channel once it is retired, so a run creating channels in
+// a loop does not hold a chanState per channel for its whole life.
+func (r *runState) dropChannel(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.channels, name)
+}
+
 // threadState is one attempt of one thread: its history and a cursor through it.
 // serial is the position replay has reached.
 type threadState struct {

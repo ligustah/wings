@@ -547,26 +547,31 @@ func (t *threadState) channelCount() uint64 {
 	return t.channels
 }
 
-// retireCallChannels asks the host to reclaim the shared channels this thread
-// created during a call that has just returned — its channels numbered [start,
-// now). The call's result is recorded and a replay re-inserts it rather than
-// re-entering the call, so those channels are dead. A no-op unless the host is a
-// [ChannelRetirer]; a channel created by a sub-thread it forked is that thread's,
-// numbered under it, and is not among these.
+// retireCallChannels reclaims the shared channels this thread created during a
+// call that has just returned — its channels numbered [start, now). The call's
+// result is recorded and a replay re-inserts it rather than re-entering the call,
+// so those channels are dead: their pumps are stopped and the chanStates dropped
+// here, and the store reclaims their streams if it is a [ChannelRetirer]. A
+// channel created by a sub-thread it forked is that thread's, numbered under it,
+// and is not among these. When the call ran on a worker the chanStates live in the
+// worker's run, so the local teardown is a no-op and only the streams are reclaimed.
 func (t *threadState) retireCallChannels(ctx context.Context, start uint64) {
-	retirer, ok := t.run.store.(ChannelRetirer)
-	if !ok {
-		return
-	}
 	end := t.channelCount()
 	if end <= start {
 		return
 	}
 	ids := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
-		ids = append(ids, t.run.channelID(fmt.Sprintf("%s.ch%d", t.id, i)))
+		name := fmt.Sprintf("%s.ch%d", t.id, i)
+		if cs := t.run.channel(name); cs != nil {
+			cs.retire()
+			t.run.dropChannel(name)
+		}
+		ids = append(ids, t.run.channelID(name))
 	}
-	retirer.RetireChannels(ctx, t.run.name, ids)
+	if retirer, ok := t.run.store.(ChannelRetirer); ok {
+		retirer.RetireChannels(ctx, t.run.name, ids)
+	}
 }
 
 // callError is the failure of a call the run made or a thread it forked — its

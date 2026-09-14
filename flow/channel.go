@@ -573,10 +573,13 @@ type chanState struct {
 	// store and id are how they and the channel's writes reach the streams. Every
 	// channel is stream-backed: the single reader drains the value stream the way it
 	// drains a local channel — the pump mirrors it into items — so no per-receive
-	// state is kept here.
+	// state is kept here. stop ends this channel's pumps on retire, ahead of the
+	// run-wide teardown, so a run creating channels in a loop does not hold a pump
+	// per channel for its whole life (see [chanState.retire]).
 	started bool
 	store   Store
 	id      string
+	stop    context.CancelFunc
 	// announced is set once the reader has written its consume stream's link marker,
 	// so the announce is made once (see [chanState.announceReader]).
 	announced bool
