@@ -8,7 +8,39 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
+	"github.com/ligustah/wings/flow"
 )
+
+var p2pSquare = flow.Define(func(ctx flow.Context, n int) (int, error) { return n * n, nil })
+
+// TestP2PInProcessRunsWork starts a p2p cluster on the in-process target — a
+// coordinator bootstrap node and two worker observer nodes — and dispatches work
+// to it, so the whole wiring runs end to end over a replicated cluster.
+func TestP2PInProcessRunsWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, err := Start(ctx, Config{
+		Target:  InProcess(),
+		Workers: 2,
+		Dir:     t.TempDir(),
+		P2P:     &P2P{ReplicationFactor: 2},
+		Logger:  quietP2PLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start p2p cluster: %v", err)
+	}
+	defer c.Stop(context.Background())
+
+	bctx := c.Bind(ctx)
+	got, err := p2pSquare(bctx, 7)
+	if err != nil {
+		t.Fatalf("call work: %v", err)
+	}
+	if got != 49 {
+		t.Fatalf("p2pSquare(7) = %d, want 49", got)
+	}
+}
 
 func quietP2PLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

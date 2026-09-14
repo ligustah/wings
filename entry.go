@@ -72,6 +72,8 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		reconnectTimeout = flag.Duration("reconnect-timeout", 0, "how long a worker may be unreachable before its work is redispatched; 0 uses the default (2m), negative gives up at once")
 		keepChannelData  = flag.Bool("keep-channel-data", false, "keep a settled activity's shared-channel streams instead of dropping them, for replaying a returned activity step by step while debugging")
 		compression      = flag.String("compression", "", "storage codec for the durable streams this cluster creates: none | snappy | s2 | zstd; empty uses the default (zstd)")
+		p2p              = flag.Bool("p2p", false, "peer-to-peer replication: the cluster's nodes form a durable-streams cluster and hold replicas of one another's streams, so a peer keeps the data when a node is lost")
+		p2pRF            = flag.Int("p2p-replication-factor", 0, "with -p2p, how many nodes hold a copy of each stream; 0 uses the default (3)")
 		verbose          = flag.Bool("v", false, "log at debug level")
 		workflow         = flag.String("workflow", "", "which defined workflow to run; unneeded when the program defines only one")
 		input            = flag.String("input", "", "the workflow's input as JSON, or @file to read it from a file; leave off to resume a run already in -dir")
@@ -148,6 +150,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		ReconnectTimeout:  *reconnectTimeout,
 		Compression:       comp,
 		Logger:            log,
+		P2P:               p2pConfig(*p2p, *p2pRF),
 		Scaling: Scaling{
 			Min:           *minWorkers,
 			Max:           *maxWorkers,
@@ -203,6 +206,14 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		log.Error("wings: stop", "err", stopErr)
 		os.Exit(1)
 	}
+}
+
+// p2pConfig turns the -p2p flags into a [Config.P2P], or nil when off.
+func p2pConfig(on bool, rf int) *P2P {
+	if !on {
+		return nil
+	}
+	return &P2P{ReplicationFactor: rf}
 }
 
 // listenAddr normalizes a UI/inspect listen address so it is easy to expose: a

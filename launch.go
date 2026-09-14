@@ -54,6 +54,64 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 	return out, nil
 }
 
+// launchP2P runs each worker as a goroutine on its own node of the replicated
+// cluster — an observer that joins the coordinator and holds replicas, so the
+// cluster's stream data lives on more than the coordinator. The coordinator
+// reaches every worker's streams through its own routing client, as in-process.
+func (c *Cluster) launchP2P(ctx context.Context, n int) ([]*workerConn, error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []*workerConn
+	for range n {
+		id := c.workerID("p2p")
+		wn, err := startP2PNode(ctx, p2pNodeConfig{
+			id:                id,
+			dir:               filepath.Join(c.dir, id),
+			observer:          true,
+			join:              c.p2p.peerAddr,
+			replicationFactor: c.cfg.P2P.ReplicationFactor,
+			log:               c.log,
+		})
+		if err != nil {
+			return nil, closePartial(ctx, out, err)
+		}
+		// The observer must have joined and learned the controller before it can
+		// place its own streams.
+		if err := wn.awaitReady(ctx); err != nil {
+			wn.close()
+			return nil, closePartial(ctx, out, err)
+		}
+
+		// The worker runs on its own node's client, so its reads and writes
+		// participate in the cluster; the coordinator reaches the same streams
+		// through the shared routing client.
+		node, err := newWorkerNode(ctx, wn.client, id, c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval(), c.log)
+		if err != nil {
+			wn.close()
+			return nil, closePartial(ctx, out, err)
+		}
+		w, err := c.connect(id, client, false)
+		if err != nil {
+			wn.close()
+			return nil, closePartial(ctx, out, err)
+		}
+		w.node = node
+		w.p2p = wn
+
+		w.wg.Go(func() {
+			if err := node.run(w.ctx); err != nil && w.ctx.Err() == nil && !node.leaving.Load() {
+				c.log.Error("wings: p2p worker stopped", "worker", id, "err", err)
+			}
+		})
+
+		out = append(out, w)
+	}
+	return out, nil
+}
+
 // launchLocalProcess runs each worker as a child copy of this binary — no
 // cross-compilation, which is what makes this the cheap way to test the process
 // boundary.

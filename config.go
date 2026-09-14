@@ -166,8 +166,23 @@ type Config struct {
 	// Build controls cross-compilation of the worker binary. Used only by [Remote].
 	Build BuildConfig
 
+	// P2P, when non-nil, turns on peer-to-peer replication: the cluster's nodes
+	// form a durable-streams cluster and hold replicas of one another's streams,
+	// so a peer already has the data when a node is lost. It layers on top of
+	// Target, which still says where nodes run. Nil is off, leaving the
+	// coordinator relay in place.
+	P2P *P2P
+
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+}
+
+// P2P configures the peer-to-peer replication mode; set [Config.P2P] to enable
+// it. The zero value is valid and uses the defaults.
+type P2P struct {
+	// ReplicationFactor is how many nodes hold a copy of each stream. Zero uses
+	// the default (3); a cluster smaller than this replicates to every node.
+	ReplicationFactor int
 }
 
 // BuildConfig describes how to cross-compile the worker binary for a remote

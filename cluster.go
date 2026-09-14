@@ -51,8 +51,12 @@ type Cluster struct {
 	// coordinator that never brought its engine up pulled nothing home.
 	sharedUp atomic.Bool
 	// engine is the instance itself, for what only the engine can do: pull
-	// a worker's transactions. See pull.go.
+	// a worker's transactions. See pull.go. Nil in p2p mode, where the coordinator
+	// runs a clustered node instead and store-and-forward is unused.
 	engine *embed.InProcess
+	// p2p is the coordinator's own node of the replicated cluster, brought up in
+	// place of the embedded instance when Config.P2P is set. Its client is shared.
+	p2p *p2pNode
 	// engineSrv serves the engine on loopback so worker child processes can dial
 	// it, for the shared-broker local target. Nil otherwise.
 	engineOnce sync.Once
@@ -147,6 +151,7 @@ type workerConn struct {
 	ownsClient bool
 
 	node    *workerNode // in-process only; shares the cluster engine, owns nothing
+	p2p     *p2pNode    // in-process p2p only: this worker's own node of the cluster
 	proc    *os.Process // local-process only
 	dir     string      // local-process only: the child's broker directory
 	machine Machine     // remote only
@@ -526,6 +531,12 @@ func (c *Cluster) placeHeld() {
 
 // launch brings up n workers for the configured target.
 func (c *Cluster) launch(ctx context.Context, n int) ([]*workerConn, error) {
+	if c.cfg.P2P != nil {
+		if c.cfg.Target.kind != targetInProcess {
+			return nil, fmt.Errorf("wings: p2p mode currently runs on the in-process target only")
+		}
+		return c.launchP2P(ctx, n)
+	}
 	switch c.cfg.Target.kind {
 	case targetInProcess:
 		return c.launchInProcess(ctx, n)
@@ -600,6 +611,29 @@ func boundsOf(name string) flow.Bounds {
 func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 	c.sharedOnce.Do(func() {
 		dir := filepath.Join(c.dir, "engine")
+		if c.cfg.P2P != nil {
+			node, err := startP2PNode(c.ctx, p2pNodeConfig{
+				id:                coordinatorID,
+				dir:               dir,
+				bootstrap:         true,
+				replicationFactor: c.cfg.P2P.ReplicationFactor,
+				log:               c.log,
+			})
+			if err != nil {
+				c.sharedErr = fmt.Errorf("wings: start p2p coordinator node in %s: %w", dir, err)
+				return
+			}
+			if err := node.awaitReady(c.ctx); err != nil {
+				node.close()
+				c.sharedErr = fmt.Errorf("wings: p2p coordinator node not ready: %w", err)
+				return
+			}
+			c.p2p = node
+			c.shared = node.client
+			c.sharedStop = func() error { node.close(); return nil }
+			c.sharedUp.Store(true)
+			return
+		}
 		b, err := embed.StartInProcess(embed.InProcessConfig{Dir: dir, Logger: streamLogger(c.log)})
 		if err != nil {
 			c.sharedErr = fmt.Errorf("wings: start embedded streams in %s: %w", dir, err)
@@ -612,6 +646,9 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 	})
 	return c.shared, c.sharedErr
 }
+
+// coordinatorID is the cluster id of the coordinator's own node in p2p mode.
+const coordinatorID = "coordinator"
 
 // serveEngine serves the coordinator's engine on loopback so worker child
 // processes can dial it, for the shared-broker local target. Served once; the
@@ -1631,6 +1668,9 @@ func (w *workerConn) close(ctx context.Context) error {
 	var errs []error
 	if w.ownsClient && w.client != nil {
 		errs = append(errs, w.client.Close())
+	}
+	if w.p2p != nil {
+		w.p2p.close()
 	}
 	if w.proc != nil {
 		// Kill's error is dropped: the process may already be gone, and on Windows
