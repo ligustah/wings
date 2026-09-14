@@ -396,8 +396,13 @@ func Start(ctx context.Context, cfg Config) (*Cluster, error) {
 	}
 
 	c.startChannelRelay()
-	if err := c.startOutputMirror(); err != nil {
-		return fail(err, nil)
+	// The output mirror only pushes a channel's value stream to a reader's worker;
+	// in p2p the reader follows the replicated stream directly, so there is nothing
+	// to push.
+	if c.cfg.P2P == nil {
+		if err := c.startOutputMirror(); err != nil {
+			return fail(err, nil)
+		}
 	}
 
 	// Before provisioning: recover whatever a previous coordinator left running

@@ -352,8 +352,8 @@ func (c *Cluster) hydrateChannels(ctx context.Context, w *workerConn, job jobEnv
 	if err != nil {
 		return err
 	}
-	if w.client == client {
-		return nil // one broker; the worker already reads the coordinator's canonical
+	if c.cfg.P2P != nil || w.client == client {
+		return nil // the worker follows the replicated stream directly (p2p), or shares the coordinator's broker
 	}
 	ids, err := c.receivedChannels(ctx, client, job)
 	if err != nil || len(ids) == 0 {
