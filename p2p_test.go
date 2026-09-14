@@ -46,6 +46,48 @@ func quietP2PLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TestP2PInProcessResumesAcrossRestart shows a p2p cluster brought up a second
+// time over the same Dir resumes its control plane rather than forming a new one,
+// so it goes on dispatching work.
+func TestP2PInProcessResumesAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	cfg := Config{
+		Target:  InProcess(),
+		Workers: 2,
+		Dir:     t.TempDir(),
+		P2P:     &P2P{ReplicationFactor: 2},
+		Logger:  quietP2PLogger(),
+	}
+
+	c1, err := Start(ctx, cfg)
+	if err != nil {
+		t.Fatalf("start 1: %v", err)
+	}
+	got, err := p2pSquare(c1.Bind(ctx), 6)
+	if err != nil {
+		t.Fatalf("call 1: %v", err)
+	}
+	if got != 36 {
+		t.Fatalf("p2pSquare(6) = %d, want 36", got)
+	}
+	if err := c1.Stop(ctx); err != nil {
+		t.Fatalf("stop 1: %v", err)
+	}
+
+	c2, err := Start(ctx, cfg)
+	if err != nil {
+		t.Fatalf("start 2 (resume): %v", err)
+	}
+	defer c2.Stop(ctx)
+	got, err = p2pSquare(c2.Bind(ctx), 8)
+	if err != nil {
+		t.Fatalf("call 2: %v", err)
+	}
+	if got != 64 {
+		t.Fatalf("p2pSquare(8) = %d, want 64", got)
+	}
+}
+
 // TestP2PSingleNodeRoundTrips brings up one bootstrap node and shows a stream
 // created through the cluster catalog takes writes and reads them back.
 func TestP2PSingleNodeRoundTrips(t *testing.T) {

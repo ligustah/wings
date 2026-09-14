@@ -612,10 +612,20 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 	c.sharedOnce.Do(func() {
 		dir := filepath.Join(c.dir, "engine")
 		if c.cfg.P2P != nil {
+			peerAddr, raftAddr, err := coordinatorAddrs(dir)
+			if err != nil {
+				c.sharedErr = fmt.Errorf("wings: p2p coordinator addresses: %w", err)
+				return
+			}
 			node, err := startP2PNode(c.ctx, p2pNodeConfig{
-				id:                coordinatorID,
-				dir:               dir,
-				bootstrap:         true,
+				id:       coordinatorID,
+				dir:      dir,
+				peerAddr: peerAddr,
+				raftAddr: raftAddr,
+				// Form the cluster only the first time; a restart over the same Dir
+				// resumes the raft state it left, and bootstrapping again would form
+				// a second cluster that believes it is the whole thing.
+				bootstrap:         !clusterStateExists(dir),
 				replicationFactor: c.cfg.P2P.ReplicationFactor,
 				log:               c.log,
 			})

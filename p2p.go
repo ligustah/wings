@@ -2,10 +2,13 @@ package wings
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ligustah/durable_streams/broker/cluster"
@@ -165,12 +168,13 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 	return n, nil
 }
 
-// awaitReady blocks until this node has replayed the consensus log and the
-// cluster has a controller, so streams can be placed and served. It returns
-// ctx's error if ctx ends first.
+// awaitReady blocks until this node has replayed the consensus log, the cluster
+// has a controller, and the node has dropped whatever the cluster says it no
+// longer holds — so on a restart its existing streams are served rather than
+// refused as unreclaimed. It returns ctx's error if ctx ends first.
 func (n *p2pNode) awaitReady(ctx context.Context) error {
 	for {
-		if n.node.CaughtUp() && n.node.LeaderID() != "" {
+		if n.node.CaughtUp() && n.node.LeaderID() != "" && n.svc.HasReclaimed() {
 			return nil
 		}
 		select {
@@ -203,6 +207,55 @@ func (n *p2pNode) close() {
 	if n.engine != nil {
 		_ = n.engine.Close()
 	}
+}
+
+type nodeAddrs struct {
+	Peer string `json:"peer"`
+	Raft string `json:"raft"`
+}
+
+// coordinatorAddrs returns the coordinator node's stable peer and raft
+// addresses, allocating and persisting them under dir on first use so a restart
+// binds the same ones: raft recognises a resuming node by the address in its
+// persisted configuration, so a node that came back on a fresh port would be a
+// stranger to the cluster it was part of.
+func coordinatorAddrs(dir string) (peerAddr, raftAddr string, err error) {
+	path := filepath.Join(dir, "p2p-coordinator.json")
+	if b, err := os.ReadFile(path); err == nil {
+		var a nodeAddrs
+		if err := json.Unmarshal(b, &a); err == nil && a.Peer != "" && a.Raft != "" {
+			return a.Peer, a.Raft, nil
+		}
+	}
+	if peerAddr, err = freeLoopbackAddr(); err != nil {
+		return "", "", err
+	}
+	if raftAddr, err = freeLoopbackAddr(); err != nil {
+		return "", "", err
+	}
+	if err = os.MkdirAll(dir, 0o755); err != nil {
+		return "", "", err
+	}
+	b, err := json.Marshal(nodeAddrs{Peer: peerAddr, Raft: raftAddr})
+	if err != nil {
+		return "", "", err
+	}
+	if err = os.WriteFile(path, b, 0o644); err != nil {
+		return "", "", err
+	}
+	return peerAddr, raftAddr, nil
+}
+
+// clusterControlDir is where a node keeps its control-plane raft state, relative
+// to its data directory — matching embed.ControlPlaneConfig's default siting.
+const clusterControlDir = ".cluster"
+
+// clusterStateExists reports whether a node's data directory already holds
+// control-plane state, so a coordinator resumes its cluster on restart rather
+// than bootstrapping a second one.
+func clusterStateExists(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, clusterControlDir))
+	return err == nil && info.IsDir()
 }
 
 // freeLoopbackAddr picks a loopback address the OS reports free. It races an
