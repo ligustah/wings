@@ -27,34 +27,97 @@ func pullSource(workerID string) string { return "wings.worker." + workerID }
 
 // pull keeps the coordinator's copy of what one worker's attempts commit, until
 // the worker is gone. In-process workers share the engine and have nothing to copy.
+//
+// dest.Pull blocks until it errs or the context ends; a broker that wedges on a
+// transaction it can neither finish nor abandon leaves it blocked without ever
+// returning to be retried. So it runs on its own goroutine and this one watches
+// the coordinator's progress against the worker's committed offsets: a pull that
+// stays behind while applying nothing is reconnected, and if that does not clear
+// it, the worker is treated as lost so its jobs move rather than the run hanging.
 func (c *Cluster) pull(w *workerConn) {
 	if w.remote == nil || c.engine == nil {
 		return
 	}
 	dest := c.engine.Coordinator()
-	for w.ctx.Err() == nil {
-		err := dest.Pull(w.ctx, streams.PullOptions{
-			Source:   pullSource(w.id),
-			Producer: "wings.pull." + w.id,
-			Open: func(ctx context.Context, from int64) (streams.TransactionSource, error) {
-				// Resolved each open: the connection is the cluster's to replace.
-				broker := w.remote.Conn()
-				if broker == nil {
-					var err error
-					if broker, err = w.remote.Cluster().Any(); err != nil {
-						return nil, err
+	t := time.NewTicker(pullWatchInterval)
+	defer t.Stop()
+
+	var watch pullWatch
+	for w.ctx.Err() == nil && !w.dead.Load() {
+		pullCtx, cancel := context.WithCancel(w.ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- dest.Pull(pullCtx, streams.PullOptions{
+				Source:   pullSource(w.id),
+				Producer: "wings.pull." + w.id,
+				Open: func(ctx context.Context, from int64) (streams.TransactionSource, error) {
+					// Resolved each open: the connection is the cluster's to replace.
+					broker := w.remote.Conn()
+					if broker == nil {
+						var err error
+						if broker, err = w.remote.Cluster().Any(); err != nil {
+							return nil, err
+						}
 					}
+					return broker.SubscribeTransactions(ctx, "wings.coordinator", from)
+				},
+				// One incarnation per writer: a moved job is a new attempt under a
+				// new id, so no writer is superseded under the same name.
+				Epoch:   func(string) (uint16, error) { return 1, nil },
+				Only:    c.pullWanted,
+				Stream:  c.pulledStream,
+				Options: c.pulledOptions,
+			})
+		}()
+
+		var (
+			err         error
+			interrupted bool
+		)
+	watching:
+		for {
+			select {
+			case err = <-done:
+				cancel()
+				break watching
+			case <-w.ctx.Done():
+				cancel()
+				<-done
+				return
+			case now := <-t.C:
+				ours, behind, perr := c.pullStatus(w.ctx, w, "")
+				if perr != nil {
+					continue // a reading we could not take is not a stall
 				}
-				return broker.SubscribeTransactions(ctx, "wings.coordinator", from)
-			},
-			// One incarnation per writer: a moved job is a new attempt under a
-			// new id, so no writer is superseded under the same name.
-			Epoch:   func(string) (uint16, error) { return 1, nil },
-			Only:    c.pullWanted,
-			Stream:  c.pulledStream,
-			Options: c.pulledOptions,
-		})
-		if w.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				reconnect, lost := watch.observe(behind, ours, now)
+				if lost {
+					c.log.Error("wings: coordinator's pull of a worker is wedged; treating the worker as lost",
+						"worker", w.id, "stalled_for", pullFaultGrace)
+					cancel()
+					<-done
+					c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "pull wedged"})
+					w.dead.Store(true)
+					c.redispatchFrom(w)
+					return
+				}
+				if reconnect {
+					c.log.Warn("wings: coordinator's pull of a worker has made no progress; reconnecting",
+						"worker", w.id, "stalled_for", pullInterruptGrace)
+					interrupted = true
+					cancel()
+					err = <-done
+					break watching
+				}
+			}
+		}
+
+		if w.ctx.Err() != nil {
+			return
+		}
+		if interrupted {
+			continue // reopen at once; the stall clock keeps running across it
+		}
+		if errors.Is(err, context.Canceled) {
 			return
 		}
 		if errors.Is(err, streams.ErrIncompleteTransaction) {
@@ -71,6 +134,41 @@ func (c *Cluster) pull(w *workerConn) {
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// pullWatch tracks whether the coordinator's pull of a worker is making
+// progress. It escalates only while the coordinator is behind the worker's own
+// committed offsets and the total it has applied is not climbing: a pull that is
+// merely slow still advances, resetting the clock, so paging never trips it.
+type pullWatch struct {
+	applied     int64     // the total committed offset last seen on the coordinator
+	stalledFrom time.Time // when the current behind-and-frozen stretch began; zero if none
+	reconnected bool      // a reconnect has already been asked for this stretch
+}
+
+// observe folds one progress reading into the watch and says what to do:
+// reconnect the pull once it has been frozen while behind for pullInterruptGrace,
+// then declare the worker lost if it stays frozen through pullFaultGrace.
+func (pw *pullWatch) observe(behind bool, applied int64, now time.Time) (reconnect, lost bool) {
+	if !behind || applied > pw.applied {
+		pw.applied = applied
+		pw.stalledFrom = time.Time{}
+		pw.reconnected = false
+		return false, false
+	}
+	if pw.stalledFrom.IsZero() {
+		pw.stalledFrom = now
+		return false, false
+	}
+	stalled := now.Sub(pw.stalledFrom)
+	switch {
+	case stalled >= pullFaultGrace:
+		return false, true
+	case stalled >= pullInterruptGrace && !pw.reconnected:
+		pw.reconnected = true
+		return true, false
+	}
+	return false, false
 }
 
 // pullWanted declines only an attempt the job has already moved past — those
@@ -156,13 +254,26 @@ func (c *Cluster) pulledOptions(string) []streams.StreamOption {
 // pulledLevel reports whether the coordinator's copies of a job's outputs (or
 // every job's, when job is empty) are as complete as the worker's own.
 func (c *Cluster) pulledLevel(ctx context.Context, w *workerConn, job string) (bool, error) {
-	client, err := c.sharedClient()
+	_, behind, err := c.pullStatus(ctx, w, job)
 	if err != nil {
 		return false, err
 	}
+	return !behind, nil
+}
+
+// pullStatus reports the coordinator's copy of a job's outputs (every job's,
+// when job is empty) against the worker's own: behind is true when any copy is
+// short of the worker, and applied is the total committed offset the coordinator
+// holds — a figure that only climbs as the pull applies more, so a frozen one
+// while behind is a wedged pull rather than a slow one.
+func (c *Cluster) pullStatus(ctx context.Context, w *workerConn, job string) (applied int64, behind bool, err error) {
+	client, err := c.sharedClient()
+	if err != nil {
+		return 0, false, err
+	}
 	names, err := w.client.ListStreams(ctx)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
 	for _, name := range names {
 		o, ok := parseOutput(name)
@@ -171,20 +282,23 @@ func (c *Cluster) pulledLevel(ctx context.Context, w *workerConn, job string) (b
 		}
 		theirs, err := committedThrough(ctx, w.client, name)
 		if err != nil {
-			return false, err
+			return 0, false, err
 		}
 		if theirs < 0 {
 			continue
 		}
 		ours, err := committedThrough(ctx, client, name)
 		if err != nil {
-			return false, err
+			return 0, false, err
+		}
+		if ours > 0 {
+			applied += ours
 		}
 		if ours < theirs {
-			return false, nil
+			behind = true
 		}
 	}
-	return true, nil
+	return applied, behind, nil
 }
 
 // committedThrough is the offset of a stream's last committed record, or -1 when

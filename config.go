@@ -75,6 +75,21 @@ const (
 // wrong. A var so tests can shorten it.
 var pollInterval = 30 * time.Second
 
+// The coordinator's pull of a worker can wedge inside the broker on a
+// transaction it can neither finish nor abandon, without returning to be
+// retried. These bound that: while the coordinator is behind the worker's own
+// committed offsets and applying nothing new, pullInterruptGrace is how long
+// before the pull is reconnected (which clears a transient stall), and
+// pullFaultGrace how long before the worker is treated as lost and its jobs
+// redispatched, so a run recovers or fails rather than hanging forever. A
+// pull that is merely slow keeps advancing and never trips either. Vars so
+// tests can shorten them.
+var (
+	pullWatchInterval  = 5 * time.Second
+	pullInterruptGrace = 45 * time.Second
+	pullFaultGrace     = 2 * time.Minute
+)
+
 // Config configures a [Cluster].
 type Config struct {
 	// Target says where workers run. The zero value is [InProcess].
