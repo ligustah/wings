@@ -1,0 +1,150 @@
+package wings
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"testing"
+	"time"
+
+	"github.com/ligustah/durable_streams/dsclient"
+)
+
+func quietP2PLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestP2PSingleNodeRoundTrips brings up one bootstrap node and shows a stream
+// created through the cluster catalog takes writes and reads them back.
+func TestP2PSingleNodeRoundTrips(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n, err := startP2PNode(ctx, p2pNodeConfig{
+		id:                "coordinator",
+		dir:               t.TempDir(),
+		bootstrap:         true,
+		replicationFactor: 1,
+		reconcile:         150 * time.Millisecond,
+		log:               quietP2PLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start bootstrap node: %v", err)
+	}
+	defer n.close()
+
+	if err := n.awaitReady(ctx); err != nil {
+		t.Fatalf("await ready: %v", err)
+	}
+
+	const stream = "p2p.roundtrip"
+	if err := n.client.CreateStream(ctx, stream, &dsclient.StreamConfig{Partitions: 1}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	s, err := n.client.OpenStream[string](stream)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	want := []string{"a", "b", "c"}
+	if _, err := s.Append(ctx, want); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	recs, err := s.Read(ctx, 0, len(want))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(recs) != len(want) {
+		t.Fatalf("read %d records, want %d", len(recs), len(want))
+	}
+	for i, r := range recs {
+		if r.Record != want[i] {
+			t.Fatalf("record %d = %q, want %q", i, r.Record, want[i])
+		}
+	}
+}
+
+// TestP2PReplicatesAcrossNodes forms a two-node cluster — a bootstrap voter and
+// a data observer — and shows a stream created at replication factor 2 is placed
+// on both brokers, so a peer already holds the data.
+func TestP2PReplicatesAcrossNodes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const reconcile = 150 * time.Millisecond
+	coord, err := startP2PNode(ctx, p2pNodeConfig{
+		id:                "coordinator",
+		dir:               t.TempDir(),
+		bootstrap:         true,
+		replicationFactor: 2,
+		reconcile:         reconcile,
+		log:               quietP2PLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start coordinator: %v", err)
+	}
+	defer coord.close()
+
+	data, err := startP2PNode(ctx, p2pNodeConfig{
+		id:                "data-1",
+		dir:               t.TempDir(),
+		observer:          true,
+		join:              coord.peerAddr,
+		replicationFactor: 2,
+		reconcile:         reconcile,
+		log:               quietP2PLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start data node: %v", err)
+	}
+	defer data.close()
+
+	if err := coord.awaitReady(ctx); err != nil {
+		t.Fatalf("await ready: %v", err)
+	}
+	// Placement can only put two replicas once both brokers are registered.
+	waitFor(t, "both brokers registered", func() bool {
+		return len(coord.node.Registry().Unfenced()) == 2
+	})
+
+	const stream = "p2p.replicated"
+	if err := coord.client.CreateStream(ctx, stream, &dsclient.StreamConfig{Partitions: 1}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	replicas, _, placed := coord.manager.AssignmentOf(stream, 0)
+	if !placed {
+		t.Fatalf("stream %q not placed after CreateStream returned", stream)
+	}
+	if got := distinct(replicas); len(got) != 2 {
+		t.Fatalf("stream placed on %v, want 2 distinct replicas", replicas)
+	}
+
+	s, err := coord.client.OpenStream[string](stream)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	want := []string{"x", "y"}
+	if _, err := s.Append(ctx, want); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	recs, err := s.Read(ctx, 0, len(want))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(recs) != len(want) {
+		t.Fatalf("read %d records, want %d", len(recs), len(want))
+	}
+}
+
+func distinct(ss []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range ss {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
