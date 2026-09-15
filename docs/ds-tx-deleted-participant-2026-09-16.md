@@ -1,5 +1,19 @@
 # Undecided tx stranded by a deleted participant stream (2026-09-16)
 
+## Resolution
+
+A durable_streams bug, fixed in **durable_streams v0.173.0 + broker v0.278.0**
+(wings upgraded; client modules unchanged). A participant with positive evidence
+of deletion (a tombstone in the coordinator's catalog or the cluster registry) is
+now skipped with a single WARN and the transaction settles without it; absence
+alone still retries. Delete order no longer matters, so wings needs no change on
+its side — an earlier fence-before-drop mitigation was reverted as redundant. Per
+the DS owner: an already-wedged transaction settles on the coordinator's next
+sweep (~10s) once its broker is restarted onto the fixed version. Q2 aside: the
+other jobs' stalled commits were the fenced broker still leading their partitions,
+which `-replace-fenced-after` (v0.277.0) evicts after the grace, not this tx.
+
+
 Surfaced by a wings 4-node GCP-spot p2p chaos test (coordinator + 4 worker/broker
 nodes over a tailnet). Versions: durable_streams v0.172.0, broker v0.277.0,
 dsclient v0.58.0, dswire v0.41.0.

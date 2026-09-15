@@ -14,8 +14,8 @@ require (
 	github.com/ligustah/commitlog v0.106.0
 	github.com/ligustah/commitlog/blockv3 v0.1.0
 	github.com/ligustah/commitlog/compress v0.1.0
-	github.com/ligustah/durable_streams v0.172.0
-	github.com/ligustah/durable_streams/broker v0.277.0
+	github.com/ligustah/durable_streams v0.173.0
+	github.com/ligustah/durable_streams/broker v0.278.0
 	github.com/ligustah/durable_streams/broker/client v0.71.0
 	github.com/ligustah/durable_streams/broker/protos v0.52.0
 	github.com/ligustah/durable_streams/dsclient v0.58.0

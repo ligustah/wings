@@ -31,21 +31,27 @@ var killWork = flow.Define(func(ctx flow.Context, steps int) (int, error) {
 //
 // It also stands as the local reproduction attempt for finding #2 (a prepared
 // attempt's tx stranded when its participant history stream is dropped on settle,
-// see docs/ds-tx-deleted-participant-2026-09-16.md). It PASSES locally: the wedge
-// did not reproduce over fast loopback, so that failure is timing/overlay-latency
-// dependent, not a plain local ordering bug. Kept as a happy-path guard that would
-// catch the wedge if it ever surfaces locally.
+// see docs/ds-tx-deleted-participant-2026-09-16.md). Even with a wide commit
+// interval holding the attempt's transaction open across the kill, the wedge does
+// not reproduce over fast loopback: the coordinating broker is alive and resolves
+// the abandoned transaction long before settle drops its participant. The bug was
+// in durable_streams and is fixed in v0.173.0 / broker v0.278.0 (a deleted
+// participant now settles the transaction rather than retrying forever).
 func TestP2PWorkSurvivesAWorkerKilledMidCheckpoint(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns child processes")
 	}
 
 	c := start(t, Config{
-		Target:      LocalProcess(),
-		P2P:         &P2P{ReplicationFactor: 2},
-		Workers:     3,
-		Concurrency: 2,
-		Logger:      quietP2PLogger(),
+		Target: LocalProcess(),
+		P2P:    &P2P{ReplicationFactor: 2},
+		// A wide commit interval holds each attempt's transaction open across the
+		// kill, so the killed worker leaves it prepared — the widest window this
+		// harness can open toward finding #2 without controlling broker fencing.
+		CommitInterval: 5 * time.Second,
+		Workers:        3,
+		Concurrency:    2,
+		Logger:         quietP2PLogger(),
 	})
 
 	const jobs = 9

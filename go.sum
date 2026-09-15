@@ -251,10 +251,10 @@ github.com/ligustah/commitlog/blockv3 v0.1.0 h1:sHab4FXnW5mHRnbtcLHCWb08o2J9z2jk
 github.com/ligustah/commitlog/blockv3 v0.1.0/go.mod h1:bRd48aG1+KMUmTiM5JpM1hkKhUF1mj9K7MqXDnz+5RM=
 github.com/ligustah/commitlog/compress v0.1.0 h1:FsoTkPSLmBVcxw8YGYmlYIslU6I3lIKrMGTtF/T6q3M=
 github.com/ligustah/commitlog/compress v0.1.0/go.mod h1:xn0HE0vbEuSfivJJZfs5+e9HpdH+oKD5S5YlyTn5JF0=
-github.com/ligustah/durable_streams v0.172.0 h1:SYveOPp5ANB7X10ybeGxeO4sW/0jdIxpaMoa8dXprxU=
-github.com/ligustah/durable_streams v0.172.0/go.mod h1:RUzIlcuU096S7SC/OZVAFNKmYsgtNAwhkwvlTCfz4cA=
-github.com/ligustah/durable_streams/broker v0.277.0 h1:AWe1DphHKlgm9L+Xkft2/YiJZcP4WX8FY5alwwLzJgM=
-github.com/ligustah/durable_streams/broker v0.277.0/go.mod h1:Pl8mFSZiZ5xeDujXOhkyTEMpjUJevV8Ji80HNOpeAuo=
+github.com/ligustah/durable_streams v0.173.0 h1:olXMa8ykNCewXINquLvC2toWVtWcTPtFvfRRTDtwLMM=
+github.com/ligustah/durable_streams v0.173.0/go.mod h1:RUzIlcuU096S7SC/OZVAFNKmYsgtNAwhkwvlTCfz4cA=
+github.com/ligustah/durable_streams/broker v0.278.0 h1:+T6eOUTuBgtl7cbbJbE4EahaGj4ig9YT8iwK8Mx5XuU=
+github.com/ligustah/durable_streams/broker v0.278.0/go.mod h1:hJPnfIw2e78oLw7gfGnGIqy0byAWTvgC56PcpGuSokQ=
 github.com/ligustah/durable_streams/broker/client v0.71.0 h1:Oj8eT/57/cO+sj4ctzDIYOVlWp6bTGYp/WF0PTMPu+0=
 github.com/ligustah/durable_streams/broker/client v0.71.0/go.mod h1:pfZqd4CDsDNcJuNO57FXhsGS9K/a4+PomRmOETUDqis=
 github.com/ligustah/durable_streams/broker/protos v0.52.0 h1:4ClkxIJUb4i7QUNsruhm7i6uSETqXEc6e+hrdcqpisE=
