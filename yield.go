@@ -75,6 +75,42 @@ func (e *evictError) Error() string {
 	return fmt.Sprintf("wings: evicted while waiting on %s from channel %s", e.wait.On, e.wait.Channel)
 }
 
+// preemptAfter is how long a running thread may hold its slot before the worker
+// preempts it to reload in place, giving another thread a turn. Zero disables
+// preemption. A cooperative point: the thread yields at its next checkpoint (a
+// Heartbeat or other context-aware step), not mid-step. A variable for tests; the
+// production trigger — slot contention — arrives with the rest of preemption.
+var preemptAfter time.Duration
+
+// preemptError is the cause a preempted attempt is cancelled with. Like an
+// eviction the worker reloads it in place, but there is nothing to wait for: it
+// just gets back in line for a slot (worker.go).
+type preemptError struct{}
+
+func (e *preemptError) Error() string { return "wings: preempted to give another thread a turn" }
+
+// preempt ends a running attempt so the worker can reload it after another thread
+// has had the slot. Cooperative: the attempt notices the cancellation at its next
+// context-aware step, commits what it has, and is reloaded from there.
+func (n *workerNode) preempt(job string, attempt int) {
+	key := attemptKey(job, attempt)
+	n.runMu.Lock()
+	cancel, ok := n.running[key]
+	n.runMu.Unlock()
+	if !ok {
+		return
+	}
+	n.log.Info("wings: preempting a running thread to give another a turn", "job", job, "attempt", attempt)
+	cancel(&preemptError{})
+}
+
+// preemptedOf reports whether an attempt was preempted; the worker reloads such a
+// job in place once it can take a slot again.
+func preemptedOf(ctx context.Context, err error) bool {
+	_, ok := errors.AsType[*preemptError](context.Cause(ctx))
+	return ok && errors.Is(err, context.Canceled)
+}
+
 // evict ends a job's attempt so the worker can reload it when its channel wakes;
 // the attempt commits what it has, as an unload does, but the worker keeps the
 // job and drives the reload itself.

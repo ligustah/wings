@@ -157,6 +157,7 @@ type progressOf struct {
 	job     string
 	attempt int
 	txns    *attemptTxns
+	slot    *jobSlot
 }
 
 // Heartbeat commits the calling thread's own transaction before reporting
@@ -167,7 +168,20 @@ func (p progressOf) Heartbeat(ctx context.Context, checkpoint []byte) error {
 	if err := p.txns.For(threadOrMain(ctx)).commit(ctx); err != nil {
 		return err
 	}
-	return p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint})
+	if err := p.n.sendBeat(ctx, beatEnvelope{Job: p.job, Attempt: p.attempt, Checkpoint: checkpoint}); err != nil {
+		return err
+	}
+	// Kept so a reload in place resumes from here rather than restarting (yield.go).
+	if p.slot != nil {
+		p.slot.setCheckpoint(checkpoint)
+	}
+	// A checkpoint is where a running thread cooperatively yields to a preemption:
+	// its progress is now committed, so returning the cancellation unwinds it here
+	// and the worker reloads it from exactly this point (yield.go).
+	if _, ok := errors.AsType[*preemptError](context.Cause(ctx)); ok {
+		return ctx.Err()
+	}
+	return nil
 }
 
 // sendBeat publishes one progress report, outside the attempt's transaction so
@@ -381,30 +395,52 @@ func (n *workerNode) serve(ctx context.Context, queue *dsclient.Stream[jobEnvelo
 }
 
 // runJob runs one job in a slot and reports its result.
+// waitPreempt names a preempted thread's wait in a beat, so the coordinator
+// counts it as blocked — off its worker's load and off the watchdog — until it
+// reloads, the same as a channel-blocked one.
+const waitPreempt = "preempt"
+
+// reloadPlan tells runJob to reload the same attempt in place rather than hand
+// its result to the coordinator. A channel eviction waits for a value first; a
+// preemption only gets back in line for a slot.
+type reloadPlan struct {
+	wait  flow.Wait
+	watch bool
+}
+
 func (n *workerNode) runJob(ctx context.Context, job jobEnvelope) {
 	slot := &jobSlot{n: n, job: job}
 	if err := slot.take(ctx, false); err != nil {
 		return
 	}
 	for {
-		res, evicted := n.runOne(ctx, job, slot)
+		res, plan := n.runOne(ctx, job, slot)
 		slot.give()
 		if n.leaving.Load() {
 			return
 		}
-		// Worker-owned eviction: the footprint is gone but the job stays here. Hold
-		// a node-local watch on its channel and reload it in place when the value
-		// arrives; the coordinator is told (Evicted) but never drives the wake. Only
-		// the reload the worker cannot carry through — its context ended, or the
-		// channel went away — falls back to handing the yield to the coordinator.
-		if evicted != nil {
-			n.beat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Wait: evicted.On, Evicted: true, Channel: evicted.Channel})
-			if err := n.awaitChannelValue(ctx, *evicted); err == nil {
+		// Worker-owned reload: the footprint is gone but the job stays here. An
+		// eviction holds a node-local watch on its channel and reloads when the value
+		// arrives; a preemption just gets back in line for a slot. The coordinator is
+		// told (Evicted) for its picture but never drives the reload. Only an
+		// eviction whose channel went away falls back to handing the yield over.
+		if plan != nil {
+			b := beatEnvelope{Job: job.ID, Attempt: job.Attempt, Evicted: true, Wait: waitPreempt}
+			if plan.watch {
+				b.Wait, b.Channel = plan.wait.On, plan.wait.Channel
+			}
+			n.beat(ctx, b)
+			if !plan.watch || n.awaitChannelValue(ctx, plan.wait) == nil {
 				n.clearOpen(job.ID)
 				if err := slot.take(ctx, true); err != nil {
 					return
 				}
 				slot.evicting.Store(false)
+				// Resume from the latest committed checkpoint, so a preempted compute
+				// thread makes progress across reloads rather than restarting.
+				if cp := slot.lastCheckpoint(); cp != nil {
+					job.Checkpoint = cp
+				}
 				n.beat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Woke: true})
 				continue
 			}
@@ -436,7 +472,7 @@ func (n *workerNode) clearOpen(job string) {
 	}
 }
 
-func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot) (res resultEnvelope, evicted *flow.Wait) {
+func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot) (res resultEnvelope, plan *reloadPlan) {
 	res.ID = job.ID
 	res.Attempt = job.Attempt
 
@@ -463,7 +499,7 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 	// Progress and the last attempt's checkpoint, installed for every job since
 	// Heartbeat is always allowed and the checkpoint is what makes a redispatch cheap.
 	txns := newAttemptTxns(n, job)
-	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, txns}, flow.Resume{
+	ctx = flow.WithProgress(ctx, progressOf{n, job.ID, job.Attempt, txns, slot}, flow.Resume{
 		Attempt: job.Attempt, Checkpoint: job.Checkpoint,
 	})
 	state := &jobState{id: job.ID, attempt: job.Attempt, priors: job.Priors, node: n, txns: txns}
@@ -518,14 +554,19 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		err = cerr
 	}
 	if err != nil {
+		// Reloaded in place by the worker, not handed to the coordinator: a channel
+		// eviction (watch the channel first) or a preemption (just take a slot again).
+		if w, ok := evictedWaitOf(ctx, err); ok {
+			res.Yield = yieldOf(ctx, err)
+			return res, &reloadPlan{wait: w, watch: true}
+		}
+		if preemptedOf(ctx, err) {
+			return res, &reloadPlan{}
+		}
 		// A yield, not an answer: run again later, and when. See yield.go.
 		if y := yieldOf(ctx, err); y != nil {
 			res.Yield = y
-			// An eviction the worker will reload itself, not hand to the coordinator.
-			if w, ok := evictedWaitOf(ctx, err); ok {
-				evicted = &w
-			}
-			return res, evicted
+			return res, nil
 		}
 		res.Error = err.Error()
 		// Name the function and bound rather than a bare "deadline exceeded"; the

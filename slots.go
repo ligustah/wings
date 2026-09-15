@@ -104,6 +104,25 @@ type jobSlot struct {
 	// (yield.go), so the park's resume does not report a wake the worker will drive
 	// itself — the coordinator sees Evicted, then Woke on the reload, not a wake now.
 	evicting atomic.Bool
+	// preemptTimer fires while a thread holds the slot running, to preempt it after
+	// preemptAfter and let another have a turn (yield.go). Stopped when it parks or
+	// finishes, so only running time counts. Guarded by mu.
+	preemptTimer *time.Timer
+	// checkpoint is the latest progress the attempt has committed, so a reload in
+	// place resumes from there rather than restarting. Guarded by mu.
+	checkpoint []byte
+}
+
+func (s *jobSlot) setCheckpoint(b []byte) {
+	s.mu.Lock()
+	s.checkpoint = b
+	s.mu.Unlock()
+}
+
+func (s *jobSlot) lastCheckpoint() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checkpoint
 }
 
 func (s *jobSlot) take(ctx context.Context, urgent bool) error {
@@ -124,6 +143,9 @@ func (s *jobSlot) take(ctx context.Context, urgent bool) error {
 		return nil
 	}
 	s.held = true
+	if preemptAfter > 0 {
+		s.preemptTimer = time.AfterFunc(preemptAfter, func() { s.n.preempt(s.job.ID, s.job.Attempt) })
+	}
 	return nil
 }
 
@@ -131,6 +153,10 @@ func (s *jobSlot) give() {
 	s.mu.Lock()
 	held := s.held
 	s.held = false
+	if s.preemptTimer != nil {
+		s.preemptTimer.Stop()
+		s.preemptTimer = nil
+	}
 	s.mu.Unlock()
 	if held {
 		s.n.slots.release()
