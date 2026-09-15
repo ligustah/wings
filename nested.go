@@ -111,6 +111,11 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	if client == nil {
 		return
 	}
+	// ID and thread identity are stable across a pendingJob's attempts; snapshot
+	// them under the lock that move() holds to reassign p.job, then read off-lock.
+	c.mu.Lock()
+	job := p.job
+	c.mu.Unlock()
 	current := func() bool {
 		if c.ctx.Err() != nil || p.finished() {
 			return false
@@ -130,7 +135,7 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	// A thread of run code carries its ancestors' histories too; their forks
 	// are the ancestors', dispatched elsewhere. Only the job's own thread and
 	// threads named under it are its. See lineage.go.
-	own := threadOf(p.job)
+	own := threadOf(job)
 	owned := func(id string) bool { return id == own || strings.HasPrefix(id, own+".") }
 
 	// Each thread of the run has its own history stream; a child's Fork/Join
@@ -142,7 +147,7 @@ func (c *Cluster) follow(p *pendingJob, attempt int) {
 	dispatched := map[string]bool{}
 	readers := map[string]int64{}
 	for current() {
-		names, err := historyStreams(c.ctx, client, p.job.ID, attempt)
+		names, err := historyStreams(c.ctx, client, job.ID, attempt)
 		if err != nil {
 			if c.ctx.Err() != nil {
 				return
