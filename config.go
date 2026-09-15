@@ -24,24 +24,19 @@ const (
 	// than a broker of its own. envP2PRF carries the replication factor.
 	envP2PJoin = "WINGS_P2P_JOIN"
 	envP2PRF   = "WINGS_P2P_RF"
-	// envP2POverlayControl and envP2POverlayAuthKey enrol a p2p worker child into
-	// a userspace Tailscale overlay: given both, the child brings its node up on a
-	// tsnet node reachable only through the overlay, so peers behind different NATs
-	// form one cluster. Absent, the child binds plain TCP.
+	// envHeadscaleURL and envHeadscaleAuthKey point wings at a hosted Tailscale
+	// control plane: set both (a .env file is loaded if present) and, with -p2p,
+	// every node enrols onto that tailnet so peers behind different NATs form one
+	// cluster. The control plane must serve a publicly trusted TLS cert.
+	envHeadscaleURL     = "HEADSCALE_URL"
+	envHeadscaleAuthKey = "HEADSCALE_PRE_AUTH_KEY"
+
+	// envP2POverlayControl and envP2POverlayAuthKey carry the control URL and
+	// pre-auth key from the coordinator to a p2p worker child: given both, the
+	// child brings its node up on a tsnet node reachable only through the overlay.
+	// Absent, the child binds plain TCP.
 	envP2POverlayControl = "WINGS_P2P_OVERLAY_CONTROL"
 	envP2POverlayAuthKey = "WINGS_P2P_OVERLAY_AUTHKEY"
-
-	// envSSLCert is Go's own SSL_CERT_FILE: it points crypto/x509 at an extra
-	// trusted cert. The overlay control plane serves a self-signed cert, and the
-	// pre-Noise control-key fetch verifies TLS, so every node that talks to it
-	// must trust that cert through this variable.
-	envSSLCert = "SSL_CERT_FILE"
-
-	// envP2POverlayCert carries the overlay control plane's self-signed cert as
-	// PEM, so a worker on another machine — where the coordinator's cert file
-	// does not exist — writes it out and points envSSLCert at it before its node's
-	// first TLS.
-	envP2POverlayCert = "WINGS_P2P_OVERLAY_CERT_PEM"
 
 	modeWorker = "worker"
 
@@ -222,13 +217,14 @@ type P2P struct {
 	// the default (3); a cluster smaller than this replicates to every node.
 	ReplicationFactor int
 
-	// Overlay, when set, hosts an embedded Tailscale control plane at this address
-	// and enrols every node — the coordinator and each worker — onto the resulting
-	// tailnet, so peers behind different NATs form one cluster. The coordinator
-	// runs the control plane in a child process, since it traps process-global
-	// signals. The address must be one the workers can reach to enrol; empty binds
-	// plain TCP on the host network.
-	Overlay string
+	// OverlayControl and OverlayAuthKey, when set, enrol every node — the
+	// coordinator and each worker — onto a hosted Tailscale control plane, so peers
+	// behind different NATs form one cluster. OverlayControl is the control plane's
+	// URL (it must serve a publicly trusted TLS cert); OverlayAuthKey is a reusable
+	// pre-auth key. Empty binds plain TCP on the host network. The CLI fills these
+	// from HEADSCALE_URL and HEADSCALE_PRE_AUTH_KEY.
+	OverlayControl string
+	OverlayAuthKey string
 }
 
 // BuildConfig describes how to cross-compile the worker binary for a remote

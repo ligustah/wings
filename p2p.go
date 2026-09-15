@@ -93,6 +93,21 @@ type p2pNodeConfig struct {
 	// forwards to; on an overlay it dials them over it, so a read or write routed
 	// to another node rides the tailnet like everything else.
 	clientDialOptions []grpc.DialOption
+
+	// labels and taints describe this broker for stream placement: the coordinator
+	// carries the role label leadership anchors to and a taint that keeps the
+	// expendable tier off it; workers carry neither.
+	labels map[string]string
+	taints []string
+
+	// placementFor stamps a stream's placement by name when its create states
+	// none; nil leaves every stream to default, untolerated placement.
+	placementFor func(stream string) *dswire.StreamPlacement
+
+	// replaceFencedAfter evicts a broker fenced for longer than this so repair
+	// re-replicates its partitions onto live brokers; 0 never evicts. Only the
+	// controller acts on it, so it matters on the coordinator alone.
+	replaceFencedAfter time.Duration
 }
 
 // p2pListen creates the listener a p2p node serves its peer and client endpoint
@@ -171,7 +186,7 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 	// address is what peers dial, so raftAddr becomes advertise-only. The control
 	// plane closes the listener with the node.
 	cp := embed.ControlPlaneConfig{
-		Identity:    peer.Identity{ID: peer.ID(cfg.id), PeerAddr: n.peerAddr, ClientAddr: n.peerAddr},
+		Identity:    peer.Identity{ID: peer.ID(cfg.id), PeerAddr: n.peerAddr, ClientAddr: n.peerAddr, Labels: cfg.labels, Taints: cfg.taints},
 		RaftAddr:    raftAddr,
 		DataDir:     cfg.dir,
 		Bootstrap:   cfg.bootstrap,
@@ -200,13 +215,15 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 		reconcile = defaultP2PReconcile
 	}
 	if n.manager, err = embed.StartCluster(nodeCtx, embed.ClusterConfig{
-		Identity:          ident,
-		Dir:               cfg.dir,
-		Join:              cfg.join,
-		Observer:          cfg.observer,
-		ReconcileInterval: reconcile,
-		PeerDialOptions:   cfg.peerDialOptions,
-		Logger:            streamLogger(log),
+		Identity:           ident,
+		Dir:                cfg.dir,
+		Join:               cfg.join,
+		Observer:           cfg.observer,
+		ReconcileInterval:  reconcile,
+		PeerDialOptions:    cfg.peerDialOptions,
+		PlacementFor:       cfg.placementFor,
+		ReplaceFencedAfter: cfg.replaceFencedAfter,
+		Logger:             streamLogger(log),
 	}, n.node, engine, n.svc); err != nil {
 		return nil, err
 	}
@@ -223,6 +240,7 @@ func startP2PNode(ctx context.Context, cfg p2pNodeConfig) (_ *p2pNode, err error
 		ReplicationFactor: int32(rf),
 		Reclaimed:         n.svc.HasReclaimed,
 		ClientDialOptions: cfg.clientDialOptions,
+		PlacementFor:      cfg.placementFor,
 	}); err != nil {
 		return nil, err
 	}
@@ -303,6 +321,27 @@ func (c *Cluster) drainP2PNode(ctx context.Context, cat *cluster.Catalog, broker
 	}
 }
 
+// forceRemoveP2PNodes evicts confirmed-dead brokers from the cluster at once:
+// each one's replica slots drop from every set and repair re-replicates them
+// onto live brokers, so a hard-lost node's copies are restored rather than
+// stranded a slot in a set that never looks short. A no-op off p2p. A partition
+// whose only copy was on the removed node is kept and reported.
+func (c *Cluster) forceRemoveP2PNodes(gone []*workerConn) {
+	if c.p2p == nil || c.p2p.node == nil {
+		return
+	}
+	cat := cluster.NewCatalog(c.p2p.node)
+	for _, w := range gone {
+		switch _, kept, err := cat.ForceRemove(w.id); {
+		case err != nil:
+			c.log.Warn("wings: could not force-remove a dead node", "broker", w.id, "err", err)
+		case len(kept) > 0:
+			c.log.Warn("wings: partitions whose only copy was on a removed node",
+				"broker", w.id, "partitions", len(kept))
+		}
+	}
+}
+
 // leaderOf reports the cluster node currently leading a stream's single
 // partition, and whether the cluster has placed it at all. A placed but
 // leaderless partition (mid-election) reports ok false, since nothing serves it
@@ -339,45 +378,26 @@ func (n *p2pNode) close() {
 	}
 }
 
-// hostOverlay runs the embedded control plane in a child process and brings the
-// coordinator's own node up on the resulting tailnet, so the coordinator serves
-// and dials over the overlay and its worker children enrol from the same
-// credentials. It fills cfg's overlay wiring and remembers how to tear it down.
-func (c *Cluster) hostOverlay(dir string, cfg *p2pNodeConfig) error {
-	hs, err := startHostedHeadscale(c.ctx, filepath.Join(dir, "headscale"), c.cfg.P2P.Overlay)
+// joinOverlay brings the coordinator's own node up on the hosted control plane,
+// so the coordinator serves and dials over the overlay and its worker children
+// enrol from the same credentials. It fills cfg's overlay wiring and remembers
+// how to tear it down.
+func (c *Cluster) joinOverlay(dir string, cfg *p2pNodeConfig) error {
+	overlay, err := startOverlayNode(c.ctx, filepath.Join(dir, "overlay"),
+		c.cfg.P2P.OverlayControl, c.cfg.P2P.OverlayAuthKey, coordinatorID)
 	if err != nil {
-		return fmt.Errorf("wings: host overlay control plane: %w", err)
-	}
-	// Every node must trust the control plane's self-signed cert: the tailnet's
-	// Noise layer secures the connection, but the pre-Noise control-key fetch
-	// verifies TLS. Set it before the node's first TLS; worker children get it in
-	// their environment (see p2pWorkerEnv).
-	if err := os.Setenv(envSSLCert, hs.certPath); err != nil {
-		hs.stop()
-		return fmt.Errorf("wings: trust overlay cert: %w", err)
-	}
-	certPEM, err := os.ReadFile(hs.certPath)
-	if err != nil {
-		hs.stop()
-		return fmt.Errorf("wings: read overlay cert: %w", err)
-	}
-	overlay, err := startOverlayNode(c.ctx, filepath.Join(dir, "overlay"), hs.control, hs.authKey, coordinatorID)
-	if err != nil {
-		hs.stop()
 		return err
 	}
 	w, err := overlayHooks(overlay)
 	if err != nil {
 		overlay.Close()
-		hs.stop()
 		return err
 	}
 	cfg.listen, cfg.peerDialOptions, cfg.peerAddr = w.listen, w.peerDial, w.peerAddr
 	cfg.clientDialOptions = w.clientDial
 	cfg.raftListen, cfg.raftDial, cfg.raftAddr = w.raftListen, w.raftDial, w.raftAddr
-	c.overlayControl, c.overlayAuthKey, c.overlayCert = hs.control, hs.authKey, hs.certPath
-	c.overlayCertPEM = string(certPEM)
-	c.overlayStop = func() { overlay.Close(); hs.stop() }
+	c.overlayControl, c.overlayAuthKey = c.cfg.P2P.OverlayControl, c.cfg.P2P.OverlayAuthKey
+	c.overlayStop = func() { overlay.Close() }
 	return nil
 }
 
@@ -400,6 +420,7 @@ func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pN
 		observer:          true,
 		join:              os.Getenv(envP2PJoin),
 		replicationFactor: rf,
+		placementFor:      streamPlacement,
 		log:               log,
 	}
 
@@ -407,18 +428,6 @@ func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pN
 	// than the host network, so it reaches a coordinator behind a different NAT.
 	var overlay *tsnet.Server
 	if control := os.Getenv(envP2POverlayControl); control != "" {
-		// The control plane's cert may not exist as a file here — a worker on
-		// another machine gets it as PEM in the environment — so write it out and
-		// trust it before the node's first TLS (see envSSLCert).
-		if pem := os.Getenv(envP2POverlayCert); pem != "" {
-			path := filepath.Join(dir, "overlay-cert.pem")
-			if err := os.WriteFile(path, []byte(pem), 0o600); err != nil {
-				return nil, fmt.Errorf("wings: write overlay cert: %w", err)
-			}
-			if err := os.Setenv(envSSLCert, path); err != nil {
-				return nil, fmt.Errorf("wings: trust overlay cert: %w", err)
-			}
-		}
 		var err error
 		if overlay, err = startOverlayNode(ctx, filepath.Join(dir, "overlay"), control, os.Getenv(envP2POverlayAuthKey), id); err != nil {
 			return nil, err

@@ -31,3 +31,6 @@ firebase-debug.log
 /*-????????????.json
 /*.iam.json
 /*-credentials.json
+
+# Local overlay config: HEADSCALE_URL and the pre-auth key. Holds a secret.
+.env

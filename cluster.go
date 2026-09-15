@@ -58,15 +58,11 @@ type Cluster struct {
 	// place of the embedded instance when Config.P2P is set. Its client is shared.
 	p2p *p2pNode
 	// overlayControl and overlayAuthKey enrol a node onto the hosted tailnet, set
-	// when Config.P2P.Overlay is on; worker children get them in their environment.
+	// when Config.P2P.OverlayControl is on; worker children get them in their
+	// environment.
 	overlayControl, overlayAuthKey string
-	// overlayCert is the control plane's self-signed cert file; the coordinator's
-	// own node trusts it through envSSLCert. overlayCertPEM is the same cert's
-	// bytes, shipped to worker children so one on another machine can trust it too.
-	overlayCert    string
-	overlayCertPEM string
-	// overlayStop tears the coordinator's own overlay node and the headscale child
-	// down; nil when the overlay is off.
+	// overlayStop tears the coordinator's own overlay node down; nil when the
+	// overlay is off.
 	overlayStop func()
 	// engineSrv serves the engine on loopback so worker child processes can dial
 	// it, for the shared-broker local target. Nil otherwise.
@@ -664,10 +660,17 @@ func (c *Cluster) sharedClient() (*dsclient.Client, error) {
 				// a second cluster that believes it is the whole thing.
 				bootstrap:         !clusterStateExists(dir),
 				replicationFactor: c.cfg.P2P.ReplicationFactor,
-				log:               c.log,
+				// The coordinator is the durable tier: it carries the role label and
+				// taint, stamps every stream's placement, and evicts a broker gone
+				// past the reconnect window so repair restores the copies it held.
+				labels:             coordinatorLabels,
+				taints:             coordinatorTaints,
+				placementFor:       streamPlacement,
+				replaceFencedAfter: c.cfg.reconnect(),
+				log:                c.log,
 			}
-			if c.cfg.P2P.Overlay != "" {
-				if err := c.hostOverlay(dir, &cfg); err != nil {
+			if c.cfg.P2P.OverlayControl != "" {
+				if err := c.joinOverlay(dir, &cfg); err != nil {
 					c.sharedErr = err
 					return
 				}

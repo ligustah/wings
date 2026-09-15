@@ -226,11 +226,28 @@ func (c *Cluster) mirroredResults(ctx context.Context) (map[string]resultEnvelop
 	return out, nil
 }
 
+// clusterStreamNames lists every live stream cluster-wide. In p2p mode a stream
+// can live entirely off the coordinator — the placement split keeps the workers'
+// expendable streams off it — so its local catalog is not the whole picture; the
+// names come from the raft registry every node agrees on. Off p2p the
+// coordinator holds them all, so the client's own listing is enough.
+func (c *Cluster) clusterStreamNames(ctx context.Context, client *dsclient.Client) ([]string, error) {
+	if c.p2p != nil && c.p2p.node != nil {
+		recs := c.p2p.node.Registry().Streams()
+		names := make([]string, len(recs))
+		for i, r := range recs {
+			names[i] = r.GetName()
+		}
+		return names, nil
+	}
+	return client.ListStreams(ctx)
+}
+
 // settledResults is mirroredResults for p2p mode: it reads the workers' result
 // streams directly, since the cluster already holds them replicated. A yield is
 // not a settlement, so it is skipped as it is on the mirror.
 func (c *Cluster) settledResults(ctx context.Context, client *dsclient.Client) (map[string]resultEnvelope, error) {
-	names, err := client.ListStreams(ctx)
+	names, err := c.clusterStreamNames(ctx, client)
 	if err != nil {
 		return nil, fmt.Errorf("wings: list streams: %w", err)
 	}

@@ -236,6 +236,12 @@ func (c *Cluster) reapDead() {
 		c.pokeOutputs()
 	}
 
+	// In p2p a dead worker is also a broker whose replica slots the controller
+	// will not free on its own: it keeps its place in every set, so the set never
+	// looks short of its replication factor. Evict it so repair re-replicates its
+	// copies onto live brokers as soon as we know it is gone.
+	c.forceRemoveP2PNodes(reaped)
+
 	for _, w := range reaped {
 		c.log.Info("wings: releasing dead worker", "worker", w.id)
 		c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "died"})

@@ -350,7 +350,6 @@ func (c *Cluster) deployP2P(ctx context.Context, m Machine, id, remoteBin string
 	if c.overlayControl != "" {
 		env[envP2POverlayControl] = c.overlayControl
 		env[envP2POverlayAuthKey] = c.overlayAuthKey
-		env[envP2POverlayCert] = c.overlayCertPEM
 	}
 	if c.cfg.Concurrency > 0 {
 		env[envConcurrency] = fmt.Sprint(c.cfg.Concurrency)

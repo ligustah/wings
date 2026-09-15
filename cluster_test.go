@@ -24,9 +24,6 @@ import (
 // worker by re-executing os.Executable(), which under `go test` is this binary,
 // so it has to recognise the worker environment before it starts running tests.
 func TestMain(m *testing.M) {
-	// The headscale child is this same binary re-executed; under `go test` it has
-	// to take over before the tests run, exactly as a worker process does.
-	maybeRunHeadscaleChild()
 	if isWorkerProcess() {
 		// Never returns.
 		_, _ = Start(context.Background(), Config{})

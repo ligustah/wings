@@ -18,6 +18,10 @@ import (
 
 const threadStreamPrefix = "flow.thread."
 
+// ThreadStreamPrefix is the prefix every [ThreadStream] name carries; a stream
+// whose name starts with it holds one thread's history.
+const ThreadStreamPrefix = threadStreamPrefix
+
 // ThreadStream is the stream name [NewStore] keeps one thread's history under.
 func ThreadStream(run, thread string) string { return streamName(run, thread) }
 

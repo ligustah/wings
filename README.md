@@ -287,16 +287,20 @@ processes for testing, over `remote` a cluster across machines.
 |---|---|
 | `-p2p` | turn peer-to-peer replication on |
 | `-p2p-replication-factor` | nodes holding a copy of each stream (0 = default 3) |
-| `-p2p-overlay <addr>` | host an embedded overlay control plane here (see below) |
 
 For nodes on one host or LAN that is all. To span **different networks** — peers
-behind separate NATs — `-p2p-overlay <addr>` hosts a self-contained overlay: the
-coordinator runs an embedded [Tailscale](https://tailscale.com) control plane
-([Headscale](https://github.com/juanfont/headscale)) with its own DERP relay at
-`addr`, enrols every node onto the resulting tailnet, and all cluster traffic —
-replication, consensus, and job dispatch — rides it. Nodes connect directly when they
-can and relay through the coordinator's DERP when a NAT forbids a direct path. Nothing
-depends on a third-party service; `addr` only needs to be reachable by the workers.
+behind separate NATs — enrol every node onto a [Tailscale](https://tailscale.com)
+overlay served by a [Headscale](https://github.com/juanfont/headscale) control
+plane you host. Set `HEADSCALE_URL` and `HEADSCALE_PRE_AUTH_KEY` (a `.env` file is
+loaded if present) and, with `-p2p`, the coordinator and every worker join that
+tailnet, so all cluster traffic — replication, consensus, and job dispatch — rides
+it, direct where possible and relayed through DERP otherwise. The control plane
+must serve a publicly trusted TLS cert.
+
+```sh
+HEADSCALE_URL=https://vpn.example.com HEADSCALE_PRE_AUTH_KEY=hskey-... \
+  ./myapp -target remote -workers 4 -p2p -provider gcp -gcp.project p -gcp.zone z
+```
 
 ## Configuration
 

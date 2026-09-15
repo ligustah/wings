@@ -37,6 +37,12 @@ const (
 	journalBuffer = 4096
 	// journalWait is how long an entry that matters waits for room before it is dropped.
 	journalWait = time.Second
+	// journalFlushTimeout bounds one append. An append now returns only once its
+	// write commits, and during shutdown the replica that would advance the commit
+	// is already gone — so an unbounded flush wedges close forever. Past this the
+	// batch is dropped and the record takes a gap, which the coordinator's own
+	// on-disk log still holds for recovery.
+	journalFlushTimeout = 5 * time.Second
 )
 
 // journalEntry is one line in the coordinator's account, flat and self-contained
@@ -198,8 +204,11 @@ func (j *journal) flush(batch []journalEntry) {
 	if len(batch) == 0 {
 		return
 	}
-	// Background context: this runs during shutdown too, when the record matters most.
-	if _, err := j.stream.Append(context.Background(), batch); err != nil {
+	// Not the cluster context, so the final flush still runs during shutdown — but
+	// bounded, so a commit no surviving replica can advance cannot wedge close.
+	ctx, cancel := context.WithTimeout(context.Background(), journalFlushTimeout)
+	defer cancel()
+	if _, err := j.stream.Append(ctx, batch); err != nil {
 		j.dropped.Add(int64(len(batch)))
 		if j.log != nil {
 			j.log.Warn("wings: journal append failed", "entries", len(batch), "err", err)
