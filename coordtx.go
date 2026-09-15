@@ -116,23 +116,16 @@ func (a *coordOutputs) begin(ctx context.Context) error {
 	if a.tx != nil {
 		return nil
 	}
-	if a.producer == nil {
-		p, err := openProducer(ctx, a.client, a.producerID())
-		if err != nil {
-			a.err = fmt.Errorf("wings: open a producer for %s: %w", a.id, err)
-			return a.err
-		}
-		a.producer = p
-		if a.budget <= 0 {
-			a.budget = coordBudget(a.commitInterval)
-		}
+	if a.budget <= 0 {
+		a.budget = coordBudget(a.commitInterval)
 	}
-	tx, err := beginTx(ctx, a.producer, a.budget)
+	p, tx, err := beginProducerTx(ctx, a.client, a.producerID(), a.budget, a.producer)
 	if err != nil {
+		a.producer = p
 		a.err = fmt.Errorf("wings: begin a transaction for %s: %w", a.id, err)
 		return a.err
 	}
-	a.tx = tx
+	a.producer, a.tx = p, tx
 	a.opened = time.Now()
 	return nil
 }
@@ -202,16 +195,23 @@ const (
 	txBeginBackoff = 150 * time.Millisecond
 )
 
-// openProducer opens a producer for id, retrying while the broker that
-// coordinates the id is still adopting its transaction-state partition. The
-// broker waits out its own bounded window and then refuses with the retryable
-// [streams.ErrTxStateUnreachable]; the refusal clears once leadership of the
-// partition settles, so the same open tries again.
+// coordinatedElsewhere reports whether err is a redirect: another broker now
+// coordinates the id, so a fresh producer open (which re-resolves the coordinator)
+// clears it where retrying the same producer cannot (see
+// [dswire.ErrTxCoordinatedElsewhere]).
+func coordinatedElsewhere(err error) bool { return errors.Is(err, dswire.ErrTxCoordinatedElsewhere) }
+
+// openProducer opens a producer for id, retrying two conditions that a fresh open
+// clears. While the coordinating broker is still adopting the id's
+// transaction-state partition it refuses with [streams.ErrTxStateUnreachable]
+// until leadership settles; once the id's coordinator has moved, the open is
+// refused with [dswire.ErrTxCoordinatedElsewhere] and a re-open re-resolves it.
 func openProducer(ctx context.Context, client *dsclient.Client, id string) (dsclient.Producer, error) {
 	var err error
 	for try := 0; try < txBeginTries; try++ {
 		var p dsclient.Producer
-		if p, err = client.Producer(ctx, id); err == nil || !errors.Is(err, streams.ErrTxStateUnreachable) {
+		if p, err = client.Producer(ctx, id); err == nil ||
+			!(errors.Is(err, streams.ErrTxStateUnreachable) || coordinatedElsewhere(err)) {
 			return p, err
 		}
 		select {
@@ -221,6 +221,37 @@ func openProducer(ctx context.Context, client *dsclient.Client, id string) (dscl
 		}
 	}
 	return nil, err
+}
+
+// beginProducerTx opens a producer for id (reusing existing when non-nil) and
+// begins a transaction on it. A redirect at begin ([dswire.ErrTxCoordinatedElsewhere])
+// means the id's coordinator moved, so it drops the producer and re-opens — a
+// fresh open re-resolves the coordinator where retrying the same producer cannot.
+// It returns the producer it settled on so the caller can reuse it.
+func beginProducerTx(ctx context.Context, client *dsclient.Client, id string, budget time.Duration, existing dsclient.Producer) (dsclient.Producer, dsclient.Tx, error) {
+	p := existing
+	var err error
+	for try := 0; try < txBeginTries; try++ {
+		if p == nil {
+			if p, err = openProducer(ctx, client, id); err != nil {
+				return nil, nil, err
+			}
+		}
+		var tx dsclient.Tx
+		if tx, err = beginTx(ctx, p, budget); err == nil {
+			return p, tx, nil
+		}
+		if !coordinatedElsewhere(err) {
+			return p, nil, err
+		}
+		p = nil
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(txBeginBackoff):
+		}
+	}
+	return nil, nil, err
 }
 
 // beginTx opens a transaction on p, waiting out the window after a decided commit

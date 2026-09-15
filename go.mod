@@ -14,12 +14,12 @@ require (
 	github.com/ligustah/commitlog v0.106.0
 	github.com/ligustah/commitlog/blockv3 v0.1.0
 	github.com/ligustah/commitlog/compress v0.1.0
-	github.com/ligustah/durable_streams v0.171.0
-	github.com/ligustah/durable_streams/broker v0.274.0
-	github.com/ligustah/durable_streams/broker/client v0.68.0
+	github.com/ligustah/durable_streams v0.172.0
+	github.com/ligustah/durable_streams/broker v0.275.0
+	github.com/ligustah/durable_streams/broker/client v0.69.0
 	github.com/ligustah/durable_streams/broker/protos v0.50.0
 	github.com/ligustah/durable_streams/dsclient v0.58.0
-	github.com/ligustah/durable_streams/dswire v0.39.0
+	github.com/ligustah/durable_streams/dswire v0.40.0
 	golang.org/x/crypto v0.55.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.83.2
@@ -112,7 +112,7 @@ require (
 	github.com/jsimonetti/rtnetlink v1.4.2 // indirect
 	github.com/kamstrup/intmap v0.5.2 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
-	github.com/ligustah/durable_streams/dsembedded v0.92.0 // indirect
+	github.com/ligustah/durable_streams/dsembedded v0.93.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.23 // indirect
 	github.com/mdlayher/netlink v1.8.0 // indirect

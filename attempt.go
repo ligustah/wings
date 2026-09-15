@@ -88,23 +88,16 @@ func (a *attemptOutputs) begin(ctx context.Context) error {
 	if a.tx != nil {
 		return nil
 	}
-	if a.producer == nil {
-		p, err := openProducer(ctx, a.node.client, a.producerID())
-		if err != nil {
-			a.err = fmt.Errorf("wings: open a producer for job %s: %w", a.job, err)
-			return a.err
-		}
-		a.producer = p
-		if a.budget <= 0 {
-			a.budget = txBudget(a.node.commitInterval)
-		}
+	if a.budget <= 0 {
+		a.budget = txBudget(a.node.commitInterval)
 	}
-	tx, err := beginTx(ctx, a.producer, a.budget)
+	p, tx, err := beginProducerTx(ctx, a.node.client, a.producerID(), a.budget, a.producer)
 	if err != nil {
+		a.producer = p
 		a.err = fmt.Errorf("wings: begin a transaction for job %s: %w", a.job, err)
 		return a.err
 	}
-	a.tx, a.opened = tx, time.Now()
+	a.producer, a.tx, a.opened = p, tx, time.Now()
 	return nil
 }
 
