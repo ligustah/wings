@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -127,6 +128,23 @@ func TestChainErrorsAndClosesWhenLeasesRemain(t *testing.T) {
 	}
 	if !closed1 || !closed2 {
 		t.Error("machines provisioned before the shortfall must be closed")
+	}
+}
+
+func TestChainErrorNamesWhyEachProvisionerFailed(t *testing.T) {
+	a := &stubProvisioner{name: "a", fail: true}
+	b := &stubProvisioner{name: "b", fail: true}
+	c := Provisioners(
+		ProvisionerSpec{Provisioner: a},
+		ProvisionerSpec{Provisioner: b},
+	)
+
+	_, err := c.Provision(context.Background(), []string{"l0"})
+	if err == nil {
+		t.Fatal("want error when every provisioner fails")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "a down") || !strings.Contains(msg, "b down") {
+		t.Errorf("error should carry each provisioner's cause, got: %s", msg)
 	}
 }
 

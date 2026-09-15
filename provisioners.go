@@ -33,6 +33,7 @@ var _ Reattacher = (*chain)(nil)
 func (c *chain) Provision(ctx context.Context, leases []string) ([]Machine, error) {
 	remaining := leases
 	var got []Machine
+	var spills []error
 
 	for _, spec := range c.specs {
 		if len(remaining) == 0 {
@@ -45,7 +46,9 @@ func (c *chain) Provision(ctx context.Context, leases []string) ([]Machine, erro
 
 		machines, err := spec.Provisioner.Provision(ctx, offer)
 		if err != nil {
-			// The offer spills to the next provisioner rather than failing the run.
+			// The offer spills to the next provisioner rather than failing the run;
+			// the cause is kept so a run that spills to the end can report why.
+			spills = append(spills, fmt.Errorf("%T: %w", spec.Provisioner, err))
 			continue
 		}
 		got = append(got, machines...)
@@ -62,7 +65,11 @@ func (c *chain) Provision(ctx context.Context, leases []string) ([]Machine, erro
 		for _, m := range got {
 			_ = m.Close(release)
 		}
-		return nil, fmt.Errorf("wings: no provisioner could supply %d of %d machines", len(remaining), len(leases))
+		err := fmt.Errorf("wings: no provisioner could supply %d of %d machines", len(remaining), len(leases))
+		if len(spills) > 0 {
+			return nil, errors.Join(append([]error{err}, spills...)...)
+		}
+		return nil, err
 	}
 	return got, nil
 }
