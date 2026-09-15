@@ -587,6 +587,31 @@ func (c *Cluster) workerID(prefix string) string {
 	return fmt.Sprintf("%s-%s-%d", prefix, c.epoch, c.nextSeq.Add(1)-1)
 }
 
+// Bounds on waiting for a worker's cluster streams to become addressable during
+// p2p bring-up.
+const (
+	streamPlacementTimeout = 60 * time.Second
+	streamPlacementPoll    = 200 * time.Millisecond
+)
+
+// awaitPlacement retries open while it reports the stream not placed yet: in p2p
+// bring-up the coordinator can reach a joining worker's stream before its
+// placement has propagated over the overlay. Bounded by ctx; a stream never
+// placed fails with the last not-placed error.
+func awaitPlacement(ctx context.Context, open func() error) error {
+	for {
+		err := open()
+		if err == nil || !errors.Is(err, dswire.ErrStreamNotPlacedYet) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(streamPlacementPoll):
+		}
+	}
+}
+
 // connect wires a worker's streams onto a backend the coordinator can reach —
 // the one function every target funnels through.
 func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*workerConn, error) {
@@ -594,21 +619,31 @@ func (c *Cluster) connect(id string, client *dsclient.Client, owns bool) (*worke
 		submits: make(chan submission, submitBatch)}
 	w.ctx, w.stop = context.WithCancel(c.ctx)
 
+	octx, cancel := context.WithTimeout(c.ctx, streamPlacementTimeout)
+	defer cancel()
+
+	open := func(name string, into func() error) error {
+		if err := awaitPlacement(octx, into); err != nil {
+			return fmt.Errorf("wings: open %s on worker %s: %w", name, id, err)
+		}
+		return nil
+	}
+
 	var err error
-	if w.jobs, err = client.OpenStream[jobEnvelope](jobStreamFor(id)); err != nil {
-		return nil, fmt.Errorf("wings: open %s on worker %s: %w", jobStreamFor(id), id, err)
+	if err = open(jobStreamFor(id), func() (e error) { w.jobs, e = client.OpenStream[jobEnvelope](jobStreamFor(id)); return }); err != nil {
+		return nil, err
 	}
-	if w.results, err = client.OpenStream[resultEnvelope](resultStreamFor(id)); err != nil {
-		return nil, fmt.Errorf("wings: open %s on worker %s: %w", resultStreamFor(id), id, err)
+	if err = open(resultStreamFor(id), func() (e error) { w.results, e = client.OpenStream[resultEnvelope](resultStreamFor(id)); return }); err != nil {
+		return nil, err
 	}
-	if w.beats, err = client.OpenStream[beatEnvelope](beatStreamFor(id)); err != nil {
-		return nil, fmt.Errorf("wings: open %s on worker %s: %w", beatStreamFor(id), id, err)
+	if err = open(beatStreamFor(id), func() (e error) { w.beats, e = client.OpenStream[beatEnvelope](beatStreamFor(id)); return }); err != nil {
+		return nil, err
 	}
-	if w.control, err = client.OpenStream[controlEnvelope](controlStreamFor(id)); err != nil {
-		return nil, fmt.Errorf("wings: open %s on worker %s: %w", controlStreamFor(id), id, err)
+	if err = open(controlStreamFor(id), func() (e error) { w.control, e = client.OpenStream[controlEnvelope](controlStreamFor(id)); return }); err != nil {
+		return nil, err
 	}
-	if w.nested, err = client.OpenStream[jobEnvelope](nestedStreamFor(id)); err != nil {
-		return nil, fmt.Errorf("wings: open %s on worker %s: %w", nestedStreamFor(id), id, err)
+	if err = open(nestedStreamFor(id), func() (e error) { w.nested, e = client.OpenStream[jobEnvelope](nestedStreamFor(id)); return }); err != nil {
+		return nil, err
 	}
 	// In p2p mode the worker's result stream is already replicated across the
 	// cluster, so the coordinator reads it directly and keeps no store-and-forward
