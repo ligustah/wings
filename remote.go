@@ -18,6 +18,8 @@ import (
 	"github.com/ligustah/durable_streams/broker/client"
 	"github.com/ligustah/durable_streams/broker/client/dsremote"
 	"github.com/ligustah/durable_streams/broker/client/zstd"
+	"github.com/ligustah/durable_streams/dsclient"
+	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/internal/payload"
 )
 
@@ -48,6 +50,15 @@ const (
 func (c *Cluster) launchRemote(ctx context.Context, n int) ([]*workerConn, error) {
 	if c.cfg.Target.prov == nil {
 		return nil, errors.New("wings: Remote target has no Provisioner")
+	}
+
+	// In p2p the coordinator's own node — its cluster peer address and, on an
+	// overlay, the control-plane credentials the workers enrol with — must be up
+	// before any worker is deployed to join it.
+	if c.cfg.P2P != nil {
+		if _, err := c.sharedClient(); err != nil {
+			return nil, err
+		}
 	}
 
 	image, err := c.workerImage(ctx)
@@ -266,6 +277,10 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 		return nil, fmt.Errorf("wings: upload to %s: %w", m.ID(), err)
 	}
 
+	if c.cfg.P2P != nil {
+		return c.deployP2P(ctx, m, id, remoteBin)
+	}
+
 	env := map[string]string{
 		envMode:     modeWorker,
 		envWorkerID: id,
@@ -312,6 +327,85 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 	w.machine = m
 	c.log.Info("wings: remote worker ready", "worker", id, "machine", m.ID(), "via", local)
 	return w, nil
+}
+
+// deployP2P starts an uploaded worker as a node of the replicated cluster that
+// joins the coordinator over the overlay, rather than a broker the coordinator
+// tunnels to. The coordinator reaches its streams through the routing client, as
+// with a local p2p worker, so there is nothing to forward.
+func (c *Cluster) deployP2P(ctx context.Context, m Machine, id, remoteBin string) (*workerConn, error) {
+	env := map[string]string{
+		envMode:     modeWorker,
+		envWorkerID: id,
+		envDir:      path.Join(remoteWorkDir, "data"),
+		envP2PJoin:  c.p2p.peerAddr,
+
+		envCompression: fmt.Sprint(int(streamCompression)),
+		envLogLevel:    fmt.Sprint(int(logLevel)),
+		envLogBytes:    fmt.Sprint(logBudgetBytes),
+	}
+	if rf := c.cfg.P2P.ReplicationFactor; rf > 0 {
+		env[envP2PRF] = fmt.Sprint(rf)
+	}
+	if c.overlayControl != "" {
+		env[envP2POverlayControl] = c.overlayControl
+		env[envP2POverlayAuthKey] = c.overlayAuthKey
+		env[envP2POverlayCert] = c.overlayCertPEM
+	}
+	if c.cfg.Concurrency > 0 {
+		env[envConcurrency] = fmt.Sprint(c.cfg.Concurrency)
+	}
+	if c.cfg.JobTimeout > 0 {
+		env[envJobTimeout] = c.cfg.JobTimeout.String()
+	}
+	if ci := c.cfg.commitInterval(); ci > 0 {
+		env[envCommitInterval] = ci.String()
+	}
+
+	c.log.Info("wings: starting p2p worker", "machine", m.ID(), "worker", id)
+	if err := m.Start(ctx, remoteBin, env); err != nil {
+		return nil, fmt.Errorf("wings: start worker on %s: %w", m.ID(), err)
+	}
+
+	client, err := c.sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	// The worker joins over the overlay and declares its streams cluster-wide; the
+	// coordinator waits for those rather than for a broker to answer, then reads
+	// them through the routing client.
+	if err := c.awaitWorkerStreams(ctx, client, id); err != nil {
+		return nil, fmt.Errorf("wings: worker on %s never joined the cluster: %w", m.ID(), err)
+	}
+	w, err := c.connect(id, client, false)
+	if err != nil {
+		return nil, err
+	}
+	w.machine = m
+	c.log.Info("wings: remote p2p worker ready", "worker", id, "machine", m.ID())
+	return w, nil
+}
+
+// awaitWorkerStreams blocks until the worker's job stream is placed across the
+// cluster — the sign its node has joined and declared its streams — or the dial
+// timeout expires.
+func (c *Cluster) awaitWorkerStreams(ctx context.Context, client *dsclient.Client, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, remoteDialTimeout)
+	defer cancel()
+	for {
+		ok, err := flow.StreamAvailable(ctx, client, jobStreamFor(id))
+		if err == nil && ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func dialUntilReady(ctx context.Context, addr, machineID string) (*dsremote.Client, error) {

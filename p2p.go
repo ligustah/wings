@@ -356,6 +356,11 @@ func (c *Cluster) hostOverlay(dir string, cfg *p2pNodeConfig) error {
 		hs.stop()
 		return fmt.Errorf("wings: trust overlay cert: %w", err)
 	}
+	certPEM, err := os.ReadFile(hs.certPath)
+	if err != nil {
+		hs.stop()
+		return fmt.Errorf("wings: read overlay cert: %w", err)
+	}
 	overlay, err := startOverlayNode(c.ctx, filepath.Join(dir, "overlay"), hs.control, hs.authKey, coordinatorID)
 	if err != nil {
 		hs.stop()
@@ -371,6 +376,7 @@ func (c *Cluster) hostOverlay(dir string, cfg *p2pNodeConfig) error {
 	cfg.clientDialOptions = w.clientDial
 	cfg.raftListen, cfg.raftDial, cfg.raftAddr = w.raftListen, w.raftDial, w.raftAddr
 	c.overlayControl, c.overlayAuthKey, c.overlayCert = hs.control, hs.authKey, hs.certPath
+	c.overlayCertPEM = string(certPEM)
 	c.overlayStop = func() { overlay.Close(); hs.stop() }
 	return nil
 }
@@ -401,6 +407,18 @@ func startWorkerP2PNode(ctx context.Context, id string, log *slog.Logger) (*p2pN
 	// than the host network, so it reaches a coordinator behind a different NAT.
 	var overlay *tsnet.Server
 	if control := os.Getenv(envP2POverlayControl); control != "" {
+		// The control plane's cert may not exist as a file here — a worker on
+		// another machine gets it as PEM in the environment — so write it out and
+		// trust it before the node's first TLS (see envSSLCert).
+		if pem := os.Getenv(envP2POverlayCert); pem != "" {
+			path := filepath.Join(dir, "overlay-cert.pem")
+			if err := os.WriteFile(path, []byte(pem), 0o600); err != nil {
+				return nil, fmt.Errorf("wings: write overlay cert: %w", err)
+			}
+			if err := os.Setenv(envSSLCert, path); err != nil {
+				return nil, fmt.Errorf("wings: trust overlay cert: %w", err)
+			}
+		}
 		var err error
 		if overlay, err = startOverlayNode(ctx, filepath.Join(dir, "overlay"), control, os.Getenv(envP2POverlayAuthKey), id); err != nil {
 			return nil, err

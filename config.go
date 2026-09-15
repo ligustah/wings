@@ -37,6 +37,12 @@ const (
 	// must trust that cert through this variable.
 	envSSLCert = "SSL_CERT_FILE"
 
+	// envP2POverlayCert carries the overlay control plane's self-signed cert as
+	// PEM, so a worker on another machine — where the coordinator's cert file
+	// does not exist — writes it out and points envSSLCert at it before its node's
+	// first TLS.
+	envP2POverlayCert = "WINGS_P2P_OVERLAY_CERT_PEM"
+
 	modeWorker = "worker"
 
 	// readyPrefix precedes the address a worker prints once its broker serves,

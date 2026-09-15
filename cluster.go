@@ -60,9 +60,11 @@ type Cluster struct {
 	// overlayControl and overlayAuthKey enrol a node onto the hosted tailnet, set
 	// when Config.P2P.Overlay is on; worker children get them in their environment.
 	overlayControl, overlayAuthKey string
-	// overlayCert is the control plane's self-signed cert file; every node must
-	// trust it (see envSSLCert). Worker children get its path in their environment.
-	overlayCert string
+	// overlayCert is the control plane's self-signed cert file; the coordinator's
+	// own node trusts it through envSSLCert. overlayCertPEM is the same cert's
+	// bytes, shipped to worker children so one on another machine can trust it too.
+	overlayCert    string
+	overlayCertPEM string
 	// overlayStop tears the coordinator's own overlay node and the headscale child
 	// down; nil when the overlay is off.
 	overlayStop func()
@@ -561,8 +563,10 @@ func (c *Cluster) launch(ctx context.Context, n int) ([]*workerConn, error) {
 			return c.launchP2P(ctx, n)
 		case targetLocalProcess:
 			return c.launchP2PLocal(ctx, n)
+		case targetRemote:
+			return c.launchRemote(ctx, n)
 		default:
-			return nil, fmt.Errorf("wings: p2p mode runs on the in-process and local-process targets only")
+			return nil, fmt.Errorf("wings: unknown target %d", c.cfg.Target.kind)
 		}
 	}
 	switch c.cfg.Target.kind {
