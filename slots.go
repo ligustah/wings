@@ -3,6 +3,7 @@ package wings
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ligustah/wings/flow"
@@ -99,6 +100,10 @@ type jobSlot struct {
 	// blocked is how many of the job's threads are parked and reported to
 	// the coordinator; the job is reported woken when the last resumes.
 	blocked int
+	// evicting is set while the worker is evicting this job to reload it in place
+	// (yield.go), so the park's resume does not report a wake the worker will drive
+	// itself — the coordinator sees Evicted, then Woke on the reload, not a wake now.
+	evicting atomic.Bool
 }
 
 func (s *jobSlot) take(ctx context.Context, urgent bool) error {
@@ -149,8 +154,14 @@ func (s *jobSlot) Park(ctx context.Context, w flow.Wait) func(context.Context) e
 		close(reported)
 	})
 	var unload *time.Timer
-	if s.n.unloads(w) {
+	switch {
+	case s.n.unloads(w):
 		unload = time.AfterFunc(unloadAfter, func() { s.n.unload(s.job, w) })
+	case s.n.evicts(w):
+		unload = time.AfterFunc(p2pEvictAfter, func() {
+			s.evicting.Store(true)
+			s.n.evict(s.job, w)
+		})
 	}
 	return func(ctx context.Context) error {
 		if unload != nil {
@@ -162,7 +173,9 @@ func (s *jobSlot) Park(ctx context.Context, w flow.Wait) func(context.Context) e
 			s.blocked--
 			last := s.blocked == 0
 			s.mu.Unlock()
-			if last {
+			// An eviction reports no wake here: the worker keeps the job and drives
+			// its reload, telling the coordinator Evicted now and Woke then.
+			if last && !s.evicting.Load() {
 				s.beat(ctx, beatEnvelope{Job: s.job.ID, Attempt: s.job.Attempt, Woke: true})
 			}
 		}

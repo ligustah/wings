@@ -259,6 +259,10 @@ type pendingJob struct {
 	answers  map[string]resultEnvelope
 	// blocked says the worker reported a thread of this job waiting.
 	blocked bool
+	// evicted says the worker dropped a channel-waiter's footprint but still owns
+	// it and will reload it in place; the job stays blocked on its worker. A hook
+	// for the coordinator to relocate or preempt it later.
+	evicted bool
 	// yield is set while the job is off every worker by its own choice. See yield.go.
 	yield *yieldEnvelope
 	// consumeBase is the channel's consumed count when a send unloaded, so the job
@@ -295,9 +299,9 @@ func (p *pendingJob) overdue(now time.Time) (stuck bool, tooSlow bool) {
 	if p.bounds.Timeout > 0 && now.Sub(p.started) > p.bounds.Timeout {
 		tooSlow = true
 	}
-	// A job waiting on a thread it forked or on a channel is not stuck; its total
-	// bound still runs.
-	if p.bounds.Heartbeat > 0 && p.children == 0 && !p.blocked {
+	// A job waiting on a thread it forked or on a channel, or one a worker has
+	// evicted to reload in place, is not stuck; its total bound still runs.
+	if p.bounds.Heartbeat > 0 && p.children == 0 && !p.blocked && !p.evicted {
 		last := p.beat
 		if last.IsZero() {
 			last = p.started
@@ -1362,7 +1366,20 @@ func (c *Cluster) onBeat(b beatEnvelope) {
 			p.worker.blocked++
 		}
 	}
+	if b.Evicted {
+		// The worker dropped the waiter's footprint but still owns it and will
+		// reload it in place; the job stays blocked here. Recorded for the picture,
+		// a hook for the coordinator to relocate or preempt it later.
+		p.evicted = true
+		if !p.blocked {
+			p.blocked = true
+			if p.worker != nil {
+				p.worker.blocked++
+			}
+		}
+	}
 	if b.Woke {
+		p.evicted = false
 		c.unblockLocked(p)
 	}
 	if len(b.Checkpoint) > 0 {

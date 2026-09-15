@@ -43,12 +43,61 @@ func (n *workerNode) unloads(w flow.Wait) bool {
 	return true
 }
 
+// p2pEvictAfter is how long a p2p channel receiver may be parked before the
+// worker evicts its footprint and reloads it in place when the value arrives
+// (worker.go). Zero disables eviction, so a waiter stays loaded (v0.22.1); the
+// production trigger arrives with preemption. A variable for tests.
+var p2pEvictAfter time.Duration
+
+// evicts says whether the worker itself should evict a thread parked on w and
+// reload it locally, rather than either staying loaded or unloading to the
+// coordinator. Only p2p channel receivers, and only once armed: the worker holds
+// a node-local watch and owns the wake, so the coordinator never follows the
+// stream. See [workerNode.evict] and [workerNode.runJob].
+func (n *workerNode) evicts(w flow.Wait) bool {
+	return n.p2p && p2pEvictAfter > 0 && w.On == flow.WaitRecv
+}
+
 // unloadError is the cause an unloaded attempt is cancelled with, so the result
 // names the wait rather than "context canceled".
 type unloadError struct{ wait flow.Wait }
 
 func (e *unloadError) Error() string {
 	return fmt.Sprintf("wings: unloaded while waiting on %s", e.wait.On)
+}
+
+// evictError is the cause an evicted attempt is cancelled with. Unlike an unload
+// it is not handed to the coordinator: the worker reloads the job in place when
+// the channel it names has a value (worker.go).
+type evictError struct{ wait flow.Wait }
+
+func (e *evictError) Error() string {
+	return fmt.Sprintf("wings: evicted while waiting on %s from channel %s", e.wait.On, e.wait.Channel)
+}
+
+// evict ends a job's attempt so the worker can reload it when its channel wakes;
+// the attempt commits what it has, as an unload does, but the worker keeps the
+// job and drives the reload itself.
+func (n *workerNode) evict(job jobEnvelope, w flow.Wait) {
+	key := attemptKey(job.ID, job.Attempt)
+	n.runMu.Lock()
+	cancel, ok := n.running[key]
+	n.runMu.Unlock()
+	if !ok {
+		return
+	}
+	n.log.Info("wings: evicting a channel-waiter to reload it in place", "job", job.ID, "attempt", job.Attempt,
+		"thread", w.Thread, "channel", w.Channel)
+	cancel(&evictError{wait: w})
+}
+
+// evictedWaitOf reports the wait an attempt was evicted on, if it was; the worker
+// reloads such a job rather than handing its yield to the coordinator.
+func evictedWaitOf(ctx context.Context, err error) (flow.Wait, bool) {
+	if e, ok := errors.AsType[*evictError](context.Cause(ctx)); ok && errors.Is(err, context.Canceled) {
+		return e.wait, true
+	}
+	return flow.Wait{}, false
 }
 
 // unload ends a job's attempt because a thread of it has waited too long; the
@@ -75,6 +124,11 @@ func yieldOf(ctx context.Context, err error) *yieldEnvelope {
 	}
 	if u, ok := errors.AsType[*unloadError](context.Cause(ctx)); ok && errors.Is(err, context.Canceled) {
 		return &yieldEnvelope{Wait: u.wait.On, Channel: u.wait.Channel, Seq: u.wait.Seq}
+	}
+	// An eviction the worker could not reload (its context ended, or the channel
+	// went away) falls back to a yield the coordinator holds, like an unload.
+	if e, ok := errors.AsType[*evictError](context.Cause(ctx)); ok && errors.Is(err, context.Canceled) {
+		return &yieldEnvelope{Wait: e.wait.On, Channel: e.wait.Channel, Seq: e.wait.Seq}
 	}
 	return nil
 }

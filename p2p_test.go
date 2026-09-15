@@ -162,6 +162,76 @@ func TestP2PAChannelWaitStaysLoadedAndWakes(t *testing.T) {
 	}
 }
 
+// TestP2PAChannelWaitEvictsAndReloads proves the worker-owned eviction path: once
+// p2pEvictAfter is armed the worker drops a parked receiver's footprint, holds a
+// node-local watch, and reloads the job in place when the value arrives — two
+// attempts, and neither the evict nor the reload goes through the coordinator.
+func TestP2PAChannelWaitEvictsAndReloads(t *testing.T) {
+	if testing.Short() {
+		t.Skip("multi-node channel evict/reload")
+	}
+	oldUnload, oldReport, oldEvict := unloadAfter, parkReport, p2pEvictAfter
+	unloadAfter, parkReport, p2pEvictAfter = time.Minute, 20*time.Millisecond, 80*time.Millisecond
+	t.Cleanup(func() { unloadAfter, parkReport, p2pEvictAfter = oldUnload, oldReport, oldEvict })
+	receiving.attempts.Store(0)
+
+	// Concurrency 2 so the receiver gets a slot and parks at once rather than
+	// queueing behind p2pSquare; the wide margin below then evicts it well before
+	// the value, even on a loaded machine.
+	c := start(t, Config{
+		Target:      InProcess(),
+		Workers:     2,
+		Concurrency: 2,
+		Dir:         t.TempDir(),
+		P2P:         &P2P{ReplicationFactor: 2},
+		Logger:      quietP2PLogger(),
+	})
+
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int]()
+		receiver := ctx.Go(receivesOnce, feed{Values: r})
+		// Long past p2pEvictAfter: the receiver is evicted while it waits, then
+		// reloaded in place when the value arrives.
+		if _, err := ctx.Go(p2pSquare, 3).Await(ctx); err != nil {
+			return err
+		}
+		if err := ctx.Sleep(800 * time.Millisecond); err != nil {
+			return err
+		}
+		if err := w.Send(ctx, 7); err != nil {
+			return err
+		}
+		var err error
+		got, err = receiver.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("got %d, want 7", got)
+	}
+	if n := receiving.attempts.Load(); n != 2 {
+		t.Fatalf("the receiver ran %d attempts, want 2: one evicted, one reloaded in place", n)
+	}
+	// Worker-owned: the receiver's evict and reload never reached the coordinator,
+	// so its job was neither yielded to it nor redispatched by it.
+	entries := awaitJournal(t, c, func(es []journalEntry) bool {
+		for _, e := range es {
+			if e.Func == "test.receivesOnce" && e.Kind == journalCompleted {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range entries {
+		if e.Func == "test.receivesOnce" && (e.Kind == journalYielded || e.Kind == journalRedispatch) {
+			t.Fatalf("the receiver's %s reached the coordinator; eviction must be worker-owned", e.Kind)
+		}
+	}
+}
+
 // TestP2PInProcessResumesAcrossRestart shows a p2p cluster brought up a second
 // time over the same Dir resumes its control plane rather than forming a new one,
 // so it goes on dispatching work.

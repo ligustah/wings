@@ -508,6 +508,51 @@ func (c *Cluster) dropChannelData(key string) {
 	r.mu.Unlock()
 }
 
+// awaitChannelValue blocks until a value the evicted receiver can take has
+// arrived on its channel, or the channel closed — read node-locally on this
+// worker, which leads the stream, so the coordinator never follows it. It returns
+// an error only when ctx ends or the stream is gone (retired); the worker then
+// hands the eviction back to the coordinator as an ordinary yield. w.Seq is how
+// many values the receiver had already taken, so a value beyond it wakes it.
+func (n *workerNode) awaitChannelValue(ctx context.Context, w flow.Wait) error {
+	name := chanValues(w.Channel)
+	var from int64
+	var values uint64
+	for {
+		st, err := eventStream[*protos.Event](n.client, name)
+		if err != nil {
+			return err
+		}
+		readCtx, cancel := context.WithTimeout(ctx, followPoll)
+		recs, err := st.ReadBlocking(readCtx, from, recordBatch)
+		expired := readCtx.Err() != nil && ctx.Err() == nil
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if expired {
+				continue
+			}
+			return err
+		}
+		for _, rec := range recs {
+			from = rec.Offset + 1
+			it := rec.Record.GetChannelItem()
+			switch {
+			case it == nil, it.GetLink(), it.GetConsumed():
+			case it.GetClosed():
+				return nil
+			default:
+				values++
+				if values > w.Seq {
+					return nil
+				}
+			}
+		}
+	}
+}
+
 // subscribeChannel starts pushing a channel's value stream onto a worker that
 // reads it, once. Called by the output mirror when it finds the worker's consume
 // stream, which only a reader creates, so the push never targets the writer.

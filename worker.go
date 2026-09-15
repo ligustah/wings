@@ -386,23 +386,63 @@ func (n *workerNode) runJob(ctx context.Context, job jobEnvelope) {
 	if err := slot.take(ctx, false); err != nil {
 		return
 	}
-	res := n.runOne(ctx, job, slot)
-	slot.give()
-	if n.leaving.Load() {
+	for {
+		res, evicted := n.runOne(ctx, job, slot)
+		slot.give()
+		if n.leaving.Load() {
+			return
+		}
+		// Worker-owned eviction: the footprint is gone but the job stays here. Hold
+		// a node-local watch on its channel and reload it in place when the value
+		// arrives; the coordinator is told (Evicted) but never drives the wake. Only
+		// the reload the worker cannot carry through — its context ended, or the
+		// channel went away — falls back to handing the yield to the coordinator.
+		if evicted != nil {
+			n.beat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Wait: evicted.On, Evicted: true, Channel: evicted.Channel})
+			if err := n.awaitChannelValue(ctx, *evicted); err == nil {
+				n.clearOpen(job.ID)
+				if err := slot.take(ctx, true); err != nil {
+					return
+				}
+				slot.evicting.Store(false)
+				n.beat(ctx, beatEnvelope{Job: job.ID, Attempt: job.Attempt, Woke: true})
+				continue
+			}
+		}
+		if _, err := n.out.Append(context.WithoutCancel(ctx), []resultEnvelope{res}); err != nil && ctx.Err() == nil {
+			n.log.Error("wings: could not deliver a result", "job", job.ID, "err", err)
+		}
 		return
-	}
-	if _, err := n.out.Append(context.WithoutCancel(ctx), []resultEnvelope{res}); err != nil && ctx.Err() == nil {
-		n.log.Error("wings: could not deliver a result", "job", job.ID, "err", err)
 	}
 }
 
-func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot) (res resultEnvelope) {
+// beat reports one transition, logging rather than failing the job if it cannot.
+func (n *workerNode) beat(ctx context.Context, b beatEnvelope) {
+	if err := n.sendBeat(ctx, b); err != nil {
+		n.log.Debug("wings: could not report a job transition", "job", b.Job, "err", err)
+	}
+}
+
+// clearOpen forgets a job's declared output streams so a reload of the same
+// attempt may re-declare them; ensureStream is idempotent, so re-opening the
+// streams still there is safe.
+func (n *workerNode) clearOpen(job string) {
+	n.openMu.Lock()
+	defer n.openMu.Unlock()
+	for stream := range n.open {
+		if strings.Contains(stream, job) {
+			delete(n.open, stream)
+		}
+	}
+}
+
+func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot) (res resultEnvelope, evicted *flow.Wait) {
 	res.ID = job.ID
 	res.Attempt = job.Attempt
 
 	if n.leaving.Load() {
 		res.Error = "wings: this worker's machine is being taken back; the job was not started"
-		return res
+		return res, nil
 	}
 
 	// The function's own bound wins over the cluster default; a function this
@@ -481,7 +521,11 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		// A yield, not an answer: run again later, and when. See yield.go.
 		if y := yieldOf(ctx, err); y != nil {
 			res.Yield = y
-			return res
+			// An eviction the worker will reload itself, not hand to the coordinator.
+			if w, ok := evictedWaitOf(ctx, err); ok {
+				evicted = &w
+			}
+			return res, evicted
 		}
 		res.Error = err.Error()
 		// Name the function and bound rather than a bare "deadline exceeded"; the
@@ -493,17 +537,17 @@ func (n *workerNode) runOne(ctx context.Context, job jobEnvelope, slot *jobSlot)
 		if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.Canceled) && cause != context.Canceled {
 			res.Error = cause.Error()
 		}
-		return res
+		return res, nil
 	}
 	// Refused here, where the job pays, rather than as an uncarryable read on the
 	// coordinator that looks like a dropped connection.
 	if len(payload) > maxResult {
 		res.Error = fmt.Sprintf("wings: the result of %s is %d bytes, more than a result may be (%d); "+
 			"stream output this size over a flow.Channel rather than returning it", job.Func, len(payload), maxResult)
-		return res
+		return res, nil
 	}
 	res.Payload = payload
-	return res
+	return res, nil
 }
 
 // servedBroker is a broker a worker process stands up for itself, with the gRPC

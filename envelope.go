@@ -90,6 +90,12 @@ type beatEnvelope struct {
 	// load. See slots.go.
 	Wait string `json:"wait,omitempty"`
 	Woke bool   `json:"woke,omitempty"`
+	// Evicted says the worker dropped a channel-waiter's footprint but still owns
+	// it: it holds a node-local watch and will reload the job here when the value
+	// arrives (yield.go). The job stays blocked, on this worker; the coordinator
+	// records it for its picture but does not drive the wake. Channel names which.
+	Evicted bool   `json:"evicted,omitempty"`
+	Channel string `json:"channel,omitempty"`
 }
 
 // resultEnvelope is one outcome; exactly one of Payload and Error is set. A
