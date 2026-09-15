@@ -27,7 +27,6 @@ package overlay
 
 import (
 	"cmp"
-	"context"
 	"fmt"
 	"os"
 	"slices"
@@ -138,65 +137,25 @@ var _ = flow.Main(Main)
 
 // Provisioner builds the remote target from the environment, so one -target
 // remote cluster can span more than one cloud: set WINGS_OVERLAY_GCP_PROJECT (and
-// _ZONE) for GCP, WINGS_OVERLAY_AWS_REGION for EC2, or both to split workers
-// across the two. wings build bakes this in; with neither set, use -target local.
+// _ZONE) for GCP, WINGS_OVERLAY_AWS_REGION for EC2, or both to run workers across
+// the two in priority order. wings build bakes this in; with neither set, use
+// -target local.
 func Provisioner() wings.Provisioner {
-	var provs []wings.Provisioner
+	var specs []wings.ProvisionerSpec
 	if project := os.Getenv("WINGS_OVERLAY_GCP_PROJECT"); project != "" {
-		provs = append(provs, gcp.New(gcp.Config{Project: project, Zone: os.Getenv("WINGS_OVERLAY_GCP_ZONE")}))
+		specs = append(specs, wings.ProvisionerSpec{
+			Provisioner: gcp.New(gcp.Config{Project: project, Zone: os.Getenv("WINGS_OVERLAY_GCP_ZONE")}),
+		})
 	}
 	if region := os.Getenv("WINGS_OVERLAY_AWS_REGION"); region != "" {
-		provs = append(provs, aws.New(aws.Config{Region: region}))
+		specs = append(specs, wings.ProvisionerSpec{Provisioner: aws.New(aws.Config{Region: region})})
 	}
-	switch len(provs) {
+	switch len(specs) {
 	case 0:
 		return nil
 	case 1:
-		return provs[0]
+		return specs[0].Provisioner
 	default:
-		return &composite{provs: provs}
+		return wings.Provisioners(specs...)
 	}
-}
-
-// composite spreads a cluster's workers across several provisioners, so workers
-// on different clouds join one overlay. It splits leases round-robin, and asks
-// every sub-provisioner to recover on reattach — each finds only its own.
-type composite struct{ provs []wings.Provisioner }
-
-func (c *composite) Provision(ctx context.Context, leases []string) ([]wings.Machine, error) {
-	buckets := make([][]string, len(c.provs))
-	for i, lease := range leases {
-		buckets[i%len(c.provs)] = append(buckets[i%len(c.provs)], lease)
-	}
-	var all []wings.Machine
-	for i, p := range c.provs {
-		if len(buckets[i]) == 0 {
-			continue
-		}
-		machines, err := p.Provision(ctx, buckets[i])
-		if err != nil {
-			for _, m := range all {
-				_ = m.Close(ctx)
-			}
-			return nil, err
-		}
-		all = append(all, machines...)
-	}
-	return all, nil
-}
-
-func (c *composite) Reattach(ctx context.Context, leases []string) ([]wings.Machine, error) {
-	var all []wings.Machine
-	for _, p := range c.provs {
-		r, ok := p.(wings.Reattacher)
-		if !ok {
-			continue
-		}
-		machines, err := r.Reattach(ctx, leases)
-		if err != nil {
-			continue
-		}
-		all = append(all, machines...)
-	}
-	return all, nil
 }

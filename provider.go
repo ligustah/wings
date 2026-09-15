@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -66,7 +67,8 @@ func providerUsage() string {
 	if len(names) == 0 {
 		return "which cloud to provision from (none linked into this binary)"
 	}
-	return "which cloud to provision from for -target remote: " + strings.Join(names, " | ")
+	return "clouds to provision from for -target remote, priority order, each with an " +
+		"optional :cap (e.g. gcp:8,aws): " + strings.Join(names, " | ")
 }
 
 func lookupProvider(name string) (Provider, bool) {
@@ -92,29 +94,60 @@ func registerProviderFlags(fs *flag.FlagSet) {
 	}
 }
 
-func resolveProvider(name string) (Provisioner, error) {
+// resolveProvider builds the -target remote provisioner from -provider. The flag
+// is a priority-ordered, comma-separated list, each entry an optional cap after a
+// colon (-provider gcp:8,aws): fill gcp up to 8, the rest on aws. A single entry
+// resolves to that provisioner alone; several become a [Provisioners] chain.
+func resolveProvider(list string) (Provisioner, error) {
 	names := ProviderNames()
-
-	switch {
-	case len(names) == 0:
+	if len(names) == 0 {
 		return nil, fmt.Errorf("-target=remote needs a provider and none is linked in.\n" +
 			"Build with `wings build -providers gcp`, or export " +
 			"`func Provisioner() wings.Provisioner` from your package for a cloud wings does not ship")
-	case name == "" && len(names) == 1:
-		name = names[0]
-	case name == "":
-		return nil, fmt.Errorf("-provider is required: %s are linked in", strings.Join(names, ", "))
+	}
+	if list == "" {
+		if len(names) == 1 {
+			list = names[0]
+		} else {
+			return nil, fmt.Errorf("-provider is required: %s are linked in", strings.Join(names, ", "))
+		}
+	}
+
+	var specs []ProvisionerSpec
+	for entry := range strings.SplitSeq(list, ",") {
+		spec, err := resolveProviderSpec(strings.TrimSpace(entry), names)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
+	}
+	if len(specs) == 1 {
+		return specs[0].Provisioner, nil
+	}
+	return Provisioners(specs...), nil
+}
+
+func resolveProviderSpec(entry string, names []string) (ProvisionerSpec, error) {
+	name, capStr, hasCap := strings.Cut(entry, ":")
+	spec := ProvisionerSpec{}
+	if hasCap {
+		n, err := strconv.Atoi(capStr)
+		if err != nil || n < 0 {
+			return spec, fmt.Errorf("-provider %q: cap must be a non-negative integer", entry)
+		}
+		spec.Cap = n
 	}
 
 	p, ok := lookupProvider(name)
 	if !ok {
-		return nil, fmt.Errorf("unknown -provider %q; linked in: %s", name, strings.Join(names, ", "))
+		return spec, fmt.Errorf("unknown -provider %q; linked in: %s", name, strings.Join(names, ", "))
 	}
 	prov, err := p.New()
 	if err != nil {
-		return nil, fmt.Errorf("provider %s: %w", name, err)
+		return spec, fmt.Errorf("provider %s: %w", name, err)
 	}
-	return prov, nil
+	spec.Provisioner = prov
+	return spec, nil
 }
 
 func sortedKeys[V any](m map[string]V) []string {
