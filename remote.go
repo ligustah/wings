@@ -302,6 +302,9 @@ func (c *Cluster) deploy(ctx context.Context, m Machine, image *workerImage, id 
 	if ci := c.cfg.commitInterval(); ci > 0 {
 		env[envCommitInterval] = ci.String()
 	}
+	if c.cfg.PreemptAfter > 0 {
+		env[envPreemptAfter] = c.cfg.PreemptAfter.String()
+	}
 
 	c.log.Info("wings: starting worker", "machine", m.ID())
 	if err := m.Start(ctx, remoteBin, env); err != nil {
@@ -359,6 +362,9 @@ func (c *Cluster) deployP2P(ctx context.Context, m Machine, id, remoteBin string
 	}
 	if ci := c.cfg.commitInterval(); ci > 0 {
 		env[envCommitInterval] = ci.String()
+	}
+	if c.cfg.PreemptAfter > 0 {
+		env[envPreemptAfter] = c.cfg.PreemptAfter.String()
 	}
 
 	c.log.Info("wings: starting p2p worker", "machine", m.ID(), "worker", id)

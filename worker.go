@@ -39,6 +39,10 @@ type workerNode struct {
 	// commitInterval coalesces each attempt's transactional commits; zero commits
 	// every event. Read from WINGS_COMMIT_INTERVAL, or set directly in process.
 	commitInterval time.Duration
+	// preemptAfter is how long a thread may hold a slot under contention before it
+	// is preempted and reloaded in place; zero disables preemption. From
+	// Config.PreemptAfter (WINGS_PREEMPT_AFTER). See yield.go and slots.go.
+	preemptAfter time.Duration
 	log            *slog.Logger
 
 	// slots bounds how many threads run here at once. See slots.go.
@@ -689,6 +693,7 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	concurrency, _ := strconv.Atoi(os.Getenv(envConcurrency))
 	jobTimeout, _ := time.ParseDuration(os.Getenv(envJobTimeout))
 	commitInterval, _ := time.ParseDuration(os.Getenv(envCommitInterval))
+	preemptAfter, _ := time.ParseDuration(os.Getenv(envPreemptAfter))
 	if v, err := strconv.Atoi(os.Getenv(envCompression)); err == nil {
 		streamCompression = dswire.Compression(v)
 	}
@@ -728,6 +733,7 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	n.p2p = os.Getenv(envP2PJoin) != ""
+	n.preemptAfter = preemptAfter
 
 	if url := os.Getenv(PreemptionURLEnv); url != "" {
 		go n.watchPreemption(ctx, url)

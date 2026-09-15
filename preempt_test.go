@@ -40,14 +40,11 @@ func TestOversubscribedThreadsArePreemptedAndTimeSlice(t *testing.T) {
 	if testing.Short() {
 		t.Skip("preempt/reload timing")
 	}
-	old := preemptAfter
-	preemptAfter = 30 * time.Millisecond
-	t.Cleanup(func() { preemptAfter = old })
 	preemptCounter.starts.Store(0)
 	preemptCounter.steps.Store(0)
 
 	// One slot, two jobs: the second waits, so the first is preempted to share it.
-	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1, PreemptAfter: 30 * time.Millisecond})
 
 	var sum int
 	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {

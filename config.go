@@ -17,6 +17,7 @@ const (
 	envWorkerID       = "WINGS_WORKER_ID"
 	envCompression    = "WINGS_COMPRESSION"
 	envCommitInterval = "WINGS_COMMIT_INTERVAL"
+	envPreemptAfter   = "WINGS_PREEMPT_AFTER"
 	envLogLevel       = "WINGS_LOG_LEVEL"
 	envLogBytes       = "WINGS_LOG_BYTES"
 	// envP2PJoin is the coordinator's peer address a p2p worker child joins; its
@@ -182,6 +183,15 @@ type Config struct {
 	// zero value uses a 1s default; set a negative value to commit every event, so a
 	// restart loses nothing at the cost of an fsync per event.
 	CommitInterval time.Duration
+
+	// PreemptAfter oversubscribes workers: when more threads are ready than a worker
+	// has slots, a running thread that has held its slot this long is preempted at
+	// its next checkpoint and reloaded in place, giving a waiting thread a turn — a
+	// coarse time-slice for long-lived threads. A thread with no checkpoint is not
+	// preemptible until it reaches one. Zero (the default) disables preemption, so a
+	// thread runs until it blocks or finishes. Passed to workers as
+	// WINGS_PREEMPT_AFTER.
+	PreemptAfter time.Duration
 
 	// LogLevel is the lowest level [flow.Context.Logger] records; a line below it
 	// writes neither the log stream nor the history marker that dedupes it. Fixed for

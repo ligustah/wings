@@ -34,6 +34,7 @@ func (c *Cluster) launchInProcess(ctx context.Context, n int) ([]*workerConn, er
 		if err != nil {
 			return nil, closePartial(ctx, out, err)
 		}
+		node.preemptAfter = c.cfg.PreemptAfter
 
 		// ownsClient false: the engine outlives any one worker.
 		w, err := c.connect(id, client, false)
@@ -95,6 +96,7 @@ func (c *Cluster) launchP2P(ctx context.Context, n int) ([]*workerConn, error) {
 			return nil, closePartial(ctx, out, err)
 		}
 		node.p2p = true
+		node.preemptAfter = c.cfg.PreemptAfter
 		w, err := c.connect(id, client, false)
 		if err != nil {
 			wn.close()
@@ -149,6 +151,7 @@ func (c *Cluster) spawnLocalP2P(ctx context.Context, exe, id, dir string) (*work
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), p2pWorkerEnv(id, dir, c.p2p.peerAddr, c.cfg.P2P.ReplicationFactor,
 		c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval(), c.overlayControl, c.overlayAuthKey)...)
+	cmd.Env = c.withPreemptEnv(cmd.Env)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -234,6 +237,7 @@ func (c *Cluster) launchLocalProcess(ctx context.Context, n int) ([]*workerConn,
 func (c *Cluster) spawnLocalShared(ctx context.Context, exe, id, broker string) (*workerConn, error) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), sharedWorkerEnv(id, broker, c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval())...)
+	cmd.Env = c.withPreemptEnv(cmd.Env)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -279,6 +283,7 @@ func (c *Cluster) spawnLocalShared(ctx context.Context, exe, id, broker string) 
 func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerConn, error) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), workerEnv(id, "127.0.0.1:0", dir, c.cfg.Concurrency, c.cfg.JobTimeout, c.cfg.commitInterval())...)
+	cmd.Env = c.withPreemptEnv(cmd.Env)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -325,6 +330,15 @@ func (c *Cluster) spawnLocal(ctx context.Context, exe, id, dir string) (*workerC
 
 // workerEnv is the whole coordinator-to-worker contract, carried explicitly
 // because a worker process shares nothing with the Config that set it.
+// withPreemptEnv adds WINGS_PREEMPT_AFTER to a spawned worker's environment when
+// preemption is configured, so a worker process time-slices like an in-process one.
+func (c *Cluster) withPreemptEnv(env []string) []string {
+	if c.cfg.PreemptAfter > 0 {
+		env = append(env, envPreemptAfter+"="+c.cfg.PreemptAfter.String())
+	}
+	return env
+}
+
 func workerEnv(id, listen, dir string, concurrency int, jobTimeout, commitInterval time.Duration) []string {
 	env := []string{
 		envMode + "=" + modeWorker,

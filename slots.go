@@ -151,8 +151,8 @@ func (s *jobSlot) take(ctx context.Context, urgent bool) error {
 		return nil
 	}
 	s.held = true
-	if preemptAfter > 0 {
-		s.preemptTimer = time.AfterFunc(preemptAfter, s.maybePreempt)
+	if s.n.preemptAfter > 0 {
+		s.preemptTimer = time.AfterFunc(s.n.preemptAfter, s.maybePreempt)
 	}
 	return nil
 }
@@ -173,7 +173,7 @@ func (s *jobSlot) maybePreempt() {
 	}
 	s.mu.Lock()
 	if s.held {
-		s.preemptTimer = time.AfterFunc(preemptAfter, s.maybePreempt)
+		s.preemptTimer = time.AfterFunc(s.n.preemptAfter, s.maybePreempt)
 	}
 	s.mu.Unlock()
 }

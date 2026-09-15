@@ -75,13 +75,6 @@ func (e *evictError) Error() string {
 	return fmt.Sprintf("wings: evicted while waiting on %s from channel %s", e.wait.On, e.wait.Channel)
 }
 
-// preemptAfter is how long a running thread may hold its slot before the worker
-// preempts it to reload in place, giving another thread a turn. Zero disables
-// preemption. A cooperative point: the thread yields at its next checkpoint (a
-// Heartbeat or other context-aware step), not mid-step. A variable for tests; the
-// production trigger — slot contention — arrives with the rest of preemption.
-var preemptAfter time.Duration
-
 // preemptError is the cause a preempted attempt is cancelled with. Like an
 // eviction the worker reloads it in place, but there is nothing to wait for: it
 // just gets back in line for a slot (worker.go).

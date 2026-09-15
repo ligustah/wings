@@ -74,6 +74,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		inspect          = flag.String("inspect", "", "serve the inspection UI over an existing data directory and exit; does not run a workflow")
 		jobTimeout       = flag.Duration("job-timeout", 0, "bound on a single work function call; 0 means no bound")
 		commitInterval   = flag.Duration("commit-interval", 0, "coalesce the coordinator's and workers' transactional commits: hold a thread's transaction open and commit at most once per interval — fewer fsyncs for a crash-replayable tail; 0 uses the default (1s), negative commits every event. A thread still flushes when it blocks, heartbeats, or ends, so delivery is unaffected")
+		preemptAfter     = flag.Duration("preempt-after", 0, "oversubscribe workers: when more threads are ready than a worker has slots, preempt one that has held its slot this long at its next checkpoint and reload it, so long-lived threads time-slice; 0 disables it")
 		maxAttempts      = flag.Int("max-attempts", 0, "how many workers one job may be tried on before the run fails; 0 uses the default (5), below 1 means a single attempt")
 		reconnectTimeout = flag.Duration("reconnect-timeout", 0, "how long a worker may be unreachable before its work is redispatched; 0 uses the default (2m), negative gives up at once")
 		keepChannelData  = flag.Bool("keep-channel-data", false, "keep a settled activity's shared-channel streams instead of dropping them, for replaying a returned activity step by step while debugging")
@@ -152,6 +153,7 @@ func CoordinatorMain(opts CoordinatorOptions) {
 		RetainChannelData: *keepChannelData,
 		JobTimeout:        *jobTimeout,
 		CommitInterval:    *commitInterval,
+		PreemptAfter:      *preemptAfter,
 		MaxAttempts:       *maxAttempts,
 		ReconnectTimeout:  *reconnectTimeout,
 		Compression:       comp,
