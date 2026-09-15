@@ -336,6 +336,26 @@ Leases are identities wings mints before it creates anything; your implementatio
 makes each machine findable by its lease, and `ID()` returns it. Implement
 `Reattacher` too so a restarted coordinator can recover running machines.
 
+### Several clouds in one run
+
+`-provider` takes a priority-ordered list, each entry with an optional `:cap`, so a
+run fills the first cloud and spills the rest to the next:
+
+```sh
+./myapp -target remote -workers 12 -provider gcp:8,aws \
+        -gcp.project my-proj -gcp.zone europe-west1-b -aws.region eu-west-1
+```
+
+In code, `wings.Provisioners` builds the same chain; a member that fails or comes up
+short spills its leases to the one after it.
+
+```go
+wings.Remote(wings.Provisioners(
+    wings.ProvisionerSpec{Provisioner: gcp.New(gcpCfg), Cap: 8},
+    wings.ProvisionerSpec{Provisioner: aws.New(awsCfg)},
+))
+```
+
 ## Requirements
 
 - Go 1.27+ (generic methods)
