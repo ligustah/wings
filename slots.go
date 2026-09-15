@@ -149,7 +149,7 @@ func (s *jobSlot) Park(ctx context.Context, w flow.Wait) func(context.Context) e
 		close(reported)
 	})
 	var unload *time.Timer
-	if unloadable(w) {
+	if s.n.unloads(w) {
 		unload = time.AfterFunc(unloadAfter, func() { s.n.unload(s.job, w) })
 	}
 	return func(ctx context.Context) error {

@@ -32,6 +32,10 @@ type workerNode struct {
 	id          string
 	concurrency int
 	timeout     time.Duration
+	// p2p is set when this worker runs its own node of the replicated cluster.
+	// A channel-blocked thread then stays loaded and is woken by the worker's own
+	// stream subscription, so it is not unloaded onto the coordinator (yield.go).
+	p2p bool
 	// commitInterval coalesces each attempt's transactional commits; zero commits
 	// every event. Read from WINGS_COMMIT_INTERVAL, or set directly in process.
 	commitInterval time.Duration
@@ -638,6 +642,7 @@ func runWorkerProcess(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	n.p2p = os.Getenv(envP2PJoin) != ""
 
 	if url := os.Getenv(PreemptionURLEnv); url != "" {
 		go n.watchPreemption(ctx, url)

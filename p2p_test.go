@@ -109,6 +109,59 @@ func TestP2PLocalProcessChannelCrossesProcesses(t *testing.T) {
 	}
 }
 
+// TestP2PAChannelWaitStaysLoadedAndWakes proves a channel receiver in p2p stays
+// loaded across a wait that would unload it elsewhere, and is woken in place by
+// the worker's own stream subscription when the value arrives — the coordinator
+// never follows the worker-led channel stream. It runs once: no unload, no
+// redispatch. It still frees its slot while parked (yield_test.go covers that).
+func TestP2PAChannelWaitStaysLoadedAndWakes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("multi-node channel wait/wake")
+	}
+	oldUnload, oldReport := unloadAfter, parkReport
+	unloadAfter, parkReport = 150*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { unloadAfter, parkReport = oldUnload, oldReport })
+	receiving.attempts.Store(0)
+
+	c := start(t, Config{
+		Target:      InProcess(),
+		Workers:     2,
+		Concurrency: 1,
+		Dir:         t.TempDir(),
+		P2P:         &P2P{ReplicationFactor: 2},
+		Logger:      quietP2PLogger(),
+	})
+
+	var got int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		r, w := ctx.NewChannel[int]()
+		receiver := ctx.Go(receivesOnce, feed{Values: r})
+		// Long past unloadAfter: elsewhere the receiver would be unloaded, but in
+		// p2p it stays loaded and its subscription wakes it when the value lands.
+		if _, err := ctx.Go(p2pSquare, 3).Await(ctx); err != nil {
+			return err
+		}
+		if err := ctx.Sleep(600 * time.Millisecond); err != nil {
+			return err
+		}
+		if err := w.Send(ctx, 7); err != nil {
+			return err
+		}
+		var err error
+		got, err = receiver.Await(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("got %d, want 7", got)
+	}
+	if n := receiving.attempts.Load(); n != 1 {
+		t.Fatalf("the receiver ran %d attempts, want 1: it stayed loaded and was woken in place", n)
+	}
+}
+
 // TestP2PInProcessResumesAcrossRestart shows a p2p cluster brought up a second
 // time over the same Dir resumes its control plane rather than forming a new one,
 // so it goes on dispatching work.

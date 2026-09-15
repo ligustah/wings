@@ -94,6 +94,7 @@ func (c *Cluster) launchP2P(ctx context.Context, n int) ([]*workerConn, error) {
 			wn.close()
 			return nil, closePartial(ctx, out, err)
 		}
+		node.p2p = true
 		w, err := c.connect(id, client, false)
 		if err != nil {
 			wn.close()

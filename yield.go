@@ -28,6 +28,21 @@ func unloadable(w flow.Wait) bool {
 	return false
 }
 
+// unloads says whether a thread parked on w should be unloaded from this worker.
+// In p2p a channel-blocked thread stays loaded: the worker's own stream
+// subscription wakes it directly, and the coordinator cannot follow a worker-led
+// channel stream to drive the wake without stalling its own commits. Only the
+// joins, whose end the coordinator sees regardless, are unloaded there.
+func (n *workerNode) unloads(w flow.Wait) bool {
+	if !unloadable(w) {
+		return false
+	}
+	if n.p2p && (w.On == flow.WaitRecv || w.On == flow.WaitSend) {
+		return false
+	}
+	return true
+}
+
 // unloadError is the cause an unloaded attempt is cancelled with, so the result
 // names the wait rather than "context canceled".
 type unloadError struct{ wait flow.Wait }
