@@ -24,6 +24,14 @@ type slots struct {
 
 func newSlots(n int) *slots { return &slots{free: n} }
 
+// contended reports whether a thread is waiting for a slot — the signal that a
+// running thread's slice is worth preempting.
+func (s *slots) contended() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.urgent) > 0 || len(s.normal) > 0
+}
+
 // acquire takes a slot, waiting for one if none is free. urgent puts the
 // caller ahead of every non-urgent waiter.
 func (s *slots) acquire(ctx context.Context, urgent bool) error {
@@ -144,9 +152,30 @@ func (s *jobSlot) take(ctx context.Context, urgent bool) error {
 	}
 	s.held = true
 	if preemptAfter > 0 {
-		s.preemptTimer = time.AfterFunc(preemptAfter, func() { s.n.preempt(s.job.ID, s.job.Attempt) })
+		s.preemptTimer = time.AfterFunc(preemptAfter, s.maybePreempt)
 	}
 	return nil
+}
+
+// maybePreempt preempts this thread once it has held its slot a full slice, but
+// only while another thread is waiting for a slot — an idle worker does not churn.
+// With no waiter it waits another slice and checks again.
+func (s *jobSlot) maybePreempt() {
+	s.mu.Lock()
+	held := s.held
+	s.mu.Unlock()
+	if !held {
+		return
+	}
+	if s.n.slots.contended() {
+		s.n.preempt(s.job.ID, s.job.Attempt)
+		return
+	}
+	s.mu.Lock()
+	if s.held {
+		s.preemptTimer = time.AfterFunc(preemptAfter, s.maybePreempt)
+	}
+	s.mu.Unlock()
 }
 
 func (s *jobSlot) give() {

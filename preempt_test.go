@@ -32,11 +32,11 @@ var preemptWork = flow.Define(func(ctx flow.Context, n int) (int, error) {
 	return n, nil
 }, flow.WithName("test.preemptWork"))
 
-// THE POINT: a running thread is preempted at its next checkpoint, gives up its
-// slot, and is reloaded in place from that checkpoint — making progress across
-// several preemptions and finishing with the right answer, without the
-// coordinator redispatching it.
-func TestARunningThreadIsPreemptedAndReloaded(t *testing.T) {
+// THE POINT: two threads oversubscribe one slot; each is preempted at a
+// checkpoint to give the other a turn, reloaded in place from that checkpoint,
+// and both finish with the right answer — time-slicing, not running one to
+// completion before the other starts. Preemption never reaches the coordinator.
+func TestOversubscribedThreadsArePreemptedAndTimeSlice(t *testing.T) {
 	if testing.Short() {
 		t.Skip("preempt/reload timing")
 	}
@@ -46,16 +46,48 @@ func TestARunningThreadIsPreemptedAndReloaded(t *testing.T) {
 	preemptCounter.starts.Store(0)
 	preemptCounter.steps.Store(0)
 
+	// One slot, two jobs: the second waits, so the first is preempted to share it.
 	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1})
 
-	got, err := preemptWork(c.Bind(t.Context()), 10)
+	var sum int
+	err := c.Run(t.Context(), flow.NewName(), func(ctx flow.Context) error {
+		a := ctx.Go(preemptWork, 6)
+		b := ctx.Go(preemptWork, 6)
+		ra, err := a.Await(ctx)
+		if err != nil {
+			return err
+		}
+		rb, err := b.Await(ctx)
+		if err != nil {
+			return err
+		}
+		sum = ra + rb
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("preemptWork: %v", err)
+		t.Fatalf("Run: %v", err)
 	}
-	if got != 10 {
-		t.Fatalf("got %d, want 10", got)
+	if sum != 12 {
+		t.Fatalf("sum %d, want 12", sum)
 	}
-	if n := preemptCounter.starts.Load(); n < 2 {
-		t.Fatalf("preemptWork started %d times; want at least 2 — it must have been preempted and reloaded", n)
+	// Two jobs sharing one slot: with preemption both are reloaded, so the work
+	// function starts more than twice.
+	if n := preemptCounter.starts.Load(); n <= 2 {
+		t.Fatalf("preemptWork started %d times; want > 2 — the two must have preempted each other", n)
+	}
+	// Worker-owned: preemption never reached the coordinator.
+	entries := awaitJournal(t, c, func(es []journalEntry) bool {
+		n := 0
+		for _, e := range es {
+			if e.Func == "test.preemptWork" && e.Kind == journalCompleted {
+				n++
+			}
+		}
+		return n >= 2
+	})
+	for _, e := range entries {
+		if e.Func == "test.preemptWork" && (e.Kind == journalYielded || e.Kind == journalRedispatch) {
+			t.Fatalf("preemptWork's %s reached the coordinator; preemption must be worker-owned", e.Kind)
+		}
 	}
 }
