@@ -53,3 +53,15 @@ participant history stream was deleted.
 attempt's history stream. It has no knowledge of whether that attempt's tx is
 still undecided — for a killed worker it always is, since the worker never
 committed or aborted before dying.
+
+## Local reproduction result
+
+A local `LocalProcess` p2p worker-kill (a checkpointing job in flight, worker
+hard-killed mid-attempt) does NOT reproduce the wedge — the run completes and the
+work redispatches. See `TestP2PWorkSurvivesAWorkerKilledMidCheckpoint`. So the
+wedge is timing / overlay-latency dependent: on GCP the killed node was also a
+broker holding replicas, fenced over a ~2-minute grace under overlay latency,
+which widened the window between the prepared tx being stranded and its participant
+history stream being dropped. Reproducing it locally likely needs a longer commit
+interval and/or a delayed reap, or a slowed peer link — a lead to pursue once DS
+confirms whether the deleted-participant tx is meant to be resolvable.
