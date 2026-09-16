@@ -459,15 +459,19 @@ func (c *Cluster) releaseWorker(ctx context.Context, w *workerConn) error {
 	if w.lease == "" {
 		return err
 	}
-	// Bounded like the journal's final flush: recording the release routes to
-	// machineStream's leader, which at shutdown can be a peer that is also gone, so
-	// an unbounded append would hang Stop. A missed release is reconciled from the
-	// cloud on restart, so a timeout here is a lost note, not a reason to hang.
+	// Bounded like the journal's final flush, and best effort: recording the release
+	// routes to machineStream's leader, which at shutdown can be a peer that is also
+	// gone, so an unbounded append would hang Stop. A missed release is reconciled
+	// from the cloud on restart, so a failure is logged, not returned — an otherwise
+	// clean shutdown should not report failure over a lost note.
 	relCtx, cancel := context.WithTimeout(ctx, teardownGrace)
 	defer cancel()
-	return errors.Join(err, c.machines.write(relCtx, machineRecord{
+	if werr := c.machines.write(relCtx, machineRecord{
 		Kind: machineReleased, Lease: w.lease, Worker: w.id,
-	}))
+	}); werr != nil {
+		c.log.Warn("wings: could not record a worker's release", "worker", w.id, "err", werr)
+	}
+	return err
 }
 
 // dropWorkerStreams removes what a worker that is not coming back left on the
