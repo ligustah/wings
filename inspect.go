@@ -28,11 +28,14 @@ func (c *Cluster) startUI(addr string) error {
 	srv := &http.Server{Handler: c.uiHandler()}
 	c.uiSrv = srv
 	c.uiAddr = lis.Addr().String()
-	c.wg.Go(func() {
+	// Not under c.wg: Stop waits on c.wg partway through teardown, but the UI must
+	// stay up THROUGH teardown so a Stop-phase hang is still pprof-dumpable. Stop
+	// closes this server last.
+	go func() {
 		if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
 			c.log.Error("wings: UI server stopped", "err", err)
 		}
-	})
+	}()
 	c.log.Info("wings: serving the inspection UI", "addr", c.uiAddr)
 	c.wg.Go(c.logRuntimeStats)
 	return nil

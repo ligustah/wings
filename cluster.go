@@ -1850,11 +1850,6 @@ func (c *Cluster) Stop(ctx context.Context) error {
 
 	c.journal.record(journalEntry{Kind: journalClusterStop})
 
-	// Stop serving the UI first: it only reads, so nothing depends on it.
-	if c.uiSrv != nil {
-		_ = c.uiSrv.Shutdown(ctx)
-	}
-
 	// Drain each worker's outputs before the mirror is cancelled and its machine
 	// destroyed, or a persistent Dir would keep only the front of a file whose
 	// handle promised the whole of it. The workers must still be in c.workers
@@ -1894,6 +1889,12 @@ func (c *Cluster) Stop(ctx context.Context) error {
 		c.engineSrv.GracefulStop()
 	}
 	errs = append(errs, c.closeShared())
+	// Close the UI last, so pprof stays reachable through teardown and a Stop-phase
+	// hang is still dumpable. Close, not Shutdown: the process is exiting and a
+	// graceful wait could itself block on a stuck handler.
+	if c.uiSrv != nil {
+		_ = c.uiSrv.Close()
+	}
 	return errors.Join(errs...)
 }
 
