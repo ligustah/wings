@@ -360,17 +360,10 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 		}
 	}
 
-	log.Info("wings: creating instance", "type", p.cfg.MachineType, "zone", p.cfg.Zone)
-	op, err := client.Insert(ctx, &computepb.InsertInstanceRequest{
-		Project:          p.cfg.Project,
-		Zone:             p.cfg.Zone,
-		InstanceResource: inst,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("wings: create instance %s: %w", name, err)
-	}
-
-	// The instance may now exist even if we fail, so every exit deletes it.
+	// The instance may exist even when the create call itself fails: a context
+	// cancel can return an error after GCP has already accepted the Insert. So arm
+	// the reaper before the call and route every exit — a failed Insert included —
+	// through it, or a canceled scale-up leaks a running instance.
 	m := &gcpMachine{
 		name:    name,
 		lease:   lease,
@@ -382,6 +375,16 @@ func (p *gcpProvisioner) createOne(ctx context.Context, client *compute.Instance
 	fail := func(err error) (wings.Machine, error) {
 		_ = m.Close(context.WithoutCancel(ctx))
 		return nil, err
+	}
+
+	log.Info("wings: creating instance", "type", p.cfg.MachineType, "zone", p.cfg.Zone)
+	op, err := client.Insert(ctx, &computepb.InsertInstanceRequest{
+		Project:          p.cfg.Project,
+		Zone:             p.cfg.Zone,
+		InstanceResource: inst,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("wings: create instance %s: %w", name, err))
 	}
 
 	if err := op.Wait(ctx); err != nil {
