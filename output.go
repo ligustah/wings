@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/ligustah/durable_streams/dsclient"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ligustah/wings/flow"
 	"github.com/ligustah/wings/flow/protos"
@@ -663,17 +665,31 @@ func (c *Cluster) wasDropped(name string) bool {
 	return c.dropped[name]
 }
 
-// dropStream deletes a stream. Deleting one already gone is not an error.
+// dropStreamRetries bounds how long dropStream waits out a broker still replaying
+// the cluster catalog before it gives up and returns the error.
+const dropStreamRetries = 6
+
+// dropStream deletes a stream. Deleting one already gone is not an error. A
+// clustered broker still catching up refuses the existence check
+// (codes.Unavailable) rather than answer "gone" — answering gone would skip the
+// delete and leave the stream's follower and log running on its holders — so wait
+// that out and retry rather than treat the refusal as gone.
 func dropStream(ctx context.Context, client *dsclient.Client, name string) error {
-	ok, err := client.StreamExists(ctx, name)
-	if err != nil {
-		return fmt.Errorf("wings: check %s: %w", name, err)
-	}
-	if !ok {
+	for attempt := 0; ; attempt++ {
+		ok, err := client.StreamExists(ctx, name)
+		if err != nil {
+			if status.Code(err) == codes.Unavailable && attempt < dropStreamRetries &&
+				sleepCtx(ctx, reconnectBackoff(attempt+1)) {
+				continue
+			}
+			return fmt.Errorf("wings: check %s: %w", name, err)
+		}
+		if !ok {
+			return nil
+		}
+		if err := client.DeleteStream(ctx, name); err != nil {
+			return fmt.Errorf("wings: discard %s: %w", name, err)
+		}
 		return nil
 	}
-	if err := client.DeleteStream(ctx, name); err != nil {
-		return fmt.Errorf("wings: discard %s: %w", name, err)
-	}
-	return nil
 }
