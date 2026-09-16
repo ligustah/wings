@@ -473,6 +473,12 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 	if err != nil {
 		return
 	}
+	// Bounded, because this must never wedge Stop: in p2p these deletes route to
+	// each stream's partition leader, which for a lost worker's own streams can be
+	// a peer that is also gone, so an unbounded delete would block shutdown forever
+	// against an unreachable leader. A stream left behind is a leak, not a failure.
+	ctx, cancel := context.WithTimeout(ctx, dropStreamsGrace)
+	defer cancel()
 	var names []string
 	if c.cfg.P2P == nil {
 		names = append(names, mirrorStreamFor(w.id))
@@ -803,6 +809,10 @@ func (c *Cluster) closeShared() error {
 // shutdownGrace bounds releasing the shared engine at [Cluster.Stop], so a raft or
 // overlay Close blocked on an unreachable peer cannot hang the coordinator's exit.
 const shutdownGrace = 20 * time.Second
+
+// dropStreamsGrace bounds the best-effort delete of a gone worker's streams, so a
+// p2p delete routed to an unreachable leader cannot hang [Cluster.Stop].
+const dropStreamsGrace = 15 * time.Second
 
 // tail mirrors a worker's results onto the coordinator's streams and delivers
 // them, until the cluster stops or the worker is genuinely gone — a transient
