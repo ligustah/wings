@@ -528,6 +528,7 @@ func (c *Cluster) adopt(w *workerConn) {
 	loop(c.tailBeats)
 	loop(c.submitter)
 	loop(c.pull)
+	loop(c.watchMachine)
 
 	// So the mirror keeps this worker's output at once, not after a discovery pass.
 	c.pokeOutputs()
@@ -943,6 +944,35 @@ func (c *Cluster) tail(w *workerConn) {
 			}
 			from = r.Offset + 1
 			c.deliver(r.Record)
+		}
+	}
+}
+
+// machineProbeInterval is how often watchMachine asks a remote worker's machine
+// whether it still exists.
+const machineProbeInterval = 15 * time.Second
+
+// watchMachine reaps a remote worker as soon as its provider confirms the machine
+// is gone, instead of waiting for a read on the worker's result stream to fail —
+// in p2p that stream is replicated, so reads keep succeeding from a surviving
+// replica and the tail loop can take many minutes to notice the worker died. Only
+// a definite "gone" reaps; the reap is idempotent with the tail path via w.dead.
+func (c *Cluster) watchMachine(w *workerConn) {
+	if _, ok := w.machine.(Prober); !ok {
+		return
+	}
+	for {
+		if !sleepCtx(w.ctx, machineProbeInterval) {
+			return
+		}
+		if w.dead.Load() {
+			return
+		}
+		if c.machineGone(w) && w.dead.CompareAndSwap(false, true) {
+			c.log.Error("wings: worker's machine is gone", "worker", w.id)
+			c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "machine is gone"})
+			c.redispatchFrom(w)
+			return
 		}
 	}
 }
