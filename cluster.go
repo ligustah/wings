@@ -459,7 +459,13 @@ func (c *Cluster) releaseWorker(ctx context.Context, w *workerConn) error {
 	if w.lease == "" {
 		return err
 	}
-	return errors.Join(err, c.machines.write(ctx, machineRecord{
+	// Bounded like the journal's final flush: recording the release routes to
+	// machineStream's leader, which at shutdown can be a peer that is also gone, so
+	// an unbounded append would hang Stop. A missed release is reconciled from the
+	// cloud on restart, so a timeout here is a lost note, not a reason to hang.
+	relCtx, cancel := context.WithTimeout(ctx, teardownGrace)
+	defer cancel()
+	return errors.Join(err, c.machines.write(relCtx, machineRecord{
 		Kind: machineReleased, Lease: w.lease, Worker: w.id,
 	}))
 }
@@ -477,7 +483,7 @@ func (c *Cluster) dropWorkerStreams(ctx context.Context, w *workerConn) {
 	// each stream's partition leader, which for a lost worker's own streams can be
 	// a peer that is also gone, so an unbounded delete would block shutdown forever
 	// against an unreachable leader. A stream left behind is a leak, not a failure.
-	ctx, cancel := context.WithTimeout(ctx, dropStreamsGrace)
+	ctx, cancel := context.WithTimeout(ctx, teardownGrace)
 	defer cancel()
 	var names []string
 	if c.cfg.P2P == nil {
@@ -810,9 +816,11 @@ func (c *Cluster) closeShared() error {
 // overlay Close blocked on an unreachable peer cannot hang the coordinator's exit.
 const shutdownGrace = 20 * time.Second
 
-// dropStreamsGrace bounds the best-effort delete of a gone worker's streams, so a
-// p2p delete routed to an unreachable leader cannot hang [Cluster.Stop].
-const dropStreamsGrace = 15 * time.Second
+// teardownGrace bounds a best-effort cluster write during [Cluster.Stop] — dropping
+// a gone worker's streams, recording its release — so an op routed to a partition
+// leader that is also gone cannot hang shutdown. A skipped one is a leak or a lost
+// note (recovery reconciles machines from the cloud), not a reason to hang.
+const teardownGrace = 15 * time.Second
 
 // tail mirrors a worker's results onto the coordinator's streams and delivers
 // them, until the cluster stops or the worker is genuinely gone — a transient
