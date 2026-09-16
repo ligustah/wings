@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// statsInterval is how often the inspection server logs the live goroutine count.
+// statsInterval is how often the inspection server logs runtime stats.
 const statsInterval = 30 * time.Second
 
 // The inspection API: a read-only view of the cluster served over HTTP when
@@ -38,19 +38,23 @@ func (c *Cluster) startUI(addr string) error {
 	return nil
 }
 
-// logRuntimeStats logs the live goroutine count every statsInterval while the
-// inspection server runs — a cheap always-on signal for goroutine growth. To see
-// what is churning (short-lived goroutines by call site) rather than the live
-// count, capture the execution trace at /debug/pprof/trace.
+// logRuntimeStats logs the live goroutine count and heap/total memory every
+// statsInterval while the inspection server runs — a cheap always-on signal for
+// goroutine or memory growth. To see what is churning (short-lived goroutines by
+// call site) rather than the live count, capture the execution trace at
+// /debug/pprof/trace.
 func (c *Cluster) logRuntimeStats() {
 	t := time.NewTicker(statsInterval)
 	defer t.Stop()
+	var m runtime.MemStats
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-t.C:
-			c.log.Info("wings: runtime", "goroutines", runtime.NumGoroutine())
+			runtime.ReadMemStats(&m)
+			c.log.Info("wings: runtime", "goroutines", runtime.NumGoroutine(),
+				"heapMB", m.HeapAlloc>>20, "sysMB", m.Sys>>20)
 		}
 	}
 }
