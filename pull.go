@@ -98,7 +98,7 @@ func (c *Cluster) pull(w *workerConn) {
 					<-done
 					c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "pull wedged"})
 					w.dead.Store(true)
-					c.redispatchFrom(w)
+					c.redispatchFrom(w, true)
 					return
 				}
 				if reconnect {

@@ -284,6 +284,11 @@ type pendingJob struct {
 	// once when a lost worker's jobs are redispatched so the retry can prefer a
 	// peer that still leads the channel data. Set and read under mu; p2p only.
 	channels []string
+	// infraMoves is how many of this job's moves were caused by losing the node
+	// under it (unreachable, machine gone, preempted) rather than by the job. It
+	// raises the give-up ceiling one-for-one so infrastructure loss resumes from
+	// the checkpoint without ever spending the job's attempt budget.
+	infraMoves int
 }
 
 // overdue reports whether a job has run out of time and which bound it hit, so
@@ -568,7 +573,7 @@ func (c *Cluster) placeHeld() {
 	}
 	c.log.Info("wings: a worker arrived; placing the jobs that were waiting for one", "jobs", len(held))
 	for _, p := range held {
-		c.moveJob(p, "a worker arrived")
+		c.moveJob(p, "a worker arrived", false)
 	}
 }
 
@@ -856,7 +861,7 @@ func (c *Cluster) tail(w *workerConn) {
 			c.log.Error("wings: worker did not come back", "worker", w.id, "after", time.Since(trouble))
 			c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "unreachable"})
 			w.dead.Store(true)
-			c.redispatchFrom(w)
+			c.redispatchFrom(w, true)
 			return
 		}
 
@@ -912,12 +917,15 @@ func (c *Cluster) tail(w *workerConn) {
 			}
 
 			// A worker we can see has exited is dead now; no reason to wait out
-			// the reconnect window.
+			// the reconnect window. Only a local worker exits under us like this
+			// (a remote's machine is watched instead), so an exit is the job's
+			// worker dying — charged, which is how a job that kills every worker
+			// is eventually given up on.
 			if w.hasExited() {
 				c.log.Error("wings: worker exited", "worker", w.id, "err", err)
 				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "process exited"})
 				w.dead.Store(true)
-				c.redispatchFrom(w)
+				c.redispatchFrom(w, false)
 				return
 			}
 
@@ -932,7 +940,7 @@ func (c *Cluster) tail(w *workerConn) {
 				c.log.Error("wings: worker's machine is gone", "worker", w.id, "after", time.Since(trouble))
 				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "machine is gone"})
 				w.dead.Store(true)
-				c.redispatchFrom(w)
+				c.redispatchFrom(w, true)
 				return
 			}
 			attempts++
@@ -993,7 +1001,7 @@ func (c *Cluster) watchMachine(w *workerConn) {
 		if c.machineGone(w) && w.dead.CompareAndSwap(false, true) {
 			c.log.Error("wings: worker's machine is gone", "worker", w.id)
 			c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "machine is gone"})
-			c.redispatchFrom(w)
+			c.redispatchFrom(w, true)
 			return
 		}
 	}
@@ -1258,8 +1266,10 @@ func (c *Cluster) charge(w *workerConn) {
 
 // redispatchFrom re-sends everything a dead worker still owed us. This is where
 // at-least-once is paid for: a job may have finished on the dead worker and died
-// with its result, and nothing here can tell that from one that never ran.
-func (c *Cluster) redispatchFrom(dead *workerConn) {
+// with its result, and nothing here can tell that from one that never ran. Set
+// infra when the node was lost to something other than the job (unreachable,
+// machine gone, preempted), so the retries do not spend the attempt budget.
+func (c *Cluster) redispatchFrom(dead *workerConn, infra bool) {
 	c.mu.Lock()
 	var orphans []*pendingJob
 	for _, p := range c.pending {
@@ -1285,21 +1295,24 @@ func (c *Cluster) redispatchFrom(dead *workerConn) {
 				c.mu.Unlock()
 			}
 		}
-		c.moveJob(p, fmt.Sprintf("worker %s was lost", dead.id))
+		c.moveJob(p, fmt.Sprintf("worker %s was lost", dead.id), infra)
 	}
 }
 
 // moveJob sends one outstanding job to a different worker. The job keeps its id,
 // gains an attempt, and carries its last checkpoint so a long job does not
 // restart from nothing. The old worker is credited back, or it would never be
-// reaped and its machine would bill on until the cluster stopped.
-func (c *Cluster) moveJob(p *pendingJob, why string) { c.move(p, why, true) }
+// reaped and its machine would bill on until the cluster stopped. Set infra when
+// the move is forced by losing the node, not by the job, so it does not spend the
+// attempt budget.
+func (c *Cluster) moveJob(p *pendingJob, why string, infra bool) { c.move(p, why, true, infra) }
 
 // move is moveJob, with a say in whether the move counts against the job's
 // attempt budget. A move on suspicion is counted (so a job that kills every
 // worker is eventually given up on); a move for balance, of a job that has not
-// started, is not.
-func (c *Cluster) move(p *pendingJob, why string, counted bool) {
+// started, is not. An infra move is counted but also lifts the ceiling, so
+// losing the node under a job never gives up on it.
+func (c *Cluster) move(p *pendingJob, why string, counted, infra bool) {
 	c.mu.Lock()
 	if cur, still := c.pending[p.job.ID]; !still || cur != p {
 		c.mu.Unlock()
@@ -1307,6 +1320,11 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 	}
 	c.unblockLocked(p)
 	from, left := p.worker, p.job.Attempt
+	// Raised before any give-up check and once per lost node, matching the attempt
+	// this move will add, so an infrastructure loss is net-neutral on the budget.
+	if infra && p.placed {
+		p.infraMoves++
+	}
 	if p.incomplete {
 		// Recovered from the journal, which has no input: nothing to send until
 		// the replay forks it again. Held until then.
@@ -1325,7 +1343,7 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		c.stopOn(from, job.ID, left, why)
 		return
 	}
-	if counted && p.placed && p.job.Attempt+1 >= c.cfg.attempts() {
+	if counted && p.placed && p.job.Attempt+1 >= c.cfg.attempts()+p.infraMoves {
 		if from != nil {
 			c.release(from)
 			p.worker = nil
@@ -1430,7 +1448,7 @@ func (c *Cluster) move(p *pendingJob, why string, counted bool) {
 		if err := c.send(c.ctx, w, job); err != nil {
 			c.log.Warn("wings: could not hand a moved job to a worker; moving it again",
 				"job", job.ID, "worker", w.id, "err", err)
-			c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true)
+			c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true, false)
 		}
 	})
 }
@@ -1556,7 +1574,7 @@ func (c *Cluster) sweep(now time.Time) {
 	for i, p := range stuck {
 		c.log.Warn("wings: job is overdue, moving it", "job", p.job.ID,
 			"fn", p.job.Func, "worker", workerID(p.worker), "why", whys[i])
-		c.moveJob(p, whys[i])
+		c.moveJob(p, whys[i], false)
 	}
 	for _, p := range due {
 		c.wake(p, "its sleep is over")
@@ -1723,7 +1741,7 @@ func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, 
 				Worker: workerID(live.worker), Attempt: live.job.Attempt,
 			}.from(live.origin))
 			if place {
-				c.moveJob(live, "recovered with nothing to run it on, and now forked again")
+				c.moveJob(live, "recovered with nothing to run it on, and now forked again", false)
 			}
 			return live, nil
 		}
@@ -1771,7 +1789,7 @@ func (c *Cluster) submitJob(ctx context.Context, job jobEnvelope) (*pendingJob, 
 		// nothing can ever be handed to fails rather than loops.
 		c.log.Warn("wings: could not hand a job to a worker; moving it",
 			"job", job.ID, "worker", w.id, "err", err)
-		c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true)
+		c.move(p, fmt.Sprintf("could not hand it to %s: %v", w.id, err), true, false)
 		return p, nil
 	}
 	c.journal.record(journalEntry{
@@ -1983,7 +2001,7 @@ func (c *Cluster) tailBeats(w *workerConn) {
 				c.log.Warn("wings: worker is leaving; its machine is being taken back", "worker", w.id)
 				c.journal.record(journalEntry{Kind: journalWorkerGone, Worker: w.id, Err: "preempted"})
 				w.dead.Store(true)
-				c.redispatchFrom(w)
+				c.redispatchFrom(w, true)
 				return
 			}
 			c.onBeat(r.Record)

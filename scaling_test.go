@@ -116,7 +116,7 @@ func TestRebalancingDoesNotSpendAttempts(t *testing.T) {
 	// the job had the moves counted. There is only one worker, so the move
 	// lands it back where it was, which is fine for the arithmetic under test.
 	for range 2 {
-		c.move(queued, "rebalanced: test", false)
+		c.move(queued, "rebalanced: test", false, false)
 	}
 
 	if res, err := c.await(t.Context(), queued); err != nil {
@@ -126,6 +126,38 @@ func TestRebalancingDoesNotSpendAttempts(t *testing.T) {
 	}
 	if _, err := c.await(t.Context(), first); err != nil {
 		t.Fatalf("await first: %v", err)
+	}
+}
+
+// Losing the node under a running job is not the job's fault: an infra move
+// lifts the give-up ceiling in step with the attempt it adds, so a job whose
+// machines keep vanishing resumes from its checkpoint instead of exhausting its
+// budget. Charged only when the job itself is suspect.
+func TestInfraLossDoesNotSpendAttempts(t *testing.T) {
+	c := start(t, Config{Target: InProcess(), Workers: 1, Concurrency: 1, MaxAttempts: 2})
+
+	p := submitSlow(t, c, 800*time.Millisecond)
+
+	// Placed on the one worker before we start moving it, or the moves are no-ops.
+	if !eventually(t, 5*time.Second, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return p.placed
+	}) {
+		t.Fatal("the job was never placed")
+	}
+
+	// Moved as an infrastructure loss three times — past MaxAttempts of 2, which
+	// would have failed the job had the moves been charged. One worker, so each
+	// move lands it back where it was.
+	for range 3 {
+		c.move(p, "machine is gone: test", true, true)
+	}
+
+	if res, err := c.await(t.Context(), p); err != nil {
+		t.Fatalf("await: %v", err)
+	} else if res.Error != "" {
+		t.Fatalf("a job moved for infrastructure loss failed: %s", res.Error)
 	}
 }
 

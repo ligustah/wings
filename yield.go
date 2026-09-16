@@ -198,7 +198,7 @@ func (c *Cluster) wake(p *pendingJob, why string) {
 	p.yield = nil
 	c.mu.Unlock()
 	c.log.Info("wings: waking a job", "job", p.job.ID, "fn", p.job.Func, "why", why)
-	c.move(p, why, false)
+	c.move(p, why, false, false)
 }
 
 // yieldSettled reports whether a channel wait was already satisfied when the

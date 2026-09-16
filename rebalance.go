@@ -69,6 +69,6 @@ func (c *Cluster) rebalance(now time.Time) {
 	c.log.Info("wings: moving queued jobs to workers with less to do", "jobs", len(moves),
 		"from", moves[0].from.id, "to", moves[0].to.id)
 	for _, m := range moves {
-		c.move(m.p, fmt.Sprintf("rebalanced: queued on %s while %s had less to do", m.from.id, m.to.id), false)
+		c.move(m.p, fmt.Sprintf("rebalanced: queued on %s while %s had less to do", m.from.id, m.to.id), false, false)
 	}
 }
