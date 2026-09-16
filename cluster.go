@@ -783,11 +783,25 @@ func (c *Cluster) closeShared() error {
 		return nil
 	}
 	// The client wraps the engine's backend, which Close also releases; only one may.
-	err := c.sharedStop()
+	stop := c.sharedStop
 	c.sharedStop, c.shared = nil, nil
 	c.sharedUp.Store(false)
-	return err
+	// Bound the release: a p2p node's raft or overlay Close can block indefinitely
+	// against a peer whose machine is gone, and the coordinator must still exit.
+	// Abandoning the goroutine is safe — the process is shutting down.
+	done := make(chan error, 1)
+	go func() { done <- stop() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(shutdownGrace):
+		return fmt.Errorf("wings: shared engine did not release within %s; abandoning it so shutdown completes", shutdownGrace)
+	}
 }
+
+// shutdownGrace bounds releasing the shared engine at [Cluster.Stop], so a raft or
+// overlay Close blocked on an unreachable peer cannot hang the coordinator's exit.
+const shutdownGrace = 20 * time.Second
 
 // tail mirrors a worker's results onto the coordinator's streams and delivers
 // them, until the cluster stops or the worker is genuinely gone — a transient
